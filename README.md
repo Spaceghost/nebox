@@ -81,7 +81,7 @@ Stated here rather than worked around:
 - `ls` prints one entry per line in every mode (no columns); sorting flags -r -t -S and -h -i -n -A are supported. `-l` and `id`
   resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
   has no `getpwuid`); unknown ids print as numbers.
-- `id` reports only the primary group.
+- `id` lists supplementary groups from `getgroups`; `-G` is supported.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `sort` offers `-r -n -u -f -o`; no `-k` keys or field separators.
 - `tr` has ranges, `[:class:]`, `[c*n]`, `-c`, `-d`, `-s`, and escapes; no equivalence classes.
