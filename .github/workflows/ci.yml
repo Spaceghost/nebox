@@ -1,6 +1,6 @@
 name: ci
-# Runs on the self-hosted bak runner (Incus container gh-runners on bak), which
-# carries Nelua (Spaceghost/nelua-lang 3c29419) and Zig 0.17.0 under /opt.
+# Runs on a self-hosted Linux x86-64 runner that carries Nelua
+# (Spaceghost/nelua-lang) and Zig under /opt.
 on:
   push:
     branches: [main]
@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-test:
-    runs-on: [self-hosted, linux, x64, bak]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     env:
       NELUA: /opt/nelua/nelua

@@ -1,10 +1,11 @@
 # nebox: Nelua multicall binary linked against libnelibc-standalone.
-# Builds run inside the Incus container nelibc-writ on bak (see AGENTS.md);
-# the defaults below are that container's paths.
-NELUA ?= /opt/nelua/nelua
-ZIG ?= /opt/zig/zig
+# Builds run in a Linux x86-64 container with Nelua and Zig (see AGENTS.md).
+# Override NELUA, ZIG and NELIBC for your layout; NELIBC is a nelibc checkout
+# with build/libnelibc-standalone-zig.a already built.
+NELUA ?= nelua
+ZIG ?= zig
 ZIGFLAGS ?= -mcpu=x86_64
-NELIBC ?= /work/nelibc
+NELIBC ?= ../nelibc
 NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-zig.a
 OUT ?= build
 NM ?= nm

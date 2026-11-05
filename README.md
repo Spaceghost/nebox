@@ -8,13 +8,26 @@ applet) or from the first operand (`nebox cat FILE`).
 
 ## Build and test
 
-Builds and tests run only inside the Incus container `nelibc-writ` on bak,
-where nelibc is checked out at `/work/nelibc` with
-`build/libnelibc-standalone-zig.a` already built:
+Needs Nelua ([Spaceghost/nelua-lang](https://github.com/Spaceghost/nelua-lang)),
+Zig (`zig cc`), GNU coreutils as the test reference, and a
+[nelibc](https://github.com/Spaceghost/nelibc) checkout with its standalone
+archive built. Builds and tests are meant to run in a Linux x86-64 container,
+not on a workstation:
 
 ```sh
-tools/remote.sh          # sync, build, run tests/run.sh in the container
-tools/remote.sh build    # build only
+git clone https://github.com/Spaceghost/nelibc ../nelibc
+make -C ../nelibc lib-standalone-zig
+make NELIBC=../nelibc          # build/nebox
+make NELIBC=../nelibc test     # tests/run.sh
+```
+
+`tools/remote.sh` does the same inside a remote Incus container: it tars the
+tree over ssh and runs `make` there, reading the target from `NEBOX_HOST`,
+`NEBOX_CONTAINER`, `NEBOX_DEST` and `NEBOX_NELIBC`:
+
+```sh
+NEBOX_HOST=buildbox NEBOX_CONTAINER=nelua tools/remote.sh        # sync, build, test
+NEBOX_HOST=buildbox NEBOX_CONTAINER=nelua tools/remote.sh build  # build only
 ```
 
 `make` compiles `src/nebox.nelua` with Nelua (release mode) through
