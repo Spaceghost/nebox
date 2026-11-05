@@ -27,10 +27,31 @@ local function readnames(dir: string, all: boolean): (sequence(string), boolean)
   return names, true
 end
 
-local function ls_long(path: string, shown: string, st: *sys.Stat)
-  util.writef('%s %3d %5d %5d %8d %s %s', util.modestr(st.st_mode), (@integer)(st.st_nlink),
+local function digits(v: integer): integer
+  local n: integer = 1
+  while v >= 10 do v = v // 10; n = n + 1 end
+  return n
+end
+
+-- Column widths for -l, computed per listing as GNU ls does.
+local LsWidths = @record{nlink: integer, uid: integer, gid: integer, size: integer}
+
+local function widths_of(stats: sequence(sys.Stat)): LsWidths
+  local w: LsWidths = {1, 1, 1, 1}
+  for _, st in ipairs(stats) do
+    local d = digits((@integer)(st.st_nlink)); if d > w.nlink then w.nlink = d end
+    d = digits((@integer)(st.st_uid)); if d > w.uid then w.uid = d end
+    d = digits((@integer)(st.st_gid)); if d > w.gid then w.gid = d end
+    d = digits((@integer)(st.st_size)); if d > w.size then w.size = d end
+  end
+  return w
+end
+
+local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths)
+  local fmt = string.format('%%s %%%dd %%%dd %%%dd %%%dd %%s %%s', w.nlink, w.uid, w.gid, w.size)
+  util.write(string.format(fmt, util.modestr(st.st_mode), (@integer)(st.st_nlink),
     (@integer)(st.st_uid), (@integer)(st.st_gid), (@integer)(st.st_size),
-    util.timefmt(st.st_mtim.tv_sec, '%b %e %H:%M'), shown)
+    util.timefmt(st.st_mtim.tv_sec, '%b %e %H:%M'), shown))
   if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
     local buf: [4096]byte
     local n = sys.readlink(path, &buf[0], #buf)
@@ -41,10 +62,8 @@ end
 
 local Ls = @record{long: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer}
 
-function Ls:entry(path: string, shown: string)
-  local st: sys.Stat
-  if sys.lstat(path, &st) ~= 0 then util.perror(path); self.rc = 2; return end
-  if self.long then ls_long(path, shown, &st) return end
+function Ls:show(path: string, shown: string, st: *sys.Stat, w: LsWidths)
+  if self.long then ls_long(path, shown, st, w) return end
   util.write(shown)
   local kind = st.st_mode & sys.S_IFMT
   if (self.classify or self.slash) and kind == sys.S_IFDIR then util.writebyte(47)
@@ -53,11 +72,33 @@ function Ls:entry(path: string, shown: string)
   util.writebyte(10)
 end
 
+-- Print a group of entries (operand files, or one directory's contents).
+function Ls:group(paths: sequence(string), shown: sequence(string), total: boolean)
+  local stats: sequence(sys.Stat)
+  local okpaths: sequence(string)
+  local okshown: sequence(string)
+  local blocks: integer = 0
+  for i, p in ipairs(paths) do
+    local st: sys.Stat
+    if sys.lstat(p, &st) ~= 0 then
+      util.err("cannot access '" .. p .. "': " .. sys.errstr()); self.rc = 2
+    else
+      stats:push(st); okpaths:push(p); okshown:push(shown[i])
+      blocks = blocks + (@integer)(st.st_blocks)
+    end
+  end
+  local w = widths_of(stats)
+  if self.long and total then util.writef('total %d\n', blocks // 2) end
+  for i, p in ipairs(okpaths) do self:show(p, okshown[i], &stats[i], w) end
+end
+
 function Ls:listdir(dir: string, label: boolean)
   local names, ok = readnames(dir, self.all)
-  if not ok then util.perror(dir); self.rc = 2; return end
+  if not ok then util.err("cannot open directory '" .. dir .. "': " .. sys.errstr()); self.rc = 2; return end
   if label then util.write(dir); util.line(':') end
-  for _, n in ipairs(names) do self:entry(util.join(dir, n), n) end
+  local paths: sequence(string)
+  for _, n in ipairs(names) do paths:push(util.join(dir, n)) end
+  self:group(paths, names, true)
   if self.recursive then
     for _, n in ipairs(names) do
       if n == '.' or n == '..' then continue end
@@ -82,7 +123,7 @@ global function applet_ls(args: sequence(string)): integer
   for _, p in ipairs(o.operands) do
     if not dironly and util.isdir(p) then dirs:push(p) else files:push(p) end
   end
-  for _, p in ipairs(files) do ls:entry(p, p) end
+  if #files > 0 then ls:group(files, files, false) end
   for i, d in ipairs(dirs) do
     if #files > 0 or i > 1 then util.writebyte(10) end
     ls:listdir(d, #o.operands > 1 or ls.recursive)

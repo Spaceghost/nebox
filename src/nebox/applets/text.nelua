@@ -70,12 +70,15 @@ global function applet_cat(args: sequence(string)): integer
 end
 
 -- head/tail share operand handling: "-n N", "-c N", legacy "-N".
+local count_plus: boolean = false  -- "+N" was given (tail: from the Nth item)
+
 local function count_args(args: sequence(string)): (sequence(string), boolean, integer, boolean, boolean)
-  -- returns operands, bytes-mode, count, quiet, ok
+  -- returns operands, bytes-mode, count, verbose, ok
   local rest: sequence(string)
   local bytes = false
   local count: integer = 10
   local quiet, verbose = false, false
+  count_plus = false
   local i: integer = 1
   while i <= #args do
     local a = args[i]
@@ -88,6 +91,7 @@ local function count_args(args: sequence(string)): (sequence(string), boolean, i
       local n, ok = util.tosize(v)
       if not ok then util.err("invalid number of " .. (c == 110 and "lines" or "bytes") .. ": '" .. v .. "'"); return rest, false, 0, false, false end
       count = n
+      count_plus = v:byte(1) == 43
       bytes = c == 99
     elseif c >= 48 and c <= 57 then
       local n, ok = util.tosize(a:sub(2))
@@ -161,17 +165,19 @@ global function applet_tail(args: sequence(string)): integer
     if verbose then header(path, idx == 1) end
     if bytes then
       local n = count
+      if n < 0 then n = -n end
       local start: integer = 0
-      if n < 0 then start = -n - 1 else start = (@integer)(data.size) - n end
+      if count_plus then start = n - 1 else start = (@integer)(data.size) - n end
       if start < 0 then start = 0 end
       if start > (@integer)(data.size) then start = (@integer)(data.size) end
       util.writebytes(&data.data[start], data.size - (@usize)(start))
     else
       -- count newlines from the end
       local n = count
-      if n < 0 then
+      if n < 0 then n = -n end
+      if count_plus then
         -- "+N": start at line N
-        local want = -n
+        local want = n
         local line: integer = 1
         local start: usize = 0
         while line < want and start < data.size do
@@ -533,7 +539,9 @@ global function applet_tr(args: sequence(string)): integer
   local map: [256]byte
   for b: integer = 0, 255 do map[b] = (@byte)(b) end
   local deleting = o:has('d')
-  if not deleting then
+  if not deleting and o:has('s') and #o.operands == 1 then
+    -- squeeze only
+  elseif not deleting then
     if #o.operands < 2 then util.err('missing operand after \'' .. o.operands[1] .. '\''); return 1 end
     local set2 = expand_set(o.operands[2])
     if #set2 == 0 then util.err('when not truncating set1, string2 must be non-empty'); return 1 end
@@ -736,6 +744,7 @@ global function applet_printf(args: sequence(string)): integer
   local ai: integer = 2
   local rc: integer = 0
   repeat
+    local before = ai
     local i: usize = 1
     while i <= fmt.size do
       local c = fmt:byte(i)
@@ -800,7 +809,7 @@ global function applet_printf(args: sequence(string)): integer
         i = i + 1
       end
     end
-  until ai > #args or ai == 2
+  until ai > #args or ai == before
   return rc
 end
 

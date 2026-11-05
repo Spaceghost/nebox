@@ -35,7 +35,7 @@ snapshot() {
 
 run_in() { # dir path-prefix command
   rm -rf "$1"; cp -a "$W/fixture" "$1"
-  (cd "$1" && PATH="$2$PATH" sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
+  (cd "$1" && LC_ALL=C PATH="$2$PATH" sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
 }
 
 same() { # name command
@@ -268,7 +268,13 @@ expect list-has-cat 'exit=0' "$BIN --list | grep -qx cat"
 expect unknown-applet 'exit=127' "$BIN nosuchapplet"
 expect multicall 'ok
 exit=0' "$BIN echo ok"
-expect nosuch-link 'exit=127' "cp $W/bin/cat ./nosuch 2>/dev/null; ./nosuch"
+expect nosuch-link 'hi
+exit=0' "cp $W/bin/cat ./nosuch 2>/dev/null; ./nosuch echo hi"
+same tail-plus-c 'tail -c +4 words.txt'
+same tr-s-one 'echo "aaabbb" | tr -s ab'
+same printf-noconv 'printf "hi\n" a b'
+same ls-l-dir 'ls -l sub | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same ls-l-total 'ls -l empty' 
 expect ls-l-shape 'exit=0' "ls -l words.txt | grep -Eq '^-rw-r--r-- +1 +[0-9]+ +[0-9]+ +31 [A-Z][a-z]{2} +[0-9]+ [0-9:]{5} words.txt\$'"
 expect grep-E-unsupported 'exit=2' "grep -E a words.txt"
 

@@ -138,6 +138,7 @@ function util.parse(args: sequence(string), spec: string): util.Opts
     while j <= a.size do
       local c = a:byte(j)
       local known, takes = spec_find(spec, c)
+      if c >= 128 then known = false end
       if not known then
         o.bad = string.char(c)
         return o
