@@ -36,21 +36,28 @@ end
 -- Column widths for -l, computed per listing as GNU ls does.
 local LsWidths = @record{nlink: integer, uid: integer, gid: integer, size: integer}
 
+local function owner(st: *sys.Stat): (string, string)
+  return util.idname(util.username((@integer)(st.st_uid)), (@integer)(st.st_uid)),
+         util.idname(util.groupname((@integer)(st.st_gid)), (@integer)(st.st_gid))
+end
+
 local function widths_of(stats: sequence(sys.Stat)): LsWidths
   local w: LsWidths = {1, 1, 1, 1}
   for _, st in ipairs(stats) do
+    local u, g = owner(&st)
     local d = digits((@integer)(st.st_nlink)); if d > w.nlink then w.nlink = d end
-    d = digits((@integer)(st.st_uid)); if d > w.uid then w.uid = d end
-    d = digits((@integer)(st.st_gid)); if d > w.gid then w.gid = d end
+    d = (@integer)(u.size); if d > w.uid then w.uid = d end
+    d = (@integer)(g.size); if d > w.gid then w.gid = d end
     d = digits((@integer)(st.st_size)); if d > w.size then w.size = d end
   end
   return w
 end
 
 local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths)
-  local fmt = string.format('%%s %%%dd %%%dd %%%dd %%%dd %%s %%s', w.nlink, w.uid, w.gid, w.size)
+  local u, g = owner(st)
+  local fmt = string.format('%%s %%%dd %%-%ds %%-%ds %%%dd %%s %%s', w.nlink, w.uid, w.gid, w.size)
   util.write(string.format(fmt, util.modestr(st.st_mode), (@integer)(st.st_nlink),
-    (@integer)(st.st_uid), (@integer)(st.st_gid), (@integer)(st.st_size),
+    u, g, (@integer)(st.st_size),
     util.timefmt(st.st_mtim.tv_sec, '%b %e %H:%M'), shown))
   if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
     local buf: [4096]byte
@@ -60,10 +67,10 @@ local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths)
   util.writebyte(10)
 end
 
-local Ls = @record{long: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer}
+local Ls = @record{longfmt: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer}
 
 function Ls:show(path: string, shown: string, st: *sys.Stat, w: LsWidths)
-  if self.long then ls_long(path, shown, st, w) return end
+  if self.longfmt then ls_long(path, shown, st, w) return end
   util.write(shown)
   local kind = st.st_mode & sys.S_IFMT
   if (self.classify or self.slash) and kind == sys.S_IFDIR then util.writebyte(47)
@@ -88,7 +95,7 @@ function Ls:group(paths: sequence(string), shown: sequence(string), total: boole
     end
   end
   local w = widths_of(stats)
-  if self.long and total then util.writef('total %d\n', blocks // 2) end
+  if self.longfmt and total then util.writef('total %d\n', (blocks + 1) // 2) end
   for i, p in ipairs(okpaths) do self:show(p, okshown[i], &stats[i], w) end
 end
 
@@ -123,6 +130,8 @@ global function applet_ls(args: sequence(string)): integer
   for _, p in ipairs(o.operands) do
     if not dironly and util.isdir(p) then dirs:push(p) else files:push(p) end
   end
+  util.sort(files, name_less)
+  util.sort(dirs, name_less)
   if #files > 0 then ls:group(files, files, false) end
   for i, d in ipairs(dirs) do
     if #files > 0 or i > 1 then util.writebyte(10) end

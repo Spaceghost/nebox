@@ -155,12 +155,26 @@ global function applet_id(args: sequence(string)): integer
   if not o:ok() then return util.optfail(o) end
   local uid, euid = sys.getuid(), sys.geteuid()
   local gid, egid = sys.getgid(), sys.getegid()
-  if o:has('u') then util.writef('%d\n', (@integer)(o:has('r') and uid or euid)); return 0 end
-  if o:has('g') then util.writef('%d\n', (@integer)(o:has('r') and gid or egid)); return 0 end
-  util.writef('uid=%d gid=%d', (@integer)(uid), (@integer)(gid))
-  if euid ~= uid then util.writef(' euid=%d', (@integer)(euid)) end
-  if egid ~= gid then util.writef(' egid=%d', (@integer)(egid)) end
-  util.writef(' groups=%d\n', (@integer)(gid))
+  local u: integer = (@integer)(o:has('r') and uid or euid)
+  local g: integer = (@integer)(o:has('r') and gid or egid)
+  if o:has('u') then
+    if o:has('n') then util.line(util.idname(util.username(u), u)) else util.writef('%d\n', u) end
+    return 0
+  end
+  if o:has('g') then
+    if o:has('n') then util.line(util.idname(util.groupname(g), g)) else util.writef('%d\n', g) end
+    return 0
+  end
+  local function show(label: string, id: integer, name: string)
+    util.write(label); util.writef('%d', id)
+    if name.size > 0 then util.write('(' .. name .. ')') end
+  end
+  show('uid=', (@integer)(uid), util.username((@integer)(uid)))
+  show(' gid=', (@integer)(gid), util.groupname((@integer)(gid)))
+  if euid ~= uid then show(' euid=', (@integer)(euid), util.username((@integer)(euid))) end
+  if egid ~= gid then show(' egid=', (@integer)(egid), util.groupname((@integer)(egid))) end
+  show(' groups=', (@integer)(gid), util.groupname((@integer)(gid)))
+  util.writebyte(10)
   return 0
 end
 
@@ -211,7 +225,8 @@ global function applet_which(args: sequence(string)): integer
   local o = util.parse(args, 'a')
   if not o:ok() then return util.optfail(o) end
   local path = sys.getenv('PATH')
-  local pathstr: string = path ~= nilptr and path or '/usr/local/bin:/usr/bin:/bin'
+  local pathstr: string = '/usr/local/bin:/usr/bin:/bin'
+  if path ~= nilptr then pathstr = path end
   local rc: integer = 0
   for _, name in ipairs(o.operands) do
     local found = false
@@ -273,22 +288,8 @@ global function applet_date(args: sequence(string)): integer
 end
 
 global function applet_nproc(args: sequence(string)): integer
-  local data, ok = util.readfile('/sys/devices/system/cpu/online')
-  if not ok then return 1 end
-  -- "0-7" or "0,2-3"
-  local n: integer = 0
-  local lo: integer = -1
-  local cur: integer = 0
-  local have = false
-  for i: usize = 0, data.size do
-    local b: byte = i < data.size and data.data[i] or 10
-    if b >= 48 and b <= 57 then cur = cur * 10 + (b - 48); have = true
-    elseif b == 45 then lo = cur; cur = 0; have = false
-    elseif have then
-      if lo >= 0 then n = n + (cur - lo + 1) else n = n + 1 end
-      lo = -1; cur = 0; have = false
-    end
-  end
+  local n = util.cpucount()
+  if n == 0 then return util.die('sched_getaffinity: ' .. sys.errstr()) end
   util.writef('%d\n', n)
   return 0
 end

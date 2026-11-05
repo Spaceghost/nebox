@@ -5,12 +5,12 @@
 
 global sys = @record{}
 
-global sys.Timespec: type <cimport 'struct timespec', cinclude '<time.h>', nodecl> = @record{
+global sys.Timespec: type <cimport 'nebox_timespec', cinclude '<time.h>', nodecl, ctypedef 'timespec'> = @record{
   tv_sec: clong,
   tv_nsec: clong,
 }
 
-global sys.Stat: type <cimport 'struct stat', cinclude '<sys/stat.h>', nodecl> = @record{
+global sys.Stat: type <cimport 'nebox_stat', cinclude '<sys/stat.h>', nodecl, ctypedef 'stat'> = @record{
   st_dev: culong,
   st_ino: culong,
   st_nlink: culong,
@@ -28,7 +28,7 @@ global sys.Stat: type <cimport 'struct stat', cinclude '<sys/stat.h>', nodecl> =
   __reserved: [3]clong,
 }
 
-global sys.Dirent: type <cimport 'struct dirent', cinclude '<dirent.h>', nodecl> = @record{
+global sys.Dirent: type <cimport 'nebox_dirent', cinclude '<dirent.h>', nodecl, ctypedef 'dirent'> = @record{
   d_ino: culong,
   d_off: clong,
   d_reclen: cushort,
@@ -38,13 +38,13 @@ global sys.Dirent: type <cimport 'struct dirent', cinclude '<dirent.h>', nodecl>
 
 global sys.DIR: type <cimport 'DIR', cinclude '<dirent.h>', nodecl> = @record{}
 
-global sys.Tm: type <cimport 'struct tm', cinclude '<time.h>', nodecl> = @record{
+global sys.Tm: type <cimport 'nebox_tm', cinclude '<time.h>', nodecl, ctypedef 'tm'> = @record{
   tm_sec: cint, tm_min: cint, tm_hour: cint, tm_mday: cint, tm_mon: cint,
   tm_year: cint, tm_wday: cint, tm_yday: cint, tm_isdst: cint,
   tm_gmtoff: clong, tm_zone: cstring,
 }
 
-global sys.Utsname: type <cimport 'struct utsname', cinclude '<sys/utsname.h>', nodecl> = @record{
+global sys.Utsname: type <cimport 'nebox_utsname', cinclude '<sys/utsname.h>', nodecl, ctypedef 'utsname'> = @record{
   sysname: [65]cchar, nodename: [65]cchar, release: [65]cchar,
   version: [65]cchar, machine: [65]cchar, domainname: [65]cchar,
 }
@@ -124,6 +124,7 @@ function sys.execvp(file: cstring, argv: *[0]cstring): cint <cimport 'execvp', c
 function sys.setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport 'setenv', cinclude '<stdlib.h>'> end
 function sys.unsetenv(name: cstring): cint <cimport 'unsetenv', cinclude '<stdlib.h>'> end
 function sys.getenv(name: cstring): cstring <cimport 'getenv', cinclude '<stdlib.h>'> end
+function sys.sched_getaffinity(pid: cint, size: csize, mask: pointer): cint <cimport 'sched_getaffinity', cinclude '<sched.h>'> end
 function sys.sync(): void <cimport 'sync', cinclude '<unistd.h>'> end
 function sys.umask(mask: cuint): cuint <cimport 'umask', cinclude '<sys/stat.h>'> end
 function sys._exit(code: cint): void <cimport '_exit', cinclude '<unistd.h>', noreturn> end

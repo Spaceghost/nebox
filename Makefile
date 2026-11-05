@@ -15,15 +15,15 @@ SOURCES := src/nebox.nelua src/nebox/sys.nelua src/nebox/util.nelua \
 CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-protector \
   -ffreestanding -fno-builtin -fno-sanitize=all -Wl,-e,_start -Wl,--build-id=none \
   -I$(NELIBC)/include
-LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive
+LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive -Wl,--strip-all
 
-.PHONY: all build test clean nelibc
+.PHONY: all nebox test clean
 
-all: build
+all: nebox
 
-build: $(OUT)/nebox
+nebox: $(OUT)/nebox
 
-$(OUT)/nebox: $(SOURCES) $(NELIBC_LIB) | $(OUT)
+$(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) | $(OUT)
 	$(NELUA) -r -L src --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(LDFLAGS)' -o $@ src/nebox.nelua
 	@test -z "$$($(NM) -u $@)" || { echo "undefined symbols:"; $(NM) -u $@; exit 1; }
 	@echo "built $@ ($$(stat -c %s $@) bytes, static, no host libc)"

@@ -35,7 +35,7 @@ snapshot() {
 
 run_in() { # dir path-prefix command
   rm -rf "$1"; cp -a "$W/fixture" "$1"
-  (cd "$1" && LC_ALL=C PATH="$2$PATH" sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
+  (cd "$1" && LC_ALL=C PATH="$2$PATH" timeout 20 sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
 }
 
 same() { # name command
@@ -275,7 +275,17 @@ same tr-s-one 'echo "aaabbb" | tr -s ab'
 same printf-noconv 'printf "hi\n" a b'
 same ls-l-dir 'ls -l sub | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
 same ls-l-total 'ls -l empty' 
-expect ls-l-shape 'exit=0' "ls -l words.txt | grep -Eq '^-rw-r--r-- +1 +[0-9]+ +[0-9]+ +31 [A-Z][a-z]{2} +[0-9]+ [0-9:]{5} words.txt\$'"
+same ls-l-file 'ls -l words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same ls-l-all 'ls -la | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same id-full 'id'
+same id-un 'id -un'
+same id-gn 'id -gn'
+same head-pipe 'yes | head -c 5'
+same wc-stdin-all 'wc < words.txt'
+same wc-pipe 'cat words.txt | wc'
+same wc-two 'wc words.txt big.bin'
+same nl-s 'nl -s: -w3 spaces.txt'
+same seq-opt-bad 'seq -x 3; echo $?' 
 expect grep-E-unsupported 'exit=2' "grep -E a words.txt"
 
 echo "nebox tests: $pass passed, $fail failed"

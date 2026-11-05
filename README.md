@@ -43,9 +43,11 @@ Stated here rather than worked around:
 - `grep` matches fixed strings only. `-E`/`-G` exit 2 with a message.
 - `date` prints UTC. nelibc has no zone database, so there is no local time.
   `-d` understands only `@SECONDS`; setting the date is unsupported.
-- `ls` prints one entry per line in every mode (no columns), and `-l` shows
-  numeric uid/gid: nelibc has no `getpwuid`/`getgrgid`.
-- `id` prints numeric ids and only the primary group.
+- `ls` prints one entry per line in every mode (no columns). `-l` and `id`
+  resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
+  has no `getpwuid`); unknown ids print as numbers.
+- `id` reports only the primary group.
+- `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `sort` offers `-r -n -u -f -o`; no `-k` keys or field separators.
 - `tr` has ranges, `-c`, `-d`, `-s`, and backslash escapes; no `[:class:]`.
 - `seq` is integer-only.
@@ -55,5 +57,6 @@ Stated here rather than worked around:
 - `mv` across filesystems copies then removes; `cp -a` is `-rp`.
 
 Everything in the applet list has at least one passing case in
-`tests/run.sh`; see the test names for the exact flags covered. Status of
-the last container run is recorded in the commit messages, not here.
+`tests/run.sh`; see the test names for the exact flags covered. The result
+of the last container run is recorded in the commit message of each commit
+that changed behavior.

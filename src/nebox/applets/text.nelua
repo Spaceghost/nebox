@@ -117,36 +117,75 @@ local function header(path: string, first: boolean)
   util.line(' <==')
 end
 
+-- head streams: it must stop reading after N lines so `yes | head` ends.
+local function head_stream(fd: cint, path: string, bytes: boolean, n: integer): boolean
+  local chunk: [65536]byte
+  local remaining = n
+  while remaining > 0 do
+    local want: usize = #chunk
+    if bytes and (@usize)(remaining) < want then want = (@usize)(remaining) end
+    local r = sys.read(fd, &chunk[0], want)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      util.perror(path)
+      return false
+    end
+    if r == 0 then break end
+    local got = (@usize)(r)
+    if bytes then
+      util.writebytes(&chunk[0], got)
+      remaining = remaining - (@integer)(got)
+    else
+      local stop = got
+      for i: usize = 0, < got do
+        if chunk[i] == 10 then
+          remaining = remaining - 1
+          if remaining == 0 then stop = i + 1; break end
+        end
+      end
+      util.writebytes(&chunk[0], stop)
+    end
+  end
+  return true
+end
+
 global function applet_head(args: sequence(string)): integer
   local files, bytes, count, verbose, ok = count_args(args)
   if not ok then return 1 end
   if #files == 0 then files:push('-') end
   local rc: integer = 0
   for idx, path in ipairs(files) do
+    if verbose then header(path, idx == 1) end
+    if count >= 0 then
+      local fd = util.openin(path)
+      if fd < 0 then rc = 1; continue end
+      if not head_stream(fd, path, bytes, count) then rc = 1 end
+      if fd ~= 0 then sys.close(fd) end
+      util.flush()
+      continue
+    end
+    -- negative count: all but the last N; needs the whole input
     local data, rok = util.readfile(path)
     if not rok then rc = 1; continue end
-    if verbose then header(path, idx == 1) end
+    local n = count
     if bytes then
-      local n = count
-      if n < 0 then n = (@integer)(data.size) + n; if n < 0 then n = 0 end end
-      if n > (@integer)(data.size) then n = (@integer)(data.size) end
+      n = (@integer)(data.size) + n; if n < 0 then n = 0 end
       util.writebytes(data.data, (@usize)(n))
     else
-      local n = count
       local total: integer = 0
       for i: usize = 0, < data.size do if data.data[i] == 10 then total = total + 1 end end
       if data.size > 0 and data.data[data.size - 1] ~= 10 then total = total + 1 end
-      if n < 0 then n = total + n; if n < 0 then n = 0 end end
+      n = total + n; if n < 0 then n = 0 end
       local seen: integer = 0
       local stop: usize = data.size
       if n < total then
+        stop = 0
         for i: usize = 0, < data.size do
           if data.data[i] == 10 then
             seen = seen + 1
             if seen == n then stop = i + 1; break end
           end
         end
-        if n == 0 then stop = 0 end
       end
       util.writebytes(data.data, stop)
     end
@@ -205,11 +244,11 @@ global function applet_tail(args: sequence(string)): integer
   return rc
 end
 
-local WcShow = @record{wl: boolean, ww: boolean, wc: boolean, wL: boolean, narrow: boolean}
+local WcShow = @record{wl: boolean, ww: boolean, wc: boolean, wL: boolean, width: integer}
 
 function WcShow:col(first: boolean, v: integer)
   if not first then util.writebyte(32) end
-  if self.narrow then util.writef('%d', v) else util.writef('%7d', v) end
+  util.write(string.format('%' .. string.format('%d', self.width) .. 'd', v))
 end
 
 function WcShow:line(l: integer, w: integer, c: integer, L: integer, name: string)
@@ -231,8 +270,31 @@ global function applet_wc(args: sequence(string)): integer
   if #o.operands == 0 then o.operands:push('-') end
   local tl, tw, tc, tL: integer = 0, 0, 0, 0
   local rc: integer = 0
-  local narrow = #o.operands == 1 and o.operands[1] == '-'
-  local show: WcShow = {wl, ww, wc, wL, narrow}
+  -- GNU widths: 1 when a single count prints; else digits of the total
+  -- size when every input is a regular file; else 7.
+  local counts: integer = 0
+  if wl then counts = counts + 1 end
+  if ww then counts = counts + 1 end
+  if wc then counts = counts + 1 end
+  if wL then counts = counts + 1 end
+  local width: integer = 7
+  if counts == 1 then width = 1
+  else
+    local regular = true
+    local total: integer = 0
+    for _, path in ipairs(o.operands) do
+      local st: sys.Stat
+      local r: cint
+      if path == '-' then r = sys.fstat(0, &st) else r = sys.stat(path, &st) end
+      if r ~= 0 or (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG then regular = false; break end
+      total = total + (@integer)(st.st_size)
+    end
+    if regular then
+      width = 1
+      while total >= 10 do total = total // 10; width = width + 1 end
+    end
+  end
+  local show: WcShow = {wl, ww, wc, wL, width}
   for _, path in ipairs(o.operands) do
     local data, ok = util.readfile(path)
     if not ok then rc = 1; continue end
@@ -241,8 +303,13 @@ global function applet_wc(args: sequence(string)): integer
     for i: usize = 0, < data.size do
       local b = data.data[i]
       if b == 10 then l = l + 1; if cur > L then L = cur end; cur = 0 else cur = cur + 1 end
+      -- GNU wc: whitespace ends a word, a printable byte starts one, and
+      -- other bytes (controls, high bytes in the C locale) do neither.
       local space = b == 32 or (b >= 9 and b <= 13)
-      if space then inword = false elseif not inword then inword = true; w = w + 1 end
+      if space then inword = false
+      elseif b >= 33 and b <= 126 then
+        if not inword then inword = true; w = w + 1 end
+      end
     end
     if cur > L then L = cur end
     show:line(l, w, (@integer)(data.size), L, path)
@@ -693,26 +760,47 @@ global function applet_yes(args: sequence(string)): integer
 end
 
 global function applet_seq(args: sequence(string)): integer
-  local o = util.parse(args, 's:w')
-  if not o:ok() then return util.optfail(o) end
-  local n = #o.operands
+  -- options by hand: "-2" is a number, not an option
+  local sep: string = '\n'
+  local pad = false
+  local operands: sequence(string)
+  local i: integer = 1
+  while i <= #args do
+    local a = args[i]
+    if a == '--' then i = i + 1; break end
+    if a.size >= 2 and a:byte(1) == 45 and (a:byte(2) == 115 or a:byte(2) == 119) then
+      if a:byte(2) == 119 then pad = true
+      elseif a.size > 2 then sep = a:sub(3)
+      else
+        i = i + 1
+        if i > #args then return util.die("option requires an argument -- 's'") end
+        sep = args[i]
+      end
+    elseif a.size >= 2 and a:byte(1) == 45 and not (a:byte(2) >= 48 and a:byte(2) <= 57) and a:byte(2) ~= 46 then
+      return util.die("invalid option -- '" .. a:sub(2, 2) .. "'")
+    else
+      break
+    end
+    i = i + 1
+  end
+  while i <= #args do operands:push(args[i]); i = i + 1 end
+  local n = #operands
   if n < 1 or n > 3 then util.err(n == 0 and 'missing operand' or 'extra operand'); return 1 end
   local first, inc, last: integer = 1, 1, 0
   local ok: boolean
-  if n == 1 then last, ok = util.toint(o.operands[1])
+  if n == 1 then last, ok = util.toint(operands[1])
   elseif n == 2 then
-    first, ok = util.toint(o.operands[1]); if not ok then util.err("invalid argument: '" .. o.operands[1] .. "'"); return 1 end
-    last, ok = util.toint(o.operands[2])
+    first, ok = util.toint(operands[1]); if not ok then util.err("invalid argument: '" .. operands[1] .. "'"); return 1 end
+    last, ok = util.toint(operands[2])
   else
-    first, ok = util.toint(o.operands[1]); if not ok then util.err("invalid argument: '" .. o.operands[1] .. "'"); return 1 end
-    inc, ok = util.toint(o.operands[2]); if not ok then util.err("invalid argument: '" .. o.operands[2] .. "'"); return 1 end
-    last, ok = util.toint(o.operands[3])
+    first, ok = util.toint(operands[1]); if not ok then util.err("invalid argument: '" .. operands[1] .. "'"); return 1 end
+    inc, ok = util.toint(operands[2]); if not ok then util.err("invalid argument: '" .. operands[2] .. "'"); return 1 end
+    last, ok = util.toint(operands[3])
   end
-  if not ok then util.err("invalid argument: '" .. o.operands[n] .. "'"); return 1 end
+  if not ok then util.err("invalid argument: '" .. operands[n] .. "'"); return 1 end
   if inc == 0 then util.err('invalid zero increment value'); return 1 end
-  local sep: string = o:has('s') and o:get('s') or '\n'
   local width: integer = 0
-  if o:has('w') then
+  if pad then
     local a, b = string.format('%d', first), string.format('%d', last)
     width = (@integer)(a.size > b.size and a.size or b.size)
   end
@@ -833,8 +921,7 @@ global function applet_nl(args: sequence(string)): integer
         util.write(string.format('%' .. string.format('%d', width) .. 'd', n))
         util.write(sep)
       else
-        for _ = 1, width do util.writebyte(32) end
-        util.write(sep)
+        for _ = 1, width + (@integer)(sep.size) do util.writebyte(32) end
       end
       util.line(line)
     end

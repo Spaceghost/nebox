@@ -432,3 +432,51 @@ function util.unescape(s: string): (string, boolean)
   end
   return sb:promote(), false
 end
+
+-- Name lookups from /etc/passwd and /etc/group (nelibc has no getpwuid).
+-- Returns "" when the id is not listed.
+local function lookup_name(file: string, id: integer): string
+  local fd = sys.open(file, sys.O_RDONLY, 0)
+  if fd < 0 then return '' end
+  local data, ok = util.readfd(fd)
+  sys.close(fd)
+  if not ok then return '' end
+  for _, line in ipairs(util.lines(data)) do
+    -- name:x:id:...
+    local c1 = line:find(':', 1, true)
+    if c1 <= 0 then continue end
+    local c2 = line:find(':', c1 + 1, true)
+    if c2 <= 0 then continue end
+    local c3 = line:find(':', c2 + 1, true)
+    if c3 <= 0 then c3 = (@isize)(line.size) + 1 end
+    local v, vok = util.toint(line:sub(c2 + 1, c3 - 1))
+    if vok and v == id then return line:sub(1, c1 - 1) end
+  end
+  return ''
+end
+
+function util.username(uid: integer): string
+  return lookup_name('/etc/passwd', uid)
+end
+
+function util.groupname(gid: integer): string
+  return lookup_name('/etc/group', gid)
+end
+
+-- Name or the number when unknown.
+function util.idname(name: string, id: integer): string
+  if name.size > 0 then return name end
+  return string.format('%d', id)
+end
+
+-- CPUs this process may run on, as nproc reports.
+function util.cpucount(): integer
+  local mask: [128]byte
+  if sys.sched_getaffinity(0, 128, &mask[0]) ~= 0 then return 0 end
+  local n: integer = 0
+  for i: integer = 0, 127 do
+    local b = mask[i]
+    while b ~= 0 do n = n + (b & 1); b = b >> 1 end
+  end
+  return n
+end
