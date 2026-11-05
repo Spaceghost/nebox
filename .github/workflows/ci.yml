@@ -1,0 +1,40 @@
+name: ci
+# Runs on the self-hosted bak runner (Incus container gh-runners on bak), which
+# carries Nelua (Spaceghost/nelua-lang 3c29419) and Zig 0.17.0 under /opt.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: [self-hosted, linux, x64, bak]
+    timeout-minutes: 30
+    env:
+      NELUA: /opt/nelua/nelua
+      ZIG: /opt/zig/zig
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nebox
+      - uses: actions/checkout@v4
+        with:
+          repository: Spaceghost/nelibc
+          path: nelibc
+      - name: toolchains
+        run: |
+          "$NELUA" --version | head -1
+          "$ZIG" version
+      - name: nelibc standalone archive
+        run: make -C nelibc lib-standalone-zig NELUA="$NELUA" ZIG="$ZIG"
+      - name: build nebox
+        run: make -C nebox nebox NELUA="$NELUA" ZIG="$ZIG" NELIBC="$GITHUB_WORKSPACE/nelibc"
+      - name: conformance tests
+        run: make -C nebox test NELUA="$NELUA" ZIG="$ZIG" NELIBC="$GITHUB_WORKSPACE/nelibc"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nebox
+          path: nebox/build/nebox
+          if-no-files-found: ignore
