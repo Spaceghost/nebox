@@ -1,0 +1,110 @@
+-- nebox: a toybox-style multicall binary written in Nelua against nelibc.
+-- The applet is chosen from argv[0]'s basename; when that is "nebox" the
+-- first operand names the applet.
+## pragmas.nogc = true
+
+require 'arg'
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.applets.text'
+require 'nebox.applets.fs'
+require 'nebox.applets.proc'
+
+local Applet = @record{name: string, run: function(sequence(string)): integer}
+
+local applets: []Applet = {
+  {'[', applet_test}, {'basename', applet_basename}, {'cat', applet_cat},
+  {'chmod', applet_chmod}, {'cp', applet_cp}, {'cut', applet_cut},
+  {'date', applet_date}, {'dirname', applet_dirname}, {'echo', applet_echo},
+  {'env', applet_env}, {'false', applet_false}, {'grep', applet_grep},
+  {'head', applet_head}, {'hostname', applet_hostname}, {'id', applet_id},
+  {'kill', applet_kill}, {'ln', applet_ln}, {'ls', applet_ls},
+  {'mkdir', applet_mkdir}, {'mv', applet_mv}, {'nl', applet_nl},
+  {'nproc', applet_nproc}, {'printenv', applet_printenv}, {'printf', applet_printf},
+  {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'rev', applet_rev},
+  {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'seq', applet_seq},
+  {'sleep', applet_sleep}, {'sort', applet_sort}, {'sync', applet_sync},
+  {'tail', applet_tail}, {'tee', applet_tee}, {'test', applet_test},
+  {'touch', applet_touch}, {'tr', applet_tr}, {'true', applet_true},
+  {'uname', applet_uname}, {'uniq', applet_uniq}, {'wc', applet_wc},
+  {'which', applet_which}, {'yes', applet_yes},
+}
+
+local function find(name: string): integer
+  for i: integer = 0, < #applets do
+    if applets[i].name == name then return i end
+  end
+  return -1
+end
+
+local function usage(): integer
+  util.line('usage: nebox APPLET [ARGUMENT...]')
+  util.line('       nebox --list')
+  util.line('       nebox --install [-s] DIR')
+  util.line('')
+  util.line('Applets:')
+  for i: integer = 0, < #applets do
+    util.write(i % 8 == 0 and '  ' or ' ')
+    util.write(applets[i].name)
+    if i % 8 == 7 or i == #applets - 1 then util.writebyte(10) end
+  end
+  return 0
+end
+
+-- Create one link per applet in DIR, pointing at this binary.
+local function install(dir: string, symbolic: boolean): integer
+  local buf: [4096]byte
+  local n = sys.readlink('/proc/self/exe', &buf[0], #buf)
+  if n <= 0 then return util.die('cannot resolve /proc/self/exe: ' .. sys.errstr()) end
+  local self = string.copy((@string){data=&buf[0], size=(@usize)(n)})
+  if not util.isdir(dir) and sys.mkdir(dir, 0x1FF) ~= 0 then
+    return util.die("cannot create directory '" .. dir .. "': " .. sys.errstr())
+  end
+  local rc: integer = 0
+  for i: integer = 0, < #applets do
+    local link = util.join(dir, applets[i].name)
+    sys.unlink(link)
+    local r: cint
+    if symbolic then r = sys.symlink(self, link) else r = sys.link(self, link) end
+    if r ~= 0 then util.err("cannot link '" .. link .. "': " .. sys.errstr()); rc = 1 end
+  end
+  return rc
+end
+
+local function main(): integer
+  local name = util.basename(arg[0])
+  local first: integer = 1
+  if name == 'nebox' or find(name) < 0 then
+    if #arg < 1 then return usage() end
+    name = arg[1]
+    first = 2
+    if name == '--list' then
+      for i: integer = 0, < #applets do util.line(applets[i].name) end
+      return 0
+    elseif name == '--install' then
+      local symbolic = false
+      if first <= #arg and arg[first] == '-s' then symbolic = true; first = first + 1 end
+      if first > #arg then return util.die('--install needs a directory') end
+      return install(arg[first], symbolic)
+    elseif name == '--help' or name == '-h' then
+      return usage()
+    end
+  end
+  local idx = find(name)
+  if idx < 0 then
+    util.err(name .. ': applet not found')
+    return 127
+  end
+  util.applet = name
+  local args: sequence(string)
+  for i: integer = first, #arg do args:push(arg[i]) end
+  return applets[idx].run(args)
+end
+
+local rc = main()
+if not util.flush() then
+  if rc == 0 then rc = 1 end
+end
+sys._exit((@cint)(rc))

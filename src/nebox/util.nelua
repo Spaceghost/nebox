@@ -1,0 +1,433 @@
+-- Shared helpers: buffered stdout, diagnostics, option parsing, file I/O,
+-- path and line utilities. Applets never touch stdio; everything is fd I/O.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+
+global util = @record{}
+
+-- The applet name currently running, for diagnostics.
+global util.applet: string = 'nebox'
+
+-- Buffered output on fd 1.
+local OUTCAP: usize <comptime> = 65536
+local outbuf: [OUTCAP]byte
+local outlen: usize = 0
+local outfd: cint = 1
+
+local function write_all(fd: cint, p: *[0]byte, n: usize): boolean
+  local done: usize = 0
+  while done < n do
+    local r = sys.write(fd, &p[done], n - done)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return false
+    end
+    done = done + (@usize)(r)
+  end
+  return true
+end
+
+function util.flush(): boolean
+  if outlen == 0 then return true end
+  local ok = write_all(outfd, &outbuf[0], outlen)
+  outlen = 0
+  return ok
+end
+
+function util.setout(fd: cint)
+  util.flush()
+  outfd = fd
+end
+
+function util.writebytes(p: *[0]byte, n: usize)
+  if n >= OUTCAP then
+    util.flush()
+    write_all(outfd, p, n)
+    return
+  end
+  if outlen + n > OUTCAP then util.flush() end
+  for i: usize = 0, < n do outbuf[outlen + i] = p[i] end
+  outlen = outlen + n
+end
+
+function util.write(s: string)
+  util.writebytes(s.data, s.size)
+end
+
+function util.writebyte(b: byte)
+  if outlen >= OUTCAP then util.flush() end
+  outbuf[outlen] = b
+  outlen = outlen + 1
+end
+
+function util.line(s: string)
+  util.write(s)
+  util.writebyte(10)
+end
+
+function util.writef(fmt: string, ...: varargs)
+  util.write(string.format(fmt, ...))
+end
+
+-- Diagnostics go straight to fd 2, after stdout is flushed so ordering is sane.
+function util.err(s: string)
+  util.flush()
+  local msg = util.applet .. ': ' .. s .. '\n'
+  write_all(2, msg.data, msg.size)
+end
+
+function util.errf(fmt: string, ...: varargs)
+  util.err(string.format(fmt, ...))
+end
+
+-- "name: strerror" style message for a failed call on `path`.
+function util.perror(path: string)
+  util.err(path .. ': ' .. sys.errstr())
+end
+
+function util.die(s: string): integer
+  util.err(s)
+  return 1
+end
+
+-- Option parsing: short flags only, POSIX style. `spec` lists the accepted
+-- letters; a letter followed by ':' takes a value. Parsing stops at the first
+-- operand, at "--", or at "-" (which is an operand).
+global util.Opts = @record{
+  set: [128]boolean,
+  value: [128]string,
+  operands: sequence(string),
+  bad: string,  -- unknown option letter, or "" if none
+  missing: string, -- option that lacked its value, or ""
+}
+
+function util.Opts:has(c: string): boolean
+  return self.set[c:byte(1)]
+end
+
+function util.Opts:get(c: string): string
+  return self.value[c:byte(1)]
+end
+
+function util.Opts:ok(): boolean
+  return self.bad.size == 0 and self.missing.size == 0
+end
+
+local function spec_find(spec: string, c: byte): (boolean, boolean)
+  for i: usize = 1, spec.size do
+    if spec:byte(i) == c then
+      local takes = i < spec.size and spec:byte(i + 1) == 58
+      return true, takes
+    end
+  end
+  return false, false
+end
+
+function util.parse(args: sequence(string), spec: string): util.Opts
+  local o: util.Opts
+  local i: integer = 1
+  while i <= #args do
+    local a = args[i]
+    if a.size < 2 or a:byte(1) ~= 45 then break end
+    if a == '--' then i = i + 1; break end
+    local j: usize = 2
+    while j <= a.size do
+      local c = a:byte(j)
+      local known, takes = spec_find(spec, c)
+      if not known then
+        o.bad = string.char(c)
+        return o
+      end
+      o.set[c] = true
+      if takes then
+        if j < a.size then
+          o.value[c] = a:sub(j + 1)
+        elseif i < #args then
+          i = i + 1
+          o.value[c] = args[i]
+        else
+          o.missing = string.char(c)
+          return o
+        end
+        break
+      end
+      j = j + 1
+    end
+    i = i + 1
+  end
+  while i <= #args do
+    o.operands:push(args[i])
+    i = i + 1
+  end
+  return o
+end
+
+-- Report a parse failure in the usual coreutils phrasing; returns the exit code.
+function util.optfail(o: util.Opts): integer
+  if o.bad.size > 0 then return util.die("invalid option -- '" .. o.bad .. "'") end
+  return util.die("option requires an argument -- '" .. o.missing .. "'")
+end
+
+-- Read a whole file descriptor into a string.
+function util.readfd(fd: cint): (string, boolean)
+  local sb: stringbuilder
+  local chunk: [65536]byte
+  while true do
+    local r = sys.read(fd, &chunk[0], #chunk)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return sb:promote(), false
+    end
+    if r == 0 then break end
+    sb:write((@string){data=&chunk[0], size=(@usize)(r)})
+  end
+  return sb:promote(), true
+end
+
+-- Open an input operand; "-" is stdin. Returns fd or -1 (after reporting).
+function util.openin(path: string): cint
+  if path == '-' then return 0 end
+  local fd = sys.open(path, sys.O_RDONLY, 0)
+  if fd < 0 then util.perror(path) end
+  return fd
+end
+
+function util.readfile(path: string): (string, boolean)
+  local fd = util.openin(path)
+  if fd < 0 then return '', false end
+  local data, ok = util.readfd(fd)
+  if not ok then util.perror(path) end
+  if fd ~= 0 then sys.close(fd) end
+  return data, ok
+end
+
+-- Stream an fd to stdout; returns false on read error.
+function util.copyfd(fd: cint): boolean
+  local chunk: [65536]byte
+  while true do
+    local r = sys.read(fd, &chunk[0], #chunk)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return false
+    end
+    if r == 0 then return true end
+    util.writebytes(&chunk[0], (@usize)(r))
+  end
+  return true
+end
+
+-- Split data into lines (views, no copies). A trailing newline does not
+-- produce an empty final line.
+function util.lines(data: string): sequence(string)
+  local out: sequence(string)
+  local start: usize = 0
+  for i: usize = 0, < data.size do
+    if data.data[i] == 10 then
+      out:push((@string){data=&data.data[start], size=i - start})
+      start = i + 1
+    end
+  end
+  if start < data.size then
+    out:push((@string){data=&data.data[start], size=data.size - start})
+  end
+  return out
+end
+
+-- Path helpers matching basename(1)/dirname(1).
+function util.basename(path: string): string
+  if path.size == 0 then return '' end
+  local e: isize = (@isize)(path.size)
+  while e > 1 and path:byte(e) == 47 do e = e - 1 end
+  if e == 1 and path:byte(1) == 47 then return '/' end
+  local s: isize = e
+  while s > 1 and path:byte(s - 1) ~= 47 do s = s - 1 end
+  return path:sub(s, e)
+end
+
+function util.dirname(path: string): string
+  if path.size == 0 then return '.' end
+  local e: isize = (@isize)(path.size)
+  while e > 1 and path:byte(e) == 47 do e = e - 1 end
+  while e > 0 and path:byte(e) ~= 47 do e = e - 1 end
+  while e > 1 and path:byte(e) == 47 do e = e - 1 end
+  if e == 0 then return '.' end
+  return path:sub(1, e)
+end
+
+function util.join(dir: string, name: string): string
+  if dir.size > 0 and dir:byte(dir.size) == 47 then return dir .. name end
+  return dir .. '/' .. name
+end
+
+-- Parse a decimal integer operand, with optional leading '-'/'+'.
+function util.toint(s: string): (integer, boolean)
+  if s.size == 0 then return 0, false end
+  local i: usize = 1
+  local neg = false
+  local c = s:byte(1)
+  if c == 45 then neg = true; i = 2 elseif c == 43 then i = 2 end
+  if i > s.size then return 0, false end
+  local v: integer = 0
+  while i <= s.size do
+    c = s:byte(i)
+    if c < 48 or c > 57 then return 0, false end
+    v = v * 10 + (c - 48)
+    i = i + 1
+  end
+  if neg then v = -v end
+  return v, true
+end
+
+-- Integer with an optional size suffix (k, M, G, b) as head/tail accept.
+function util.tosize(s: string): (integer, boolean)
+  if s.size == 0 then return 0, false end
+  local last = s:byte(s.size)
+  local mult: integer = 1
+  local body = s
+  if last == 107 or last == 75 then mult = 1024; body = s:sub(1, -2)
+  elseif last == 77 or last == 109 then mult = 1024 * 1024; body = s:sub(1, -2)
+  elseif last == 71 or last == 103 then mult = 1024 * 1024 * 1024; body = s:sub(1, -2)
+  elseif last == 98 then mult = 512; body = s:sub(1, -2) end
+  local v, ok = util.toint(body)
+  return v * mult, ok
+end
+
+function util.isdir(path: string): boolean
+  local st: sys.Stat
+  if sys.stat(path, &st) ~= 0 then return false end
+  return (st.st_mode & sys.S_IFMT) == sys.S_IFDIR
+end
+
+function util.exists(path: string): boolean
+  local st: sys.Stat
+  return sys.lstat(path, &st) == 0
+end
+
+-- Stable merge sort on a sequence of strings with a less-than callback.
+function util.sort(items: sequence(string), less: function(string, string): boolean)
+  local n = #items
+  if n < 2 then return end
+  local tmp: sequence(string)
+  tmp:resize((@usize)(n))
+  local width: integer = 1
+  while width < n do
+    local i: integer = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local a, b, k = i, mid, i
+      while a < mid and b < hi do
+        if less(items[b], items[a]) then tmp[k] = items[b]; b = b + 1
+        else tmp[k] = items[a]; a = a + 1 end
+        k = k + 1
+      end
+      while a < mid do tmp[k] = items[a]; a = a + 1; k = k + 1 end
+      while b < hi do tmp[k] = items[b]; b = b + 1; k = k + 1 end
+      i = hi
+    end
+    for j: integer = 1, n do items[j] = tmp[j] end
+    width = width * 2
+  end
+  tmp:destroy()
+end
+
+-- Mode bits as ls -l shows them.
+function util.modestr(mode: cuint): string
+  local t: string = '-'
+  local f = mode & sys.S_IFMT
+  if f == sys.S_IFDIR then t = 'd'
+  elseif f == sys.S_IFLNK then t = 'l'
+  elseif f == sys.S_IFCHR then t = 'c'
+  elseif f == sys.S_IFBLK then t = 'b'
+  elseif f == sys.S_IFIFO then t = 'p'
+  elseif f == sys.S_IFSOCK then t = 's' end
+  local bits: [9]byte = {114, 119, 120, 114, 119, 120, 114, 119, 120}
+  local out: [10]byte
+  out[0] = t:byte(1)
+  for i: integer = 0, 8 do
+    local set = (mode >> (@cuint)(8 - i)) & 1 == 1
+    out[i + 1] = set and bits[i] or 45
+  end
+  if mode & 0x800 ~= 0 then out[3] = (out[3] == 120) and 115 or 83 end
+  if mode & 0x400 ~= 0 then out[6] = (out[6] == 120) and 115 or 83 end
+  if mode & 0x200 ~= 0 then out[9] = (out[9] == 120) and 116 or 84 end
+  return string.copy((@string){data=&out[0], size=10})
+end
+
+-- Format a UTC timestamp with strftime.
+function util.timefmt(t: clong, fmt: string): string
+  local tm: sys.Tm
+  sys.gmtime_r(&t, &tm)
+  local buf: [256]cchar
+  local n = sys.strftime(&buf[0], 256, fmt, &tm)
+  return string.copy((@string){data=(@*[0]byte)(&buf[0]), size=n})
+end
+
+-- Expand backslash escapes as echo -e / printf do. Returns the string and
+-- whether a \c (stop output) was seen.
+function util.unescape(s: string): (string, boolean)
+  local sb: stringbuilder
+  local i: usize = 1
+  while i <= s.size do
+    local c = s:byte(i)
+    if c == 92 and i < s.size then
+      i = i + 1
+      local e = s:byte(i)
+      if e == 110 then sb:writebyte(10)
+      elseif e == 116 then sb:writebyte(9)
+      elseif e == 114 then sb:writebyte(13)
+      elseif e == 97 then sb:writebyte(7)
+      elseif e == 98 then sb:writebyte(8)
+      elseif e == 102 then sb:writebyte(12)
+      elseif e == 118 then sb:writebyte(11)
+      elseif e == 101 then sb:writebyte(27)
+      elseif e == 92 then sb:writebyte(92)
+      elseif e == 99 then return sb:promote(), true
+      elseif e == 48 or (e >= 49 and e <= 55) then
+        -- \0NNN or \NNN octal
+        local v: integer = 0
+        local digits: integer = 0
+        if e == 48 then i = i + 1 end
+        while digits < 3 and i <= s.size do
+          local d = s:byte(i)
+          if d < 48 or d > 55 then break end
+          v = v * 8 + (d - 48)
+          i = i + 1
+          digits = digits + 1
+        end
+        sb:writebyte((@byte)(v & 0xff))
+        continue
+      elseif e == 120 then
+        local v: integer = 0
+        local digits: integer = 0
+        i = i + 1
+        while digits < 2 and i <= s.size do
+          local d = s:byte(i)
+          local dv: integer = -1
+          if d >= 48 and d <= 57 then dv = d - 48
+          elseif d >= 97 and d <= 102 then dv = d - 87
+          elseif d >= 65 and d <= 70 then dv = d - 55 end
+          if dv < 0 then break end
+          v = v * 16 + dv
+          i = i + 1
+          digits = digits + 1
+        end
+        if digits == 0 then sb:writebyte(92); sb:writebyte(120)
+        else sb:writebyte((@byte)(v)) end
+        continue
+      else
+        sb:writebyte(92); sb:writebyte(e)
+      end
+    else
+      sb:writebyte(c)
+    end
+    i = i + 1
+  end
+  return sb:promote(), false
+end

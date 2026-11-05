@@ -1,0 +1,656 @@
+-- Filesystem applets: ls mkdir rmdir rm touch cp mv ln readlink pwd basename
+-- dirname chmod test
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function name_less(a: string, b: string): boolean
+  return a < b
+end
+
+local function readnames(dir: string, all: boolean): (sequence(string), boolean)
+  local names: sequence(string)
+  local d = sys.opendir(dir)
+  if d == nilptr then return names, false end
+  while true do
+    local de = sys.readdir(d)
+    if de == nilptr then break end
+    local name = string.copy(sys.cstr(&de.d_name))
+    if not all and name:byte(1) == 46 then continue end
+    names:push(name)
+  end
+  sys.closedir(d)
+  util.sort(names, name_less)
+  return names, true
+end
+
+local function ls_long(path: string, shown: string, st: *sys.Stat)
+  util.writef('%s %3d %5d %5d %8d %s %s', util.modestr(st.st_mode), (@integer)(st.st_nlink),
+    (@integer)(st.st_uid), (@integer)(st.st_gid), (@integer)(st.st_size),
+    util.timefmt(st.st_mtim.tv_sec, '%b %e %H:%M'), shown)
+  if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
+    local buf: [4096]byte
+    local n = sys.readlink(path, &buf[0], #buf)
+    if n > 0 then util.write(' -> '); util.writebytes(&buf[0], (@usize)(n)) end
+  end
+  util.writebyte(10)
+end
+
+local Ls = @record{long: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer}
+
+function Ls:entry(path: string, shown: string)
+  local st: sys.Stat
+  if sys.lstat(path, &st) ~= 0 then util.perror(path); self.rc = 2; return end
+  if self.long then ls_long(path, shown, &st) return end
+  util.write(shown)
+  local kind = st.st_mode & sys.S_IFMT
+  if (self.classify or self.slash) and kind == sys.S_IFDIR then util.writebyte(47)
+  elseif self.classify and kind == sys.S_IFLNK then util.writebyte(64)
+  elseif self.classify and (st.st_mode & 0x49) ~= 0 and kind == sys.S_IFREG then util.writebyte(42) end
+  util.writebyte(10)
+end
+
+function Ls:listdir(dir: string, label: boolean)
+  local names, ok = readnames(dir, self.all)
+  if not ok then util.perror(dir); self.rc = 2; return end
+  if label then util.write(dir); util.line(':') end
+  for _, n in ipairs(names) do self:entry(util.join(dir, n), n) end
+  if self.recursive then
+    for _, n in ipairs(names) do
+      if n == '.' or n == '..' then continue end
+      local p = util.join(dir, n)
+      local st: sys.Stat
+      if sys.lstat(p, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+        util.writebyte(10)
+        self:listdir(p, true)
+      end
+    end
+  end
+end
+
+global function applet_ls(args: sequence(string)): integer
+  local o = util.parse(args, 'al1dFRp')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then o.operands:push('.') end
+  local ls: Ls = {o:has('l'), o:has('a'), o:has('F'), o:has('p'), o:has('R'), 0}
+  local dironly = o:has('d')
+  local files: sequence(string)
+  local dirs: sequence(string)
+  for _, p in ipairs(o.operands) do
+    if not dironly and util.isdir(p) then dirs:push(p) else files:push(p) end
+  end
+  for _, p in ipairs(files) do ls:entry(p, p) end
+  for i, d in ipairs(dirs) do
+    if #files > 0 or i > 1 then util.writebyte(10) end
+    ls:listdir(d, #o.operands > 1 or ls.recursive)
+  end
+  return ls.rc
+end
+
+local function mkdir_p(path: string, mode: cuint): boolean
+  if util.isdir(path) then return true end
+  local parent = util.dirname(path)
+  if parent ~= path and parent ~= '.' and parent ~= '/' then
+    if not mkdir_p(parent, mode) then return false end
+  end
+  if sys.mkdir(path, mode) ~= 0 then
+    if sys.errno() == sys.EEXIST and util.isdir(path) then return true end
+    util.err("cannot create directory '" .. path .. "': " .. sys.errstr())
+    return false
+  end
+  return true
+end
+
+local function parse_mode(s: string): (cuint, boolean)
+  if s.size == 0 or s.size > 4 then return 0, false end
+  local v: cuint = 0
+  for i: usize = 1, s.size do
+    local c = s:byte(i)
+    if c < 48 or c > 55 then return 0, false end
+    v = v * 8 + (c - 48)
+  end
+  return v, true
+end
+
+global function applet_mkdir(args: sequence(string)): integer
+  local o = util.parse(args, 'pm:v')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local mode: cuint = 0x1FF
+  if o:has('m') then
+    local m, ok = parse_mode(o:get('m'))
+    if not ok then return util.die("invalid mode '" .. o:get('m') .. "'") end
+    mode = m
+  end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    if o:has('p') then
+      if not mkdir_p(p, 0x1FF) then rc = 1
+      elseif o:has('m') then sys.chmod(p, mode) end
+    elseif sys.mkdir(p, mode) ~= 0 then
+      util.err("cannot create directory '" .. p .. "': " .. sys.errstr())
+      rc = 1
+    elseif o:has('m') then
+      sys.chmod(p, mode)
+    end
+  end
+  return rc
+end
+
+global function applet_rmdir(args: sequence(string)): integer
+  local o = util.parse(args, 'p')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    if sys.rmdir(p) ~= 0 then
+      util.err("failed to remove '" .. p .. "': " .. sys.errstr())
+      rc = 1
+    elseif o:has('p') then
+      local d = util.dirname(p)
+      while d ~= '.' and d ~= '/' and sys.rmdir(d) == 0 do d = util.dirname(d) end
+    end
+  end
+  return rc
+end
+
+local function rm_tree(path: string, force: boolean, verbose: boolean): boolean
+  local st: sys.Stat
+  if sys.lstat(path, &st) ~= 0 then
+    if force and sys.errno() == sys.ENOENT then return true end
+    util.err("cannot remove '" .. path .. "': " .. sys.errstr())
+    return false
+  end
+  local ok = true
+  if (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    local names, rok = readnames(path, true)
+    if not rok then util.perror(path); return false end
+    for _, n in ipairs(names) do
+      if n ~= '.' and n ~= '..' then
+        if not rm_tree(util.join(path, n), force, verbose) then ok = false end
+      end
+    end
+    if sys.rmdir(path) ~= 0 then util.err("cannot remove '" .. path .. "': " .. sys.errstr()); return false end
+  elseif sys.unlink(path) ~= 0 then
+    util.err("cannot remove '" .. path .. "': " .. sys.errstr())
+    return false
+  end
+  if verbose and ok then util.line("removed '" .. path .. "'") end
+  return ok
+end
+
+global function applet_rm(args: sequence(string)): integer
+  local o = util.parse(args, 'rRfvi')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then
+    if o:has('f') then return 0 end
+    return util.die('missing operand')
+  end
+  local rc: integer = 0
+  local recursive = o:has('r') or o:has('R')
+  for _, p in ipairs(o.operands) do
+    if recursive then
+      if not rm_tree(p, o:has('f'), o:has('v')) then rc = 1 end
+    else
+      local st: sys.Stat
+      if sys.lstat(p, &st) ~= 0 then
+        if not (o:has('f') and sys.errno() == sys.ENOENT) then
+          util.err("cannot remove '" .. p .. "': " .. sys.errstr()); rc = 1
+        end
+      elseif (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+        util.err("cannot remove '" .. p .. "': Is a directory"); rc = 1
+      elseif sys.unlink(p) ~= 0 then
+        util.err("cannot remove '" .. p .. "': " .. sys.errstr()); rc = 1
+      elseif o:has('v') then
+        util.line("removed '" .. p .. "'")
+      end
+    end
+  end
+  return rc
+end
+
+global function applet_touch(args: sequence(string)): integer
+  local o = util.parse(args, 'camh')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing file operand') end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    if not util.exists(p) then
+      if o:has('c') then continue end
+      local fd = sys.open(p, sys.O_WRONLY | sys.O_CREAT, 0x1B6)
+      if fd < 0 then util.err("cannot touch '" .. p .. "': " .. sys.errstr()); rc = 1; continue end
+      sys.close(fd)
+    end
+    local flags: cint = o:has('h') and sys.AT_SYMLINK_NOFOLLOW or 0
+    if sys.utimensat(sys.AT_FDCWD, p, nilptr, flags) ~= 0 then
+      util.err("setting times of '" .. p .. "': " .. sys.errstr()); rc = 1
+    end
+  end
+  return rc
+end
+
+local function copy_file(src: string, dst: string, mode: cuint): boolean
+  local ifd = sys.open(src, sys.O_RDONLY, 0)
+  if ifd < 0 then util.err("cannot open '" .. src .. "' for reading: " .. sys.errstr()); return false end
+  local ofd = sys.open(dst, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, mode & 0x1FF)
+  if ofd < 0 then util.err("cannot create regular file '" .. dst .. "': " .. sys.errstr()); sys.close(ifd); return false end
+  local chunk: [65536]byte
+  local ok = true
+  while true do
+    local r = sys.read(ifd, &chunk[0], #chunk)
+    if r < 0 then if sys.errno() == sys.EINTR then continue end; util.perror(src); ok = false; break end
+    if r == 0 then break end
+    local done: clong = 0
+    while done < r do
+      local w = sys.write(ofd, &chunk[done], (@usize)(r - done))
+      if w < 0 then util.perror(dst); ok = false; break end
+      done = done + w
+    end
+    if not ok then break end
+  end
+  sys.close(ifd)
+  sys.close(ofd)
+  return ok
+end
+
+local function copy_tree(src: string, dst: string, recursive: boolean, preserve: boolean): boolean
+  local st: sys.Stat
+  if sys.lstat(src, &st) ~= 0 then util.err("cannot stat '" .. src .. "': " .. sys.errstr()); return false end
+  local kind = st.st_mode & sys.S_IFMT
+  local ok = true
+  if kind == sys.S_IFDIR then
+    if not recursive then util.err("-r not specified; omitting directory '" .. src .. "'"); return false end
+    if not util.isdir(dst) and sys.mkdir(dst, st.st_mode & 0x1FF) ~= 0 then
+      util.err("cannot create directory '" .. dst .. "': " .. sys.errstr()); return false
+    end
+    local names, rok = readnames(src, true)
+    if not rok then util.perror(src); return false end
+    for _, n in ipairs(names) do
+      if n ~= '.' and n ~= '..' then
+        if not copy_tree(util.join(src, n), util.join(dst, n), recursive, preserve) then ok = false end
+      end
+    end
+  elseif kind == sys.S_IFLNK and recursive then
+    local buf: [4096]byte
+    local n = sys.readlink(src, &buf[0], #buf)
+    if n < 0 then util.perror(src); return false end
+    sys.unlink(dst)
+    local target = string.copy((@string){data=&buf[0], size=(@usize)(n)})
+    if sys.symlink(target, dst) ~= 0 then util.err("cannot create symbolic link '" .. dst .. "': " .. sys.errstr()); return false end
+    return true
+  else
+    ok = copy_file(src, dst, st.st_mode)
+  end
+  if ok and preserve then
+    sys.chmod(dst, st.st_mode & 0xFFF)
+    local times: [2]sys.Timespec = {st.st_atim, st.st_mtim}
+    sys.utimensat(sys.AT_FDCWD, dst, &times, 0)
+  end
+  return ok
+end
+
+global function applet_cp(args: sequence(string)): integer
+  local o = util.parse(args, 'rRfpvaint')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands < 2 then return util.die(#o.operands == 0 and 'missing file operand' or "missing destination file operand after '" .. o.operands[1] .. "'") end
+  local recursive = o:has('r') or o:has('R') or o:has('a')
+  local preserve = o:has('p') or o:has('a')
+  local dst = o.operands[#o.operands]
+  local nsrc = #o.operands - 1
+  local dstdir = util.isdir(dst)
+  if nsrc > 1 and not dstdir then return util.die("target '" .. dst .. "' is not a directory") end
+  local rc: integer = 0
+  for i: integer = 1, nsrc do
+    local src = o.operands[i]
+    local target = dstdir and util.join(dst, util.basename(src)) or dst
+    if o:has('n') and util.exists(target) then continue end
+    if o:has('f') and not util.isdir(target) then sys.unlink(target) end
+    if not copy_tree(src, target, recursive, preserve) then rc = 1
+    elseif o:has('v') then util.line("'" .. src .. "' -> '" .. target .. "'") end
+  end
+  return rc
+end
+
+global function applet_mv(args: sequence(string)): integer
+  local o = util.parse(args, 'fivn')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands < 2 then return util.die(#o.operands == 0 and 'missing file operand' or "missing destination file operand after '" .. o.operands[1] .. "'") end
+  local dst = o.operands[#o.operands]
+  local nsrc = #o.operands - 1
+  local dstdir = util.isdir(dst)
+  if nsrc > 1 and not dstdir then return util.die("target '" .. dst .. "' is not a directory") end
+  local rc: integer = 0
+  for i: integer = 1, nsrc do
+    local src = o.operands[i]
+    local target = dstdir and util.join(dst, util.basename(src)) or dst
+    if o:has('n') and util.exists(target) then continue end
+    if sys.rename(src, target) ~= 0 then
+      if sys.errno() == sys.EXDEV then
+        if copy_tree(src, target, true, true) and rm_tree(src, false, false) then
+          if o:has('v') then util.line("renamed '" .. src .. "' -> '" .. target .. "'") end
+          continue
+        end
+      else
+        util.err("cannot move '" .. src .. "' to '" .. target .. "': " .. sys.errstr())
+      end
+      rc = 1
+    elseif o:has('v') then
+      util.line("renamed '" .. src .. "' -> '" .. target .. "'")
+    end
+  end
+  return rc
+end
+
+global function applet_ln(args: sequence(string)): integer
+  local o = util.parse(args, 'sfnvT')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands < 1 then return util.die('missing file operand') end
+  local targets: sequence(string)
+  local dst: string
+  if #o.operands == 1 then
+    targets:push(o.operands[1]); dst = util.basename(o.operands[1])
+  else
+    for i: integer = 1, #o.operands - 1 do targets:push(o.operands[i]) end
+    dst = o.operands[#o.operands]
+  end
+  local dstdir = util.isdir(dst) and not (o:has('n') and not util.isdir(dst))
+  if #targets > 1 and not dstdir then return util.die("target '" .. dst .. "' is not a directory") end
+  local rc: integer = 0
+  for _, t in ipairs(targets) do
+    local link = dstdir and util.join(dst, util.basename(t)) or dst
+    if o:has('f') then sys.unlink(link) end
+    local r: cint
+    if o:has('s') then r = sys.symlink(t, link) else r = sys.link(t, link) end
+    if r ~= 0 then
+      util.err("failed to create " .. (o:has('s') and 'symbolic' or 'hard') .. " link '" .. link .. "': " .. sys.errstr())
+      rc = 1
+    elseif o:has('v') then
+      util.line("'" .. link .. "' -> '" .. t .. "'")
+    end
+  end
+  return rc
+end
+
+global function applet_readlink(args: sequence(string)): integer
+  local o = util.parse(args, 'fenmqsv')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    if o:has('f') or o:has('e') or o:has('m') then
+      local buf: [4096]cchar
+      local r = sys.realpath(p, &buf[0])
+      if r == nilptr then
+        if o:has('f') then
+          -- all but the last component must exist
+          local d = sys.realpath(util.dirname(p), &buf[0])
+          if d ~= nilptr then util.line(util.join(sys.cstr(&buf[0]), util.basename(p))); continue end
+        end
+        if not o:has('q') and not o:has('s') then util.perror(p) end
+        rc = 1
+      else
+        util.line(sys.cstr(&buf[0]))
+      end
+    else
+      local buf: [4096]byte
+      local n = sys.readlink(p, &buf[0], #buf)
+      if n < 0 then
+        if o:has('v') then util.perror(p) end
+        rc = 1
+      else
+        util.writebytes(&buf[0], (@usize)(n))
+        if not o:has('n') then util.writebyte(10) end
+      end
+    end
+  end
+  return rc
+end
+
+global function applet_pwd(args: sequence(string)): integer
+  local o = util.parse(args, 'LP')
+  if not o:ok() then return util.optfail(o) end
+  if o:has('L') then
+    local env = sys.getenv('PWD')
+    if env ~= nilptr then
+      local p: string = env
+      local a: sys.Stat
+      local b: sys.Stat
+      if p.size > 0 and p:byte(1) == 47 and sys.stat(p, &a) == 0 and sys.stat('.', &b) == 0 and a.st_ino == b.st_ino and a.st_dev == b.st_dev then
+        util.line(p); return 0
+      end
+    end
+  end
+  local buf: [4096]cchar
+  if sys.getcwd(&buf[0], 4096) == nilptr then return util.die('cannot get current directory: ' .. sys.errstr()) end
+  util.line(sys.cstr(&buf[0]))
+  return 0
+end
+
+global function applet_basename(args: sequence(string)): integer
+  local o = util.parse(args, 'as:z')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local multi = o:has('a') or o:has('s')
+  local suffix: string = o:has('s') and o:get('s') or ''
+  local names: sequence(string)
+  if multi then names = o.operands
+  else
+    names:push(o.operands[1])
+    if #o.operands > 1 then suffix = o.operands[2] end
+    if #o.operands > 2 then return util.die("extra operand '" .. o.operands[3] .. "'") end
+  end
+  for _, p in ipairs(names) do
+    local b = util.basename(p)
+    if suffix.size > 0 and b.size > suffix.size and b:sub(-(@isize)(suffix.size)) == suffix then
+      b = b:sub(1, (@isize)(b.size - suffix.size))
+    end
+    util.write(b)
+    util.writebyte(o:has('z') and 0 or 10)
+  end
+  return 0
+end
+
+global function applet_dirname(args: sequence(string)): integer
+  local o = util.parse(args, 'z')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  for _, p in ipairs(o.operands) do
+    util.write(util.dirname(p))
+    util.writebyte(o:has('z') and 0 or 10)
+  end
+  return 0
+end
+
+-- chmod: octal modes and the simple symbolic forms [ugoa][+-=][rwxst]
+local function apply_symbolic(mode: cuint, spec: string): (cuint, boolean)
+  local i: usize = 1
+  while i <= spec.size do
+    local who: cuint = 0
+    while i <= spec.size do
+      local c = spec:byte(i)
+      if c == 117 then who = who | 0x1C0 elseif c == 103 then who = who | 0x38
+      elseif c == 111 then who = who | 0x7 elseif c == 97 then who = who | 0x1FF
+      else break end
+      i = i + 1
+    end
+    if who == 0 then who = 0x1FF end
+    if i > spec.size then return mode, false end
+    local op = spec:byte(i)
+    if op ~= 43 and op ~= 45 and op ~= 61 then return mode, false end
+    i = i + 1
+    local bits: cuint = 0
+    local special: cuint = 0
+    while i <= spec.size and spec:byte(i) ~= 44 do
+      local c = spec:byte(i)
+      if c == 114 then bits = bits | 0x124 elseif c == 119 then bits = bits | 0x92
+      elseif c == 120 then bits = bits | 0x49 elseif c == 115 then special = special | 0xC00
+      elseif c == 116 then special = special | 0x200
+      elseif c == 88 then if (mode & sys.S_IFMT) == sys.S_IFDIR or (mode & 0x49) ~= 0 then bits = bits | 0x49 end
+      else return mode, false end
+      i = i + 1
+    end
+    bits = bits & who
+    if (who & 0x1C0) == 0 then special = special & ~(@cuint)(0x800) end
+    if (who & 0x38) == 0 then special = special & ~(@cuint)(0x400) end
+    if op == 43 then mode = mode | bits | special
+    elseif op == 45 then mode = mode & ~(bits | special)
+    else mode = (mode & ~who) | bits | special end
+    if i <= spec.size then i = i + 1 end
+  end
+  return mode, true
+end
+
+local function chmod_path(path: string, spec: string, recursive: boolean, verbose: boolean): boolean
+  local st: sys.Stat
+  if sys.lstat(path, &st) ~= 0 then util.err("cannot access '" .. path .. "': " .. sys.errstr()); return false end
+  if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then return true end
+  local mode: cuint
+  local ok: boolean
+  mode, ok = parse_mode(spec)
+  if not ok then mode, ok = apply_symbolic(st.st_mode, spec) end
+  if not ok then util.err("invalid mode: '" .. spec .. "'"); return false end
+  mode = mode & 0xFFF
+  if sys.chmod(path, mode) ~= 0 then util.err("changing permissions of '" .. path .. "': " .. sys.errstr()); return false end
+  if verbose then util.line(string.format("mode of '%s' changed to %04o", path, (@integer)(mode))) end
+  local all = true
+  if recursive and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    local names, rok = readnames(path, true)
+    if not rok then util.perror(path); return false end
+    for _, n in ipairs(names) do
+      if n ~= '.' and n ~= '..' then
+        if not chmod_path(util.join(path, n), spec, true, verbose) then all = false end
+      end
+    end
+  end
+  return all
+end
+
+global function applet_chmod(args: sequence(string)): integer
+  -- the mode may look like an option (-x), so parse by hand
+  local recursive, verbose = false, false
+  local i: integer = 1
+  while i <= #args do
+    local a = args[i]
+    if a == '-R' then recursive = true
+    elseif a == '-v' then verbose = true
+    elseif a == '--' then i = i + 1; break
+    else break end
+    i = i + 1
+  end
+  if #args - i + 1 < 2 then return util.die('missing operand') end
+  local spec = args[i]
+  local rc: integer = 0
+  for j: integer = i + 1, #args do
+    if not chmod_path(args[j], spec, recursive, verbose) then rc = 1 end
+  end
+  return rc
+end
+
+-- test / [ : the POSIX subset with -a/-o and parentheses left out.
+local function test_unary(op: string, a: string): (boolean, boolean)
+  local st: sys.Stat
+  local c = op:byte(2)
+  if c == 122 then return a.size == 0, true end
+  if c == 110 then return a.size > 0, true end
+  if c == 116 then local fd, ok = util.toint(a); return ok and sys.isatty((@cint)(fd)) == 1, true end
+  if c == 104 or c == 76 then return sys.lstat(a, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFLNK, true end
+  if c == 114 then return sys.access(a, sys.R_OK) == 0, true end
+  if c == 119 then return sys.access(a, sys.W_OK) == 0, true end
+  if c == 120 then return sys.access(a, sys.X_OK) == 0, true end
+  if sys.stat(a, &st) ~= 0 then
+    if c == 101 or c == 102 or c == 100 or c == 115 or c == 112 or c == 98 or c == 99 or c == 83 then return false, true end
+    return false, false
+  end
+  local kind = st.st_mode & sys.S_IFMT
+  if c == 101 then return true, true end
+  if c == 102 then return kind == sys.S_IFREG, true end
+  if c == 100 then return kind == sys.S_IFDIR, true end
+  if c == 115 then return st.st_size > 0, true end
+  if c == 112 then return kind == sys.S_IFIFO, true end
+  if c == 98 then return kind == sys.S_IFBLK, true end
+  if c == 99 then return kind == sys.S_IFCHR, true end
+  if c == 83 then return kind == sys.S_IFSOCK, true end
+  return false, false
+end
+
+local function test_binary(a: string, op: string, b: string): (boolean, boolean)
+  if op == '=' or op == '==' then return a == b, true end
+  if op == '!=' then return a ~= b, true end
+  if op == '<' then return a < b, true end
+  if op == '>' then return b < a, true end
+  local x, okx = util.toint(a)
+  local y, oky = util.toint(b)
+  if op == '-eq' or op == '-ne' or op == '-lt' or op == '-le' or op == '-gt' or op == '-ge' then
+    if not okx then util.err("integer expression expected: '" .. a .. "'"); return false, false end
+    if not oky then util.err("integer expression expected: '" .. b .. "'"); return false, false end
+    if op == '-eq' then return x == y, true end
+    if op == '-ne' then return x ~= y, true end
+    if op == '-lt' then return x < y, true end
+    if op == '-le' then return x <= y, true end
+    if op == '-gt' then return x > y, true end
+    return x >= y, true
+  end
+  if op == '-nt' or op == '-ot' or op == '-ef' then
+    local sa: sys.Stat
+    local sb: sys.Stat
+    local ea, eb = sys.stat(a, &sa) == 0, sys.stat(b, &sb) == 0
+    if op == '-ef' then return ea and eb and sa.st_dev == sb.st_dev and sa.st_ino == sb.st_ino, true end
+    if not ea or not eb then return false, true end
+    if op == '-nt' then return sa.st_mtim.tv_sec > sb.st_mtim.tv_sec, true end
+    return sa.st_mtim.tv_sec < sb.st_mtim.tv_sec, true
+  end
+  return false, false
+end
+
+local function test_eval(args: sequence(string), lo: integer, hi: integer): (boolean, boolean)
+  local n = hi - lo + 1
+  if n <= 0 then return false, true end
+  if args[lo] == '!' then
+    local v, ok = test_eval(args, lo + 1, hi)
+    return not v, ok
+  end
+  -- lowest precedence: -o, then -a
+  for i: integer = lo + 1, hi - 1 do
+    if args[i] == '-o' then
+      local l, okl = test_eval(args, lo, i - 1)
+      local r, okr = test_eval(args, i + 1, hi)
+      return l or r, okl and okr
+    end
+  end
+  for i: integer = lo + 1, hi - 1 do
+    if args[i] == '-a' then
+      local l, okl = test_eval(args, lo, i - 1)
+      local r, okr = test_eval(args, i + 1, hi)
+      return l and r, okl and okr
+    end
+  end
+  if n == 1 then return args[lo].size > 0, true end
+  if n == 2 then
+    local a = args[lo]
+    if a.size == 2 and a:byte(1) == 45 then return test_unary(a, args[lo + 1]) end
+    util.err("unknown unary operator '" .. a .. "'")
+    return false, false
+  end
+  if n == 3 then
+    local v, ok = test_binary(args[lo], args[lo + 1], args[lo + 2])
+    if ok then return v, true end
+    util.err("unknown binary operator '" .. args[lo + 1] .. "'")
+    return false, false
+  end
+  util.err('too many arguments')
+  return false, false
+end
+
+global function applet_test(args: sequence(string)): integer
+  local hi = #args
+  if util.applet == '[' then
+    if hi == 0 or args[hi] ~= ']' then util.err("missing ']'"); return 2 end
+    hi = hi - 1
+  end
+  local v, ok = test_eval(args, 1, hi)
+  if not ok then return 2 end
+  return v and 0 or 1
+end

@@ -1,0 +1,145 @@
+-- Linux x86-64 system interface for nebox, declared against nelibc's headers.
+-- Every function here is provided by libnelibc-standalone; nothing comes from
+-- a host libc. Constants are the Linux x86-64 ABI values.
+## pragmas.nogc = true
+
+global sys = @record{}
+
+global sys.Timespec: type <cimport 'struct timespec', cinclude '<time.h>', nodecl> = @record{
+  tv_sec: clong,
+  tv_nsec: clong,
+}
+
+global sys.Stat: type <cimport 'struct stat', cinclude '<sys/stat.h>', nodecl> = @record{
+  st_dev: culong,
+  st_ino: culong,
+  st_nlink: culong,
+  st_mode: cuint,
+  st_uid: cuint,
+  st_gid: cuint,
+  __pad0: cint,
+  st_rdev: culong,
+  st_size: clong,
+  st_blksize: clong,
+  st_blocks: clong,
+  st_atim: sys.Timespec,
+  st_mtim: sys.Timespec,
+  st_ctim: sys.Timespec,
+  __reserved: [3]clong,
+}
+
+global sys.Dirent: type <cimport 'struct dirent', cinclude '<dirent.h>', nodecl> = @record{
+  d_ino: culong,
+  d_off: clong,
+  d_reclen: cushort,
+  d_type: cuchar,
+  d_name: [256]cchar,
+}
+
+global sys.DIR: type <cimport 'DIR', cinclude '<dirent.h>', nodecl> = @record{}
+
+global sys.Tm: type <cimport 'struct tm', cinclude '<time.h>', nodecl> = @record{
+  tm_sec: cint, tm_min: cint, tm_hour: cint, tm_mday: cint, tm_mon: cint,
+  tm_year: cint, tm_wday: cint, tm_yday: cint, tm_isdst: cint,
+  tm_gmtoff: clong, tm_zone: cstring,
+}
+
+global sys.Utsname: type <cimport 'struct utsname', cinclude '<sys/utsname.h>', nodecl> = @record{
+  sysname: [65]cchar, nodename: [65]cchar, release: [65]cchar,
+  version: [65]cchar, machine: [65]cchar, domainname: [65]cchar,
+}
+
+-- open(2) flags and mode bits
+global sys.O_RDONLY: cint <comptime> = 0
+global sys.O_WRONLY: cint <comptime> = 1
+global sys.O_RDWR: cint <comptime> = 2
+global sys.O_CREAT: cint <comptime> = 0x40
+global sys.O_EXCL: cint <comptime> = 0x80
+global sys.O_TRUNC: cint <comptime> = 0x200
+global sys.O_APPEND: cint <comptime> = 0x400
+global sys.O_DIRECTORY: cint <comptime> = 0x10000
+global sys.O_NOFOLLOW: cint <comptime> = 0x20000
+global sys.AT_FDCWD: cint <comptime> = -100
+global sys.AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+global sys.S_IFMT: cuint <comptime> = 0xF000
+global sys.S_IFDIR: cuint <comptime> = 0x4000
+global sys.S_IFREG: cuint <comptime> = 0x8000
+global sys.S_IFLNK: cuint <comptime> = 0xA000
+global sys.S_IFCHR: cuint <comptime> = 0x2000
+global sys.S_IFBLK: cuint <comptime> = 0x6000
+global sys.S_IFIFO: cuint <comptime> = 0x1000
+global sys.S_IFSOCK: cuint <comptime> = 0xC000
+global sys.F_OK: cint <comptime> = 0
+global sys.X_OK: cint <comptime> = 1
+global sys.W_OK: cint <comptime> = 2
+global sys.R_OK: cint <comptime> = 4
+global sys.DT_DIR: cuchar <comptime> = 4
+global sys.DT_LNK: cuchar <comptime> = 10
+global sys.CLOCK_REALTIME: cint <comptime> = 0
+global sys.EEXIST: cint <comptime> = 17
+global sys.ENOENT: cint <comptime> = 2
+global sys.EXDEV: cint <comptime> = 18
+global sys.ENOTDIR: cint <comptime> = 20
+global sys.EINTR: cint <comptime> = 4
+
+function sys.read(fd: cint, buf: pointer, n: csize): clong <cimport 'read', cinclude '<unistd.h>'> end
+function sys.write(fd: cint, buf: pointer, n: csize): clong <cimport 'write', cinclude '<unistd.h>'> end
+function sys.open(path: cstring, flags: cint, mode: cuint): cint <cimport 'open', cinclude '<fcntl.h>'> end
+function sys.close(fd: cint): cint <cimport 'close', cinclude '<unistd.h>'> end
+function sys.lseek(fd: cint, off: clong, whence: cint): clong <cimport 'lseek', cinclude '<unistd.h>'> end
+function sys.stat(path: cstring, st: *sys.Stat): cint <cimport 'stat', cinclude '<sys/stat.h>'> end
+function sys.lstat(path: cstring, st: *sys.Stat): cint <cimport 'lstat', cinclude '<sys/stat.h>'> end
+function sys.fstat(fd: cint, st: *sys.Stat): cint <cimport 'fstat', cinclude '<sys/stat.h>'> end
+function sys.mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', cinclude '<sys/stat.h>'> end
+function sys.rmdir(path: cstring): cint <cimport 'rmdir', cinclude '<unistd.h>'> end
+function sys.unlink(path: cstring): cint <cimport 'unlink', cinclude '<unistd.h>'> end
+function sys.rename(from: cstring, to: cstring): cint <cimport 'rename', cinclude '<stdio.h>'> end
+function sys.symlink(target: cstring, path: cstring): cint <cimport 'symlink', cinclude '<unistd.h>'> end
+function sys.link(from: cstring, to: cstring): cint <cimport 'link', cinclude '<unistd.h>'> end
+function sys.readlink(path: cstring, buf: pointer, n: csize): clong <cimport 'readlink', cinclude '<unistd.h>'> end
+function sys.realpath(path: cstring, resolved: cstring): cstring <cimport 'realpath', cinclude '<stdlib.h>'> end
+function sys.chdir(path: cstring): cint <cimport 'chdir', cinclude '<unistd.h>'> end
+function sys.getcwd(buf: cstring, n: csize): cstring <cimport 'getcwd', cinclude '<unistd.h>'> end
+function sys.chmod(path: cstring, mode: cuint): cint <cimport 'chmod', cinclude '<sys/stat.h>'> end
+function sys.access(path: cstring, mode: cint): cint <cimport 'access', cinclude '<unistd.h>'> end
+function sys.utimensat(dirfd: cint, path: cstring, times: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
+function sys.opendir(path: cstring): *sys.DIR <cimport 'opendir', cinclude '<dirent.h>'> end
+function sys.readdir(d: *sys.DIR): *sys.Dirent <cimport 'readdir', cinclude '<dirent.h>'> end
+function sys.closedir(d: *sys.DIR): cint <cimport 'closedir', cinclude '<dirent.h>'> end
+function sys.isatty(fd: cint): cint <cimport 'isatty', cinclude '<unistd.h>'> end
+function sys.nanosleep(req: *sys.Timespec, rem: *sys.Timespec): cint <cimport 'nanosleep', cinclude '<time.h>'> end
+function sys.clock_gettime(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_gettime', cinclude '<time.h>'> end
+function sys.gmtime_r(t: *clong, out: *sys.Tm): *sys.Tm <cimport 'gmtime_r', cinclude '<time.h>'> end
+function sys.strftime(buf: cstring, n: csize, fmt: cstring, tm: *sys.Tm): csize <cimport 'strftime', cinclude '<time.h>'> end
+function sys.uname(u: *sys.Utsname): cint <cimport 'uname', cinclude '<sys/utsname.h>'> end
+function sys.gethostname(buf: cstring, n: csize): cint <cimport 'gethostname', cinclude '<unistd.h>'> end
+function sys.getpid(): cint <cimport 'getpid', cinclude '<unistd.h>'> end
+function sys.getppid(): cint <cimport 'getppid', cinclude '<unistd.h>'> end
+function sys.getuid(): cuint <cimport 'getuid', cinclude '<unistd.h>'> end
+function sys.geteuid(): cuint <cimport 'geteuid', cinclude '<unistd.h>'> end
+function sys.getgid(): cuint <cimport 'getgid', cinclude '<unistd.h>'> end
+function sys.getegid(): cuint <cimport 'getegid', cinclude '<unistd.h>'> end
+function sys.kill(pid: cint, sig: cint): cint <cimport 'kill', cinclude '<signal.h>'> end
+function sys.execvp(file: cstring, argv: *[0]cstring): cint <cimport 'execvp', cinclude '<unistd.h>'> end
+function sys.setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport 'setenv', cinclude '<stdlib.h>'> end
+function sys.unsetenv(name: cstring): cint <cimport 'unsetenv', cinclude '<stdlib.h>'> end
+function sys.getenv(name: cstring): cstring <cimport 'getenv', cinclude '<stdlib.h>'> end
+function sys.sync(): void <cimport 'sync', cinclude '<unistd.h>'> end
+function sys.umask(mask: cuint): cuint <cimport 'umask', cinclude '<sys/stat.h>'> end
+function sys._exit(code: cint): void <cimport '_exit', cinclude '<unistd.h>', noreturn> end
+function sys.strerror(e: cint): cstring <cimport 'strerror', cinclude '<string.h>'> end
+local function errno_location(): *cint <cimport 'nelibc_errno_location', cinclude '<errno.h>'> end
+global environ: *[0]cstring <cimport 'environ', cinclude '<unistd.h>'>
+
+function sys.errno(): cint
+  return $errno_location()
+end
+
+function sys.errstr(): string
+  return sys.strerror(sys.errno())
+end
+
+-- Build a C string from an array of C chars (nul-terminated by the kernel).
+function sys.cstr(buf: *[0]cchar): string
+  return (@cstring)(buf)
+end

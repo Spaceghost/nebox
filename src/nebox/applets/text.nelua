@@ -1,0 +1,834 @@
+-- Text applets: echo cat head tail wc sort uniq tee grep tr cut rev yes seq printf nl
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+global function applet_echo(args: sequence(string)): integer
+  local i: integer = 1
+  local newline, escapes = true, false
+  while i <= #args do
+    local a = args[i]
+    if a == '-n' then newline = false
+    elseif a == '-e' then escapes = true
+    elseif a == '-E' then escapes = false
+    elseif a == '-ne' or a == '-en' then newline = false; escapes = true
+    else break end
+    i = i + 1
+  end
+  local stop = false
+  for j: integer = i, #args do
+    if j > i then util.writebyte(32) end
+    if escapes then
+      local s, c = util.unescape(args[j])
+      util.write(s)
+      if c then stop = true; break end
+    else
+      util.write(args[j])
+    end
+  end
+  if newline and not stop then util.writebyte(10) end
+  return 0
+end
+
+global function applet_cat(args: sequence(string)): integer
+  local o = util.parse(args, 'nbuEvTAs')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then o.operands:push('-') end
+  local rc: integer = 0
+  local number = o:has('n') or o:has('b')
+  local lineno: integer = 0
+  for _, path in ipairs(o.operands) do
+    local fd = util.openin(path)
+    if fd < 0 then rc = 1; continue end
+    if number then
+      local data, ok = util.readfd(fd)
+      if not ok then util.perror(path); rc = 1 end
+      local start: usize = 0
+      for i: usize = 0, < data.size do
+        if data.data[i] == 10 then
+          local line = (@string){data=&data.data[start], size=i - start}
+          if o:has('b') and line.size == 0 then util.writebyte(10)
+          else lineno = lineno + 1; util.writef('%6d\t', lineno); util.line(line) end
+          start = i + 1
+        end
+      end
+      if start < data.size then
+        lineno = lineno + 1
+        util.writef('%6d\t', lineno)
+        util.write((@string){data=&data.data[start], size=data.size - start})
+      end
+    else
+      if not util.copyfd(fd) then util.perror(path); rc = 1 end
+    end
+    if fd ~= 0 then sys.close(fd) end
+  end
+  return rc
+end
+
+-- head/tail share operand handling: "-n N", "-c N", legacy "-N".
+local function count_args(args: sequence(string)): (sequence(string), boolean, integer, boolean, boolean)
+  -- returns operands, bytes-mode, count, quiet, ok
+  local rest: sequence(string)
+  local bytes = false
+  local count: integer = 10
+  local quiet, verbose = false, false
+  local i: integer = 1
+  while i <= #args do
+    local a = args[i]
+    if a == '--' then i = i + 1; break end
+    if a.size < 2 or a:byte(1) ~= 45 then break end
+    local c = a:byte(2)
+    if c == 110 or c == 99 then
+      local v: string
+      if a.size > 2 then v = a:sub(3) else i = i + 1; if i > #args then return rest, false, 0, false, false end; v = args[i] end
+      local n, ok = util.tosize(v)
+      if not ok then util.err("invalid number of " .. (c == 110 and "lines" or "bytes") .. ": '" .. v .. "'"); return rest, false, 0, false, false end
+      count = n
+      bytes = c == 99
+    elseif c >= 48 and c <= 57 then
+      local n, ok = util.tosize(a:sub(2))
+      if not ok then return rest, false, 0, false, false end
+      count = n
+    elseif a == '-q' then quiet = true
+    elseif a == '-v' then verbose = true
+    else
+      util.err("invalid option -- '" .. a:sub(2, 2) .. "'")
+      return rest, false, 0, false, false
+    end
+    i = i + 1
+  end
+  while i <= #args do rest:push(args[i]); i = i + 1 end
+  if #rest > 1 and not quiet then verbose = true end
+  return rest, bytes, count, verbose, true
+end
+
+local function header(path: string, first: boolean)
+  if not first then util.writebyte(10) end
+  util.write('==> ')
+  util.write(path == '-' and 'standard input' or path)
+  util.line(' <==')
+end
+
+global function applet_head(args: sequence(string)): integer
+  local files, bytes, count, verbose, ok = count_args(args)
+  if not ok then return 1 end
+  if #files == 0 then files:push('-') end
+  local rc: integer = 0
+  for idx, path in ipairs(files) do
+    local data, rok = util.readfile(path)
+    if not rok then rc = 1; continue end
+    if verbose then header(path, idx == 1) end
+    if bytes then
+      local n = count
+      if n < 0 then n = (@integer)(data.size) + n; if n < 0 then n = 0 end end
+      if n > (@integer)(data.size) then n = (@integer)(data.size) end
+      util.writebytes(data.data, (@usize)(n))
+    else
+      local n = count
+      local total: integer = 0
+      for i: usize = 0, < data.size do if data.data[i] == 10 then total = total + 1 end end
+      if data.size > 0 and data.data[data.size - 1] ~= 10 then total = total + 1 end
+      if n < 0 then n = total + n; if n < 0 then n = 0 end end
+      local seen: integer = 0
+      local stop: usize = data.size
+      if n < total then
+        for i: usize = 0, < data.size do
+          if data.data[i] == 10 then
+            seen = seen + 1
+            if seen == n then stop = i + 1; break end
+          end
+        end
+        if n == 0 then stop = 0 end
+      end
+      util.writebytes(data.data, stop)
+    end
+  end
+  return rc
+end
+
+global function applet_tail(args: sequence(string)): integer
+  local files, bytes, count, verbose, ok = count_args(args)
+  if not ok then return 1 end
+  if #files == 0 then files:push('-') end
+  local rc: integer = 0
+  for idx, path in ipairs(files) do
+    local data, rok = util.readfile(path)
+    if not rok then rc = 1; continue end
+    if verbose then header(path, idx == 1) end
+    if bytes then
+      local n = count
+      local start: integer = 0
+      if n < 0 then start = -n - 1 else start = (@integer)(data.size) - n end
+      if start < 0 then start = 0 end
+      if start > (@integer)(data.size) then start = (@integer)(data.size) end
+      util.writebytes(&data.data[start], data.size - (@usize)(start))
+    else
+      -- count newlines from the end
+      local n = count
+      if n < 0 then
+        -- "+N": start at line N
+        local want = -n
+        local line: integer = 1
+        local start: usize = 0
+        while line < want and start < data.size do
+          if data.data[start] == 10 then line = line + 1 end
+          start = start + 1
+        end
+        util.writebytes(&data.data[start], data.size - start)
+      else
+        if n == 0 then continue end
+        local i: isize = (@isize)(data.size) - 1
+        if i >= 0 and data.data[i] == 10 then i = i - 1 end
+        local seen: integer = 0
+        while i >= 0 do
+          if data.data[i] == 10 then
+            seen = seen + 1
+            if seen == n then break end
+          end
+          i = i - 1
+        end
+        local start: usize = (@usize)(i + 1)
+        util.writebytes(&data.data[start], data.size - start)
+      end
+    end
+  end
+  return rc
+end
+
+local WcShow = @record{wl: boolean, ww: boolean, wc: boolean, wL: boolean, narrow: boolean}
+
+function WcShow:col(first: boolean, v: integer)
+  if not first then util.writebyte(32) end
+  if self.narrow then util.writef('%d', v) else util.writef('%7d', v) end
+end
+
+function WcShow:line(l: integer, w: integer, c: integer, L: integer, name: string)
+  local first = true
+  if self.wl then self:col(first, l); first = false end
+  if self.ww then self:col(first, w); first = false end
+  if self.wc then self:col(first, c); first = false end
+  if self.wL then self:col(first, L); first = false end
+  if name ~= '-' then util.write(' '); util.write(name) end
+  util.writebyte(10)
+end
+
+global function applet_wc(args: sequence(string)): integer
+  local o = util.parse(args, 'lwcmL')
+  if not o:ok() then return util.optfail(o) end
+  local wl, ww, wc = o:has('l'), o:has('w'), o:has('c') or o:has('m')
+  local wL = o:has('L')
+  if not (wl or ww or wc or wL) then wl, ww, wc = true, true, true end
+  if #o.operands == 0 then o.operands:push('-') end
+  local tl, tw, tc, tL: integer = 0, 0, 0, 0
+  local rc: integer = 0
+  local narrow = #o.operands == 1 and o.operands[1] == '-'
+  local show: WcShow = {wl, ww, wc, wL, narrow}
+  for _, path in ipairs(o.operands) do
+    local data, ok = util.readfile(path)
+    if not ok then rc = 1; continue end
+    local l, w, L, cur: integer = 0, 0, 0, 0
+    local inword = false
+    for i: usize = 0, < data.size do
+      local b = data.data[i]
+      if b == 10 then l = l + 1; if cur > L then L = cur end; cur = 0 else cur = cur + 1 end
+      local space = b == 32 or (b >= 9 and b <= 13)
+      if space then inword = false elseif not inword then inword = true; w = w + 1 end
+    end
+    if cur > L then L = cur end
+    show:line(l, w, (@integer)(data.size), L, path)
+    tl = tl + l; tw = tw + w; tc = tc + (@integer)(data.size); if L > tL then tL = L end
+  end
+  if #o.operands > 1 then show:line(tl, tw, tc, tL, 'total') end
+  return rc
+end
+
+-- Leading numeric value of a line for sort -n (integer or decimal, with sign).
+local function numkey(s: string): (float64)
+  local i: usize = 1
+  while i <= s.size and (s:byte(i) == 32 or s:byte(i) == 9) do i = i + 1 end
+  local neg = false
+  if i <= s.size and s:byte(i) == 45 then neg = true; i = i + 1 end
+  local v: float64 = 0
+  local any = false
+  while i <= s.size and s:byte(i) >= 48 and s:byte(i) <= 57 do
+    v = v * 10 + (s:byte(i) - 48); i = i + 1; any = true
+  end
+  if i <= s.size and s:byte(i) == 46 then
+    i = i + 1
+    local scale: float64 = 0.1
+    while i <= s.size and s:byte(i) >= 48 and s:byte(i) <= 57 do
+      v = v + (s:byte(i) - 48) * scale; scale = scale * 0.1; i = i + 1; any = true
+    end
+  end
+  if not any then return 0 end
+  return neg and -v or v
+end
+
+local function lower(b: byte): byte
+  if b >= 65 and b <= 90 then return b + 32 end
+  return b
+end
+
+local function cmp_fold(a: string, b: string): integer
+  local n = a.size < b.size and a.size or b.size
+  for i: usize = 0, < n do
+    local x, y = lower(a.data[i]), lower(b.data[i])
+    if x ~= y then return x < y and -1 or 1 end
+  end
+  if a.size == b.size then return 0 end
+  return a.size < b.size and -1 or 1
+end
+
+local sort_numeric, sort_reverse, sort_fold: boolean = false, false, false
+
+local function sort_less(a: string, b: string): boolean
+  local r: integer = 0
+  if sort_numeric then
+    local x, y = numkey(a), numkey(b)
+    if x < y then r = -1 elseif x > y then r = 1 end
+  elseif sort_fold then
+    r = cmp_fold(a, b)
+  end
+  if r == 0 then
+    if a < b then r = -1 elseif b < a then r = 1 end
+  end
+  if sort_reverse then return r > 0 end
+  return r < 0
+end
+
+global function applet_sort(args: sequence(string)): integer
+  local o = util.parse(args, 'rnufso:')
+  if not o:ok() then return util.optfail(o) end
+  sort_numeric, sort_reverse, sort_fold = o:has('n'), o:has('r'), o:has('f')
+  if #o.operands == 0 then o.operands:push('-') end
+  local all: sequence(string)
+  local rc: integer = 0
+  for _, path in ipairs(o.operands) do
+    local data, ok = util.readfile(path)
+    if not ok then rc = 1; continue end
+    for _, l in ipairs(util.lines(data)) do all:push(l) end
+  end
+  util.sort(all, sort_less)
+  if o:has('o') then
+    local fd = sys.open(o:get('o'), sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
+    if fd < 0 then util.perror(o:get('o')); return 2 end
+    util.setout(fd)
+  end
+  local prev: string
+  local have = false
+  for _, l in ipairs(all) do
+    if o:has('u') and have then
+      local same: boolean
+      if sort_numeric then same = numkey(prev) == numkey(l)
+      elseif sort_fold then same = cmp_fold(prev, l) == 0
+      else same = prev == l end
+      if same then continue end
+    end
+    util.line(l)
+    prev = l
+    have = true
+  end
+  util.flush()
+  util.setout(1)
+  return rc
+end
+
+global function applet_uniq(args: sequence(string)): integer
+  local o = util.parse(args, 'cdui')
+  if not o:ok() then return util.optfail(o) end
+  local inpath = #o.operands >= 1 and o.operands[1] or '-'
+  local data, ok = util.readfile(inpath)
+  if not ok then return 1 end
+  if #o.operands >= 2 then
+    local fd = sys.open(o.operands[2], sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
+    if fd < 0 then util.perror(o.operands[2]); return 1 end
+    util.setout(fd)
+  end
+  local lines = util.lines(data)
+  local fold, onlydup, onlyuniq, count = o:has('i'), o:has('d'), o:has('u'), o:has('c')
+  local i: integer = 1
+  while i <= #lines do
+    local j = i
+    while j + 1 <= #lines do
+      local same: boolean
+      if fold then same = cmp_fold(lines[j + 1], lines[i]) == 0 else same = lines[j + 1] == lines[i] end
+      if not same then break end
+      j = j + 1
+    end
+    local n = j - i + 1
+    local skip = (onlydup and n < 2) or (onlyuniq and n > 1)
+    if not skip then
+      if count then util.writef('%7d ', n) end
+      util.line(lines[i])
+    end
+    i = j + 1
+  end
+  util.flush()
+  util.setout(1)
+  return 0
+end
+
+global function applet_tee(args: sequence(string)): integer
+  local o = util.parse(args, 'ai')
+  if not o:ok() then return util.optfail(o) end
+  local fds: sequence(cint)
+  local rc: integer = 0
+  local flags = sys.O_WRONLY | sys.O_CREAT | (o:has('a') and sys.O_APPEND or sys.O_TRUNC)
+  for _, path in ipairs(o.operands) do
+    local fd = sys.open(path, flags, 0x1B6)
+    if fd < 0 then util.perror(path); rc = 1 else fds:push(fd) end
+  end
+  local chunk: [65536]byte
+  while true do
+    local r = sys.read(0, &chunk[0], #chunk)
+    if r < 0 then if sys.errno() == sys.EINTR then continue end; break end
+    if r == 0 then break end
+    util.writebytes(&chunk[0], (@usize)(r))
+    util.flush()
+    for _, fd in ipairs(fds) do
+      local done: clong = 0
+      while done < r do
+        local w = sys.write(fd, &chunk[done], (@usize)(r - done))
+        if w < 0 then rc = 1; break end
+        done = done + w
+      end
+    end
+  end
+  for _, fd in ipairs(fds) do sys.close(fd) end
+  return rc
+end
+
+-- grep: fixed-string matching only (no regular expressions yet).
+local function find_fold(hay: string, needle: string): boolean
+  if needle.size == 0 then return true end
+  if needle.size > hay.size then return false end
+  for i: usize = 0, hay.size - needle.size do
+    local ok = true
+    for j: usize = 0, < needle.size do
+      if lower(hay.data[i + j]) ~= lower(needle.data[j]) then ok = false; break end
+    end
+    if ok then return true end
+  end
+  return false
+end
+
+local function isword(b: byte): boolean
+  return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+end
+
+local function find_word(hay: string, needle: string, fold: boolean): boolean
+  if needle.size == 0 or needle.size > hay.size then return false end
+  for i: usize = 0, hay.size - needle.size do
+    local ok = true
+    for j: usize = 0, < needle.size do
+      local a, b = hay.data[i + j], needle.data[j]
+      if fold then a, b = lower(a), lower(b) end
+      if a ~= b then ok = false; break end
+    end
+    if ok then
+      local before = i == 0 or not isword(hay.data[i - 1])
+      local after = i + needle.size >= hay.size or not isword(hay.data[i + needle.size])
+      if before and after then return true end
+    end
+  end
+  return false
+end
+
+global function applet_grep(args: sequence(string)): integer
+  local o = util.parse(args, 'ivnclqHhFEGwxe:sr')
+  if not o:ok() then return util.optfail(o) end
+  if o:has('E') or o:has('G') then
+    return util.die('regular expressions are not supported; only fixed strings (-F) match') + 1
+  end
+  local patterns: sequence(string)
+  local operands = o.operands
+  if o:has('e') then
+    patterns:push(o:get('e'))
+  else
+    if #operands == 0 then util.err('usage: grep [-ivnclqHhFwxs] [-e] PATTERN [FILE...]'); return 2 end
+    patterns:push(operands[1])
+    operands:remove(1)
+  end
+  if #operands == 0 then operands:push('-') end
+  local fold, invert = o:has('i'), o:has('v')
+  local withname = (#operands > 1 or o:has('H')) and not o:has('h')
+  local anymatch = false
+  local rc: integer = 0
+  for _, path in ipairs(operands) do
+    local data, ok = util.readfile(path)
+    if not ok then rc = 2; continue end
+    local count: integer = 0
+    local n: integer = 0
+    for _, line in ipairs(util.lines(data)) do
+      n = n + 1
+      local m = false
+      for _, p in ipairs(patterns) do
+        if o:has('x') then
+          m = fold and cmp_fold(line, p) == 0 or line == p
+        elseif o:has('w') then
+          m = find_word(line, p, fold)
+        elseif fold then
+          m = find_fold(line, p)
+        else
+          m = line:find(p, 1, true) > 0
+        end
+        if m then break end
+      end
+      if m ~= invert then
+        count = count + 1
+        anymatch = true
+        if o:has('q') then return 0 end
+        if o:has('l') then break end
+        if not o:has('c') then
+          if withname then util.write(path); util.writebyte(58) end
+          if o:has('n') then util.writef('%d:', n) end
+          util.line(line)
+        end
+      end
+    end
+    if o:has('l') then
+      if count > 0 then util.line(path) end
+    elseif o:has('c') then
+      if withname then util.write(path); util.writebyte(58) end
+      util.writef('%d\n', count)
+    end
+  end
+  if rc ~= 0 then return rc end
+  return anymatch and 0 or 1
+end
+
+-- tr: expand a set with ranges and escapes into bytes
+local function expand_set(s: string): sequence(byte)
+  local out: sequence(byte)
+  local u = util.unescape(s)
+  local i: usize = 1
+  while i <= u.size do
+    local c = u:byte(i)
+    if i + 2 <= u.size and u:byte(i + 1) == 45 then
+      local hi = u:byte(i + 2)
+      if hi >= c then
+        for b: integer = c, hi do out:push((@byte)(b)) end
+        i = i + 3
+        continue
+      end
+    end
+    out:push(c)
+    i = i + 1
+  end
+  return out
+end
+
+global function applet_tr(args: sequence(string)): integer
+  local o = util.parse(args, 'dsc')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands < 1 then util.err('missing operand'); return 1 end
+  local set1 = expand_set(o.operands[1])
+  local in1: [256]boolean
+  for _, b in ipairs(set1) do in1[b] = true end
+  if o:has('c') then for b: integer = 0, 255 do in1[b] = not in1[b] end end
+  local map: [256]byte
+  for b: integer = 0, 255 do map[b] = (@byte)(b) end
+  local deleting = o:has('d')
+  if not deleting then
+    if #o.operands < 2 then util.err('missing operand after \'' .. o.operands[1] .. '\''); return 1 end
+    local set2 = expand_set(o.operands[2])
+    if #set2 == 0 then util.err('when not truncating set1, string2 must be non-empty'); return 1 end
+    if o:has('c') then
+      local last = set2[#set2]
+      for b: integer = 0, 255 do if in1[b] then map[b] = last end end
+    else
+      for i: integer = 1, #set1 do
+        local j = i <= #set2 and i or #set2
+        map[set1[i]] = set2[j]
+      end
+    end
+  end
+  local data, ok = util.readfd(0)
+  if not ok then return 1 end
+  local squeeze = o:has('s')
+  local last: integer = -1
+  for i: usize = 0, < data.size do
+    local b = data.data[i]
+    if deleting and in1[b] then continue end
+    local outb = map[b]
+    if squeeze and in1[b] and (@integer)(outb) == last then continue end
+    util.writebyte(outb)
+    last = in1[b] and (@integer)(outb) or -1
+  end
+  return 0
+end
+
+-- cut: field/char lists like "1,3-5,7-"
+local Range = @record{lo: integer, hi: integer}
+
+local function parse_list(s: string): (sequence(Range), boolean)
+  local out: sequence(Range)
+  local start: usize = 1
+  for i: usize = 1, s.size + 1 do
+    if i > s.size or s:byte(i) == 44 then
+      local part = s:sub(start, i - 1)
+      start = i + 1
+      if part.size == 0 then return out, false end
+      local dash = part:find('-', 1, true)
+      local r: Range = {1, 0x7fffffff}
+      if dash == 0 then
+        local v, ok = util.toint(part); if not ok or v < 1 then return out, false end
+        r.lo, r.hi = v, v
+      else
+        if dash > 1 then local v, ok = util.toint(part:sub(1, dash - 1)); if not ok then return out, false end; r.lo = v end
+        if dash < (@isize)(part.size) then local v, ok = util.toint(part:sub(dash + 1)); if not ok then return out, false end; r.hi = v end
+        if r.lo < 1 or r.hi < r.lo then return out, false end
+      end
+      out:push(r)
+    end
+  end
+  return out, #out > 0
+end
+
+local function inlist(list: sequence(Range), n: integer): boolean
+  for _, r in ipairs(list) do if n >= r.lo and n <= r.hi then return true end end
+  return false
+end
+
+global function applet_cut(args: sequence(string)): integer
+  local o = util.parse(args, 'b:c:f:d:sn')
+  if not o:ok() then return util.optfail(o) end
+  local mode: string = ''
+  local spec: string
+  if o:has('f') then mode = 'f'; spec = o:get('f')
+  elseif o:has('c') then mode = 'c'; spec = o:get('c')
+  elseif o:has('b') then mode = 'c'; spec = o:get('b') end
+  if mode == '' then util.err('you must specify a list of bytes, characters, or fields'); return 1 end
+  local list, ok = parse_list(spec)
+  if not ok then util.err("invalid list '" .. spec .. "'"); return 1 end
+  local delim: byte = 9
+  if o:has('d') then
+    local d = o:get('d')
+    if d.size ~= 1 then util.err('the delimiter must be a single character'); return 1 end
+    delim = d:byte(1)
+  end
+  if #o.operands == 0 then o.operands:push('-') end
+  local rc: integer = 0
+  for _, path in ipairs(o.operands) do
+    local data, rok = util.readfile(path)
+    if not rok then rc = 1; continue end
+    for _, line in ipairs(util.lines(data)) do
+      if mode == 'c' then
+        for i: usize = 0, < line.size do
+          if inlist(list, (@integer)(i) + 1) then util.writebyte(line.data[i]) end
+        end
+        util.writebyte(10)
+      else
+        local hasdelim = false
+        for i: usize = 0, < line.size do if line.data[i] == delim then hasdelim = true; break end end
+        if not hasdelim then
+          if not o:has('s') then util.line(line) end
+          continue
+        end
+        local field: integer = 1
+        local start: usize = 0
+        local first = true
+        for i: usize = 0, line.size do
+          if i == line.size or line.data[i] == delim then
+            if inlist(list, field) then
+              if not first then util.writebyte(delim) end
+              util.writebytes(&line.data[start], i - start)
+              first = false
+            end
+            field = field + 1
+            start = i + 1
+          end
+        end
+        util.writebyte(10)
+      end
+    end
+  end
+  return rc
+end
+
+global function applet_rev(args: sequence(string)): integer
+  if #args == 0 then args:push('-') end
+  local rc: integer = 0
+  for _, path in ipairs(args) do
+    local data, ok = util.readfile(path)
+    if not ok then rc = 1; continue end
+    local start: usize = 0
+    for i: usize = 0, data.size do
+      if i == data.size or data.data[i] == 10 then
+        local j: isize = (@isize)(i) - 1
+        while j >= (@isize)(start) do util.writebyte(data.data[j]); j = j - 1 end
+        if i < data.size then util.writebyte(10) end
+        start = i + 1
+      end
+    end
+  end
+  return rc
+end
+
+global function applet_yes(args: sequence(string)): integer
+  local s: string = 'y'
+  if #args > 0 then
+    local sb: stringbuilder
+    for i, a in ipairs(args) do if i > 1 then sb:writebyte(32) end; sb:write(a) end
+    s = sb:promote()
+  end
+  -- flush after every line so a closed pipe ends the loop
+  while true do
+    util.line(s)
+    if not util.flush() then return 1 end
+  end
+  return 0
+end
+
+global function applet_seq(args: sequence(string)): integer
+  local o = util.parse(args, 's:w')
+  if not o:ok() then return util.optfail(o) end
+  local n = #o.operands
+  if n < 1 or n > 3 then util.err(n == 0 and 'missing operand' or 'extra operand'); return 1 end
+  local first, inc, last: integer = 1, 1, 0
+  local ok: boolean
+  if n == 1 then last, ok = util.toint(o.operands[1])
+  elseif n == 2 then
+    first, ok = util.toint(o.operands[1]); if not ok then util.err("invalid argument: '" .. o.operands[1] .. "'"); return 1 end
+    last, ok = util.toint(o.operands[2])
+  else
+    first, ok = util.toint(o.operands[1]); if not ok then util.err("invalid argument: '" .. o.operands[1] .. "'"); return 1 end
+    inc, ok = util.toint(o.operands[2]); if not ok then util.err("invalid argument: '" .. o.operands[2] .. "'"); return 1 end
+    last, ok = util.toint(o.operands[3])
+  end
+  if not ok then util.err("invalid argument: '" .. o.operands[n] .. "'"); return 1 end
+  if inc == 0 then util.err('invalid zero increment value'); return 1 end
+  local sep: string = o:has('s') and o:get('s') or '\n'
+  local width: integer = 0
+  if o:has('w') then
+    local a, b = string.format('%d', first), string.format('%d', last)
+    width = (@integer)(a.size > b.size and a.size or b.size)
+  end
+  local v = first
+  local any = false
+  while (inc > 0 and v <= last) or (inc < 0 and v >= last) do
+    if any then util.write(sep) end
+    if width > 0 then
+      local s = string.format('%d', v)
+      local neg = v < 0
+      if neg then util.writebyte(45); s = s:sub(2) end
+      for _ = (@integer)(s.size) + (neg and 1 or 0), width - 1 do util.writebyte(48) end
+      util.write(s)
+    else
+      util.writef('%d', v)
+    end
+    any = true
+    v = v + inc
+  end
+  if any then util.writebyte(10) end
+  return 0
+end
+
+-- printf with %s %d %i %u %x %X %o %c %% and width/precision flags; the
+-- format is reused while arguments remain, as coreutils does.
+global function applet_printf(args: sequence(string)): integer
+  if #args == 0 then util.err('usage: printf FORMAT [ARGUMENT...]'); return 1 end
+  local fmt = args[1]
+  local ai: integer = 2
+  local rc: integer = 0
+  repeat
+    local i: usize = 1
+    while i <= fmt.size do
+      local c = fmt:byte(i)
+      if c == 92 then
+        -- escape: hand a two-byte slice (or more for octal/hex) to unescape
+        local j = i + 1
+        while j <= fmt.size and j < i + 4 and fmt:byte(j) >= 48 and fmt:byte(j) <= 55 do j = j + 1 end
+        if j == i + 1 and i + 1 <= fmt.size then j = i + 2 end
+        if i + 1 <= fmt.size and fmt:byte(i + 1) == 120 then j = i + 2; while j <= fmt.size and j < i + 4 do j = j + 1 end end
+        local s, stop = util.unescape(fmt:sub(i, j - 1))
+        util.write(s)
+        if stop then return rc end
+        i = j
+      elseif c == 37 then
+        if i + 1 <= fmt.size and fmt:byte(i + 1) == 37 then util.writebyte(37); i = i + 2; continue end
+        local j = i + 1
+        while j <= fmt.size do
+          local d = fmt:byte(j)
+          if d == 45 or d == 43 or d == 32 or d == 35 or d == 48 or d == 46 or (d >= 49 and d <= 57) then j = j + 1 else break end
+        end
+        if j > fmt.size then util.err('missing conversion in format'); return 1 end
+        local conv = fmt:byte(j)
+        local spec = fmt:sub(i, j - 1)
+        local a: string = ''
+        if ai <= #args then a = args[ai]; ai = ai + 1 end
+        if conv == 115 then
+          util.write(string.format(spec .. 's', a))
+        elseif conv == 99 then
+          util.write(string.format(spec .. 's', a.size > 0 and a:sub(1, 1) or ''))
+        elseif conv == 100 or conv == 105 or conv == 117 or conv == 120 or conv == 88 or conv == 111 then
+          local v: integer = 0
+          if a.size > 0 then
+            local ok: boolean
+            if a:byte(1) == 39 or a:byte(1) == 34 then v = a.size > 1 and a:byte(2) or 0; ok = true
+            else
+              local base = 10
+              local body = a
+              if a.size > 2 and a:byte(1) == 48 and (a:byte(2) == 120 or a:byte(2) == 88) then base = 16; body = a:sub(3)
+              elseif a.size > 1 and a:byte(1) == 48 then base = 8; body = a:sub(2) end
+              if base == 10 then v, ok = util.toint(a)
+              else
+                ok = true; v = 0
+                for k: usize = 1, body.size do
+                  local d = body:byte(k)
+                  local dv: integer = -1
+                  if d >= 48 and d <= 57 then dv = d - 48 elseif d >= 97 and d <= 102 then dv = d - 87 elseif d >= 65 and d <= 70 then dv = d - 55 end
+                  if dv < 0 or dv >= base then ok = false; break end
+                  v = v * base + dv
+                end
+              end
+            end
+            if not ok then util.err("'" .. a .. "': expected a numeric value"); rc = 1; v = 0 end
+          end
+          local letter = conv == 105 and 'd' or string.char(conv)
+          util.write(string.format(spec .. letter, v))
+        else
+          util.err('%' .. string.char(conv) .. ': invalid conversion specification'); return 1
+        end
+        i = j + 1
+      else
+        util.writebyte(c)
+        i = i + 1
+      end
+    end
+  until ai > #args or ai == 2
+  return rc
+end
+
+global function applet_nl(args: sequence(string)): integer
+  local o = util.parse(args, 'b:s:w:')
+  if not o:ok() then return util.optfail(o) end
+  local style = o:has('b') and o:get('b') or 't'
+  local sep = o:has('s') and o:get('s') or '\t'
+  local width: integer = 6
+  if o:has('w') then local v, ok = util.toint(o:get('w')); if not ok or v < 1 then util.err('invalid line number field width'); return 1 end; width = v end
+  if #o.operands == 0 then o.operands:push('-') end
+  local n: integer = 0
+  local rc: integer = 0
+  for _, path in ipairs(o.operands) do
+    local data, ok = util.readfile(path)
+    if not ok then rc = 1; continue end
+    for _, line in ipairs(util.lines(data)) do
+      local number = style == 'a' or (style == 't' and line.size > 0)
+      if number then
+        n = n + 1
+        util.write(string.format('%' .. string.format('%d', width) .. 'd', n))
+        util.write(sep)
+      else
+        for _ = 1, width do util.writebyte(32) end
+        util.write(sep)
+      end
+      util.line(line)
+    end
+  end
+  return rc
+end
