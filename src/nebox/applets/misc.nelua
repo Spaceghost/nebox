@@ -1,0 +1,358 @@
+-- dd, diff
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+-- dd ------------------------------------------------------------------------
+global function applet_dd(args: sequence(string)): integer
+  local inpath: string, outpath: string = '-', '-'
+  local ibs: integer, obs: integer = 512, 512
+  local count: integer = -1
+  local skip: integer, seek: integer = 0, 0
+  local notrunc, syncpad, status_none, status_noxfer = false, false, false, false
+  for _, a in ipairs(args) do
+    local eq = a:find('=', 1, true)
+    if eq <= 0 then return util.die("unrecognized operand '" .. a .. "'") end
+    local k, v = a:sub(1, eq - 1), a:sub(eq + 1)
+    if k == 'if' then inpath = v
+    elseif k == 'of' then outpath = v
+    elseif k == 'bs' or k == 'ibs' or k == 'obs' or k == 'count' or k == 'skip' or k == 'seek' then
+      local n, ok = util.tosize(v)
+      if not ok or n < 0 then return util.die("invalid number: '" .. v .. "'") end
+      if k == 'bs' then ibs = n; obs = n elseif k == 'ibs' then ibs = n elseif k == 'obs' then obs = n
+      elseif k == 'count' then count = n elseif k == 'skip' then skip = n else seek = n end
+    elseif k == 'conv' then
+      for part in v:gmatch('[^,]+') do
+        if part == 'notrunc' then notrunc = true
+        elseif part == 'sync' then syncpad = true
+        elseif part == 'fsync' or part == 'fdatasync' or part == 'noerror' then
+        else return util.die("invalid conversion: '" .. part .. "'") end
+      end
+    elseif k == 'status' then
+      if v == 'none' then status_none = true elseif v == 'noxfer' then status_noxfer = true
+      elseif v ~= 'progress' then return util.die("invalid status level: '" .. v .. "'") end
+    elseif k == 'iflag' or k == 'oflag' then
+    else return util.die("unrecognized operand '" .. a .. "'") end
+  end
+  if ibs <= 0 or obs <= 0 then return util.die('invalid block size') end
+  local ifd: cint = 0
+  if inpath ~= '-' then
+    ifd = sys.open(inpath, sys.O_RDONLY, 0)
+    if ifd < 0 then return util.die("failed to open '" .. inpath .. "': " .. sys.errstr()) end
+  end
+  local ofd: cint = 1
+  if outpath ~= '-' then
+    local flags = sys.O_WRONLY | sys.O_CREAT
+    if not notrunc and seek == 0 then flags = flags | sys.O_TRUNC end
+    ofd = sys.open(outpath, flags, 0x1B6)
+    if ofd < 0 then return util.die("failed to open '" .. outpath .. "': " .. sys.errstr()) end
+  end
+  util.flush()
+  -- skip input blocks
+  if skip > 0 then
+    if ifd ~= 0 and sys.lseek(ifd, skip * ibs, 0) < 0 or ifd == 0 then
+      local buf: [65536]byte
+      local left = skip * ibs
+      while left > 0 do
+        local want: usize = (@usize)(left < 65536 and left or 65536)
+        local r = sys.read(ifd, &buf[0], want)
+        if r <= 0 then break end
+        left = left - r
+      end
+    end
+  end
+  if seek > 0 then
+    if sys.lseek(ofd, seek * obs, 0) < 0 then return util.die('cannot seek output: ' .. sys.errstr()) end
+    if not notrunc and ofd ~= 1 then
+      local st: sys.Stat
+      if sys.fstat(ofd, &st) == 0 and st.st_size > seek * obs then sys.truncate(outpath, seek * obs) end
+    end
+  end
+  local ibuf: sequence(byte)
+  ibuf:resize((@usize)(ibs))
+  local obuf: sequence(byte)
+  obuf:resize((@usize)(obs))
+  local opos: integer = 0
+  local full_in, part_in, full_out, part_out: integer = 0, 0, 0, 0
+  local total: integer = 0
+  local t0: sys.Timespec
+  sys.clock_gettime(sys.CLOCK_MONOTONIC, &t0)
+  while count < 0 or full_in + part_in < count do
+    local r = sys.read(ifd, &ibuf[1], (@usize)(ibs))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      util.err("error reading '" .. inpath .. "': " .. sys.errstr()); break
+    end
+    if r == 0 then break end
+    local n = (@integer)(r)
+    if n == ibs then full_in = full_in + 1 else
+      part_in = part_in + 1
+      if syncpad then
+        for i = n + 1, ibs do ibuf[i] = 0 end
+        n = ibs
+      end
+    end
+    -- copy into the output buffer, flushing full blocks
+    local i: integer = 1
+    while i <= n do
+      local room = obs - opos
+      local take = n - i + 1
+      if take > room then take = room end
+      for k = 0, < take do obuf[opos + k + 1] = ibuf[i + k] end
+      opos = opos + take
+      i = i + take
+      if opos == obs then
+        local w = sys.write(ofd, &obuf[1], (@usize)(obs))
+        if w < 0 then util.err("error writing '" .. outpath .. "': " .. sys.errstr()); return 1 end
+        total = total + obs; full_out = full_out + 1; opos = 0
+      end
+    end
+  end
+  if opos > 0 then
+    local w = sys.write(ofd, &obuf[1], (@usize)(opos))
+    if w < 0 then util.err("error writing '" .. outpath .. "': " .. sys.errstr()); return 1 end
+    total = total + opos; part_out = part_out + 1
+  end
+  if ifd ~= 0 then sys.close(ifd) end
+  if ofd ~= 1 then sys.close(ofd) end
+  if not status_none then
+    local t1: sys.Timespec
+    sys.clock_gettime(sys.CLOCK_MONOTONIC, &t1)
+    local secs = (@float64)(t1.tv_sec - t0.tv_sec) + (@float64)(t1.tv_nsec - t0.tv_nsec) * 1e-9
+    local sb: stringbuilder
+    sb:writef('%d+%d records in\n%d+%d records out\n', full_in, part_in, full_out, part_out)
+    if not status_noxfer then
+      sb:writef('%d bytes copied, %.6g s\n', total, secs)
+    end
+    local msg = sb:promote()
+    sys.write(2, msg.data, msg.size)
+  end
+  return 0
+end
+
+-- diff ------------------------------------------------------------------------
+-- Myers O(ND) shortest edit script over line sequences.
+local Edit = @record{ kind: byte, a: integer, b: integer }  -- kind: 61 '=', 45 '-', 43 '+'
+
+local diff_ignore_case, diff_ignore_space, diff_ignore_blank = false, false, false
+
+local function norm_line(s: string): string
+  if not diff_ignore_case and not diff_ignore_space and not diff_ignore_blank then return s end
+  local sb: stringbuilder
+  local pending_space = false
+  for i: usize = 0, < s.size do
+    local b = s.data[i]
+    local sp = b == 32 or b == 9
+    if diff_ignore_space and sp then continue end
+    if diff_ignore_blank and sp then
+      pending_space = true
+      continue
+    end
+    if pending_space then sb:writebyte(32); pending_space = false end
+    if diff_ignore_case and b >= 65 and b <= 90 then b = b + 32 end
+    sb:writebyte(b)
+  end
+  return sb:promote()
+end
+
+local function myers(a: sequence(string), b: sequence(string)): sequence(Edit)
+  local n, m = #a, #b
+  local max = n + m
+  local edits: sequence(Edit)
+  if max == 0 then return edits end
+  local ka: sequence(string)
+  local kb: sequence(string)
+  for _, s in ipairs(a) do ka:push(norm_line(s)) end
+  for _, s in ipairs(b) do kb:push(norm_line(s)) end
+  -- V arrays per d, offset by max
+  local trace: sequence(sequence(integer))
+  local v: sequence(integer)
+  v:resize((@usize)(2 * max + 2))
+  for i = 1, #v do v[i] = 0 end
+  local found_d: integer = -1
+  for d = 0, max do
+    local snapshot: sequence(integer)
+    for i = 1, #v do snapshot:push(v[i]) end
+    trace:push(snapshot)
+    local k = -d
+    while k <= d do
+      local x: integer
+      if k == -d or (k ~= d and v[k - 1 + max + 1] < v[k + 1 + max + 1]) then
+        x = v[k + 1 + max + 1]
+      else
+        x = v[k - 1 + max + 1] + 1
+      end
+      local y = x - k
+      while x < n and y < m and ka[x + 1] == kb[y + 1] do x = x + 1; y = y + 1 end
+      v[k + max + 1] = x
+      if x >= n and y >= m then found_d = d; break end
+      k = k + 2
+    end
+    if found_d >= 0 then break end
+  end
+  -- backtrack
+  local x, y = n, m
+  local rev: sequence(Edit)
+  for d = found_d, 1, -1 do
+    local vv = trace[d + 1]
+    local k = x - y
+    local prev_k: integer
+    if k == -d or (k ~= d and vv[k - 1 + max + 1] < vv[k + 1 + max + 1]) then prev_k = k + 1 else prev_k = k - 1 end
+    local prev_x = vv[prev_k + max + 1]
+    local prev_y = prev_x - prev_k
+    while x > prev_x and y > prev_y do
+      rev:push((@Edit){61, x, y}); x = x - 1; y = y - 1
+    end
+    if x == prev_x then rev:push((@Edit){43, x, y})   -- insertion of b[y]
+    else rev:push((@Edit){45, x, y}) end               -- deletion of a[x]
+    x, y = prev_x, prev_y
+  end
+  while x > 0 and y > 0 do rev:push((@Edit){61, x, y}); x = x - 1; y = y - 1 end
+  for i = #rev, 1, -1 do edits:push(rev[i]) end
+  return edits
+end
+
+-- Group edits into hunks: ranges [a1,a2] deleted from a and [b1,b2] inserted in b.
+local Hunk = @record{ a1: integer, a2: integer, b1: integer, b2: integer }
+
+local function hunks_of(edits: sequence(Edit)): sequence(Hunk)
+  local out: sequence(Hunk)
+  local i: integer = 1
+  local ai: integer, bi: integer = 0, 0
+  while i <= #edits do
+    local e = edits[i]
+    if e.kind == 61 then ai = ai + 1; bi = bi + 1; i = i + 1; continue end
+    local h: Hunk = {ai + 1, ai, bi + 1, bi}
+    while i <= #edits and edits[i].kind ~= 61 do
+      if edits[i].kind == 45 then ai = ai + 1; h.a2 = ai else bi = bi + 1; h.b2 = bi end
+      i = i + 1
+    end
+    out:push(h)
+  end
+  return out
+end
+
+local function range(lo: integer, hi: integer): string
+  if hi < lo then return string.format('%d', lo - 1) end
+  if hi == lo then return string.format('%d', lo) end
+  return string.format('%d,%d', lo, hi)
+end
+
+local function diff_timestamp(path: string): string
+  local st: sys.Stat
+  if sys.stat(path, &st) ~= 0 then return '1970-01-01 00:00:00.000000000 +0000' end
+  return util.timefmt(st.st_mtim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_mtim.tv_nsec)
+end
+
+local function print_lines(prefix: string, lines: sequence(string), lo: integer, hi: integer, nonl: boolean, total: integer)
+  for i = lo, hi do
+    util.write(prefix); util.line(lines[i])
+    if nonl and i == total then util.line('\\ No newline at end of file') end
+  end
+end
+
+local function unified(la: sequence(string), lb: sequence(string), nla: boolean, nlb: boolean, hunks: sequence(Hunk), ctx: integer)
+  local i: integer = 1
+  while i <= #hunks do
+    -- merge hunks whose context overlaps
+    local j = i
+    while j < #hunks and hunks[j + 1].a1 - hunks[j].a2 - 1 <= 2 * ctx do j = j + 1 end
+    local first, last = hunks[i], hunks[j]
+    local a_lo = first.a1 - ctx; if a_lo < 1 then a_lo = 1 end
+    local a_hi = last.a2 + ctx
+    if last.a2 < last.a1 then a_hi = last.a1 - 1 + ctx end
+    if a_hi > #la then a_hi = #la end
+    local b_lo = first.b1 - ctx; if b_lo < 1 then b_lo = 1 end
+    local b_hi = last.b2 + ctx
+    if last.b2 < last.b1 then b_hi = last.b1 - 1 + ctx end
+    if b_hi > #lb then b_hi = #lb end
+    local alen = a_hi - a_lo + 1
+    local blen = b_hi - b_lo + 1
+    local astart = alen == 0 and a_lo - 1 or a_lo
+    local bstart = blen == 0 and b_lo - 1 or b_lo
+    local sb: stringbuilder
+    sb:write('@@ -')
+    if alen == 1 then sb:writef('%d', astart) else sb:writef('%d,%d', astart, alen) end
+    sb:write(' +')
+    if blen == 1 then sb:writef('%d', bstart) else sb:writef('%d,%d', bstart, blen) end
+    sb:write(' @@')
+    util.line(sb:promote())
+    local ai, bi = a_lo, b_lo
+    for h = i, j do
+      local hk = hunks[h]
+      while ai < hk.a1 do print_lines(' ', la, ai, ai, nla, #la); ai = ai + 1; bi = bi + 1 end
+      print_lines('-', la, hk.a1, hk.a2, nla, #la); ai = hk.a2 + 1
+      print_lines('+', lb, hk.b1, hk.b2, nlb, #lb); bi = hk.b2 + 1
+    end
+    while ai <= a_hi do print_lines(' ', la, ai, ai, nla, #la); ai = ai + 1; bi = bi + 1 end
+    i = j + 1
+  end
+end
+
+global function applet_diff(args: sequence(string)): integer
+  local o = util.parse(args, 'uqsiwbBNrU:ac')
+  if not o:ok() then return util.optfail(o) + 1 end
+  if #o.operands ~= 2 then
+    if #o.operands < 2 then util.err('missing operand after \'' .. (#o.operands == 1 and o.operands[1] or 'diff') .. '\''); return 2 end
+    util.err("extra operand '" .. o.operands[3] .. "'"); return 2
+  end
+  diff_ignore_case, diff_ignore_space, diff_ignore_blank = o:has('i'), o:has('w'), o:has('b')
+  local pa, pb = o.operands[1], o.operands[2]
+  if util.isdir(pa) and not util.isdir(pb) then pa = util.join(pa, util.basename(pb)) end
+  if util.isdir(pb) and not util.isdir(pa) then pb = util.join(pb, util.basename(pa)) end
+  if util.isdir(pa) and util.isdir(pb) then util.err('directory comparison is not supported'); return 2 end
+  local da, oka = util.readfile(pa)
+  if not oka then
+    if o:has('N') then da = ''; oka = true else return 2 end
+  end
+  local db, okb = util.readfile(pb)
+  if not okb then
+    if o:has('N') then db = ''; okb = true else return 2 end
+  end
+  if da == db then
+    if o:has('s') then util.line('Files ' .. pa .. ' and ' .. pb .. ' are identical') end
+    return 0
+  end
+  local la, lb = util.lines(da), util.lines(db)
+  local nla = da.size > 0 and da.data[da.size - 1] ~= 10
+  local nlb = db.size > 0 and db.data[db.size - 1] ~= 10
+  local edits = myers(la, lb)
+  local hunks = hunks_of(edits)
+  if #hunks == 0 and nla == nlb then
+    if o:has('s') then util.line('Files ' .. pa .. ' and ' .. pb .. ' are identical') end
+    return 0
+  end
+  if o:has('q') then util.line('Files ' .. pa .. ' and ' .. pb .. ' differ'); return 1 end
+  if #hunks == 0 then
+    -- only the trailing newline differs: GNU reports the last line changed
+    local h: Hunk = {#la, #la, #lb, #lb}
+    hunks:push(h)
+  end
+  if o:has('u') or o:has('U') then
+    local ctx: integer = 3
+    if o:has('U') then
+      local v, ok = util.toint(o:get('U'))
+      if not ok or v < 0 then util.err("invalid context length '" .. o:get('U') .. "'"); return 2 end
+      ctx = v
+    end
+    util.line('--- ' .. pa .. '\t' .. diff_timestamp(pa))
+    util.line('+++ ' .. pb .. '\t' .. diff_timestamp(pb))
+    unified(la, lb, nla, nlb, hunks, ctx)
+    return 1
+  end
+  for _, h in ipairs(hunks) do
+    local del = h.a2 >= h.a1
+    local add = h.b2 >= h.b1
+    local op: string
+    if del and add then op = 'c' elseif del then op = 'd' else op = 'a' end
+    util.line(range(h.a1, h.a2) .. op .. range(h.b1, h.b2))
+    if del then print_lines('< ', la, h.a1, h.a2, nla, #la) end
+    if del and add then util.line('---') end
+    if add then print_lines('> ', lb, h.b1, h.b2, nlb, #lb) end
+  end
+  return 1
+end
