@@ -7,26 +7,6 @@ require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
 
-local function name_less(a: string, b: string): boolean
-  return a < b
-end
-
-local function readnames(dir: string, all: boolean): (sequence(string), boolean)
-  local names: sequence(string)
-  local d = sys.opendir(dir)
-  if d == nilptr then return names, false end
-  while true do
-    local de = sys.readdir(d)
-    if de == nilptr then break end
-    local name = string.copy(sys.cstr(&de.d_name))
-    if not all and name:byte(1) == 46 then continue end
-    names:push(name)
-  end
-  sys.closedir(d)
-  util.sort(names, name_less)
-  return names, true
-end
-
 local function digits(v: integer): integer
   local n: integer = 1
   while v >= 10 do v = v // 10; n = n + 1 end
@@ -100,7 +80,7 @@ function Ls:group(paths: sequence(string), shown: sequence(string), total: boole
 end
 
 function Ls:listdir(dir: string, label: boolean)
-  local names, ok = readnames(dir, self.all)
+  local names, ok = util.readnames(dir, self.all)
   if not ok then util.err("cannot open directory '" .. dir .. "': " .. sys.errstr()); self.rc = 2; return end
   if label then util.write(dir); util.line(':') end
   local paths: sequence(string)
@@ -130,8 +110,8 @@ global function applet_ls(args: sequence(string)): integer
   for _, p in ipairs(o.operands) do
     if not dironly and util.isdir(p) then dirs:push(p) else files:push(p) end
   end
-  util.sort(files, name_less)
-  util.sort(dirs, name_less)
+  util.sort(files, util.name_less)
+  util.sort(dirs, util.name_less)
   if #files > 0 then ls:group(files, files, false) end
   for i, d in ipairs(dirs) do
     if #files > 0 or i > 1 then util.writebyte(10) end
@@ -216,7 +196,7 @@ local function rm_tree(path: string, force: boolean, verbose: boolean): boolean
   end
   local ok = true
   if (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
-    local names, rok = readnames(path, true)
+    local names, rok = util.readnames(path, true)
     if not rok then util.perror(path); return false end
     for _, n in ipairs(names) do
       if n ~= '.' and n ~= '..' then
@@ -316,7 +296,7 @@ local function copy_tree(src: string, dst: string, recursive: boolean, preserve:
     if not util.isdir(dst) and sys.mkdir(dst, st.st_mode & 0x1FF) ~= 0 then
       util.err("cannot create directory '" .. dst .. "': " .. sys.errstr()); return false
     end
-    local names, rok = readnames(src, true)
+    local names, rok = util.readnames(src, true)
     if not rok then util.perror(src); return false end
     for _, n in ipairs(names) do
       if n ~= '.' and n ~= '..' then
@@ -567,7 +547,7 @@ local function chmod_path(path: string, spec: string, recursive: boolean, verbos
   if verbose then util.line(string.format("mode of '%s' changed to %04o", path, (@integer)(mode))) end
   local all = true
   if recursive and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
-    local names, rok = readnames(path, true)
+    local names, rok = util.readnames(path, true)
     if not rok then util.perror(path); return false end
     for _, n in ipairs(names) do
       if n ~= '.' and n ~= '..' then

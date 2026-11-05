@@ -16,7 +16,7 @@ global function applet_false(args: sequence(string)): integer
 end
 
 -- Parse "1.5", "2m", "1h", "3d" style durations into a timespec.
-local function duration(s: string, ts: *sys.Timespec): boolean
+global function parse_duration(s: string, ts: *sys.Timespec): boolean
   if s.size == 0 then return false end
   local mult: float64 = 1
   local body = s
@@ -51,7 +51,7 @@ global function applet_sleep(args: sequence(string)): integer
   local total: sys.Timespec
   for _, a in ipairs(args) do
     local ts: sys.Timespec
-    if not duration(a, &ts) then return util.die("invalid time interval '" .. a .. "'") end
+    if not parse_duration(a, &ts) then return util.die("invalid time interval '" .. a .. "'") end
     total.tv_sec = total.tv_sec + ts.tv_sec
     total.tv_nsec = total.tv_nsec + ts.tv_nsec
     if total.tv_nsec >= 1000000000 then total.tv_sec = total.tv_sec + 1; total.tv_nsec = total.tv_nsec - 1000000000 end
@@ -186,7 +186,7 @@ local signals: []SigName = {
   {'TTIN', 21}, {'TTOU', 22}, {'WINCH', 28},
 }
 
-local function signum(s: string): cint
+global function signum(s: string): cint
   local name = s
   if name.size > 3 and name:sub(1, 3):upper() == 'SIG' then name = name:sub(4) end
   local v, ok = util.toint(name)

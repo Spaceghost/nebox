@@ -28,9 +28,12 @@ stdout, exit status, and the resulting directory tree.
 ## Applets
 
 ```
-[ basename cat chmod cp cut date dirname echo env false grep head hostname
-id kill ln ls mkdir mv nl nproc printenv printf pwd readlink rev rm rmdir
-seq sleep sort sync tail tee test touch tr true uname uniq wc which yes
+[ base64 basename cat chgrp chmod chown cksum cmp comm cp cut date dirname du
+echo env expand expr factor false fold grep groups head hostname id kill link
+ln ls md5sum mkdir mktemp mv nl nproc paste printenv printf pwd readlink
+realpath rev rm rmdir seq sha1sum sha256sum sleep sort split stat strings sync
+tac tail tee test timeout touch tr true truncate tty unexpand uname uniq unlink
+wc which whoami xargs yes
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
@@ -40,7 +43,20 @@ per applet in `DIR`.
 
 Stated here rather than worked around:
 
-- `grep` matches fixed strings only. `-E`/`-G` exit 2 with a message.
+- `grep` and `expr` use nebox's own regex engine (`src/nebox/regex.nelua`):
+  POSIX BRE and ERE with brackets, classes, intervals, groups, alternation,
+  back-references, and the GNU `\w \W \s \S \b \B \< \>` escapes. Matching
+  is leftmost-first (backtracking), not POSIX leftmost-longest, which only
+  differs for alternations whose branches are prefixes of each other. No
+  multibyte locales. `grep` has no `-A/-B/-C` context or `-z`.
+- `du` prints entries in sorted name order; GNU prints in directory order.
+- `stat` shows times in UTC and has no `%w`/birth time or device-name
+  formatting beyond `%d`/`%D`/`%t`/`%T`.
+- `xargs` runs commands with `fork`+`execvp`; no `-P`, `-L`, or `-s` limits.
+- `timeout` polls the child every 2 ms rather than using signals; `-k` is
+  accepted but ignored.
+- `mktemp` draws names from `getrandom`; `groups`/`whoami` know only the
+  current process.
 - `date` prints UTC. nelibc has no zone database, so there is no local time.
   `-d` understands only `@SECONDS`; setting the date is unsupported.
 - `ls` prints one entry per line in every mode (no columns). `-l` and `id`

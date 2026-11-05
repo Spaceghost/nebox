@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.regex'
 
 global function applet_echo(args: sequence(string)): integer
   local i: integer = 1
@@ -511,26 +512,81 @@ local function find_word(hay: string, needle: string, fold: boolean): boolean
   return false
 end
 
-global function applet_grep(args: sequence(string)): integer
-  local o = util.parse(args, 'ivnclqHhFEGwxe:sr')
-  if not o:ok() then return util.optfail(o) end
-  if o:has('E') or o:has('G') then
-    return util.die('regular expressions are not supported; only fixed strings (-F) match') + 1
+-- Build one regex covering every pattern, honouring -w / -x by wrapping.
+local function grep_compile(patterns: sequence(string), ere: boolean, icase: boolean, word: boolean, whole: boolean): (regex.Prog, string)
+  local sb: stringbuilder
+  -- (?: groups are an internal non-capturing extension so user back-references keep their numbers
+  local open: string = ere and '(?:' or '\\(?:'
+  local close: string = ere and ')' or '\\)'
+  local bar: string = ere and '|' or '\\|'
+  for i, p in ipairs(patterns) do
+    if i > 1 then sb:write(bar) end
+    sb:write(open); sb:write(p); sb:write(close)
   end
+  local body = sb:promote()
+  if whole then body = '^' .. open .. body .. close .. '$'
+  elseif word then body = open .. '^' .. bar .. '[^[:alnum:]_]' .. close .. open .. body .. close .. open .. '[^[:alnum:]_]' .. bar .. '$' .. close end
+  return regex.compile(body, ere, icase)
+end
+
+global function applet_grep(args: sequence(string)): integer
+  local o = util.parse(args, 'ivnclqHhFEGwxe:srom:')
+  if not o:ok() then return util.optfail(o) + 1 end
   local patterns: sequence(string)
   local operands = o.operands
   if o:has('e') then
-    patterns:push(o:get('e'))
+    for _, e in ipairs(o:all('e')) do
+      for _, p in ipairs(util.lines(e)) do patterns:push(p) end
+      if e.size == 0 then patterns:push('') end
+    end
   else
-    if #operands == 0 then util.err('usage: grep [-ivnclqHhFwxs] [-e] PATTERN [FILE...]'); return 2 end
-    patterns:push(operands[1])
+    if #operands == 0 then util.err('usage: grep [-ivnclqHhFEGwxors] [-e] PATTERN [FILE...]'); return 2 end
+    for _, p in ipairs(util.lines(operands[1])) do patterns:push(p) end
+    if operands[1].size == 0 then patterns:push('') end
     operands:remove(1)
   end
+  if o:has('r') and #operands == 0 then operands:push('.') end
   if #operands == 0 then operands:push('-') end
   local fold, invert = o:has('i'), o:has('v')
-  local withname = (#operands > 1 or o:has('H')) and not o:has('h')
+  local fixed = o:has('F')
+  local prog: regex.Prog
+  if not fixed then
+    local err: string
+    prog, err = grep_compile(patterns, o:has('E'), fold, o:has('w'), o:has('x'))
+    if err.size > 0 then util.err('grep: ' .. err); return 2 end
+  end
+  local maxcount: integer = -1
+  if o:has('m') then
+    local v, ok = util.toint(o:get('m'))
+    if not ok then util.err("grep: invalid max count"); return 2 end
+    maxcount = v
+  end
+  -- expand -r directories into files
+  if o:has('r') then
+    local expanded: sequence(string)
+    local stack: sequence(string)
+    for _, p in ipairs(operands) do stack:push(p) end
+    local i: integer = 1
+    while i <= #stack do
+      local p = stack[i]
+      if util.isdir(p) then
+        local names, ok = util.readnames(p, true)
+        if ok then
+          for _, n in ipairs(names) do
+            if n ~= '.' and n ~= '..' then stack:push(p == '.' and n or util.join(p, n)) end
+          end
+        end
+      else
+        expanded:push(p)
+      end
+      i = i + 1
+    end
+    operands = expanded
+  end
+  local withname = (#operands > 1 or o:has('H') or o:has('r')) and not o:has('h')
   local anymatch = false
   local rc: integer = 0
+  local caps: regex.Caps
   for _, path in ipairs(operands) do
     local data, ok = util.readfile(path)
     if not ok then rc = 2; continue end
@@ -539,17 +595,21 @@ global function applet_grep(args: sequence(string)): integer
     for _, line in ipairs(util.lines(data)) do
       n = n + 1
       local m = false
-      for _, p in ipairs(patterns) do
-        if o:has('x') then
-          m = fold and cmp_fold(line, p) == 0 or line == p
-        elseif o:has('w') then
-          m = find_word(line, p, fold)
-        elseif fold then
-          m = find_fold(line, p)
-        else
-          m = line:find(p, 1, true) > 0
+      if fixed then
+        for _, p in ipairs(patterns) do
+          if o:has('x') then
+            m = fold and cmp_fold(line, p) == 0 or line == p
+          elseif o:has('w') then
+            m = find_word(line, p, fold)
+          elseif fold then
+            m = find_fold(line, p)
+          else
+            m = line:find(p, 1, true) > 0
+          end
+          if m then break end
         end
-        if m then break end
+      else
+        m = prog:search(line, 0, &caps)
       end
       if m ~= invert then
         count = count + 1
@@ -557,10 +617,25 @@ global function applet_grep(args: sequence(string)): integer
         if o:has('q') then return 0 end
         if o:has('l') then break end
         if not o:has('c') then
-          if withname then util.write(path); util.writebyte(58) end
-          if o:has('n') then util.writef('%d:', n) end
-          util.line(line)
+          if o:has('o') and not fixed and not invert then
+            local pos: isize = 0
+            while pos <= (@isize)(line.size) and prog:search(line, pos, &caps) do
+              if caps.at[1] > caps.at[0] then
+                if withname then util.write(path); util.writebyte(58) end
+                if o:has('n') then util.writef('%d:', n) end
+                util.line(line:sub(caps.at[0] + 1, caps.at[1]))
+                pos = caps.at[1]
+              else
+                pos = caps.at[0] + 1
+              end
+            end
+          else
+            if withname then util.write(path); util.writebyte(58) end
+            if o:has('n') then util.writef('%d:', n) end
+            util.line(line)
+          end
         end
+        if maxcount >= 0 and count >= maxcount then break end
       end
     end
     if o:has('l') then

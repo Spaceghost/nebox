@@ -76,6 +76,8 @@ global sys.R_OK: cint <comptime> = 4
 global sys.DT_DIR: cuchar <comptime> = 4
 global sys.DT_LNK: cuchar <comptime> = 10
 global sys.CLOCK_REALTIME: cint <comptime> = 0
+global sys.CLOCK_MONOTONIC: cint <comptime> = 1
+global sys.WNOHANG: cint <comptime> = 1
 global sys.EEXIST: cint <comptime> = 17
 global sys.ENOENT: cint <comptime> = 2
 global sys.EXDEV: cint <comptime> = 18
@@ -131,6 +133,15 @@ function sys._exit(code: cint): void <cimport '_exit', cinclude '<unistd.h>', no
 function sys.strerror(e: cint): cstring <cimport 'strerror', cinclude '<string.h>'> end
 local function errno_location(): *cint <cimport 'nelibc_errno_location', cinclude '<errno.h>'> end
 global environ: *[0]cstring <cimport 'environ', cinclude '<unistd.h>'>
+
+function sys.fork(): cint <cimport 'fork', cinclude '<unistd.h>'> end
+function sys.waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', cinclude '<sys/wait.h>'> end
+function sys.chown(path: cstring, uid: cuint, gid: cuint): cint <cimport 'chown', cinclude '<unistd.h>'> end
+function sys.lchown(path: cstring, uid: cuint, gid: cuint): cint <cimport 'lchown', cinclude '<unistd.h>'> end
+function sys.truncate(path: cstring, len: clong): cint <cimport 'truncate', cinclude '<unistd.h>'> end
+function sys.getrandom(buf: pointer, n: csize, flags: cuint): clong <cimport 'getrandom', cinclude '<sys/random.h>'> end
+function sys.getgroups(n: cint, list: *[0]cuint): cint <cimport 'getgroups', cinclude '<unistd.h>'> end
+function sys.strtod(s: cstring, endp: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
 
 function sys.errno(): cint
   return $errno_location()

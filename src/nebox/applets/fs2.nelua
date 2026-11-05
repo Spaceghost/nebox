@@ -1,0 +1,419 @@
+-- More filesystem applets: du stat chown chgrp mktemp truncate realpath link unlink
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+-- Directory children, sorted, without . and ..
+local function children(path: string): sequence(string)
+  local out: sequence(string)
+  local names, ok = util.readnames(path, true)
+  if not ok then return out end
+  for _, n in ipairs(names) do
+    if n ~= '.' and n ~= '..' then out:push(n) end
+  end
+  return out
+end
+
+-- du
+local Du = @record{
+  summarize: boolean, all: boolean, apparent: boolean, human: boolean,
+  bytes: boolean, total: integer, rc: integer, deref: boolean,
+}
+
+function Du:fmt(n: integer): string
+  -- n is in bytes when apparent/bytes, else in 512-byte blocks
+  if self.bytes then return string.format('%d', n) end
+  if self.apparent then
+    if self.human then return util.human(n) end
+    return string.format('%d', (n + 1023) // 1024)
+  end
+  if self.human then return util.human(n * 512) end
+  return string.format('%d', (n + 1) // 2)
+end
+
+function Du:size_of(st: *sys.Stat): integer
+  if self.apparent or self.bytes then return st.st_size end
+  return st.st_blocks
+end
+
+-- Returns the size (blocks or bytes) of path including its children.
+function Du:walk(path: string, top: boolean): integer
+  local st: sys.Stat
+  local r: cint
+  if self.deref or top then r = sys.stat(path, &st) else r = sys.lstat(path, &st) end
+  if r ~= 0 then
+    if sys.lstat(path, &st) ~= 0 then
+      util.err("du: cannot access '" .. path .. "': " .. sys.errstr()); self.rc = 1; return 0
+    end
+  end
+  local total = self:size_of(&st)
+  if (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    for _, name in ipairs(children(path)) do
+      total = total + self:walk(util.join(path, name), false)
+    end
+    if not self.summarize or top then util.line(self:fmt(total) .. '\t' .. path) end
+  elseif self.all or top then
+    util.line(self:fmt(total) .. '\t' .. path)
+  end
+  return total
+end
+
+global function applet_du(args: sequence(string)): integer
+  local o = util.parse(args, 'sabhkcLxd:')
+  if not o:ok() then return util.optfail(o) end
+  local d: Du = {summarize = o:has('s'), all = o:has('a'), apparent = o:has('b'), human = o:has('h'),
+    bytes = o:has('b'), deref = o:has('L')}
+  if o:has('d') and o:get('d') == '0' then d.summarize = true end
+  if #o.operands == 0 then o.operands:push('.') end
+  local grand: integer = 0
+  for _, p in ipairs(o.operands) do grand = grand + d:walk(p, true) end
+  if o:has('c') then util.line(d:fmt(grand) .. '\ttotal') end
+  return d.rc
+end
+
+-- stat
+local function filetype(mode: cuint, size: integer): string
+  local t = mode & sys.S_IFMT
+  if t == sys.S_IFREG then return size == 0 and 'regular empty file' or 'regular file'
+  elseif t == sys.S_IFDIR then return 'directory'
+  elseif t == sys.S_IFLNK then return 'symbolic link'
+  elseif t == sys.S_IFCHR then return 'character special file'
+  elseif t == sys.S_IFBLK then return 'block special file'
+  elseif t == sys.S_IFIFO then return 'fifo'
+  elseif t == sys.S_IFSOCK then return 'socket' end
+  return 'weird file'
+end
+
+local function stat_format(fmt: string, path: string, st: *sys.Stat)
+  local i: usize = 1
+  while i <= fmt.size do
+    local c = fmt:byte(i)
+    if c == 92 and i < fmt.size then
+      local s, _ = util.unescape(fmt:sub(i, i + 1))
+      util.write(s); i = i + 2
+      continue
+    end
+    if c ~= 37 or i == fmt.size then util.writebyte(c); i = i + 1; continue end
+    i = i + 1
+    local d = fmt:byte(i)
+    if d == 37 then util.writebyte(37)
+    elseif d == 110 then util.write(path)
+    elseif d == 78 then
+      if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
+        local buf: [4096]byte
+        local n = sys.readlink(path, &buf[0], #buf)
+        util.write("'" .. path .. "' -> '")
+        if n > 0 then util.writebytes(&buf[0], (@usize)(n)) end
+        util.write("'")
+      else util.write("'" .. path .. "'") end
+    elseif d == 115 then util.writef('%d', st.st_size)
+    elseif d == 98 then util.writef('%d', st.st_blocks)
+    elseif d == 66 then util.write('512')
+    elseif d == 111 then util.writef('%d', st.st_blksize)
+    elseif d == 102 then util.writef('%x', st.st_mode)
+    elseif d == 97 then util.writef('%o', st.st_mode & 0xFFF)
+    elseif d == 65 then util.write(util.modestr(st.st_mode))
+    elseif d == 117 then util.writef('%d', st.st_uid)
+    elseif d == 85 then util.write(util.idname(util.username(st.st_uid), st.st_uid))
+    elseif d == 103 then util.writef('%d', st.st_gid)
+    elseif d == 71 then util.write(util.idname(util.groupname(st.st_gid), st.st_gid))
+    elseif d == 105 then util.writef('%d', st.st_ino)
+    elseif d == 104 then util.writef('%d', st.st_nlink)
+    elseif d == 100 then util.writef('%d', st.st_dev)
+    elseif d == 68 then util.writef('%x', st.st_dev)
+    elseif d == 70 then util.write(filetype(st.st_mode, st.st_size))
+    elseif d == 88 then util.writef('%d', st.st_atim.tv_sec)
+    elseif d == 89 then util.writef('%d', st.st_mtim.tv_sec)
+    elseif d == 90 then util.writef('%d', st.st_ctim.tv_sec)
+    elseif d == 87 then util.write('0')
+    elseif d == 120 then util.write(util.timefmt(st.st_atim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_atim.tv_nsec))
+    elseif d == 121 then util.write(util.timefmt(st.st_mtim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_mtim.tv_nsec))
+    elseif d == 122 then util.write(util.timefmt(st.st_ctim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_ctim.tv_nsec))
+    elseif d == 116 then util.writef('%x', (st.st_rdev >> 8) & 0xFFF)
+    elseif d == 84 then util.writef('%x', (st.st_rdev & 0xFF) | ((st.st_rdev >> 12) & 0xFFF00))
+    else util.writebyte(37); util.writebyte(d) end
+    i = i + 1
+  end
+end
+
+global function applet_stat(args: sequence(string)): integer
+  local o = util.parse(args, 'Lc:t')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local fmt: string
+  if o:has('c') then fmt = o:get('c') .. '\n'
+  elseif o:has('t') then fmt = '%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n'
+  else
+    fmt = '  File: %N\n  Size: %-10s\tBlocks: %-10b IO Block: %-6o %F\nDevice: %Dh/%dd\tInode: %-10i  Links: %h\nAccess: (%04a/%A)  Uid: (%5u/%8U)   Gid: (%5g/%8G)\nAccess: %x\nModify: %y\nChange: %z\n Birth: -\n'
+  end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    local st: sys.Stat
+    local r: cint
+    if o:has('L') then r = sys.stat(p, &st) else r = sys.lstat(p, &st) end
+    if r ~= 0 then
+      util.err("stat: cannot statx '" .. p .. "': " .. sys.errstr()); rc = 1; continue
+    end
+    stat_format(fmt, p, &st)
+  end
+  return rc
+end
+
+-- chown / chgrp
+local Chown = @record{ uid: integer, gid: integer, recursive: boolean, nofollow: boolean, verbose: boolean, rc: integer }
+
+function Chown:apply(path: string)
+  local st: sys.Stat
+  if sys.lstat(path, &st) ~= 0 then
+    util.err(util.applet .. ": cannot access '" .. path .. "': " .. sys.errstr()); self.rc = 1; return
+  end
+  local uid: cuint = self.uid >= 0 and (@cuint)(self.uid) or 0xFFFFFFFF
+  local gid: cuint = self.gid >= 0 and (@cuint)(self.gid) or 0xFFFFFFFF
+  local r: cint
+  if self.nofollow or (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then r = sys.lchown(path, uid, gid)
+  else r = sys.chown(path, uid, gid) end
+  if r ~= 0 then
+    util.err(util.applet .. ": changing ownership of '" .. path .. "': " .. sys.errstr()); self.rc = 1
+  elseif self.verbose then
+    util.line("ownership of '" .. path .. "' retained")
+  end
+  if self.recursive and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    for _, name in ipairs(children(path)) do self:apply(util.join(path, name)) end
+  end
+end
+
+local function chown_main(args: sequence(string), groupmode: boolean): integer
+  local o = util.parse(args, 'RhvfcH')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands < 2 then
+    if #o.operands == 0 then return util.die('missing operand') end
+    return util.die("missing operand after '" .. o.operands[1] .. "'")
+  end
+  local c: Chown = {uid = -1, gid = -1, recursive = o:has('R'), nofollow = o:has('h'), verbose = o:has('v')}
+  local spec = o.operands[1]
+  local user, group: string = '', ''
+  if groupmode then group = spec
+  else
+    local colon = spec:find(':', 1, true)
+    if colon <= 0 then colon = spec:find('.', 1, true) end
+    if colon > 0 then user = spec:sub(1, colon - 1); group = spec:sub(colon + 1) else user = spec end
+  end
+  if user.size > 0 then
+    local v, ok = util.toint(user)
+    if ok then c.uid = v else
+      c.uid = util.userid(user)
+      if c.uid < 0 then return util.die("invalid user: '" .. spec .. "'") end
+    end
+  end
+  if group.size > 0 then
+    local v, ok = util.toint(group)
+    if ok then c.gid = v else
+      c.gid = util.groupid(group)
+      if c.gid < 0 then return util.die("invalid group: '" .. spec .. "'") end
+    end
+  end
+  for i = 2, #o.operands do c:apply(o.operands[i]) end
+  return c.rc
+end
+
+global function applet_chown(args: sequence(string)): integer return chown_main(args, false) end
+global function applet_chgrp(args: sequence(string)): integer return chown_main(args, true) end
+
+-- mktemp: replace the trailing XXXXXX run with random letters/digits
+local function fill_template(t: string): (string, boolean)
+  local n: usize = 0
+  while n < t.size and t:byte(t.size - n) == 88 do n = n + 1 end
+  if n < 3 then return t, false end
+  local rnd: [64]byte
+  sys.getrandom(&rnd[0], n, 0)
+  local alphabet: string = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  local sb: stringbuilder
+  sb:write(t:sub(1, t.size - n))
+  for i: usize = 0, < n do sb:writebyte(alphabet:byte((rnd[i] % 62) + 1)) end
+  return sb:promote(), true
+end
+
+global function applet_mktemp(args: sequence(string)): integer
+  local o = util.parse(args, 'dqutp:')
+  if not o:ok() then return util.optfail(o) end
+  local template: string = 'tmp.XXXXXXXXXX'
+  local explicit = false
+  if #o.operands > 1 then return util.die("too many templates") end
+  if #o.operands == 1 then template = o.operands[1]; explicit = true end
+  local dir: string = ''
+  if o:has('p') then dir = o:get('p') end
+  if not explicit or o:has('t') then
+    if dir.size == 0 then
+      local env = sys.getenv('TMPDIR')
+      if env ~= nilptr then dir = env else dir = '/tmp' end
+    end
+  end
+  if explicit and not o:has('t') and template:find('/', 1, true) > 0 and dir.size > 0 then
+    return util.die("invalid template, '" .. template .. "', contains directory separator")
+  end
+  if dir.size > 0 then template = util.join(dir, template) end
+  for _ = 1, 100 do
+    local name, ok = fill_template(template)
+    if not ok then return util.die("too few X's in template '" .. o.operands[1] .. "'") end
+    if o:has('u') then util.line(name); return 0 end
+    local r: cint
+    if o:has('d') then
+      r = sys.mkdir(name, 0x1C0)
+    else
+      r = sys.open(name, sys.O_WRONLY | sys.O_CREAT | sys.O_EXCL, 0x180)
+      if r >= 0 then sys.close(r); r = 0 end
+    end
+    if r == 0 then util.line(name); return 0 end
+    if sys.errno() ~= sys.EEXIST then
+      if not o:has('q') then util.err('mktemp: failed to create ' .. (o:has('d') and 'directory' or 'file') .. ' via template \'' .. template .. '\': ' .. sys.errstr()) end
+      return 1
+    end
+  end
+  return 1
+end
+
+-- truncate: -s [+-]SIZE, -c no-create, -r REF
+global function applet_truncate(args: sequence(string)): integer
+  local o = util.parse(args, 'cos:r:')
+  if not o:ok() then return util.optfail(o) end
+  if not o:has('s') and not o:has('r') then return util.die('you must specify either -s or -r') end
+  if #o.operands == 0 then return util.die('missing file operand') end
+  local rel: integer = 0   -- 0 absolute, 1 extend, -1 shrink, 2 at-least, 3 at-most
+  local size: integer = 0
+  if o:has('r') then
+    local st: sys.Stat
+    if sys.stat(o:get('r'), &st) ~= 0 then return util.die("cannot stat '" .. o:get('r') .. "': " .. sys.errstr()) end
+    size = st.st_size
+  end
+  if o:has('s') then
+    local spec = o:get('s')
+    local first = spec:byte(1)
+    if first == 43 then rel = 1; spec = spec:sub(2)
+    elseif first == 45 then rel = -1; spec = spec:sub(2)
+    elseif first == 62 then rel = 2; spec = spec:sub(2)
+    elseif first == 60 then rel = 3; spec = spec:sub(2) end
+    local v, ok = util.tosize(spec)
+    if not ok then return util.die("invalid number: '" .. o:get('s') .. "'") end
+    size = v
+  end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    local st: sys.Stat
+    if sys.stat(p, &st) ~= 0 then
+      if o:has('c') then continue end
+      local fd = sys.open(p, sys.O_WRONLY | sys.O_CREAT, 0x1B6)
+      if fd < 0 then util.perror(p); rc = 1; continue end
+      sys.close(fd)
+      st.st_size = 0
+    end
+    local target = size
+    if rel == 1 then target = st.st_size + size
+    elseif rel == -1 then target = st.st_size - size
+    elseif rel == 2 then target = st.st_size > size and st.st_size or size
+    elseif rel == 3 then target = st.st_size < size and st.st_size or size end
+    if target < 0 then target = 0 end
+    if sys.truncate(p, target) ~= 0 then
+      util.err("truncate: cannot open '" .. p .. "' for writing: " .. sys.errstr()); rc = 1
+    end
+  end
+  return rc
+end
+
+-- realpath: like readlink -f; -e all must exist, -m nothing need exist, -s no symlink resolution
+local function absolute(p: string): string
+  if p.size > 0 and p:byte(1) == 47 then return p end
+  local buf: [4096]cchar
+  if sys.getcwd(&buf[0], #buf) == nilptr then return p end
+  return util.join(sys.cstr(&buf[0]), p)
+end
+
+-- Lexically normalise: collapse //, ., and .. segments.
+local function normalize(p: string): string
+  local parts: sequence(string)
+  local start: usize = 1
+  while start <= p.size + 1 do
+    local slash = p:find('/', start, true)
+    local seg: string
+    if slash <= 0 then seg = p:sub(start) else seg = p:sub(start, slash - 1) end
+    if seg == '..' then
+      if #parts > 0 then parts:remove(#parts) end
+    elseif seg.size > 0 and seg ~= '.' then
+      parts:push(seg)
+    end
+    if slash <= 0 then break end
+    start = (@usize)(slash) + 1
+  end
+  local sb: stringbuilder
+  for _, s in ipairs(parts) do sb:write('/'); sb:write(s) end
+  if #parts == 0 then return '/' end
+  return sb:promote()
+end
+
+global function applet_realpath(args: sequence(string)): integer
+  local o = util.parse(args, 'emsqzPL')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local rc: integer = 0
+  for _, p in ipairs(o.operands) do
+    local out: string
+    local ok = true
+    if o:has('s') then
+      out = normalize(absolute(p))
+      if o:has('e') and not util.exists(out) then ok = false end
+    else
+      local buf: [4096]cchar
+      if sys.realpath(p, &buf[0]) ~= nilptr then
+        out = sys.cstr(&buf[0])
+      elseif o:has('e') then
+        ok = false
+      else
+        -- resolve the longest existing prefix, append the rest lexically
+        local full = normalize(absolute(p))
+        local prefix = full
+        local rest: string = ''
+        while prefix.size > 1 and sys.realpath(prefix, &buf[0]) == nilptr do
+          if not o:has('m') and rest.size > 0 then ok = false; break end
+          local base = util.basename(prefix)
+          rest = rest.size > 0 and (base .. '/' .. rest) or base
+          prefix = util.dirname(prefix)
+        end
+        if ok then
+          if sys.realpath(prefix, &buf[0]) == nilptr then ok = false
+          else out = util.join(sys.cstr(&buf[0]), rest) end
+        end
+      end
+    end
+    if not ok then
+      if not o:has('q') then util.perror(p) end
+      rc = 1
+    else
+      util.write(out)
+      util.writebyte(o:has('z') and 0 or 10)
+    end
+  end
+  return rc
+end
+
+global function applet_link(args: sequence(string)): integer
+  if #args ~= 2 then
+    if #args < 2 then return util.die(#args == 0 and 'missing operand' or ("missing operand after '" .. args[1] .. "'")) end
+    return util.die("extra operand '" .. args[3] .. "'")
+  end
+  if sys.link(args[1], args[2]) ~= 0 then
+    return util.die("cannot create link '" .. args[2] .. "' to '" .. args[1] .. "': " .. sys.errstr())
+  end
+  return 0
+end
+
+global function applet_unlink(args: sequence(string)): integer
+  if #args ~= 1 then
+    if #args == 0 then return util.die('missing operand') end
+    return util.die("extra operand '" .. args[2] .. "'")
+  end
+  if sys.unlink(args[1]) ~= 0 then return util.die("cannot unlink '" .. args[1] .. "': " .. sys.errstr()) end
+  return 0
+end

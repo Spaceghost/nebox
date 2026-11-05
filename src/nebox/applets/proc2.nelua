@@ -1,0 +1,468 @@
+-- More process applets: whoami groups tty xargs timeout expr factor
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+require 'nebox.applets.proc'
+
+global function applet_whoami(args: sequence(string)): integer
+  if #args > 0 then return util.die("extra operand '" .. args[1] .. "'") end
+  local uid = (@integer)(sys.geteuid())
+  local name = util.username(uid)
+  if name.size == 0 then return util.die(string.format("cannot find name for user ID %d", uid)) end
+  util.line(name)
+  return 0
+end
+
+global function applet_groups(args: sequence(string)): integer
+  if #args > 0 then return util.die("looking up other users is not supported") end
+  local list: [256]cuint
+  local n = sys.getgroups(256, &list[0])
+  if n < 0 then return util.die('cannot get groups: ' .. sys.errstr()) end
+  local egid = (@integer)(sys.getegid())
+  util.write(util.idname(util.groupname(egid), egid))
+  for i: integer = 0, < n do
+    local g = (@integer)(list[i])
+    if g == egid then continue end
+    util.write(' ' .. util.idname(util.groupname(g), g))
+  end
+  util.writebyte(10)
+  return 0
+end
+
+global function applet_tty(args: sequence(string)): integer
+  local o = util.parse(args, 's')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands > 0 then return util.die("extra operand '" .. o.operands[1] .. "'") end
+  if sys.isatty(0) == 0 then
+    if not o:has('s') then util.line('not a tty') end
+    return 1
+  end
+  if o:has('s') then return 0 end
+  local buf: [4096]byte
+  local n = sys.readlink('/proc/self/fd/0', &buf[0], #buf)
+  if n <= 0 then return util.die('cannot resolve stdin: ' .. sys.errstr()) end
+  util.writebytes(&buf[0], (@usize)(n)); util.writebyte(10)
+  return 0
+end
+
+-- Run argv as a child; returns the wait status mapped to an exit code
+-- (128+signal when killed), or 126/127 when exec fails.
+local function spawn_wait(argv: sequence(string)): integer
+  local cargv: sequence(cstring)
+  for _, a in ipairs(argv) do cargv:push(a) end
+  cargv:push(nilptr)
+  util.flush()
+  local pid = sys.fork()
+  if pid < 0 then util.err(util.applet .. ': cannot fork: ' .. sys.errstr()); return 126 end
+  if pid == 0 then
+    sys.execvp(argv[1], &cargv[1])
+    local e = sys.errno()
+    util.err(util.applet .. ": " .. argv[1] .. ": " .. sys.errstr())
+    util.flush()
+    sys._exit(e == sys.ENOENT and 127 or 126)
+  end
+  local status: cint = 0
+  while sys.waitpid(pid, &status, 0) < 0 do
+    if sys.errno() ~= sys.EINTR then return 126 end
+  end
+  if (status & 0x7F) == 0 then return (status >> 8) & 0xFF end
+  return 128 + (status & 0x7F)
+end
+
+-- xargs: -0, -n N, -I REPL, -r, -t, -E EOF, -a FILE; default command echo
+local function xargs_split(data: string, nul: boolean, eof: string): (sequence(string), string)
+  local out: sequence(string)
+  if nul then
+    local start: usize = 0
+    for i: usize = 0, data.size do
+      if i == data.size or data.data[i] == 0 then
+        if i > start or i < data.size then out:push(data:sub(start + 1, i)) end
+        start = i + 1
+      end
+    end
+    return out, ''
+  end
+  local i: usize = 0
+  while i < data.size do
+    local c = data.data[i]
+    if c == 32 or c == 9 or c == 10 then i = i + 1; continue end
+    local sb: stringbuilder
+    while i < data.size do
+      c = data.data[i]
+      if c == 32 or c == 9 or c == 10 then break end
+      if c == 34 or c == 39 then
+        local q = c
+        i = i + 1
+        local closed = false
+        while i < data.size do
+          if data.data[i] == q then closed = true; i = i + 1; break end
+          if data.data[i] == 10 then return out, 'unmatched ' .. (q == 34 and 'double' or 'single') .. ' quote; by default quotes are special to xargs unless you use the -0 option' end
+          sb:writebyte(data.data[i]); i = i + 1
+        end
+        if not closed then return out, 'unmatched ' .. (q == 34 and 'double' or 'single') .. ' quote; by default quotes are special to xargs unless you use the -0 option' end
+      elseif c == 92 and i + 1 < data.size then
+        sb:writebyte(data.data[i + 1]); i = i + 2
+      else
+        sb:writebyte(c); i = i + 1
+      end
+    end
+    local word = sb:promote()
+    if eof.size > 0 and word == eof then break end
+    out:push(word)
+  end
+  return out, ''
+end
+
+local function replace_all(s: string, needle: string, rep: string): string
+  if needle.size == 0 then return s end
+  local sb: stringbuilder
+  local pos: isize = 1
+  while true do
+    local at = s:find(needle, pos, true)
+    if at <= 0 then sb:write(s:sub(pos)); break end
+    sb:write(s:sub(pos, at - 1)); sb:write(rep)
+    pos = at + (@isize)(needle.size)
+  end
+  return sb:promote()
+end
+
+global function applet_xargs(args: sequence(string)): integer
+  local o = util.parse(args, '0rtn:I:E:a:s:')
+  if not o:ok() then return util.optfail(o) end
+  local cmd: sequence(string)
+  if #o.operands == 0 then cmd:push('echo') else for _, a in ipairs(o.operands) do cmd:push(a) end end
+  local per: integer = 0
+  if o:has('n') then
+    local v, ok = util.toint(o:get('n'))
+    if not ok or v <= 0 then return util.die("invalid number of arguments: '" .. o:get('n') .. "'") end
+    per = v
+  end
+  local data: string
+  local ok: boolean
+  if o:has('a') then data, ok = util.readfile(o:get('a')) else data, ok = util.readfd(0) end
+  if not ok then return 1 end
+  local items: sequence(string)
+  if o:has('I') then
+    -- one line per command, leading blanks stripped
+    for _, line in ipairs(util.lines(data)) do
+      local s: usize = 1
+      while s <= line.size and (line:byte(s) == 32 or line:byte(s) == 9) do s = s + 1 end
+      if s <= line.size then items:push(line:sub(s)) end
+    end
+    per = 1
+  else
+    local err: string
+    items, err = xargs_split(data, o:has('0'), o:has('E') and o:get('E') or '')
+    if err.size > 0 then return util.die(err) end
+  end
+  if #items == 0 and (o:has('r') or o:has('I')) then return 0 end
+  local rc: integer = 0
+  local i: integer = 1
+  repeat
+    local argv: sequence(string)
+    local stop = #items
+    if per > 0 and i + per - 1 < stop then stop = i + per - 1 end
+    if o:has('I') then
+      local repl = o:get('I')
+      for _, c in ipairs(cmd) do argv:push(replace_all(c, repl, items[i])) end
+    else
+      for _, c in ipairs(cmd) do argv:push(c) end
+      for k = i, stop do argv:push(items[k]) end
+    end
+    if o:has('t') then
+      local sb: stringbuilder
+      for k, a in ipairs(argv) do if k > 1 then sb:write(' ') end; sb:write(a) end
+      util.flush()
+      local msg = sb:promote() .. '\n'
+      sys.write(2, msg.data, msg.size)
+    end
+    local r = spawn_wait(argv)
+    if r == 255 then return 124 end
+    if r >= 128 then return 125 end
+    if r == 126 or r == 127 then return r end
+    if r ~= 0 then rc = 123 end
+    i = stop + 1
+  until i > #items
+  return rc
+end
+
+-- timeout: [-s SIG] DURATION COMMAND...
+local function now_mono(): float64
+  local ts: sys.Timespec
+  sys.clock_gettime(sys.CLOCK_MONOTONIC, &ts)
+  return (@float64)(ts.tv_sec) + (@float64)(ts.tv_nsec) * 1e-9
+end
+
+global function applet_timeout(args: sequence(string)): integer
+  local o = util.parse(args, 's:k:pv')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands < 2 then
+    if #o.operands == 0 then return util.die('missing operand') + 124 end
+    return util.die("missing command") + 124
+  end
+  local limit: sys.Timespec
+  if not parse_duration(o.operands[1], &limit) then return util.die("invalid time interval '" .. o.operands[1] .. "'") + 124 end
+  local sig: cint = 15
+  if o:has('s') then
+    sig = signum(o:get('s'))
+    if sig < 0 then return util.die("'" .. o:get('s') .. "': invalid signal") + 124 end
+  end
+  local argv: sequence(string)
+  for k = 2, #o.operands do argv:push(o.operands[k]) end
+  local cargv: sequence(cstring)
+  for _, a in ipairs(argv) do cargv:push(a) end
+  cargv:push(nilptr)
+  util.flush()
+  local pid = sys.fork()
+  if pid < 0 then return util.die('cannot fork: ' .. sys.errstr()) + 124 end
+  if pid == 0 then
+    sys.execvp(argv[1], &cargv[1])
+    local e = sys.errno()
+    util.err('timeout: failed to run command \'' .. argv[1] .. '\': ' .. sys.errstr())
+    util.flush()
+    sys._exit(e == sys.ENOENT and 127 or 126)
+  end
+  local deadline = now_mono() + (@float64)(limit.tv_sec) + (@float64)(limit.tv_nsec) * 1e-9
+  local status: cint = 0
+  local timed_out = false
+  local tick: sys.Timespec = {tv_sec = 0, tv_nsec = 2000000}
+  while true do
+    local r = sys.waitpid(pid, &status, sys.WNOHANG)
+    if r == pid then break end
+    if r < 0 and sys.errno() ~= sys.EINTR then break end
+    if not timed_out and now_mono() >= deadline then
+      timed_out = true
+      sys.kill(pid, sig)
+      if o:has('v') then util.err('timeout: sending signal to command \'' .. argv[1] .. '\'') end
+    end
+    sys.nanosleep(&tick, nilptr)
+  end
+  local code: integer
+  if (status & 0x7F) == 0 then code = (status >> 8) & 0xFF else code = 128 + (status & 0x7F) end
+  if timed_out and not o:has('p') then
+    -- GNU timeout signals its own process group too, so -s KILL kills timeout itself.
+    if sig == 9 then util.flush(); sys.kill(sys.getpid(), 9) end
+    return 124
+  end
+  return code
+end
+
+-- expr: precedence climbing over the POSIX grammar
+local Expr = @record{ toks: sequence(string), pos: integer, err: string }
+
+local function is_int(s: string): boolean
+  local _, ok = util.toint(s)
+  return ok
+end
+
+local function truthy(s: string): boolean
+  if s.size == 0 then return false end
+  local v, ok = util.toint(s)
+  if ok and v == 0 then return false end
+  return true
+end
+
+function Expr:peek(): string
+  if self.pos > #self.toks then return '' end
+  return self.toks[self.pos]
+end
+
+function Expr:parse_or(): string <forwarddecl> end
+
+function Expr:regex_match(s: string, pat: string): string
+  local prog, err = regex.compile('^' .. pat, false, false)
+  if err.size > 0 then self.err = err; return '' end
+  local caps: regex.Caps
+  if prog:matchat(s, 0, &caps) then
+    if prog.nsub >= 1 then
+      if caps.at[2] < 0 then return '' end
+      return s:sub(caps.at[2] + 1, caps.at[3])
+    end
+    return string.format('%d', caps.at[1] - caps.at[0])
+  end
+  if prog.nsub >= 1 then return '' end
+  return '0'
+end
+
+
+function Expr:parse_primary(): string
+  local t = self:peek()
+  if self.pos > #self.toks then self.err = 'syntax error: missing argument'; return '' end
+  if t == '(' then
+    self.pos = self.pos + 1
+    local v = self:parse_or()
+    if self.err.size > 0 then return '' end
+    if self:peek() ~= ')' then self.err = 'syntax error: expecting )'; return '' end
+    self.pos = self.pos + 1
+    return v
+  end
+  if t == 'match' or t == 'substr' or t == 'index' or t == 'length' or t == '+' then
+    -- keywords; `+ TOKEN` quotes the token
+    self.pos = self.pos + 1
+    if t == '+' then
+      if self.pos > #self.toks then self.err = 'syntax error: missing argument'; return '' end
+      local v = self.toks[self.pos]; self.pos = self.pos + 1; return v
+    end
+    local a = self:parse_primary()
+    if self.err.size > 0 then return '' end
+    if t == 'length' then return string.format('%d', a.size) end
+    local b = self:parse_primary()
+    if self.err.size > 0 then return '' end
+    if t == 'match' then return self:regex_match(a, b) end
+    if t == 'index' then
+      for i: usize = 1, a.size do
+        if b:find(a:sub(i, i), 1, true) > 0 then return string.format('%d', i) end
+      end
+      return '0'
+    end
+    local c = self:parse_primary()
+    if self.err.size > 0 then return '' end
+    local start, ok1 = util.toint(b)
+    local len, ok2 = util.toint(c)
+    if not ok1 or not ok2 or start < 1 or len < 1 or start > (@integer)(a.size) then return '' end
+    return a:sub(start, start + len - 1)
+  end
+  self.pos = self.pos + 1
+  return t
+end
+
+function Expr:parse_match(): string
+  local left = self:parse_primary()
+  while self.err.size == 0 and self:peek() == ':' and self.pos <= #self.toks do
+    self.pos = self.pos + 1
+    local right = self:parse_primary()
+    if self.err.size > 0 then break end
+    left = self:regex_match(left, right)
+  end
+  return left
+end
+
+function Expr:parse_mul(): string
+  local left = self:parse_match()
+  while self.err.size == 0 do
+    local op = self:peek()
+    if self.pos > #self.toks or (op ~= '*' and op ~= '/' and op ~= '%') then break end
+    self.pos = self.pos + 1
+    local right = self:parse_match()
+    if self.err.size > 0 then break end
+    local a, oka = util.toint(left)
+    local b, okb = util.toint(right)
+    if not oka or not okb then self.err = 'non-integer argument'; break end
+    if op == '*' then left = string.format('%d', a * b)
+    else
+      if b == 0 then self.err = 'division by zero'; break end
+      local q = a // b
+      -- C truncation toward zero
+      if (a % b ~= 0) and ((a < 0) ~= (b < 0)) then q = q + 1 end
+      if op == '/' then left = string.format('%d', q) else left = string.format('%d', a - q * b) end
+    end
+  end
+  return left
+end
+
+function Expr:parse_add(): string
+  local left = self:parse_mul()
+  while self.err.size == 0 do
+    local op = self:peek()
+    if self.pos > #self.toks or (op ~= '+' and op ~= '-') then break end
+    self.pos = self.pos + 1
+    local right = self:parse_mul()
+    if self.err.size > 0 then break end
+    local a, oka = util.toint(left)
+    local b, okb = util.toint(right)
+    if not oka or not okb then self.err = 'non-integer argument'; break end
+    if op == '+' then left = string.format('%d', a + b) else left = string.format('%d', a - b) end
+  end
+  return left
+end
+
+function Expr:parse_cmp(): string
+  local left = self:parse_add()
+  while self.err.size == 0 do
+    local op = self:peek()
+    if self.pos > #self.toks or (op ~= '=' and op ~= '!=' and op ~= '<' and op ~= '<=' and op ~= '>' and op ~= '>=') then break end
+    self.pos = self.pos + 1
+    local right = self:parse_add()
+    if self.err.size > 0 then break end
+    local c: integer
+    local a, oka = util.toint(left)
+    local b, okb = util.toint(right)
+    if oka and okb then
+      c = a < b and -1 or (a > b and 1 or 0)
+    else
+      c = left < right and -1 or (left > right and 1 or 0)
+    end
+    local r: boolean
+    if op == '=' then r = c == 0 elseif op == '!=' then r = c ~= 0
+    elseif op == '<' then r = c < 0 elseif op == '<=' then r = c <= 0
+    elseif op == '>' then r = c > 0 else r = c >= 0 end
+    left = r and '1' or '0'
+  end
+  return left
+end
+
+function Expr:parse_and(): string
+  local left = self:parse_cmp()
+  while self.err.size == 0 and self:peek() == '&' and self.pos <= #self.toks do
+    self.pos = self.pos + 1
+    local right = self:parse_cmp()
+    if self.err.size > 0 then break end
+    if not (truthy(left) and truthy(right)) then left = '0' end
+  end
+  return left
+end
+
+function Expr:parse_or(): string
+  local left = self:parse_and()
+  while self.err.size == 0 and self:peek() == '|' and self.pos <= #self.toks do
+    self.pos = self.pos + 1
+    local right = self:parse_and()
+    if self.err.size > 0 then break end
+    if not truthy(left) then
+      if truthy(right) then left = right else left = '0' end
+    end
+  end
+  return left
+end
+
+global function applet_expr(args: sequence(string)): integer
+  if #args == 0 then util.err('expr: missing operand'); return 2 end
+  local e: Expr = {toks = args, pos = 1}
+  local v = e:parse_or()
+  if e.err.size == 0 and e.pos <= #e.toks then e.err = 'syntax error: unexpected argument \'' .. e.toks[e.pos] .. '\'' end
+  if e.err.size > 0 then util.err('expr: ' .. e.err); return 2 end
+  util.line(v)
+  return truthy(v) and 0 or 1
+end
+
+global function applet_factor(args: sequence(string)): integer
+  local nums: sequence(string)
+  if #args == 0 then
+    local data, ok = util.readfd(0)
+    if not ok then return 1 end
+    for _, line in ipairs(util.lines(data)) do
+      for w in line:gmatch('%S+') do nums:push(w) end
+    end
+  else
+    for _, a in ipairs(args) do nums:push(a) end
+  end
+  for _, s in ipairs(nums) do
+    local v, ok = util.toint(s)
+    if not ok or v < 0 then return util.die("'" .. s .. "' is not a valid positive integer") end
+    local n: uint64 = (@uint64)(v)
+    util.writef('%d:', n)
+    local p: uint64 = 2
+    while p * p <= n do
+      while n % p == 0 do util.writef(' %d', p); n = n // p end
+      p = p + (p == 2 and 1 or 2)
+    end
+    if n > 1 then util.writef(' %d', n) end
+    util.writebyte(10)
+  end
+  return 0
+end
