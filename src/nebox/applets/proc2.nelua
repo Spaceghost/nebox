@@ -52,7 +52,7 @@ end
 
 -- Run argv as a child; returns the wait status mapped to an exit code
 -- (128+signal when killed), or 126/127 when exec fails.
-local function spawn_wait(argv: sequence(string)): integer
+global function spawn_wait(argv: sequence(string)): integer
   local cargv: sequence(cstring)
   for _, a in ipairs(argv) do cargv:push(a) end
   cargv:push(nilptr)

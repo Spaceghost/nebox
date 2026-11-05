@@ -73,6 +73,8 @@ end
 -- head/tail share operand handling: "-n N", "-c N", legacy "-N".
 local count_plus: boolean = false  -- "+N" was given (tail: from the Nth item)
 
+local tail_follow = false
+
 local function count_args(args: sequence(string)): (sequence(string), boolean, integer, boolean, boolean)
   -- returns operands, bytes-mode, count, verbose, ok
   local rest: sequence(string)
@@ -80,6 +82,7 @@ local function count_args(args: sequence(string)): (sequence(string), boolean, i
   local count: integer = 10
   local quiet, verbose = false, false
   count_plus = false
+  tail_follow = false
   local i: integer = 1
   while i <= #args do
     local a = args[i]
@@ -100,6 +103,7 @@ local function count_args(args: sequence(string)): (sequence(string), boolean, i
       count = n
     elseif a == '-q' then quiet = true
     elseif a == '-v' then verbose = true
+    elseif a == '-f' or a == '-F' then tail_follow = true
     else
       util.err("invalid option -- '" .. a:sub(2, 2) .. "'")
       return rest, false, 0, false, false
@@ -199,9 +203,10 @@ global function applet_tail(args: sequence(string)): integer
   if not ok then return 1 end
   if #files == 0 then files:push('-') end
   local rc: integer = 0
+  local sizes: sequence(integer)
   for idx, path in ipairs(files) do
     local data, rok = util.readfile(path)
-    if not rok then rc = 1; continue end
+    if not rok then rc = 1; sizes:push(0); continue end
     if verbose then header(path, idx == 1) end
     if bytes then
       local n = count
@@ -239,6 +244,32 @@ global function applet_tail(args: sequence(string)): integer
         end
         local start: usize = (@usize)(i + 1)
         util.writebytes(&data.data[start], data.size - start)
+      end
+    end
+    if tail_follow then sizes:push((@integer)(data.size)) else sizes:push(0) end
+  end
+  if tail_follow and rc == 0 then
+    -- poll each file for growth once a second, as GNU does without inotify
+    local tick: sys.Timespec = {tv_sec = 1, tv_nsec = 0}
+    local last: integer = -1
+    while true do
+      util.flush()
+      sys.nanosleep(&tick, nilptr)
+      for idx, path in ipairs(files) do
+        if path == '-' then continue end
+        local st: sys.Stat
+        if sys.stat(path, &st) ~= 0 then continue end
+        if st.st_size < sizes[idx] then sizes[idx] = 0 end
+        if st.st_size > sizes[idx] then
+          local fd = sys.open(path, sys.O_RDONLY, 0)
+          if fd < 0 then continue end
+          sys.lseek(fd, sizes[idx], 0)
+          if #files > 1 and last ~= idx then header(path, false); last = idx end
+          local data, _ = util.readfd(fd)
+          sys.close(fd)
+          util.write(data)
+          sizes[idx] = sizes[idx] + (@integer)(data.size)
+        end
       end
     end
   end
@@ -357,34 +388,191 @@ local function cmp_fold(a: string, b: string): integer
   return a.size < b.size and -1 or 1
 end
 
-local sort_numeric, sort_reverse, sort_fold: boolean = false, false, false
+local sort_numeric, sort_reverse, sort_fold, sort_stable: boolean = false, false, false, false
+local sort_sep: integer = -1   -- -t byte, or -1 for blank runs
+local sort_blanks = false      -- global -b
+
+local SortKey = @record{ f1: integer, c1: integer, f2: integer, c2: integer, numeric: boolean, reverse: boolean, fold: boolean, b1: boolean, b2: boolean }
+local sort_keys: sequence(SortKey)
+
+local function isblank(b: byte): boolean return b == 32 or b == 9 end
+
+-- Byte range [s, e) of field f (1-based) in line, GNU semantics: without -t a
+-- field includes its leading blanks.
+local function field_span(line: string, f: integer): (integer, integer)
+  local n = (@integer)(line.size)
+  local pos: integer = 0
+  local cur: integer = 1
+  if sort_sep >= 0 then
+    while cur < f do
+      while pos < n and line.data[pos] ~= sort_sep do pos = pos + 1 end
+      if pos >= n then return n, n end
+      pos = pos + 1; cur = cur + 1
+    end
+    local e = pos
+    while e < n and line.data[e] ~= sort_sep do e = e + 1 end
+    return pos, e
+  end
+  while cur < f do
+    while pos < n and isblank(line.data[pos]) do pos = pos + 1 end
+    while pos < n and not isblank(line.data[pos]) do pos = pos + 1 end
+    if pos >= n then return n, n end
+    cur = cur + 1
+  end
+  local e = pos
+  while e < n and isblank(line.data[e]) do e = e + 1 end
+  while e < n and not isblank(line.data[e]) do e = e + 1 end
+  return pos, e
+end
+
+local function key_text(line: string, k: SortKey): string
+  local s, e = field_span(line, k.f1)
+  local n = (@integer)(line.size)
+  if k.b1 or sort_blanks then while s < e and isblank(line.data[s]) do s = s + 1 end end
+  if k.c1 > 1 then s = s + k.c1 - 1; if s > e then s = e end end
+  local stop: integer = n
+  if k.f2 > 0 then
+    local s2, e2 = field_span(line, k.f2)
+    if k.c2 == 0 then stop = e2
+    else
+      if k.b2 or sort_blanks then while s2 < e2 and isblank(line.data[s2]) do s2 = s2 + 1 end end
+      stop = s2 + k.c2
+      if stop > e2 then stop = e2 end
+    end
+  end
+  if stop < s then stop = s end
+  return line:sub(s + 1, stop)
+end
+
+local function cmp_plain(a: string, b: string): integer
+  if a < b then return -1 elseif b < a then return 1 end
+  return 0
+end
+
+local function cmp_key(a: string, b: string, numeric: boolean, fold: boolean): integer
+  if numeric then
+    local x, y = numkey(a), numkey(b)
+    if x < y then return -1 elseif x > y then return 1 end
+    return 0
+  elseif fold then
+    return cmp_fold(a, b)
+  end
+  return cmp_plain(a, b)
+end
+
+local function sort_compare(a: string, b: string): integer
+  if #sort_keys > 0 then
+    for _, k in ipairs(sort_keys) do
+      local ka, kb = key_text(a, k), key_text(b, k)
+      local hasmod = k.numeric or k.reverse or k.fold
+      local numeric = hasmod and k.numeric or (not hasmod and sort_numeric)
+      local fold = hasmod and k.fold or (not hasmod and sort_fold)
+      local rev = hasmod and k.reverse or (not hasmod and sort_reverse)
+      local r = cmp_key(ka, kb, numeric, fold)
+      if r ~= 0 then return rev and -r or r end
+    end
+    if sort_stable then return 0 end
+    local r = cmp_plain(a, b)
+    return sort_reverse and -r or r
+  end
+  local ka, kb = a, b
+  if sort_blanks then
+    local i: usize = 1
+    while i <= a.size and isblank(a:byte(i)) do i = i + 1 end
+    ka = a:sub(i)
+    i = 1
+    while i <= b.size and isblank(b:byte(i)) do i = i + 1 end
+    kb = b:sub(i)
+  end
+  local r = cmp_key(ka, kb, sort_numeric, sort_fold)
+  if r == 0 and not sort_stable then r = cmp_plain(a, b) end
+  return sort_reverse and -r or r
+end
 
 local function sort_less(a: string, b: string): boolean
-  local r: integer = 0
-  if sort_numeric then
-    local x, y = numkey(a), numkey(b)
-    if x < y then r = -1 elseif x > y then r = 1 end
-  elseif sort_fold then
-    r = cmp_fold(a, b)
+  return sort_compare(a, b) < 0
+end
+
+local function parse_keyspec(spec: string): (SortKey, boolean)
+  local k: SortKey
+  local i: usize = 1
+  local v: integer = 0
+  local any = false
+  while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
+  if not any or v == 0 then return k, false end
+  k.f1 = v; k.c1 = 1
+  if i <= spec.size and spec:byte(i) == 46 then
+    i = i + 1; v = 0; any = false
+    while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
+    if not any then return k, false end
+    k.c1 = v
   end
-  if r == 0 then
-    if a < b then r = -1 elseif b < a then r = 1 end
+  while i <= spec.size and spec:byte(i) ~= 44 do
+    local m = spec:byte(i)
+    if m == 110 then k.numeric = true elseif m == 114 then k.reverse = true
+    elseif m == 102 then k.fold = true elseif m == 98 then k.b1 = true
+    else return k, false end
+    i = i + 1
   end
-  if sort_reverse then return r > 0 end
-  return r < 0
+  if i <= spec.size and spec:byte(i) == 44 then
+    i = i + 1; v = 0; any = false
+    while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
+    if not any or v == 0 then return k, false end
+    k.f2 = v; k.c2 = 0
+    if i <= spec.size and spec:byte(i) == 46 then
+      i = i + 1; v = 0; any = false
+      while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
+      if not any then return k, false end
+      k.c2 = v
+    end
+    while i <= spec.size do
+      local m = spec:byte(i)
+      if m == 110 then k.numeric = true elseif m == 114 then k.reverse = true
+      elseif m == 102 then k.fold = true elseif m == 98 then k.b2 = true
+      else return k, false end
+      i = i + 1
+    end
+  end
+  return k, true
 end
 
 global function applet_sort(args: sequence(string)): integer
-  local o = util.parse(args, 'rnufso:')
+  local o = util.parse(args, 'rnufsbcCo:k:t:')
   if not o:ok() then return util.optfail(o) end
-  sort_numeric, sort_reverse, sort_fold = o:has('n'), o:has('r'), o:has('f')
+  sort_numeric, sort_reverse, sort_fold, sort_stable = o:has('n'), o:has('r'), o:has('f'), o:has('s')
+  sort_blanks = o:has('b')
+  sort_sep = -1
+  sort_keys:clear()
+  if o:has('t') then
+    local t = o:get('t')
+    if t == '\\0' then sort_sep = 0
+    elseif t.size ~= 1 then return util.die("multi-character tab '" .. t .. "'")
+    else sort_sep = t:byte(1) end
+  end
+  for _, spec in ipairs(o:all('k')) do
+    local k, ok = parse_keyspec(spec)
+    if not ok then return util.die("invalid key spec '" .. spec .. "'") + 1 end
+    sort_keys:push(k)
+  end
   if #o.operands == 0 then o.operands:push('-') end
   local all: sequence(string)
   local rc: integer = 0
   for _, path in ipairs(o.operands) do
     local data, ok = util.readfile(path)
-    if not ok then rc = 1; continue end
+    if not ok then rc = 2; continue end
     for _, l in ipairs(util.lines(data)) do all:push(l) end
+  end
+  if o:has('c') or o:has('C') then
+    for i = 2, #all do
+      local r = sort_compare(all[i - 1], all[i])
+      if r > 0 or (o:has('u') and r == 0) then
+        if o:has('c') then
+          util.errf('%s: %s:%d: disorder: %s\n', util.applet, o.operands[1], i, all[i])
+        end
+        return 1
+      end
+    end
+    return 0
   end
   util.sort(all, sort_less)
   if o:has('o') then
@@ -397,7 +585,15 @@ global function applet_sort(args: sequence(string)): integer
   for _, l in ipairs(all) do
     if o:has('u') and have then
       local same: boolean
-      if sort_numeric then same = numkey(prev) == numkey(l)
+      if #sort_keys > 0 then
+        same = true
+        for _, k in ipairs(sort_keys) do
+          local hasmod = k.numeric or k.reverse or k.fold
+          local numeric = hasmod and k.numeric or (not hasmod and sort_numeric)
+          local fold = hasmod and k.fold or (not hasmod and sort_fold)
+          if cmp_key(key_text(prev, k), key_text(l, k), numeric, fold) ~= 0 then same = false; break end
+        end
+      elseif sort_numeric then same = numkey(prev) == numkey(l)
       elseif sort_fold then same = cmp_fold(prev, l) == 0
       else same = prev == l end
       if same then continue end
@@ -650,12 +846,55 @@ global function applet_grep(args: sequence(string)): integer
 end
 
 -- tr: expand a set with ranges and escapes into bytes
-local function expand_set(s: string): sequence(byte)
+local function class_bytes(name: string, out: *sequence(byte)): boolean
+  local lo: integer, hi: integer = 0, 255
+  if name == 'alpha' then for b = 65, 90 do out:push((@byte)(b)) end; for b = 97, 122 do out:push((@byte)(b)) end
+  elseif name == 'digit' then for b = 48, 57 do out:push((@byte)(b)) end
+  elseif name == 'alnum' then for b = 48, 57 do out:push((@byte)(b)) end; for b = 65, 90 do out:push((@byte)(b)) end; for b = 97, 122 do out:push((@byte)(b)) end
+  elseif name == 'upper' then for b = 65, 90 do out:push((@byte)(b)) end
+  elseif name == 'lower' then for b = 97, 122 do out:push((@byte)(b)) end
+  elseif name == 'space' then for b = 9, 13 do out:push((@byte)(b)) end; out:push(32)
+  elseif name == 'blank' then out:push(9); out:push(32)
+  elseif name == 'punct' then
+    for b = 33, 47 do out:push((@byte)(b)) end; for b = 58, 64 do out:push((@byte)(b)) end
+    for b = 91, 96 do out:push((@byte)(b)) end; for b = 123, 126 do out:push((@byte)(b)) end
+  elseif name == 'print' then for b = 32, 126 do out:push((@byte)(b)) end
+  elseif name == 'graph' then for b = 33, 126 do out:push((@byte)(b)) end
+  elseif name == 'cntrl' then for b = 0, 31 do out:push((@byte)(b)) end; out:push(127)
+  elseif name == 'xdigit' then for b = 48, 57 do out:push((@byte)(b)) end; for b = 65, 70 do out:push((@byte)(b)) end; for b = 97, 102 do out:push((@byte)(b)) end
+  else return false end
+  local _ = lo + hi
+  return true
+end
+
+-- Expand a tr set: ranges, [:class:], [c*n] repeats, and escapes. `fill` is
+-- the length to pad [c*] repeats to (the size of set1), or 0.
+local function expand_set(s: string, fill: integer): sequence(byte)
   local out: sequence(byte)
   local u = util.unescape(s)
   local i: usize = 1
   while i <= u.size do
     local c = u:byte(i)
+    if c == 91 and i + 1 <= u.size and u:byte(i + 1) == 58 then
+      local close = u:find(':]', i + 2, true)
+      if close > 0 and class_bytes(u:sub(i + 2, close - 1), &out) then
+        i = (@usize)(close) + 2
+        continue
+      end
+    end
+    if c == 91 and i + 2 <= u.size and u:byte(i + 2) == 42 then
+      local close = u:find(']', i + 3, true)
+      if close > 0 then
+        local ch = u:byte(i + 1)
+        local cnt, ok = util.toint(u:sub(i + 3, close - 1))
+        if close == (@isize)(i) + 3 then cnt = fill - (@integer)(#out); ok = true end
+        if ok then
+          for _ = 1, cnt do out:push(ch) end
+          i = (@usize)(close) + 1
+          continue
+        end
+      end
+    end
     if i + 2 <= u.size and u:byte(i + 1) == 45 then
       local hi = u:byte(i + 2)
       if hi >= c then
@@ -674,7 +913,7 @@ global function applet_tr(args: sequence(string)): integer
   local o = util.parse(args, 'dsc')
   if not o:ok() then return util.optfail(o) end
   if #o.operands < 1 then util.err('missing operand'); return 1 end
-  local set1 = expand_set(o.operands[1])
+  local set1 = expand_set(o.operands[1], 0)
   local in1: [256]boolean
   for _, b in ipairs(set1) do in1[b] = true end
   if o:has('c') then for b: integer = 0, 255 do in1[b] = not in1[b] end end
@@ -685,7 +924,7 @@ global function applet_tr(args: sequence(string)): integer
     -- squeeze only
   elseif not deleting then
     if #o.operands < 2 then util.err('missing operand after \'' .. o.operands[1] .. '\''); return 1 end
-    local set2 = expand_set(o.operands[2])
+    local set2 = expand_set(o.operands[2], #set1)
     if #set2 == 0 then util.err('when not truncating set1, string2 must be non-empty'); return 1 end
     if o:has('c') then
       local last = set2[#set2]

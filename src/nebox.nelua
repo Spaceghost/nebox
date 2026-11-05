@@ -14,6 +14,9 @@ require 'nebox.applets.proc'
 require 'nebox.applets.text2'
 require 'nebox.applets.fs2'
 require 'nebox.applets.proc2'
+require 'nebox.applets.sed'
+require 'nebox.applets.fs3'
+require 'nebox.applets.text3'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
@@ -21,24 +24,27 @@ local applets: []Applet = {
   {'[', applet_test}, {'base64', applet_base64}, {'basename', applet_basename},
   {'cat', applet_cat}, {'chgrp', applet_chgrp}, {'chmod', applet_chmod},
   {'chown', applet_chown}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
-  {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'dirname', applet_dirname},
-  {'du', applet_du}, {'echo', applet_echo}, {'env', applet_env}, {'expand', applet_expand},
-  {'expr', applet_expr}, {'factor', applet_factor}, {'false', applet_false},
-  {'fold', applet_fold}, {'grep', applet_grep}, {'groups', applet_groups},
-  {'head', applet_head}, {'hostname', applet_hostname}, {'id', applet_id},
-  {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
-  {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
-  {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'paste', applet_paste},
-  {'printenv', applet_printenv}, {'printf', applet_printf}, {'pwd', applet_pwd},
-  {'readlink', applet_readlink}, {'realpath', applet_realpath}, {'rev', applet_rev},
-  {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'seq', applet_seq}, {'sha1sum', applet_sha1sum},
-  {'sha256sum', applet_sha256sum}, {'sleep', applet_sleep}, {'sort', applet_sort},
-  {'split', applet_split}, {'stat', applet_stat}, {'strings', applet_strings},
-  {'sync', applet_sync}, {'tac', applet_tac}, {'tail', applet_tail}, {'tee', applet_tee},
-  {'test', applet_test}, {'timeout', applet_timeout}, {'touch', applet_touch},
-  {'tr', applet_tr}, {'true', applet_true}, {'truncate', applet_truncate}, {'tty', applet_tty},
-  {'unexpand', applet_unexpand}, {'uname', applet_uname}, {'uniq', applet_uniq},
-  {'unlink', applet_unlink}, {'wc', applet_wc}, {'which', applet_which},
+  {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'df', applet_df},
+  {'dirname', applet_dirname}, {'du', applet_du}, {'echo', applet_echo}, {'env', applet_env},
+  {'expand', applet_expand}, {'expr', applet_expr}, {'factor', applet_factor},
+  {'false', applet_false}, {'find', applet_find}, {'fold', applet_fold}, {'free', applet_free},
+  {'grep', applet_grep}, {'groups', applet_groups}, {'head', applet_head},
+  {'hexdump', applet_hexdump}, {'hostname', applet_hostname}, {'id', applet_id},
+  {'install', applet_install}, {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln},
+  {'ls', applet_ls}, {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir},
+  {'mktemp', applet_mktemp}, {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc},
+  {'od', applet_od}, {'paste', applet_paste}, {'printenv', applet_printenv},
+  {'printf', applet_printf}, {'pwd', applet_pwd}, {'readlink', applet_readlink},
+  {'realpath', applet_realpath}, {'rev', applet_rev}, {'rm', applet_rm},
+  {'rmdir', applet_rmdir}, {'sed', applet_sed}, {'seq', applet_seq},
+  {'sha1sum', applet_sha1sum}, {'sha256sum', applet_sha256sum}, {'shuf', applet_shuf},
+  {'sleep', applet_sleep}, {'sort', applet_sort}, {'split', applet_split},
+  {'stat', applet_stat}, {'strings', applet_strings}, {'sync', applet_sync},
+  {'tac', applet_tac}, {'tail', applet_tail}, {'tee', applet_tee}, {'test', applet_test},
+  {'timeout', applet_timeout}, {'touch', applet_touch}, {'tr', applet_tr},
+  {'true', applet_true}, {'truncate', applet_truncate}, {'tsort', applet_tsort},
+  {'tty', applet_tty}, {'unexpand', applet_unexpand}, {'uname', applet_uname},
+  {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'wc', applet_wc}, {'which', applet_which},
   {'whoami', applet_whoami}, {'xargs', applet_xargs}, {'yes', applet_yes},
 }
 

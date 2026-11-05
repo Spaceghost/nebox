@@ -559,3 +559,88 @@ function util.readnames(dir: string, all: boolean): (sequence(string), boolean)
   return names, true
 end
 
+-- Shell-style glob match: * ? [set] [!set] and backslash escapes. `*` and
+-- `?` match any byte including '/'. With `icase`, ASCII letters fold.
+local function glob_at(pat: string, pi: usize, s: string, si: usize, icase: boolean): boolean
+  while pi <= pat.size do
+    local c = pat:byte(pi)
+    if c == 42 then
+      while pi <= pat.size and pat:byte(pi) == 42 do pi = pi + 1 end
+      if pi > pat.size then return true end
+      for k = si, s.size + 1 do
+        if glob_at(pat, pi, s, k, icase) then return true end
+      end
+      return false
+    end
+    if si > s.size then return false end
+    local b = s:byte(si)
+    if c == 63 then
+      pi = pi + 1; si = si + 1
+    elseif c == 91 then
+      local j = pi + 1
+      local negate = false
+      if j <= pat.size and (pat:byte(j) == 33 or pat:byte(j) == 94) then negate = true; j = j + 1 end
+      local matched = false
+      local first = true
+      local closed = false
+      while j <= pat.size do
+        local d = pat:byte(j)
+        if d == 93 and not first then closed = true; j = j + 1; break end
+        first = false
+        if d == 91 and j + 1 <= pat.size and pat:byte(j + 1) == 58 then
+          local close = pat:find(':]', j + 2, true)
+          if close > 0 then
+            local name = pat:sub(j + 2, close - 1)
+            local ok = false
+            if name == 'alpha' then ok = (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+            elseif name == 'digit' then ok = b >= 48 and b <= 57
+            elseif name == 'alnum' then ok = (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57)
+            elseif name == 'upper' then ok = b >= 65 and b <= 90
+            elseif name == 'lower' then ok = b >= 97 and b <= 122
+            elseif name == 'space' then ok = b == 32 or (b >= 9 and b <= 13)
+            elseif name == 'punct' then ok = (b >= 33 and b <= 47) or (b >= 58 and b <= 64) or (b >= 91 and b <= 96) or (b >= 123 and b <= 126)
+            end
+            if ok then matched = true end
+            j = (@usize)(close) + 2
+            continue
+          end
+        end
+        if d == 92 and j < pat.size then j = j + 1; d = pat:byte(j) end
+        local lo, hi = d, d
+        if j + 2 <= pat.size and pat:byte(j + 1) == 45 and pat:byte(j + 2) ~= 93 then
+          hi = pat:byte(j + 2); j = j + 2
+        end
+        local bb = b
+        if icase then
+          if bb >= 65 and bb <= 90 then bb = bb + 32 end
+          if lo >= 65 and lo <= 90 then lo = lo + 32 end
+          if hi >= 65 and hi <= 90 then hi = hi + 32 end
+        end
+        if bb >= lo and bb <= hi then matched = true end
+        j = j + 1
+      end
+      if not closed then
+        -- unterminated bracket: literal '['
+        if b ~= 91 then return false end
+        pi = pi + 1; si = si + 1
+      else
+        if matched == negate then return false end
+        pi = j; si = si + 1
+      end
+    else
+      if c == 92 and pi < pat.size then pi = pi + 1; c = pat:byte(pi) end
+      local bb = b
+      if icase then
+        if bb >= 65 and bb <= 90 then bb = bb + 32 end
+        if c >= 65 and c <= 90 then c = c + 32 end
+      end
+      if bb ~= c then return false end
+      pi = pi + 1; si = si + 1
+    end
+  end
+  return si > s.size
+end
+
+function util.glob(pat: string, s: string, icase: boolean): boolean
+  return glob_at(pat, 1, s, 1, icase)
+end

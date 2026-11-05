@@ -21,23 +21,57 @@ local function owner(st: *sys.Stat): (string, string)
          util.idname(util.groupname((@integer)(st.st_gid)), (@integer)(st.st_gid))
 end
 
-local function widths_of(stats: sequence(sys.Stat)): LsWidths
+local function widths_of(stats: sequence(sys.Stat), human: boolean, numeric: boolean): LsWidths
   local w: LsWidths = {1, 1, 1, 1}
   for _, st in ipairs(stats) do
     local u, g = owner(&st)
+    if numeric then u = string.format('%d', st.st_uid); g = string.format('%d', st.st_gid) end
     local d = digits((@integer)(st.st_nlink)); if d > w.nlink then w.nlink = d end
     d = (@integer)(u.size); if d > w.uid then w.uid = d end
     d = (@integer)(g.size); if d > w.gid then w.gid = d end
-    d = digits((@integer)(st.st_size)); if d > w.size then w.size = d end
+    if human then d = (@integer)(util.human((@integer)(st.st_size)).size) else d = digits((@integer)(st.st_size)) end
+    if d > w.size then w.size = d end
   end
   return w
 end
 
-local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths)
+-- Order entries by time or size (newest/largest first), then name; -r flips.
+local function ls_order(stats: sequence(sys.Stat), names: sequence(string), bytime: boolean, bysize: boolean, reverse: boolean): sequence(integer)
+  local idx: sequence(integer)
+  for i = 1, #stats do idx:push(i) end
+  -- insertion sort keeps this simple and stable
+  for i = 2, #idx do
+    local j = i
+    while j > 1 do
+      local a, b = idx[j - 1], idx[j]
+      local r: integer = 0
+      if bytime then
+        local ta, tb = stats[a].st_mtim, stats[b].st_mtim
+        if ta.tv_sec ~= tb.tv_sec then r = ta.tv_sec > tb.tv_sec and -1 or 1
+        elseif ta.tv_nsec ~= tb.tv_nsec then r = ta.tv_nsec > tb.tv_nsec and -1 or 1 end
+      elseif bysize then
+        if stats[a].st_size ~= stats[b].st_size then r = stats[a].st_size > stats[b].st_size and -1 or 1 end
+      end
+      if r == 0 then
+        if names[a] < names[b] then r = -1 elseif names[b] < names[a] then r = 1 end
+      end
+      if reverse then r = -r end
+      if r <= 0 then break end
+      idx[j - 1] = b; idx[j] = a
+      j = j - 1
+    end
+  end
+  return idx
+end
+
+local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths, human: boolean, numeric: boolean)
   local u, g = owner(st)
-  local fmt = string.format('%%s %%%dd %%-%ds %%-%ds %%%dd %%s %%s', w.nlink, w.uid, w.gid, w.size)
+  if numeric then u = string.format('%d', st.st_uid); g = string.format('%d', st.st_gid) end
+  local size: string = string.format('%d', (@integer)(st.st_size))
+  if human then size = util.human((@integer)(st.st_size)) end
+  local fmt = string.format('%%s %%%dd %%-%ds %%-%ds %%%ds %%s %%s', w.nlink, w.uid, w.gid, w.size)
   util.write(string.format(fmt, util.modestr(st.st_mode), (@integer)(st.st_nlink),
-    u, g, (@integer)(st.st_size),
+    u, g, size,
     util.timefmt(st.st_mtim.tv_sec, '%b %e %H:%M'), shown))
   if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
     local buf: [4096]byte
@@ -47,10 +81,12 @@ local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths)
   util.writebyte(10)
 end
 
-local Ls = @record{longfmt: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer}
+local Ls = @record{longfmt: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer,
+  reverse: boolean, bytime: boolean, bysize: boolean, human: boolean, inode: boolean, numeric: boolean, almost: boolean}
 
 function Ls:show(path: string, shown: string, st: *sys.Stat, w: LsWidths)
-  if self.longfmt then ls_long(path, shown, st, w) return end
+  if self.inode then util.writef('%d ', st.st_ino) end
+  if self.longfmt then ls_long(path, shown, st, w, self.human, self.numeric) return end
   util.write(shown)
   local kind = st.st_mode & sys.S_IFMT
   if (self.classify or self.slash) and kind == sys.S_IFDIR then util.writebyte(47)
@@ -74,14 +110,22 @@ function Ls:group(paths: sequence(string), shown: sequence(string), total: boole
       blocks = blocks + (@integer)(st.st_blocks)
     end
   end
-  local w = widths_of(stats)
-  if self.longfmt and total then util.writef('total %d\n', (blocks + 1) // 2) end
-  for i, p in ipairs(okpaths) do self:show(p, okshown[i], &stats[i], w) end
+  local w = widths_of(stats, self.human, self.numeric)
+  if self.longfmt and total then
+    if self.human then util.line('total ' .. util.human(blocks * 512)) else util.writef('total %d\n', (blocks + 1) // 2) end
+  end
+  local order = ls_order(stats, okshown, self.bytime, self.bysize, self.reverse)
+  for _, i in ipairs(order) do self:show(okpaths[i], okshown[i], &stats[i], w) end
 end
 
 function Ls:listdir(dir: string, label: boolean)
   local names, ok = util.readnames(dir, self.all)
   if not ok then util.err("cannot open directory '" .. dir .. "': " .. sys.errstr()); self.rc = 2; return end
+  if self.almost then
+    local kept: sequence(string)
+    for _, n in ipairs(names) do if n ~= '.' and n ~= '..' then kept:push(n) end end
+    names = kept
+  end
   if label then util.write(dir); util.line(':') end
   local paths: sequence(string)
   for _, n in ipairs(names) do paths:push(util.join(dir, n)) end
@@ -100,10 +144,12 @@ function Ls:listdir(dir: string, label: boolean)
 end
 
 global function applet_ls(args: sequence(string)): integer
-  local o = util.parse(args, 'al1dFRp')
+  local o = util.parse(args, 'al1dFRprtShinAgo')
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then o.operands:push('.') end
-  local ls: Ls = {o:has('l'), o:has('a'), o:has('F'), o:has('p'), o:has('R'), 0}
+  local ls: Ls = {longfmt = o:has('l') or o:has('n') or o:has('g') or o:has('o'), all = o:has('a') or o:has('A'), classify = o:has('F'), slash = o:has('p'), recursive = o:has('R'),
+    reverse = o:has('r'), bytime = o:has('t'), bysize = o:has('S'), human = o:has('h'), inode = o:has('i'), numeric = o:has('n'),
+    almost = o:has('A') and not o:has('a')}
   local dironly = o:has('d')
   local files: sequence(string)
   local dirs: sequence(string)
@@ -120,7 +166,7 @@ global function applet_ls(args: sequence(string)): integer
   return ls.rc
 end
 
-local function mkdir_p(path: string, mode: cuint): boolean
+global function mkdir_p(path: string, mode: cuint): boolean
   if util.isdir(path) then return true end
   local parent = util.dirname(path)
   if parent ~= path and parent ~= '.' and parent ~= '/' then
@@ -134,7 +180,7 @@ local function mkdir_p(path: string, mode: cuint): boolean
   return true
 end
 
-local function parse_mode(s: string): (cuint, boolean)
+global function parse_mode(s: string): (cuint, boolean)
   if s.size == 0 or s.size > 4 then return 0, false end
   local v: cuint = 0
   for i: usize = 1, s.size do
@@ -242,10 +288,86 @@ global function applet_rm(args: sequence(string)): integer
   return rc
 end
 
+-- "@SECONDS", "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", or "YYYY-MM-DDTHH:MM[:SS]" as UTC.
+global function parse_datetime(s: string): (clong, boolean)
+  if s.size > 1 and s:byte(1) == 64 then
+    local v, ok = util.toint(s:sub(2))
+    return (@clong)(v), ok
+  end
+  local nums: sequence(integer)
+  for w in s:gmatch('%d+') do local v, _ = util.toint(w); nums:push(v) end
+  if #nums < 3 then return 0, false end
+  local y, m, d = nums[1], nums[2], nums[3]
+  local hh: integer, mm: integer, ss: integer = 0, 0, 0
+  if #nums >= 4 then hh = nums[4] end
+  if #nums >= 5 then mm = nums[5] end
+  if #nums >= 6 then ss = nums[6] end
+  if m < 1 or m > 12 or d < 1 or d > 31 or hh > 23 or mm > 59 or ss > 60 then return 0, false end
+  -- days from civil (Howard Hinnant)
+  local yy = y
+  if m <= 2 then yy = yy - 1 end
+  local era = (yy >= 0 and yy or yy - 399) // 400
+  local yoe = yy - era * 400
+  local mp = (m + 9) % 12
+  local doy = (153 * mp + 2) // 5 + d - 1
+  local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+  local days = era * 146097 + doe - 719468
+  return (@clong)(days * 86400 + hh * 3600 + mm * 60 + ss), true
+end
+
+-- touch -t: [[CC]YY]MMDDhhmm[.ss]
+global function parse_touch_t(s: string): (clong, boolean)
+  local body = s
+  local ss: integer = 0
+  local dot = s:find('.', 1, true)
+  if dot > 0 then
+    local v, ok = util.toint(s:sub(dot + 1))
+    if not ok or s.size - (@usize)(dot) ~= 2 then return 0, false end
+    ss = v; body = s:sub(1, dot - 1)
+  end
+  for i: usize = 1, body.size do if body:byte(i) < 48 or body:byte(i) > 57 then return 0, false end end
+  local y: integer
+  local okv: boolean
+  if body.size == 12 then
+    y, okv = util.toint(body:sub(1, 4)); body = body:sub(5)
+  elseif body.size == 10 then
+    y, okv = util.toint(body:sub(1, 2)); body = body:sub(3)
+    if y >= 69 then y = y + 1900 else y = y + 2000 end
+  elseif body.size == 8 then
+    local ts: sys.Timespec
+    sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
+    local tm: sys.Tm
+    sys.gmtime_r(&ts.tv_sec, &tm)
+    y = (@integer)(tm.tm_year) + 1900
+  else return 0, false end
+  local mo, ok1 = util.toint(body:sub(1, 2))
+  local d, ok2 = util.toint(body:sub(3, 4))
+  local hh, ok3 = util.toint(body:sub(5, 6))
+  local mm, ok4 = util.toint(body:sub(7, 8))
+  return parse_datetime(string.format('%d-%d-%d %d:%d:%d', y, mo, d, hh, mm, ss))
+end
+
 global function applet_touch(args: sequence(string)): integer
-  local o = util.parse(args, 'camh')
+  local o = util.parse(args, 'camhd:r:t:')
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing file operand') end
+  local times: [2]sys.Timespec
+  local have_time = false
+  if o:has('r') then
+    local st: sys.Stat
+    if sys.stat(o:get('r'), &st) ~= 0 then return util.die("failed to get attributes of '" .. o:get('r') .. "': " .. sys.errstr()) end
+    times[0] = st.st_atim; times[1] = st.st_mtim; have_time = true
+  elseif o:has('d') or o:has('t') then
+    local secs: clong, ok: boolean
+    if o:has('d') then secs, ok = parse_datetime(o:get('d')) else secs, ok = parse_touch_t(o:get('t')) end
+    if not ok then return util.die("invalid date format '" .. (o:has('d') and o:get('d') or o:get('t')) .. "'") end
+    times[0].tv_sec = secs; times[1].tv_sec = secs; have_time = true
+  end
+  if have_time then
+    -- UTIME_OMIT for the time not selected by -a / -m
+    if o:has('a') and not o:has('m') then times[1].tv_nsec = 0x3FFFFFFE end
+    if o:has('m') and not o:has('a') then times[0].tv_nsec = 0x3FFFFFFE end
+  end
   local rc: integer = 0
   for _, p in ipairs(o.operands) do
     if not util.exists(p) then
@@ -255,14 +377,16 @@ global function applet_touch(args: sequence(string)): integer
       sys.close(fd)
     end
     local flags: cint = o:has('h') and sys.AT_SYMLINK_NOFOLLOW or 0
-    if sys.utimensat(sys.AT_FDCWD, p, nilptr, flags) ~= 0 then
+    local tp: *[2]sys.Timespec = nilptr
+    if have_time then tp = &times end
+    if sys.utimensat(sys.AT_FDCWD, p, tp, flags) ~= 0 then
       util.err("setting times of '" .. p .. "': " .. sys.errstr()); rc = 1
     end
   end
   return rc
 end
 
-local function copy_file(src: string, dst: string, mode: cuint): boolean
+global function copy_file(src: string, dst: string, mode: cuint): boolean
   local ifd = sys.open(src, sys.O_RDONLY, 0)
   if ifd < 0 then util.err("cannot open '" .. src .. "' for reading: " .. sys.errstr()); return false end
   local ofd = sys.open(dst, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, mode & 0x1FF)
