@@ -373,6 +373,20 @@ same grep-ctx-o "$GR grep -o -C1 x f; grep -on -B1 x f; grep -ov -C1 x f; echo \
 same grep-ctx-quiet "$GR grep -l -C1 x f n; grep -q -C1 x f; echo \$?; grep -c -A5 x f"
 same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -C 1x x f; echo \$?; grep -B \"\" x f; echo \$?; grep -A \" +1\" x f; echo \$?; grep -A 99999999999999999999 x f | wc -l"
 same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
+same touch-d-fraction "touch -d '2026-01-02 03:04:05.123456789' f; TZ=UTC stat -c '%y' f; touch -d '2026-01-02 03:04:05,5' g; TZ=UTC stat -c '%y' g"
+# diff (GNU diffutils 3.8); tests/diff_fuzz.py compares the edit scripts on random inputs
+DF='printf "a\nb\nc\n" > x; printf "a\nB\nc\nd" > y; touch -d "2026-01-02 03:04:05.123456789" x y; mkdir -p d1/sub d2/sub d1/only1 d1/o2; echo 1 > d1/f; echo 2 > d2/f; echo s > d1/sub/s; echo t > d2/sub/s; echo o > d1/o; mkdir d2/o; : > d2/o2; echo same > d1/eq; echo same > d2/eq;'
+same diff-formats "$DF TZ=UTC diff x y; echo \$?; TZ=UTC diff -c x y; TZ=America/Los_Angeles diff -u x y; diff -U0 x y; diff -C1 x y | tail -n +3; diff -e x y; echo \$?"
+same diff-same-qs "$DF diff x x; echo \$?; diff -s x x; echo \$?; diff -q x y; echo \$?; diff -qs x x"
+same diff-binary "printf 'a\0b\n' > b1; printf 'a\0c\n' > b2; diff b1 b2; echo \$?; diff -a b1 b2 | od -c | head -3"
+same diff-dirs "$DF diff d1 d2; echo \$?; diff -r d1 d2; echo \$?; diff -ru d1 d2 | grep -v '^[-+][-+][-+] '; diff -qr d1 d2; echo \$?"
+same diff-dir-file "$DF cp x d1/x; diff x d1; echo \$?; diff d1 y; echo \$?"
+same diff-N-dash "$DF diff -N x nonexist; echo \$?; diff -N nonexist x; echo \$?; diff -u -N x nonexist | tail -n +3; diff x nonexist 2>/dev/null; echo \$?"
+same diff-stdin "printf 'a\nb\nc\n' > x; printf 'a\n' | diff - x; echo \$?; printf 'a\nb\nc\n' | diff x -; echo \$?"
+same diff-ignore "printf 'a  b\nC\n\nx\n' > p; printf 'a b \nc\nx\n' > q; diff -b p q; echo \$?; diff -w p q; echo \$?; diff -i p q; echo \$?; diff -ibB p q; echo \$?; printf 'b\n' > r; printf 'b' > s; diff -b r s; echo \$?; diff -w -u r s | tail -n +3"
+same diff-ed-newline "printf 'a\nb' > p; printf 'a\nc\n' > q; diff -e p q 2>&1; echo \$?; printf 'a\nb\n' > r; diff -e p r 2>&1; echo \$?; printf 'x\n.\ny\n' > t; diff -e q t"
+same diff-empty-formats "printf 'a\nb\n' > p; : > e; diff -u e p | tail -n +3; diff -c p e | tail -n +3; diff e p; diff -e p e"
+same diff-usage "diff 2>/dev/null; echo \$?; diff x 2>/dev/null; echo \$?; diff -U x a b 2>/dev/null; echo \$?"
 # grep -z -Z -L -f -s, and -o -w (GNU grep 3.8)
 GZ='printf "alpha\nbeta\n" > ga; printf "gamma\n" > gb; : > gempty; printf "x\n\ny\n" > gblank; printf "alpha\ngamma\n" > gpats;'
 same grep-L "$GZ grep -L alpha ga gb; echo \$?; grep -L zzz ga; echo \$?; grep -L alpha ga; echo \$?; grep -Lv alpha ga gb; echo \$?"

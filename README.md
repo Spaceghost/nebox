@@ -166,6 +166,24 @@ Stated here rather than worked around:
   current non-matching behavior). `\`` and `\'` match only at the ends of
   the subject, as in GNU regex (`sed-buffer-anchors`); `.` and `[^...]`
   match a newline unless REG_NEWLINE is in effect (sed's `M` flag).
+- `diff` follows GNU diffutils 3.8's algorithm step by step (`find_identical_ends`
+  on bytes with horizon lines, `discard_confusing_lines`, the middle-snake
+  `compareseq` with its cost cut-off, `shift_boundaries`), so its edit
+  scripts are GNU's: `tests/diff_fuzz.py` compares the output with GNU diff
+  on random inputs over small alphabets for 12 option sets (24,000
+  comparisons with no difference before this was written down; `make test`
+  runs 200 cases x 12), and 40,000-line inputs with heavy changes match as
+  well. Formats: normal, context (-c, -C N; headers in the C locale's
+  `%a %b %e %T %Y`), unified (-u, -U N; ISO 8601 times with nanoseconds and
+  zone offset), ed (-e; a missing final newline is supplied and reported,
+  status 2, as GNU does). Options -i -b -w -B -a -N -q -s -r; `-` is standard
+  input; a directory and a file compare the file of the same name; directory
+  comparison prints `Only in`, `Common subdirectories`, `File ... is a ...
+  while file ... is a ...` and `diff OPTIONS a/x b/x` headers. Binary files
+  (a NUL byte) are reported as differing unless -a. Not supported: long
+  options (`--label` and the rest), -p/-F function headers, -y side by side,
+  -t/-T, -I, -x/-X, -l, -n (RCS), -D (ifdef), --minimal and
+  --speed-large-files.
 - `grep` takes -i -v -n -b -c -l -L -q -s -H -h -r -F -E -G -w -x -o -e -f -m -z -Z
   and
   the context options -A, -B, -C and -NUM, following GNU grep 3.8's prtext:
