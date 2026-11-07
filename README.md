@@ -41,13 +41,13 @@ stdout, exit status, and the resulting directory tree.
 ## Applets
 
 ```
-[ awk b2sum base64 basename cat chgrp chmod chown cksum cmp comm cp cut date
-df dirname du echo env expand expr factor false find fold free grep groups
-head hexdump hostname id install join kill link ln ls md5sum mkdir mktemp mv
-nl nproc nsh od paste patch printenv printf pwd readlink realpath rev rm rmdir
-sed seq sh sha1sum sha224sum sha256sum sha384sum sha512sum shuf sleep sort
-split stat strings sum sync tac tail tee test timeout touch tr true truncate
-tsort tty uname unexpand uniq unlink wc which whoami xargs yes
+[ awk b2sum base32 base64 basename basenc cat chgrp chmod chown cksum cmp comm
+cp cut date df dirname du echo env expand expr factor false find fold free
+grep groups head hexdump hostname id install join kill link ln ls md5sum mkdir
+mktemp mv nl nproc nsh od paste patch printenv printf pwd readlink realpath
+rev rm rmdir sed seq sh sha1sum sha224sum sha256sum sha384sum sha512sum shuf
+sleep sort split stat strings sum sync tac tail tee test timeout touch tr true
+truncate tsort tty uname unexpand uniq unlink wc which whoami xargs yes
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
@@ -232,6 +232,12 @@ Stated here rather than worked around:
   treats a read error (a directory) as end of file. `cksum --debug` is
   accepted and prints nothing (GNU names its CRC implementation).
   `tests/digest_compare.py`: 1989 cases against GNU, 0 mismatches.
+- `base64`, `base32` and `basenc` port GNU coreutils 9.1 `src/basenc.c` with
+  gnulib's `base64.c`/`base32.c`: GNU's encode and decode block sizes, the
+  gnulib decode state machines (newlines anywhere, padding rules, output up
+  to the first invalid character), `-i`, `-w`, and basenc's base64url,
+  base32hex, base16, base2msbf, base2lsbf and z85. `tests/basenc_compare.py`:
+  2588 cases (random data with damaged encodings) against GNU, 0 mismatches.
 - `diff` follows GNU diffutils 3.8's algorithm step by step (`find_identical_ends`
   on bytes with horizon lines, `discard_confusing_lines`, the middle-snake
   `compareseq` with its cost cut-off, `shift_boundaries`), so its edit

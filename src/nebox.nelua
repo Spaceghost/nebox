@@ -21,6 +21,7 @@ require 'nebox.applets.text3'
 require 'nebox.applets.dd'
 require 'nebox.applets.join'
 require 'nebox.applets.digest'
+require 'nebox.applets.basenc'
 require 'nebox.applets.awk'
 require 'nebox.applets.sh'
 require 'nebox.applets.diff'
@@ -29,7 +30,8 @@ require 'nebox.applets.patch'
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
 local applets: []Applet = {
-  {'[', applet_test}, {'awk', applet_awk}, {'b2sum', applet_b2sum}, {'base64', applet_base64}, {'basename', applet_basename},
+  {'[', applet_test}, {'awk', applet_awk}, {'b2sum', applet_b2sum}, {'base32', applet_base32}, {'base64', applet_base64},
+  {'basenc', applet_basenc}, {'basename', applet_basename},
   {'cat', applet_cat}, {'chgrp', applet_chgrp}, {'chmod', applet_chmod},
   {'chown', applet_chown}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
   {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'dd', applet_dd},

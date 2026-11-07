@@ -1,0 +1,653 @@
+-- base64, base32 and basenc: a port of GNU coreutils 9.1 src/basenc.c with
+-- gnulib's base64.c and base32.c. Encoding works in GNU's 30720-byte
+-- blocks and wraps with -w; decoding reads GNU's block sizes and runs
+-- gnulib's decode state machines (newlines allowed between any characters,
+-- '=' padding rules, everything decoded before an invalid character is
+-- written), -i drops non-alphabet bytes, and basenc adds base64url,
+-- base32hex, base16, base2msbf, base2lsbf and z85.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local E_B64: integer <comptime> = 1
+local E_B64URL: integer <comptime> = 2
+local E_B32: integer <comptime> = 3
+local E_B32HEX: integer <comptime> = 4
+local E_B16: integer <comptime> = 5
+local E_B2M: integer <comptime> = 6
+local E_B2L: integer <comptime> = 7
+local E_Z85: integer <comptime> = 8
+
+local ENC_BLOCKSIZE: integer <comptime> = 30720
+
+local progname: string
+local kind: integer   -- 64, 32 or 42 (basenc)
+local enc: integer
+
+local b64c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local b32c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+local z85c = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#'
+local b64v: [256]int16
+local b32v: [256]int16
+local z85v: [256]int16
+local tables_ready = false
+
+local function init_tables()
+  if tables_ready then return end
+  for i = 0, 255 do b64v[i] = -1; b32v[i] = -1; z85v[i] = -1 end
+  for i = 1, #b64c do b64v[b64c:byte(i)] = i - 1 end
+  for i = 1, #b32c do b32v[b32c:byte(i)] = i - 1 end
+  for i = 1, #z85c do z85v[z85c:byte(i)] = i - 1 end
+  tables_ready = true
+end
+
+local function isbase64(c: byte): boolean return b64v[c] >= 0 end
+local function isbase32(c: byte): boolean return b32v[c] >= 0 end
+local function isbase32hex(c: byte): boolean return (c >= 48 and c <= 57) or (c >= 65 and c <= 86) end
+local function isbase16(c: byte): boolean return (c >= 48 and c <= 57) or (c >= 65 and c <= 70) end
+local function isbase2(c: byte): boolean return c == 48 or c == 49 end
+local function isz85(c: byte): boolean return z85v[c] >= 0 end
+local function isbase64url(c: byte): boolean return c == 45 or c == 95 or (c ~= 43 and c ~= 47 and isbase64(c)) end
+
+local function isbase(c: byte): boolean
+  if enc == E_B64 then return isbase64(c)
+  elseif enc == E_B64URL then return isbase64url(c)
+  elseif enc == E_B32 then return isbase32(c)
+  elseif enc == E_B32HEX then return isbase32hex(c)
+  elseif enc == E_B16 then return isbase16(c)
+  elseif enc == E_Z85 then return isz85(c)
+  else return isbase2(c) end
+end
+
+local function base_length(n: integer): integer
+  if enc == E_B64 or enc == E_B64URL then return (n + 2) // 3 * 4
+  elseif enc == E_B32 or enc == E_B32HEX then return (n + 4) // 5 * 8
+  elseif enc == E_B16 then return n * 2
+  elseif enc == E_Z85 then return n * 5 // 4
+  else return n * 8 end
+end
+
+local function die(msg: string, errnum: cint)
+  util.flush()
+  if errnum ~= 0 then util.err(msg .. ': ' .. sys.strerror(errnum)) else util.err(msg) end
+  c_exit(1)
+end
+
+local function usage_fail()
+  util.flush()
+  local m = "Try '" .. progname .. " --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+-- Encoders write base_length(inlen) characters.
+local function base64_encode(src: *[0]byte, inlen: integer, out: *[0]byte, alphabet: string)
+  local o: integer = 0
+  local i: integer = 0
+  while i < inlen do
+    local n = inlen - i
+    local b0: uint32 = src[i]
+    local b1: uint32 = n > 1 and src[i + 1] or 0
+    local b2: uint32 = n > 2 and src[i + 2] or 0
+    out[o] = alphabet:byte(((b0 >> 2) & 63) + 1)
+    out[o + 1] = alphabet:byte((((b0 << 4) | (b1 >> 4)) & 63) + 1)
+    out[o + 2] = n > 1 and alphabet:byte((((b1 << 2) | (b2 >> 6)) & 63) + 1) or 61
+    out[o + 3] = n > 2 and alphabet:byte((b2 & 63) + 1) or 61
+    o = o + 4
+    i = i + 3
+  end
+end
+
+local b32hexc = '0123456789ABCDEFGHIJKLMNOPQRSTUV'
+
+local function base32_encode(src: *[0]byte, inlen: integer, out: *[0]byte, alphabet: string)
+  local o: integer = 0
+  local i: integer = 0
+  while i < inlen do
+    local n = inlen - i
+    local b: [5]uint32
+    for k = 0, 4 do b[k] = k < n and src[i + k] or 0 end
+    local idx: [8]uint32 = {
+      b[0] >> 3, ((b[0] << 2) | (b[1] >> 6)) & 31, (b[1] >> 1) & 31, ((b[1] << 4) | (b[2] >> 4)) & 31,
+      ((b[2] << 1) | (b[3] >> 7)) & 31, (b[3] >> 2) & 31, ((b[3] << 3) | (b[4] >> 5)) & 31, b[4] & 31,
+    }
+    local nchars: integer
+    if n >= 5 then nchars = 8 elseif n == 4 then nchars = 7 elseif n == 3 then nchars = 5
+    elseif n == 2 then nchars = 4 else nchars = 2 end
+    for k = 0, 7 do
+      out[o + k] = k < nchars and alphabet:byte(idx[k] + 1) or 61
+    end
+    o = o + 8
+    i = i + 5
+  end
+end
+
+local function base_encode(src: *[0]byte, inlen: integer, out: *[0]byte)
+  if enc == E_B64 then base64_encode(src, inlen, out, b64c)
+  elseif enc == E_B64URL then
+    base64_encode(src, inlen, out, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_')
+  elseif enc == E_B32 then base32_encode(src, inlen, out, b32c)
+  elseif enc == E_B32HEX then base32_encode(src, inlen, out, b32hexc)
+  elseif enc == E_B16 then
+    local hex = '0123456789ABCDEF'
+    for i = 0, < inlen do
+      out[2 * i] = hex:byte((src[i] >> 4) + 1)
+      out[2 * i + 1] = hex:byte((src[i] & 15) + 1)
+    end
+  elseif enc == E_B2M or enc == E_B2L then
+    for i = 0, < inlen do
+      local c = src[i]
+      for k = 0, 7 do
+        if enc == E_B2M then
+          out[8 * i + k] = (c & 0x80) ~= 0 and 49 or 48
+          c = c << 1
+        else
+          out[8 * i + k] = (c & 1) ~= 0 and 49 or 48
+          c = c >> 1
+        end
+      end
+    end
+  else
+    local outlen = base_length(inlen)
+    local i: integer = 0
+    local o: integer = 0
+    while true do
+      if inlen - i == 0 then return end
+      if inlen - i < 4 then die('invalid input (length must be multiple of 4 characters)', 0) end
+      local val: int64 = ((@int64)(src[i]) << 24) + ((@int64)(src[i + 1]) << 16) + ((@int64)(src[i + 2]) << 8) + src[i + 3]
+      for j = 4, 0, -1 do
+        local c = val % 85
+        val = val // 85
+        if o + j < outlen then out[o + j] = z85c:byte(c + 1) end
+      end
+      o = o + 5
+      i = i + 4
+    end
+  end
+end
+
+-- Decoding ------------------------------------------------------------------
+local Ctx = @record{
+  i: integer,            -- basenc's ctx.i (or the gnulib context's i)
+  gi: integer,           -- gnulib base64/base32 context index
+  gbuf: [8]byte,
+  nibble: integer, have_nibble: boolean,
+  zi: integer, octets: [5]integer,
+  octet: integer,
+}
+
+-- gnulib decode_4 at in[0..inlen); writes to out at *o while *outleft > 0.
+local function decode_4(src: *[0]byte, inlen: integer, out: *[0]byte, o: *integer, outleft: *integer): boolean
+  if inlen < 2 then return false end
+  if not isbase64(src[0]) or not isbase64(src[1]) then return false end
+  if $outleft > 0 then
+    out[$o] = (@byte)(((b64v[src[0]] << 2) | (b64v[src[1]] >> 4)) & 0xff); $o = $o + 1; $outleft = $outleft - 1
+  end
+  if inlen == 2 then return false end
+  if src[2] == 61 then
+    if inlen ~= 4 then return false end
+    if src[3] ~= 61 then return false end
+  else
+    if not isbase64(src[2]) then return false end
+    if $outleft > 0 then
+      out[$o] = (@byte)((((b64v[src[1]] << 4) & 0xf0) | (b64v[src[2]] >> 2)) & 0xff); $o = $o + 1; $outleft = $outleft - 1
+    end
+    if inlen == 3 then return false end
+    if src[3] == 61 then
+      if inlen ~= 4 then return false end
+    else
+      if not isbase64(src[3]) then return false end
+      if $outleft > 0 then
+        out[$o] = (@byte)((((b64v[src[2]] << 6) & 0xc0) | b64v[src[3]]) & 0xff); $o = $o + 1; $outleft = $outleft - 1
+      end
+    end
+  end
+  return true
+end
+
+local function decode_8(src: *[0]byte, inlen: integer, out: *[0]byte, o: *integer, outleft: *integer): boolean
+  if inlen < 8 then return false end
+  if not isbase32(src[0]) or not isbase32(src[1]) then return false end
+  local function put(v: integer)
+    if $outleft > 0 then out[$o] = (@byte)(v & 0xff); $o = $o + 1; $outleft = $outleft - 1 end
+  end
+  local v = &b32v
+  put((v[src[0]] << 3) | (v[src[1]] >> 2))
+  if src[2] == 61 then
+    if src[3] ~= 61 or src[4] ~= 61 or src[5] ~= 61 or src[6] ~= 61 or src[7] ~= 61 then return false end
+  else
+    if not isbase32(src[2]) or not isbase32(src[3]) then return false end
+    put(((v[src[1]] << 6) & 0xc0) | (v[src[2]] << 1) | (v[src[3]] >> 4))
+    if src[4] == 61 then
+      if src[5] ~= 61 or src[6] ~= 61 or src[7] ~= 61 then return false end
+    else
+      if not isbase32(src[4]) then return false end
+      put(((v[src[3]] << 4) & 0xf0) | (v[src[4]] >> 1))
+      if src[5] == 61 then
+        if src[6] ~= 61 or src[7] ~= 61 then return false end
+      else
+        if not isbase32(src[5]) or not isbase32(src[6]) then return false end
+        put(((v[src[4]] << 7) & 0x80) | (v[src[5]] << 2) | (v[src[6]] >> 3))
+        if src[7] ~= 61 then
+          if not isbase32(src[7]) then return false end
+          put(((v[src[6]] << 5) & 0xe0) | v[src[7]])
+        end
+      end
+    end
+  end
+  return true
+end
+
+-- gnulib base64_decode_ctx / base32_decode_ctx (always with a context).
+local function gnulib_decode(ctx: *Ctx, src: *[0]byte, inlen: integer, out: *[0]byte, outlen: *integer, q: integer): boolean
+  local outleft = $outlen
+  local o: integer = 0
+  local p: integer = 0     -- index into src
+  local ctx_i = ctx.gi
+  local flush_ctx = inlen == 0
+  while true do
+    local outleft_save = outleft
+    if ctx_i == 0 and not flush_ctx then
+      while true do
+        outleft_save = outleft
+        local ok: boolean
+        if q == 4 then ok = decode_4((@*[0]byte)(&src[p]), inlen, out, &o, &outleft)
+        else ok = decode_8((@*[0]byte)(&src[p]), inlen, out, &o, &outleft) end
+        if not ok then break end
+        p = p + q
+        inlen = inlen - q
+      end
+    end
+    if inlen == 0 and not flush_ctx then break end
+    if inlen > 0 and src[p] == 10 then
+      p = p + 1; inlen = inlen - 1
+      continue
+    end
+    o = o - (outleft_save - outleft)
+    outleft = outleft_save
+    do
+      local in_end = p + inlen
+      local non_nl: *[0]byte
+      -- get_4 / get_8
+      if ctx.gi == q then ctx.gi = 0 end
+      local got = false
+      if ctx.gi == 0 then
+        if q <= in_end - p then
+          local has_nl = false
+          for k = 0, < q do if src[p + k] == 10 then has_nl = true; break end end
+          if not has_nl then
+            non_nl = (@*[0]byte)(&src[p])
+            p = p + q
+            inlen = q
+            got = true
+          end
+        end
+      end
+      if not got then
+        while p < in_end do
+          local c = src[p]
+          p = p + 1
+          if c ~= 10 then
+            ctx.gbuf[ctx.gi] = c
+            ctx.gi = ctx.gi + 1
+            if ctx.gi == q then break end
+          end
+        end
+        inlen = ctx.gi
+        non_nl = (@*[0]byte)(&ctx.gbuf)
+      end
+      if inlen == 0 or (inlen < q and not flush_ctx) then
+        inlen = 0
+        break
+      end
+      local ok: boolean
+      if q == 4 then ok = decode_4(non_nl, inlen, out, &o, &outleft)
+      else ok = decode_8(non_nl, inlen, out, &o, &outleft) end
+      if not ok then break end
+      inlen = in_end - p
+    end
+  end
+  $outlen = $outlen - outleft
+  return inlen == 0
+end
+
+local inbuf2: sequence(byte)
+
+local function base_decode_ctx(ctx: *Ctx, src: *[0]byte, inlen: integer, out: *[0]byte, outlen: *integer): boolean
+  if enc == E_B64 then
+    local b = gnulib_decode(ctx, src, inlen, out, outlen, 4)
+    ctx.i = ctx.gi
+    return b
+  elseif enc == E_B32 then
+    local b = gnulib_decode(ctx, src, inlen, out, outlen, 8)
+    ctx.i = ctx.gi
+    return b
+  elseif enc == E_B64URL or enc == E_B32HEX then
+    inbuf2:resize((@usize)(inlen + 1))
+    for k = 0, < inlen do
+      local c = src[k]
+      if enc == E_B64URL then
+        if c == 43 or c == 47 then $outlen = 0; return false
+        elseif c == 45 then c = 43
+        elseif c == 95 then c = 47 end
+      elseif isbase32hex(c) then
+        if c <= 57 then c = c - 48 + 65             -- '0'..'9' -> 'A'..'J'
+        elseif c <= 74 then c = c - 65 + 75         -- 'A'..'J' -> 'K'..'T'
+        elseif c <= 84 then
+          local m = 'UVWXYZ2345'
+          c = m:byte(c - 75 + 1)                    -- 'K'..'T'
+        else c = c == 85 and 54 or 55 end           -- 'U','V' -> '6','7'
+      end
+      inbuf2[k + 1] = c
+    end
+    local b = gnulib_decode(ctx, (@*[0]byte)(&inbuf2[1]), inlen, out, outlen, enc == E_B64URL and 4 or 8)
+    ctx.i = ctx.gi
+    return b
+  elseif enc == E_B16 then
+    $outlen = 0
+    if inlen == 0 then return not ctx.have_nibble end
+    for k = 0, < inlen do
+      local c = src[k]
+      if c == 10 then continue end
+      local nib: integer
+      if c >= 48 and c <= 57 then nib = c - 48
+      elseif c >= 65 and c <= 70 then nib = c - 55
+      else return false end
+      if ctx.have_nibble then
+        out[$outlen] = (@byte)(((ctx.nibble << 4) + nib) & 0xff)
+        $outlen = $outlen + 1
+      else
+        ctx.nibble = nib
+      end
+      ctx.have_nibble = not ctx.have_nibble
+    end
+    return true
+  elseif enc == E_Z85 then
+    $outlen = 0
+    if inlen == 0 then return ctx.zi <= 0 end
+    for k = 0, < inlen do
+      local c = src[k]
+      if c == 10 then continue end
+      if c >= 33 and c <= 125 and z85v[c] >= 0 then c = (@byte)(z85v[c])
+      else return false end
+      ctx.octets[ctx.zi] = c
+      ctx.zi = ctx.zi + 1
+      if ctx.zi == 5 then
+        local val: int64 = (@int64)(ctx.octets[1]) * 85 * 85 * 85 + (@int64)(ctx.octets[2]) * 85 * 85
+          + (@int64)(ctx.octets[3]) * 85 + ctx.octets[4]
+        val = val + (@int64)(ctx.octets[0]) * 85 * 85 * 85 * 85
+        if ((val >> 24) & ~0xff) ~= 0 then return false end
+        out[$outlen] = (@byte)((val >> 24) & 0xff)
+        out[$outlen + 1] = (@byte)((val >> 16) & 0xff)
+        out[$outlen + 2] = (@byte)((val >> 8) & 0xff)
+        out[$outlen + 3] = (@byte)(val & 0xff)
+        $outlen = $outlen + 4
+        ctx.zi = 0
+      end
+    end
+    ctx.i = ctx.zi
+    return true
+  else
+    $outlen = 0
+    if inlen == 0 then return ctx.i == 0 end
+    for k = 0, < inlen do
+      local c = src[k]
+      if c == 10 then continue end
+      if not isbase2(c) then return false end
+      local bit: integer = c == 49 and 1 or 0
+      if enc == E_B2L then
+        ctx.octet = ctx.octet | (bit << ctx.i)
+        ctx.i = ctx.i + 1
+        if ctx.i == 8 then
+          out[$outlen] = (@byte)(ctx.octet); $outlen = $outlen + 1
+          ctx.octet = 0; ctx.i = 0
+        end
+      else
+        if ctx.i == 0 then ctx.i = 8 end
+        ctx.i = ctx.i - 1
+        ctx.octet = ctx.octet | (bit << ctx.i)
+        if ctx.i == 0 then
+          out[$outlen] = (@byte)(ctx.octet); $outlen = $outlen + 1
+          ctx.octet = 0; ctx.i = 0
+        end
+      end
+    end
+    return true
+  end
+end
+
+-- stdio-like input: fill reads until the request is met or read returns 0.
+local Input = @record{fd: cint, eof: boolean, err: cint}
+
+local function fill(inp: *Input, buf: *[0]byte, want: integer): integer
+  local got: integer = 0
+  while got < want do
+    local n = sys.read(inp.fd, &buf[got], (@csize)(want - got))
+    if n < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      inp.err = sys.errno()
+      return got
+    end
+    if n == 0 then inp.eof = true; return got end
+    got = got + n
+  end
+  return got
+end
+
+local function wrap_write(buf: *[0]byte, len: integer, wrap_column: integer, current_column: *integer)
+  if wrap_column == 0 then
+    util.writebytes(buf, (@usize)(len))
+    return
+  end
+  local written: integer = 0
+  while written < len do
+    local to_write = wrap_column - $current_column
+    if len - written < to_write then to_write = len - written end
+    if to_write == 0 then
+      util.writebyte(10)
+      $current_column = 0
+    else
+      util.writebytes((@*[0]byte)(&buf[written]), (@usize)(to_write))
+      $current_column = $current_column + to_write
+      written = written + to_write
+    end
+  end
+end
+
+local function do_encode(inp: *Input, wrap_column: integer)
+  local current_column: integer = 0
+  local inbuf: sequence(byte)
+  inbuf:resize(ENC_BLOCKSIZE)
+  local outbuf: sequence(byte)
+  outbuf:resize((@usize)(base_length(ENC_BLOCKSIZE) + 8))
+  local sum: integer
+  repeat
+    sum = fill(inp, (@*[0]byte)(&inbuf[1]), ENC_BLOCKSIZE)
+    if sum > 0 then
+      base_encode((@*[0]byte)(&inbuf[1]), sum, (@*[0]byte)(&outbuf[1]))
+      wrap_write((@*[0]byte)(&outbuf[1]), base_length(sum), wrap_column, &current_column)
+    end
+  until not (not inp.eof and inp.err == 0 and sum == ENC_BLOCKSIZE)
+  if wrap_column ~= 0 and current_column > 0 then util.writebyte(10) end
+  if inp.err ~= 0 then die('read error', inp.err) end
+end
+
+local function do_decode(inp: *Input, ignore_garbage: boolean)
+  local dec_blocksize: integer
+  if kind == 64 then dec_blocksize = 3072 elseif kind == 32 then dec_blocksize = 5120 else dec_blocksize = 4200 end
+  local inlen_max = base_length(dec_blocksize)
+  local inbuf: sequence(byte)
+  inbuf:resize((@usize)(inlen_max + 1))
+  local outbuf: sequence(byte)
+  outbuf:resize((@usize)(dec_blocksize + 16))
+  local ctx: Ctx
+  if enc == E_B16 or enc == E_Z85 then ctx.i = 1 end
+  local ib = (@*[0]byte)(&inbuf[1])
+  repeat
+    local sum: integer = 0
+    repeat
+      local n = fill(inp, (@*[0]byte)(&ib[sum]), 1 > inlen_max - sum and 0 or inlen_max - sum)
+      if ignore_garbage then
+        local i: integer = 0
+        while n > 0 and i < n do
+          local c = ib[sum + i]
+          if isbase(c) or c == 61 then
+            i = i + 1
+          else
+            n = n - 1
+            for k = i, < n do ib[sum + k] = ib[sum + k + 1] end
+          end
+        end
+      end
+      sum = sum + n
+      if inp.err ~= 0 then die('read error', inp.err) end
+    until not (sum < inlen_max and not inp.eof)
+    local passes = inp.eof and 2 or 1
+    for k = 0, < passes do
+      if k == 1 and ctx.i == 0 then break end
+      local n: integer = dec_blocksize
+      local ok = base_decode_ctx(&ctx, ib, k == 0 and sum or 0, (@*[0]byte)(&outbuf[1]), &n)
+      util.writebytes((@*[0]byte)(&outbuf[1]), (@usize)(n))
+      if not ok then die('invalid input', 0) end
+    end
+  until inp.eof
+end
+
+local BASE64_OPTION: integer <comptime> = 128
+local BASE64URL_OPTION: integer <comptime> = 129
+local BASE32_OPTION: integer <comptime> = 130
+local BASE32HEX_OPTION: integer <comptime> = 131
+local BASE16_OPTION: integer <comptime> = 132
+local BASE2MSBF_OPTION: integer <comptime> = 133
+local BASE2LSBF_OPTION: integer <comptime> = 134
+local Z85_OPTION: integer <comptime> = 135
+local HELP_OPTION: integer <comptime> = 136
+local VERSION_OPTION: integer <comptime> = 137
+
+local opts_plain: []util.LongOpt = {
+  {'decode', 0, 100}, {'wrap', 1, 119}, {'ignore-garbage', 0, 105},
+  {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+local opts_basenc: []util.LongOpt = {
+  {'decode', 0, 100}, {'wrap', 1, 119}, {'ignore-garbage', 0, 105},
+  {'base64', 0, BASE64_OPTION}, {'base64url', 0, BASE64URL_OPTION}, {'base32', 0, BASE32_OPTION},
+  {'base32hex', 0, BASE32HEX_OPTION}, {'base16', 0, BASE16_OPTION}, {'base2msbf', 0, BASE2MSBF_OPTION},
+  {'base2lsbf', 0, BASE2LSBF_OPTION}, {'z85', 0, Z85_OPTION},
+  {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+
+local function usage()
+  util.write('Usage: ' .. progname .. ' [OPTION]... [FILE]\n')
+  if kind == 42 then util.write('basenc encode or decode FILE, or standard input, to standard output.\n')
+  else util.writef('Base%d encode or decode FILE, or standard input, to standard output.\n', kind) end
+  util.write([[
+
+With no FILE, or when FILE is -, read standard input.
+
+Mandatory arguments to long options are mandatory for short options too.
+]])
+  if kind == 42 then
+    util.write([[
+      --base64          same as 'base64' program (RFC4648 section 4)
+      --base64url       file- and url-safe base64 (RFC4648 section 5)
+      --base32          same as 'base32' program (RFC4648 section 6)
+      --base32hex       extended hex alphabet base32 (RFC4648 section 7)
+      --base16          hex encoding (RFC4648 section 8)
+      --base2msbf       bit string with most significant bit (msb) first
+      --base2lsbf       bit string with least significant bit (lsb) first
+]])
+  end
+  util.write([[
+  -d, --decode          decode data
+  -i, --ignore-garbage  when decoding, ignore non-alphabet characters
+  -w, --wrap=COLS       wrap encoded lines after COLS character (default 76).
+                          Use 0 to disable line wrapping
+]])
+  if kind == 42 then
+    util.write([[
+      --z85             ascii85-like encoding (ZeroMQ spec:32/Z85);
+                        when encoding, input length must be a multiple of 4;
+                        when decoding, input length must be a multiple of 5
+]])
+  end
+  util.write([[
+      --help     display this help and exit
+      --version  output version information and exit
+]])
+end
+
+local function run(args: sequence(string), which: integer, name: string): integer
+  init_tables()
+  kind = which
+  progname = name
+  enc = kind == 32 and E_B32 or E_B64
+  local decode = false
+  local ignore_garbage = false
+  local wrap_column: integer = 76
+  local base_type: integer = 0
+  local g: util.Getopt
+  if kind == 42 then g = util.getopt(args, 'diw:', &opts_basenc, #opts_basenc)
+  else g = util.getopt(args, 'diw:', &opts_plain, #opts_plain) end
+  while true do
+    local opt = g:next()
+    if opt == -1 then break end
+    if opt == 100 then decode = true
+    elseif opt == 119 then
+      -- xstrtoimax(optarg, NULL, 10, &w, "")
+      local a = g.optarg
+      local p = 1
+      while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+      local neg = false
+      if p <= #a and (a:byte(p) == 45 or a:byte(p) == 43) then neg = a:byte(p) == 45; p = p + 1 end
+      local start = p
+      local v: integer = 0
+      local ovf = false
+      while p <= #a and a:byte(p) >= 48 and a:byte(p) <= 57 do
+        local d = a:byte(p) - 48
+        if v > (0x7fffffffffffffff - d) // 10 then ovf = true else v = v * 10 + d end
+        p = p + 1
+      end
+      if p == start or p <= #a or (neg and (v > 0 or ovf)) then
+        die("invalid wrap size: '" .. a .. "'", 0)
+      end
+      wrap_column = ovf and 0 or v
+    elseif opt == 105 then ignore_garbage = true
+    elseif kind == 42 and opt >= BASE64_OPTION and opt <= Z85_OPTION then base_type = opt
+    elseif opt == HELP_OPTION then usage(); util.flush(); return 0
+    elseif opt == VERSION_OPTION then util.line(progname .. ' (nebox) after GNU coreutils 9.1'); util.flush(); return 0
+    else usage_fail() end
+  end
+  if kind == 42 then
+    if base_type == BASE64_OPTION then enc = E_B64
+    elseif base_type == BASE64URL_OPTION then enc = E_B64URL
+    elseif base_type == BASE32_OPTION then enc = E_B32
+    elseif base_type == BASE32HEX_OPTION then enc = E_B32HEX
+    elseif base_type == BASE16_OPTION then enc = E_B16
+    elseif base_type == BASE2MSBF_OPTION then enc = E_B2M
+    elseif base_type == BASE2LSBF_OPTION then enc = E_B2L
+    elseif base_type == Z85_OPTION then enc = E_Z85
+    else util.err('missing encoding type'); usage_fail() end
+  end
+  local operands = g:operands()
+  if #operands > 1 then util.err("extra operand '" .. operands[2] .. "'"); usage_fail() end
+  local infile = #operands == 1 and operands[1] or '-'
+  local inp: Input
+  if infile == '-' then inp.fd = 0
+  else
+    inp.fd = sys.open(infile, sys.O_RDONLY, 0)
+    if inp.fd < 0 then die(util.quotef(infile), sys.errno()) end
+  end
+  if decode then do_decode(&inp, ignore_garbage) else do_encode(&inp, wrap_column) end
+  if inp.fd ~= 0 then sys.close(inp.fd) end
+  util.flush()
+  return 0
+end
+
+global function applet_base64(args: sequence(string)): integer return run(args, 64, 'base64') end
+global function applet_base32(args: sequence(string)): integer return run(args, 32, 'base32') end
+global function applet_basenc(args: sequence(string)): integer return run(args, 42, 'basenc') end
