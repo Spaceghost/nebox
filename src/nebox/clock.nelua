@@ -20,41 +20,6 @@ global util.Time = @record{
   zone: string,     -- abbreviation for %Z
 }
 
-local tz_ready = false
-
--- glibc resolves a relative TZ value (TZ=Japan, TZ=UTC, TZ=:Asia/Tokyo,
--- TZ=Asia/Tokyo) as a zone file under $TZDIR or /usr/share/zoneinfo before
--- trying it as a POSIX TZ string. nelibc looks for a zone file only when
--- the value contains '/' or starts with ':', and only under
--- /usr/share/zoneinfo, so a name such as "Japan" or "EST5EDT" would be read
--- as a POSIX string. When the named file exists and is TZif data, hand
--- nelibc its absolute path instead. This edits the process environment;
--- the applets that format times never start children.
-local function tz_prepare()
-  if tz_ready then return end
-  tz_ready = true
-  local z = sys.getenv('TZ')
-  if z == nilptr then return end
-  local name: string = z
-  if name.size > 0 and name:byte(1) == ':'_b then name = name:sub(2) end
-  if name.size == 0 or name:byte(1) == '/'_b then return end
-  local dir: string = '/usr/share/zoneinfo'
-  local d = sys.getenv('TZDIR')
-  if d ~= nilptr then
-    local ds: string = d
-    if ds.size > 0 then dir = ds end
-  end
-  local path = dir .. '/' .. name
-  local fd = sys.open(path, sys.O_RDONLY, 0)
-  if fd < 0 then return end
-  local magic: [4]byte
-  local n = sys.read(fd, &magic[0], 4)
-  sys.close(fd)
-  if n == 4 and magic[0] == 'T'_b and magic[1] == 'Z'_b and magic[2] == 'i'_b and magic[3] == 'f'_b then
-    sys.setenv('TZ', path, 1)
-  end
-end
-
 -- Break t down in the local time zone, or in UTC as `date -u` (TZ=UTC0)
 -- does. False when the year does not fit.
 function util.breaktime(t: integer, ns: integer, utc: boolean): (util.Time, boolean)
@@ -67,7 +32,6 @@ function util.breaktime(t: integer, ns: integer, utc: boolean): (util.Time, bool
     r.zone = 'UTC'
     return r, true
   end
-  tz_prepare()
   if sys.localtime_r(&tt, &r.tm) == nilptr then return r, false end
   if r.tm.tm_zone ~= nilptr then
     local zs: string = r.tm.tm_zone
@@ -80,7 +44,6 @@ end
 -- it. False when that wall time does not exist in the zone (it falls in a
 -- forward transition) or is out of range: GNU touch and date reject those.
 function util.localsecs(y: integer, mo: integer, d: integer, hh: integer, mm: integer, ss: integer): (integer, boolean)
-  tz_prepare()
   local tm: sys.Tm
   tm.tm_year = (@cint)(y - 1900); tm.tm_mon = (@cint)(mo - 1); tm.tm_mday = (@cint)(d)
   tm.tm_hour = (@cint)(hh); tm.tm_min = (@cint)(mm); tm.tm_sec = (@cint)(ss)

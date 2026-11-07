@@ -186,11 +186,11 @@ Stated here rather than worked around:
   explicit TZ values, DST transitions (America/New_York, the half-hour
   Australia/Lord_Howe), historical offsets with seconds and years from -1199 to
   2147483647 (`date-tz-*`, `touch-tz*`). Unset TZ is only exercised with a
-  UTC `/etc/localtime` (the test container's). Differences from GNU: an
-  unknown zone (`TZ=Foo/Bar`, `TZ=:Foo`) is UTC with the abbreviation `UTC`
-  where GNU shows `Foo` (`date-tz-unknown-name`); a `$TZDIR` that lacks the
-  zone falls back to `/usr/share/zoneinfo` where GNU parses the name as a
-  POSIX string (`date-tz-tzdir-missing`). `touch` rejects a wall time that a
+  UTC `/etc/localtime` (the test container's). An unknown zone
+  (`TZ=Foo/Bar`, `TZ=:Foo`) is UTC with its leading letters as the
+  abbreviation, and a `$TZDIR` that lacks the zone makes the name a POSIX
+  string, both as in glibc (`date-tz-unknown-name`,
+  `date-tz-tzdir-missing`). `touch` rejects a wall time that a
   DST change skips and takes the first of a repeated hour, as GNU does.
 - `date` formats with GNU's nstrftime rules in the C locale: every
   conversion, the `_ - 0 + ^ #` flags, widths, `E`/`O`, `%N` (and `%-N`),
@@ -215,9 +215,9 @@ Stated here rather than worked around:
   with one `e f g a E F G A` conversion and `%%`, `-s` strings, the long
   options, and exact decimal counting for integer operands with a step up
   to 200 (`seq 18446744073709551614 18446744073709551617`, `seq 1 inf`)
-  (`seq-*`). Differences, both from nelibc's printf: negative zero prints as
-  `0` where GNU prints `-0` (`seq-negzero`), and `-f %a` prints `0x1p+0`
-  where glibc prints `0x8p-3` (`seq-f-hexfloat`). No `--help`/`--version`.
+  (`seq-*`). One difference, from nelibc's printf: `-f %a` prints the
+  normalized `0x1p+0` where glibc prints `0x8p-3` (`seq-f-hexfloat`); both
+  are valid C. No `--help`/`--version`.
 - `chmod` takes octal modes and `[ugoa][+-=][rwxXst]` lists.
 - `test` has no parentheses; `-a`/`-o` bind loosest, in that order.
 - `mv` across filesystems copies then removes; `cp -a` is `-rp`.

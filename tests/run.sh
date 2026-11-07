@@ -777,16 +777,10 @@ same diff-u-tz '/usr/bin/touch -d @1710053999.25 a; seq 2 > b; /usr/bin/touch -d
 same touch-tz 'export TZ=America/New_York; touch -d "2024-07-01 12:00:00" a; touch -d "2024-11-03 01:30:00" b; touch -d 2024-01-15 c; touch -t 202411030130 d; touch -t 201612312359.60 e; stat -c "%Y %n" a b c d e; touch -d "2024-03-10 02:30:00" f; echo $?; touch -t 202403100230 f; echo $?; touch -d "2020-02-30" f; echo $?; touch -d "2016-12-31 23:59:60" f; echo $?; ls'
 same touch-tz-half 'TZ=Australia/Lord_Howe touch -d "2024-04-07 01:45:00" a; TZ=Australia/Lord_Howe touch -d "2023-10-01 02:15:00" b; echo $?; stat -c "%Y %n" a'
 same date-tz-tzdir 'TZDIR=/usr/share/zoneinfo/America TZ=New_York date -d @0 "+%T %Z"; TZDIR=/usr/share/zoneinfo/Asia TZ=:Kolkata date -d @0 "+%T %Z"; TZDIR= TZ=Japan date -d @0 "+%T %Z"'
-# limits pinned (README "Known limits"): with an unknown zone name nelibc
-# keeps UTC and its abbreviation; GNU (glibc) shows the name's leading
-# letters as the abbreviation
-expect date-tz-unknown-name '+0000 UTC
-+0000 UTC
-exit=0' 'TZ=Foo/Bar date -d @0 "+%z %Z"; TZ=:Foo date -d @0 "+%z %Z"'
-# ... and a TZDIR without the zone falls back to /usr/share/zoneinfo, where
-# GNU treats the name as a POSIX string (Asia, +0000)
-expect date-tz-tzdir-missing '09:00:00 JST
-exit=0' 'TZDIR=/nonexistent TZ=Asia/Tokyo date -d @0 "+%T %Z"'
+# an unknown zone keeps its leading letters at UTC, and a TZDIR without the
+# zone makes the name a POSIX string (Asia, +0000), as in glibc
+same date-tz-unknown-name 'TZ=Foo/Bar date -d @0 "+%z %Z"; TZ=:Foo date -d @0 "+%z %Z"'
+same date-tz-tzdir-missing 'TZDIR=/nonexistent TZ=Asia/Tokyo date -d @0 "+%T %Z"'
 # seq: floating operands, precision, -w, -f, separators, big integers
 same seq-float 'seq 0 0.1 1; seq 1 0.5 3; seq 5 -1.5 0; seq .5 3; seq 1.5; seq 0.1 0.2 0.5; seq 1 0.3 2.2; seq 0 0.01 0.03; seq 1 0.000001 1.000003; seq 1.1 1.1 7.7; seq 100 -0.1 99.5; seq -1 0.1 0; seq 0.000001 0.0000005 0.000003'
 seq_cases='seq 1 0.1 1.3; seq 0 0.2 1; seq 0.3 0.3 1.8; seq 2 -1 -2; seq 10 -3 -3; seq -1 -0.5 0; seq 3 1; seq 1 1; seq 0; seq 1.000000000000000000001 2'
@@ -801,11 +795,9 @@ same seq-bad 'for a in "1 0 2" "1 -0 2" nan "1 nan" "1e5000" "1 2 3 4" "" "4 -s,
 same seq-big 'seq 18446744073709551614 18446744073709551617; seq 99999999999999999999999 1 100000000000000000000001; seq 2e19 20000000000000000002; seq 18446744073709551615 2 18446744073709551620; seq 18446744073709551615 201 18446744073709552020; seq 2e19 1 20000000000000000003.0; seq 000 2'
 same seq-inf 'seq 1 inf | head -3; seq 1 inf inf | head -2; seq inf | head -2; seq 5 1 inf | head -2'
 same seq-tiny 'seq 1e-5000 1 | cksum'
-# nelibc printf limits pinned (README): negative zero loses its sign and
-# %La prints 0x1p+0 where glibc prints 0x8p-3
-expect seq-negzero '0
-1
-exit=0' 'seq -0 1'
+same seq-negzero 'seq -0 1'
+# pinned (README): nelibc's %La prints the normalized 0x1p+0 where glibc
+# prints 0x8p-3; both are valid C
 expect seq-f-hexfloat '0x1p+0
 0X1P+1
 exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
