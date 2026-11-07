@@ -109,6 +109,13 @@ function sys.opendir(path: cstring): *sys.DIR <cimport 'opendir', cinclude '<dir
 function sys.readdir(d: *sys.DIR): *sys.Dirent <cimport 'readdir', cinclude '<dirent.h>'> end
 function sys.closedir(d: *sys.DIR): cint <cimport 'closedir', cinclude '<dirent.h>'> end
 function sys.isatty(fd: cint): cint <cimport 'isatty', cinclude '<unistd.h>'> end
+global sys.Termios: type <cimport 'nebox_termios', cinclude '<termios.h>', nodecl, ctypedef 'termios'> = @record{
+  c_iflag: cuint, c_oflag: cuint, c_cflag: cuint, c_lflag: cuint,
+  c_line: cuchar, c_cc: [32]cuchar, __c_ispeed: cuint, __c_ospeed: cuint,
+}
+global sys.TCSADRAIN: cint <comptime> = 1
+function sys.tcgetattr(fd: cint, t: *sys.Termios): cint <cimport 'tcgetattr', cinclude '<termios.h>'> end
+function sys.tcsetattr(fd: cint, action: cint, t: *sys.Termios): cint <cimport 'tcsetattr', cinclude '<termios.h>'> end
 function sys.ioctl(fd: cint, req: culong, arg: pointer): cint <cimport 'ioctl', cinclude '<sys/ioctl.h>'> end
 function sys.nanosleep(req: *sys.Timespec, rem: *sys.Timespec): cint <cimport 'nanosleep', cinclude '<time.h>'> end
 function sys.clock_gettime(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_gettime', cinclude '<time.h>'> end

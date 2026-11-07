@@ -1,5 +1,5 @@
--- Line editor for the interactive shell: raw terminal mode through ioctl
--- (TCGETS/TCSETSW, so no <termios.h> is needed), redraw that follows lines
+-- Line editor for the interactive shell: raw terminal mode through
+-- <termios.h> (tcgetattr/tcsetattr), redraw that follows lines
 -- wrapping past the terminal width, UTF-8 aware cursor motion, emacs keys,
 -- a kill buffer, history with incremental reverse search, completion through
 -- a callback, and bracketed paste. Output goes to fd 2, as POSIX wants for
@@ -15,15 +15,8 @@ require 'nebox.util'
 
 global lineedit = @record{}
 
-local TCGETS: culong <comptime> = 0x5401
-local TCSETSW: culong <comptime> = 0x5403
 local TIOCGWINSZ: culong <comptime> = 0x5413
 
--- struct termios as the kernel's TCGETS sees it.
-local KTermios = @record{
-  c_iflag: uint32, c_oflag: uint32, c_cflag: uint32, c_lflag: uint32,
-  c_line: uint8, c_cc: [19]uint8,
-}
 local Winsize = @record{ws_row: uint16, ws_col: uint16, ws_xpixel: uint16, ws_ypixel: uint16}
 
 global lineedit.READ_OK: integer <comptime> = 0
@@ -54,7 +47,7 @@ global lineedit.Editor = @record{
   killing: boolean,         -- this key killed text
   prev_killing: boolean,    -- the previous key killed text: the next kill joins it
   last_tab: boolean,
-  saved: KTermios,
+  saved: sys.Termios,
   have_saved: boolean,
   raw: boolean,
 }
@@ -137,8 +130,8 @@ end
 
 function lineedit.Editor:enable_raw(): boolean
   if self.raw then return true end
-  local t: KTermios
-  if sys.ioctl(0, TCGETS, &t) ~= 0 then return false end
+  local t: sys.Termios
+  if sys.tcgetattr(0, &t) ~= 0 then return false end
   self.saved = t
   self.have_saved = true
   -- cfmakeraw, keeping output post-processing and ISIG off so ^C is a key
@@ -147,7 +140,7 @@ function lineedit.Editor:enable_raw(): boolean
   t.c_cflag = (t.c_cflag & ~(0x30 | 0x100)) | 0x30                              -- CSIZE PARENB -> CS8
   t.c_cc[6] = 1   -- VMIN
   t.c_cc[5] = 0   -- VTIME
-  if sys.ioctl(0, TCSETSW, &t) ~= 0 then return false end
+  if sys.tcsetattr(0, sys.TCSADRAIN, &t) ~= 0 then return false end
   self.raw = true
   out('\27[?2004h')  -- bracketed paste on
   return true
@@ -156,7 +149,7 @@ end
 function lineedit.Editor:disable_raw()
   if not self.raw then return end
   out('\27[?2004l')
-  sys.ioctl(0, TCSETSW, &self.saved)
+  sys.tcsetattr(0, sys.TCSADRAIN, &self.saved)
   self.raw = false
 end
 
