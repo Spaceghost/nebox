@@ -103,16 +103,6 @@ global longopts.fold: []util.LongOpt = {
   {'bytes', 0, 98}, {'spaces', 0, 115}, {'width', 1, 119}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.split: []util.LongOpt = {
-  {'bytes', 1, 98}, {'lines', 1, 108}, {'line-bytes', 1, util.UNSUPPORTED},
-  {'number', 1, util.UNSUPPORTED}, {'elide-empty-files', 0, util.UNSUPPORTED},
-  {'unbuffered', 0, util.UNSUPPORTED}, {'suffix-length', 1, 97},
-  {'additional-suffix', 1, util.UNSUPPORTED}, {'numeric-suffixes', 2, util.UNSUPPORTED},
-  {'hex-suffixes', 2, util.UNSUPPORTED}, {'filter', 1, util.UNSUPPORTED},
-  {'verbose', 0, util.UNSUPPORTED}, {'separator', 1, util.UNSUPPORTED},
-  {'-io-blksize', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
-}
 global longopts.shuf: []util.LongOpt = {
   {'echo', 0, 101}, {'input-range', 1, 105}, {'head-count', 1, 110}, {'output', 1, 111},
   {'random-source', 1, util.UNSUPPORTED}, {'repeat', 0, 114}, {'zero-terminated', 0, 122},

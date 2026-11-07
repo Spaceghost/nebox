@@ -118,6 +118,16 @@ Stated here rather than worked around:
   mktemp.c with gnulib gen_tempname (-d -p/--tmpdir[=DIR] -q -t -u
   --suffix, getrandom names, GNU's template checks). `util.argmatch` is
   gnulib's XARGMATCH. `tests/teemktemp_compare.py`: 47 cases, 0 mismatches.
+- `split` ports split.c: -l/-b/-C, the obsolete -NUMBER, -n N, K/N,
+  l/[K/]N and r/[K/]N (round robin with per-file buffering and the EMFILE
+  fallback), -a with GNU's automatic suffix widening (`zaaa`), -d/-x and
+  `--numeric-suffixes`/`--hex-suffixes=FROM`, `--additional-suffix`, -e, -u,
+  -t (including `\0`), `--filter` (`$SHELL -c` with `$FILE`, SIGPIPE blocked,
+  exit/signal reporting), `--verbose`, the input-overwrite check and
+  gnulib xdectoumax size parsing (`util.xdectoumax`). One deliberate
+  difference: GNU 9.1 indexes `--hex-suffixes=FROM` letters past its
+  alphabet (undefined behavior); nebox uses the digit's value.
+  `tests/split_compare.py`: 135 cases, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

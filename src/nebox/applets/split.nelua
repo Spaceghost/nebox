@@ -1,0 +1,944 @@
+-- split: a port of GNU coreutils 9.1 src/split.c. -l/-b/-C/-n (N, K/N,
+-- l/[K/]N, r/[K/]N) and the obsolete -NUMBER, -a with automatic suffix
+-- widening, -d/-x with start values, --additional-suffix, -e, -u, -t,
+-- --filter (sh -c with $FILE, SIGPIPE blocked), --verbose, ---io-blksize.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sig'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_execv(path: cstring, argv: *[0]cstring): cint <cimport 'execv', cinclude '<unistd.h>'> end
+local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
+local Sigset: type <cimport 'sigset_t', cinclude '<signal.h>', nodecl> = @record{ __val: [16]culong }
+local function c_sigemptyset(s: *Sigset): cint <cimport 'sigemptyset', cinclude '<signal.h>'> end
+local function c_sigaddset(s: *Sigset, n: cint): cint <cimport 'sigaddset', cinclude '<signal.h>'> end
+local function c_sigprocmask(how: cint, s: *Sigset, old: *Sigset): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
+local SIG_BLOCK: cint <comptime> = 0
+local SIG_SETMASK: cint <comptime> = 2
+local EOVERFLOW: cint <comptime> = 75
+local EMFILE: cint <comptime> = 24
+local ENFILE: cint <comptime> = 23
+local O_NONBLOCK: cint <comptime> = 0x800
+local SEEK_END: cint <comptime> = 2
+local OFF_T_MAX: int64 <comptime> = 0x7fffffffffffffff
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+local NOREAD: int64 <comptime> = -1 -- SIZE_MAX as "no initial read"
+
+local T_UNDEF <comptime> = 0
+local T_BYTES <comptime> = 1
+local T_BYTESLINES <comptime> = 2
+local T_LINES <comptime> = 3
+local T_DIGITS <comptime> = 4
+local T_CHUNK_BYTES <comptime> = 5
+local T_CHUNK_LINES <comptime> = 6
+local T_RR <comptime> = 7
+
+local OFD_NEW: cint <comptime> = -1
+local OFD_APPEND: cint <comptime> = -2
+
+local infile: string
+local outbase: string
+local outfile: sequence(byte)
+local outfile_mid: integer      -- 0-based offset of the suffix in outfile
+local outfile_length: integer
+local outbase_length: integer
+local addsuf_length: integer
+local sufindex: sequence(integer)
+local have_outfile = false
+local suffix_alphabet: string
+local suffix_length: uint64
+local suffix_auto = true
+local additional_suffix: string
+local have_addsuf = false
+local numeric_suffix_start: string
+local have_start = false
+local filter_command: string
+local have_filter = false
+local filter_pid: cint = 0
+local open_pipes: sequence(cint)
+local output_desc: cint = -1
+local verbose = false
+local elide_empty_files = false
+local unbuffered = false
+local eolchar: integer = -1
+local in_dev: culong
+local in_ino: culong
+local oldblocked: Sigset
+local newblocked: Sigset
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function die_errno(e: cint, msg: string)
+  if e == 0 then die(msg) end
+  die(msg .. ': ' .. sys.strerror(e))
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'split --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function ignorable(e: cint): boolean
+  return have_filter and e == sys.EPIPE
+end
+
+local function full_write(fd: cint, p: *[0]byte, n: int64): int64
+  local off: int64 = 0
+  while off < n do
+    local w = sys.write(fd, &p[off], (@csize)(n - off))
+    if w < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return off
+    end
+    off = off + w
+  end
+  return off
+end
+
+local function safe_read(fd: cint, p: *[0]byte, n: int64): int64
+  while true do
+    local r = sys.read(fd, p, (@csize)(n))
+    if r < 0 and sys.errno() == sys.EINTR then continue end
+    return r
+  end
+  return -1
+end
+
+-- gnulib last_component.
+local function last_component(s: string): string
+  local i = 1
+  while i <= #s and s:byte(i) == 47 do i = i + 1 end
+  local base = i
+  local saw_slash = false
+  while i <= #s do
+    if s:byte(i) == 47 then saw_slash = true
+    elseif saw_slash then base = i; saw_slash = false end
+    i = i + 1
+  end
+  return s:sub(base)
+end
+
+local function outname(): string
+  local sb: stringbuilder
+  for i = 1, outfile_length do sb:writebyte(outfile[i]) end
+  return sb:promote()
+end
+
+local function set_suffix_length(n_units: uint64, split_type: integer)
+  local needed: uint64 = 0
+  if have_start then suffix_auto = false end
+  if split_type == T_CHUNK_BYTES or split_type == T_CHUNK_LINES or split_type == T_RR then
+    local n_end: uint64 = n_units - 1
+    if have_start then
+      local ok, n_start = util.xdectoumax(numeric_suffix_start, 0, UMAX, '', '')
+      if ok and n_start <= UMAX - n_units and n_start < n_units then n_end = n_end + n_start end
+    end
+    local alen: uint64 = (@uint64)(#suffix_alphabet)
+    repeat
+      needed = needed + 1
+      n_end = n_end // alen
+    until n_end == 0
+    suffix_auto = false
+  end
+  if suffix_length ~= 0 then
+    if suffix_length < needed then
+      die('the suffix length needs to be at least ' .. tostring(needed))
+    end
+    suffix_auto = false
+    return
+  end
+  suffix_length = needed > 2 and needed or 2
+end
+
+local function init_name(widen: boolean)
+  if not widen then
+    outbase_length = #outbase
+    addsuf_length = have_addsuf and #additional_suffix or 0
+    outfile_length = outbase_length + (@integer)(suffix_length) + addsuf_length
+    outfile:clear()
+    for i = 1, outbase_length do outfile:push(outbase:byte(i)) end
+  else
+    outfile_length = outfile_length + 2
+    suffix_length = suffix_length + 1
+    outfile:resize(outbase_length)
+    outfile:push(suffix_alphabet:byte(sufindex[1] + 1))
+    outbase_length = outbase_length + 1
+  end
+  outfile:resize(outbase_length)
+  outfile_mid = outbase_length
+  for _ = 1, (@integer)(suffix_length) do outfile:push(suffix_alphabet:byte(1)) end
+  if have_addsuf then for i = 1, #additional_suffix do outfile:push(additional_suffix:byte(i)) end end
+  sufindex:clear()
+  for _ = 1, (@integer)(suffix_length) do sufindex:push(0) end
+  if have_start then
+    local l = #numeric_suffix_start
+    local sl = (@integer)(suffix_length)
+    for j = 1, l do
+      outfile[outfile_mid + sl - l + j] = numeric_suffix_start:byte(j)
+      -- GNU 9.1 stores c - '0' here, which for the hex digits a-f indexes
+      -- past the alphabet (undefined behavior); this takes the digit's index.
+      sufindex[sl - l + j] = suffix_alphabet:find(string.char(numeric_suffix_start:byte(j)), 1, true) - 1
+    end
+  end
+end
+
+local function next_file_name()
+  if not have_outfile then
+    have_outfile = true
+    init_name(false)
+    return
+  end
+  local alen = #suffix_alphabet
+  local i = (@integer)(suffix_length)
+  while i > 0 do
+    sufindex[i] = sufindex[i] + 1
+    if suffix_auto and i == 1 and sufindex[1] + 1 >= alen then
+      init_name(true)
+      return
+    end
+    if sufindex[i] < alen then
+      outfile[outfile_mid + i] = suffix_alphabet:byte(sufindex[i] + 1)
+      return
+    end
+    sufindex[i] = 0
+    outfile[outfile_mid + i] = suffix_alphabet:byte(1)
+    i = i - 1
+  end
+  die('output file suffixes exhausted')
+end
+
+local function create(name: string): cint
+  if not have_filter then
+    if verbose then util.write('creating file ' .. util.quoteaf(name) .. '\n') end
+    local fd = sys.open(name, sys.O_WRONLY | sys.O_CREAT, 0x1B6)
+    if fd < 0 then return fd end
+    local st: sys.Stat
+    if sys.fstat(fd, &st) ~= 0 then die_errno(sys.errno(), 'failed to stat ' .. util.quoteaf(name)) end
+    if st.st_dev == in_dev and st.st_ino == in_ino then
+      die(util.quoteaf(name) .. ' would overwrite input; aborting')
+    end
+    if c_ftruncate(fd, 0) ~= 0 and (st.st_mode & sys.S_IFMT) == 0x8000 then
+      die_errno(sys.errno(), util.quotef(name) .. ': error truncating')
+    end
+    return fd
+  end
+  local shell_s = sys.getenv('SHELL')
+  local shell: string = shell_s ~= nilptr and (@string)(shell_s) or '/bin/sh'
+  if sys.setenv('FILE', name, 1) ~= 0 then die_errno(sys.errno(), 'failed to set FILE environment variable') end
+  if verbose then util.write('executing with FILE=' .. util.quotef(name) .. '\n') end
+  local fds: [2]cint
+  if sys.pipe(&fds) ~= 0 then die_errno(sys.errno(), 'failed to create pipe') end
+  util.flush()
+  local pid = sys.fork()
+  if pid == 0 then
+    for j = 1, #open_pipes do
+      if sys.close(open_pipes[j]) ~= 0 then die_errno(sys.errno(), 'closing prior pipe') end
+    end
+    if sys.close(fds[1]) ~= 0 then die_errno(sys.errno(), 'closing output pipe') end
+    if fds[0] ~= 0 then
+      if sys.dup2(fds[0], 0) ~= 0 then die_errno(sys.errno(), 'moving input pipe') end
+      if sys.close(fds[0]) ~= 0 then die_errno(sys.errno(), 'closing input pipe') end
+    end
+    c_sigprocmask(SIG_SETMASK, &oldblocked, nilptr)
+    local argv: [4]cstring = {last_component(shell), '-c', filter_command, nilptr}
+    c_execv(shell, &argv)
+    die_errno(sys.errno(), 'failed to run command: "' .. shell .. ' -c ' .. filter_command .. '"')
+  end
+  if pid == -1 then die_errno(sys.errno(), 'fork system call failed') end
+  if sys.close(fds[0]) ~= 0 then die_errno(sys.errno(), 'failed to close input pipe') end
+  filter_pid = pid
+  open_pipes:push(fds[1])
+  return fds[1]
+end
+
+local function closeout(fd: cint, pid: cint, name: string)
+  if fd >= 0 then
+    if sys.close(fd) < 0 then die_errno(sys.errno(), util.quotef(name)) end
+    for j = 1, #open_pipes do
+      if open_pipes[j] == fd then
+        open_pipes[j] = open_pipes[#open_pipes]
+        open_pipes:pop()
+        break
+      end
+    end
+  end
+  if pid > 0 then
+    local ws: cint = 0
+    if sys.waitpid(pid, &ws, 0) == -1 and sys.errno() ~= sys.ECHILD then
+      die_errno(sys.errno(), 'waiting for child process')
+    end
+    local sigv = ws & 0x7f
+    if sigv ~= 0 and sigv ~= 0x7f then
+      if sigv ~= sys.SIGPIPE then
+        local nm = sig.sig2str(sigv)
+        if #nm == 0 then nm = tostring(sigv) end
+        util.err('with FILE=' .. util.quotef(name) .. ', signal ' .. nm .. ' from command: ' .. filter_command)
+        util.flush()
+        c_exit(sigv + 128)
+      end
+    elseif sigv == 0 then
+      local ex = (ws >> 8) & 0xff
+      if ex ~= 0 then
+        util.err('with FILE=' .. util.quotef(name) .. ', exit ' .. tostring(ex) .. ' from command: ' .. filter_command)
+        util.flush()
+        c_exit(ex)
+      end
+    else
+      die(string.format('unknown status from command (0x%X)', ws))
+    end
+  end
+end
+
+local function cwrite(new_file: boolean, bp: *[0]byte, bytes: int64): boolean
+  if new_file then
+    if bp == nilptr and bytes == 0 and elide_empty_files then return true end
+    closeout(output_desc, filter_pid, have_outfile and outname() or '')
+    filter_pid = 0
+    next_file_name()
+    output_desc = create(outname())
+    if output_desc < 0 then die_errno(sys.errno(), util.quotef(outname())) end
+  end
+  if bytes == 0 then return true end
+  if full_write(output_desc, bp, bytes) == bytes then return true end
+  local e = sys.errno()
+  if not ignorable(e) then die_errno(e, util.quotef(outname())) end
+  return false
+end
+
+local function bytes_split(n_bytes: uint64, buf: *[0]byte, bufsize: int64, initial_read: int64, max_files: uint64)
+  local new_file = true
+  local filter_ok = true
+  local to_write: uint64 = n_bytes
+  local opened: uint64 = 0
+  local eof = false
+  repeat
+    local n_read: int64
+    if initial_read ~= NOREAD then
+      n_read = initial_read
+      initial_read = NOREAD
+      eof = n_read < bufsize
+    else
+      if not filter_ok and sys.lseek(0, (@clong)(to_write), sys.SEEK_CUR) ~= -1 then
+        to_write = n_bytes
+        new_file = true
+      end
+      n_read = safe_read(0, buf, bufsize)
+      if n_read < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+      eof = n_read == 0
+    end
+    local off: int64 = 0
+    local stop = false
+    while to_write <= (@uint64)(n_read) do
+      if filter_ok or new_file then filter_ok = cwrite(new_file, &buf[off], (@int64)(to_write)) end
+      if new_file then opened = opened + 1 end
+      new_file = max_files == 0 or opened < max_files
+      if not filter_ok and not new_file then
+        n_read = 0
+        eof = true
+        break
+      end
+      off = off + (@int64)(to_write)
+      n_read = n_read - (@int64)(to_write)
+      to_write = n_bytes
+    end
+    if n_read ~= 0 then
+      if filter_ok or new_file then filter_ok = cwrite(new_file, &buf[off], n_read) end
+      if new_file then opened = opened + 1 end
+      new_file = false
+      if not filter_ok and opened == max_files then stop = true end
+      to_write = to_write - (@uint64)(n_read)
+    end
+  until stop or eof
+  while opened < max_files do
+    opened = opened + 1
+    cwrite(true, nilptr, 0)
+  end
+end
+
+local function lines_split(n_lines: uint64, buf: *[0]byte, bufsize: int64)
+  local new_file = true
+  local n: uint64 = 0
+  local eol: byte = (@byte)(eolchar)
+  repeat
+    local n_read = safe_read(0, buf, bufsize)
+    if n_read < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+    local bp: int64 = 0
+    local bp_out: int64 = 0
+    while true do
+      while bp < n_read and buf[bp] ~= eol do bp = bp + 1 end
+      if bp == n_read then
+        if n_read ~= bp_out then
+          cwrite(new_file, &buf[bp_out], n_read - bp_out)
+          new_file = false
+        end
+        break
+      end
+      bp = bp + 1
+      n = n + 1
+      if n >= n_lines then
+        cwrite(new_file, &buf[bp_out], bp - bp_out)
+        bp_out = bp
+        new_file = true
+        n = 0
+      end
+    end
+  until n_read == 0
+end
+
+local function memrchr(p: *[0]byte, c: byte, n: int64): int64
+  local i = n - 1
+  while i >= 0 do
+    if p[i] == c then return i end
+    i = i - 1
+  end
+  return -1
+end
+
+local function memchr(p: *[0]byte, c: byte, from: int64, n: int64): int64
+  for i = from, n - 1 do
+    if p[i] == c then return i end
+  end
+  return -1
+end
+
+local function line_bytes_split(n_bytes: uint64, buf: *[0]byte, bufsize: int64)
+  local n_out: uint64 = 0
+  local hold: sequence(byte)
+  local split_line = false
+  local eolc: byte = (@byte)(eolchar)
+  repeat
+    local n_read = safe_read(0, buf, bufsize)
+    if n_read < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+    local n_left: int64 = n_read
+    local sob: int64 = 0
+    while n_left > 0 do
+      local split_rest: int64 = 0
+      local has_eoc = false
+      local eol: int64
+      local n_hold = (@uint64)(#hold)
+      if n_bytes - n_out - n_hold <= (@uint64)(n_left) then
+        split_rest = (@int64)(n_bytes - n_out - n_hold)
+        has_eoc = true
+        eol = memrchr(&buf[sob], eolc, split_rest)
+      else
+        eol = memrchr(&buf[sob], eolc, n_left)
+      end
+      if #hold > 0 and not (eol < 0 and n_out ~= 0) then
+        cwrite(n_out == 0, &hold[1], #hold)
+        n_out = n_out + (@uint64)(#hold)
+        hold:clear()
+      end
+      if eol >= 0 then
+        split_line = true
+        local n_write = eol + 1
+        cwrite(n_out == 0, &buf[sob], n_write)
+        n_out = n_out + (@uint64)(n_write)
+        n_left = n_left - n_write
+        sob = sob + n_write
+        if has_eoc then split_rest = split_rest - n_write end
+      end
+      if n_left > 0 and not split_line then
+        local n_write = has_eoc and split_rest or n_left
+        cwrite(n_out == 0, &buf[sob], n_write)
+        n_out = n_out + (@uint64)(n_write)
+        n_left = n_left - n_write
+        sob = sob + n_write
+        if has_eoc then split_rest = split_rest - n_write end
+      end
+      if (has_eoc and split_rest > 0) or (not has_eoc and n_left > 0) then
+        local n_buf = has_eoc and split_rest or n_left
+        for i = 0, n_buf - 1 do hold:push(buf[sob + i]) end
+        n_left = n_left - n_buf
+        sob = sob + n_buf
+      end
+      if has_eoc then
+        n_out = 0
+        split_line = false
+      end
+    end
+  until n_read == 0
+  if #hold > 0 then cwrite(n_out == 0, &hold[1], #hold) end
+end
+
+local function lines_chunk_split(k: uint64, n: uint64, buf: *[0]byte, bufsize: int64, initial_read: int64, file_size: int64)
+  local chunk_size: int64 = file_size // (@int64)(n)
+  local chunk_no: uint64 = 1
+  local chunk_end: int64 = chunk_size - 1
+  local n_written: int64 = 0
+  local new_file = true
+  local chunk_truncated = false
+  local eolc: byte = (@byte)(eolchar)
+  if k > 1 then
+    local start: int64 = (@int64)(k - 1) * chunk_size - 1
+    if start < initial_read then
+      for i = 0, initial_read - start - 1 do buf[i] = buf[start + i] end
+      initial_read = initial_read - start
+    else
+      if sys.lseek(0, start - initial_read, sys.SEEK_CUR) < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+      initial_read = NOREAD
+    end
+    n_written = start
+    chunk_no = k - 1
+    chunk_end = (@int64)(chunk_no) * chunk_size - 1
+  end
+  while n_written < file_size do
+    local n_read: int64
+    if initial_read ~= NOREAD then
+      n_read = initial_read
+      initial_read = NOREAD
+    else
+      n_read = safe_read(0, buf, bufsize)
+      if n_read < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+    end
+    if n_read == 0 then break end
+    if n_read > file_size - n_written then n_read = file_size - n_written end
+    chunk_truncated = false
+    local bp: int64 = 0
+    local eob: int64 = n_read
+    while bp ~= eob do
+      local next = false
+      local skip: int64 = chunk_end - n_written
+      if skip < 0 then skip = 0 end
+      if skip > n_read then skip = n_read end
+      local found = memchr(&buf[bp], eolc, skip, n_read)
+      local bp_out: int64
+      if found >= 0 then
+        bp_out = bp + found + 1
+        next = true
+      else
+        bp_out = eob
+      end
+      local to_write = bp_out - bp
+      if k == chunk_no then
+        if full_write(1, &buf[bp], to_write) ~= to_write then die_errno(sys.errno(), 'write error') end
+      elseif k == 0 then
+        cwrite(new_file, &buf[bp], to_write)
+      end
+      n_written = n_written + to_write
+      bp = bp + to_write
+      n_read = n_read - to_write
+      new_file = next
+      while next or chunk_end <= n_written - 1 do
+        if not next and bp == eob then
+          chunk_truncated = true
+          break
+        end
+        chunk_no = chunk_no + 1
+        if k ~= 0 and chunk_no > k then return end
+        if chunk_no == n then chunk_end = file_size - 1 else chunk_end = chunk_end + chunk_size end
+        if chunk_end <= n_written - 1 then
+          if k == 0 then cwrite(true, nilptr, 0) end
+        else
+          next = false
+        end
+      end
+    end
+  end
+  if chunk_truncated then chunk_no = chunk_no + 1 end
+  while k == 0 and chunk_no <= n do
+    chunk_no = chunk_no + 1
+    cwrite(true, nilptr, 0)
+  end
+end
+
+local function bytes_chunk_extract(k: uint64, n: uint64, buf: *[0]byte, bufsize: int64, initial_read: int64, file_size: int64)
+  local start: int64 = (@int64)(k - 1) * (file_size // (@int64)(n))
+  local stop: int64 = k == n and file_size or (@int64)(k) * (file_size // (@int64)(n))
+  if start < initial_read then
+    for i = 0, initial_read - start - 1 do buf[i] = buf[start + i] end
+    initial_read = initial_read - start
+  else
+    if sys.lseek(0, start - initial_read, sys.SEEK_CUR) < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+    initial_read = NOREAD
+  end
+  while start < stop do
+    local n_read: int64
+    if initial_read ~= NOREAD then
+      n_read = initial_read
+      initial_read = NOREAD
+    else
+      n_read = safe_read(0, buf, bufsize)
+      if n_read < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+    end
+    if n_read == 0 then break end
+    if n_read > stop - start then n_read = stop - start end
+    if full_write(1, buf, n_read) ~= n_read and not ignorable(sys.errno()) then
+      die_errno(sys.errno(), util.quotef('-'))
+    end
+    start = start + n_read
+  end
+end
+
+-- An output of -n r/N: GNU keeps a stdio stream per file ("a" mode, a
+-- BUFSIZ buffer); this keeps the same buffering with a byte queue.
+local OFile = @record{
+  name: string,
+  fd: cint,
+  pid: cint,
+  buf: sequence(byte),
+}
+local OBUF: int64 <comptime> = 4096
+
+local function oflush(f: *OFile): boolean
+  if #f.buf == 0 then return true end
+  local n: int64 = #f.buf
+  local w = full_write(f.fd, &f.buf[1], n)
+  f.buf:clear()
+  return w == n
+end
+
+local function ofclose(f: *OFile): boolean
+  local ok = oflush(f)
+  local e = sys.errno()
+  if sys.close(f.fd) ~= 0 then return false end
+  if not ok then sys.seterrno(e) end
+  return ok
+end
+
+local function ofile_open(files: *[0]OFile, i_check: integer, nfiles: integer): boolean
+  local file_limit = false
+  if files[i_check].fd <= OFD_NEW then
+    local fd: cint
+    local i_reopen = i_check > 0 and i_check - 1 or nfiles - 1
+    while true do
+      if files[i_check].fd == OFD_NEW then
+        fd = create(files[i_check].name)
+      else
+        fd = sys.open(files[i_check].name, sys.O_WRONLY | sys.O_APPEND | O_NONBLOCK, 0)
+      end
+      if fd > -1 then break end
+      local e = sys.errno()
+      if not (e == EMFILE or e == ENFILE) then die_errno(e, util.quotef(files[i_check].name)) end
+      file_limit = true
+      while files[i_reopen].fd < 0 do
+        i_reopen = i_reopen > 0 and i_reopen - 1 or nfiles - 1
+        if i_reopen == i_check then die_errno(e, util.quotef(files[i_check].name)) end
+      end
+      if not ofclose(&files[i_reopen]) then die_errno(sys.errno(), util.quotef(files[i_reopen].name)) end
+      files[i_reopen].fd = OFD_APPEND
+    end
+    files[i_check].fd = fd
+    files[i_check].pid = filter_pid
+    filter_pid = 0
+  end
+  return file_limit
+end
+
+local function lines_rr(k: uint64, n: uint64, buf: *[0]byte, bufsize: int64)
+  local wrapped = false
+  local wrote = false
+  local file_limit = false
+  local i_file: integer = 0
+  local line_no: uint64 = 1
+  local nf: integer = 0
+  local files: *[0]OFile = nilptr
+  local eolc: byte = (@byte)(eolchar)
+  if k == 0 then
+    nf = (@integer)(n)
+    files = (@*[0]OFile)(c_malloc((@csize)(nf) * #OFile))
+    for i = 0, nf - 1 do
+      next_file_name()
+      files[i] = {name = outname(), fd = OFD_NEW, pid = 0}
+    end
+  end
+  local done = false
+  while not done do
+    local n_read = safe_read(0, buf, bufsize)
+    if n_read < 0 then die_errno(sys.errno(), util.quotef(infile)) end
+    if n_read == 0 then break end
+    local bp: int64 = 0
+    while bp ~= n_read do
+      local next = false
+      local found = memchr(buf, eolc, bp, n_read)
+      local bp_out: int64
+      if found >= 0 then bp_out = found + 1; next = true else bp_out = n_read end
+      local to_write = bp_out - bp
+      if k ~= 0 then
+        if line_no == k and unbuffered then
+          util.flush()
+          if full_write(1, &buf[bp], to_write) ~= to_write then die_errno(sys.errno(), 'write error') end
+        elseif line_no == k then
+          util.writebytes(&buf[bp], (@usize)(to_write))
+        end
+        if next then line_no = line_no == n and 1 or line_no + 1 end
+      else
+        if ofile_open(files, i_file, nf) then file_limit = true end
+        local f = &files[i_file]
+        sys.seterrno(0)
+        if unbuffered then
+          if full_write(f.fd, &buf[bp], to_write) ~= to_write and not ignorable(sys.errno()) then
+            die_errno(sys.errno(), util.quotef(f.name))
+          end
+        else
+          for i = bp, bp_out - 1 do f.buf:push(buf[i]) end
+          if #f.buf >= OBUF and not oflush(f) and not ignorable(sys.errno()) then
+            die_errno(sys.errno(), util.quotef(f.name))
+          end
+        end
+        if not ignorable(sys.errno()) then wrote = true end
+        if file_limit then
+          if not ofclose(f) then die_errno(sys.errno(), util.quotef(f.name)) end
+          f.fd = OFD_APPEND
+        end
+        if next then
+          i_file = i_file + 1
+          if i_file == nf then
+            wrapped = true
+            if not wrote then done = true; break end
+            wrote = false
+            i_file = 0
+          end
+        end
+      end
+      bp = bp_out
+    end
+  end
+  if k == 0 then
+    local ceiling = wrapped and nf or i_file
+    for i = 0, nf - 1 do
+      if i >= ceiling and not elide_empty_files then
+        if ofile_open(files, i, nf) then file_limit = true end
+      end
+      if files[i].fd >= 0 then
+        local f = &files[i]
+        if not oflush(f) and not ignorable(sys.errno()) then die_errno(sys.errno(), util.quotef(f.name)) end
+        closeout(f.fd, f.pid, f.name)
+      end
+      files[i].fd = OFD_APPEND
+    end
+  end
+end
+
+-- input_file_size: bytes readable from fd 0, the first up to BUFSIZE of
+-- them read into BUF (their count in initial).
+local function input_file_size(st: *sys.Stat, buf: *[0]byte, bufsize: int64): (int64, int64)
+  local cur = sys.lseek(0, 0, sys.SEEK_CUR)
+  if cur < 0 then
+    if sys.errno() == sys.ESPIPE then sys.seterrno(0) end
+    return -1, 0
+  end
+  local size: int64 = 0
+  repeat
+    local r = safe_read(0, &buf[size], bufsize - size)
+    if r == 0 then return size, size end
+    if r < 0 then return -1, size end
+    size = size + r
+  until size >= bufsize
+  local initial = size
+  if st.st_size == 0 then
+    sys.seterrno(EOVERFLOW)
+    return -1, initial
+  end
+  cur = cur + size
+  local stop: int64
+  if (st.st_mode & sys.S_IFMT) == 0x8000 and cur <= st.st_size then
+    stop = st.st_size
+  else
+    stop = sys.lseek(0, 0, SEEK_END)
+    if stop < 0 then return -1, initial end
+    if stop ~= cur then
+      if sys.lseek(0, cur, sys.SEEK_SET) < 0 then return -1, initial end
+      if stop < cur then stop = cur end
+    end
+  end
+  size = size + stop - cur
+  if size == OFF_T_MAX then
+    sys.seterrno(EOVERFLOW)
+    return -1, initial
+  end
+  return size, initial
+end
+
+local function num(arg: string, min: uint64, max: uint64, suffixes: string, msg: string): uint64
+  local ok, v, e = util.xdectoumax(arg, min, max, suffixes, msg)
+  if not ok then die(e) end
+  return v
+end
+
+global function applet_split(args: sequence(string)): integer
+  local split_type = T_UNDEF
+  local in_blk_size: int64 = 0
+  local k_units: uint64 = 0
+  local n_units: uint64 = 0
+  local multipliers = 'bEGKkMmPTYZ0'
+  local digits_optind = 0
+  local file_size: int64 = OFF_T_MAX
+  infile = '-'
+  outbase = 'x'
+  suffix_alphabet = 'abcdefghijklmnopqrstuvwxyz'
+  local longs: []util.LongOpt = {
+    {'bytes', 1, 98}, {'lines', 1, 108}, {'line-bytes', 1, 67}, {'number', 1, 110},
+    {'elide-empty-files', 0, 101}, {'unbuffered', 0, 117}, {'suffix-length', 1, 97},
+    {'additional-suffix', 1, 259}, {'numeric-suffixes', 2, 100}, {'hex-suffixes', 2, 120},
+    {'filter', 1, 257}, {'verbose', 0, 256}, {'separator', 1, 116}, {'-io-blksize', 1, 258},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, '0123456789C:a:b:del:n:t:ux', &longs, #longs)
+  g.quiet = true
+  local function one_way() usage_fail('cannot split in more than one way') end
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 97 then
+      suffix_length = num(g.optarg, 0, 0x1fffffffffffffff, '', 'invalid suffix length')
+    elseif c == 259 then
+      if last_component(g.optarg) ~= g.optarg then
+        usage_fail('invalid suffix ' .. util.quote(g.optarg) .. ', contains directory separator')
+      end
+      additional_suffix = g.optarg; have_addsuf = true
+    elseif c == 98 then
+      if split_type ~= T_UNDEF then one_way() end
+      split_type = T_BYTES
+      n_units = num(g.optarg, 1, (@uint64)(OFF_T_MAX), multipliers, 'invalid number of bytes')
+    elseif c == 108 then
+      if split_type ~= T_UNDEF then one_way() end
+      split_type = T_LINES
+      n_units = num(g.optarg, 1, UMAX, '', 'invalid number of lines')
+    elseif c == 67 then
+      if split_type ~= T_UNDEF then one_way() end
+      split_type = T_BYTESLINES
+      n_units = num(g.optarg, 1, (@uint64)(OFF_T_MAX), multipliers, 'invalid number of bytes')
+    elseif c == 110 then
+      if split_type ~= T_UNDEF then one_way() end
+      local a = g.optarg
+      local p = 1
+      while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+      a = a:sub(p)
+      if a:sub(1, 2) == 'r/' then split_type = T_RR; a = a:sub(3)
+      elseif a:sub(1, 2) == 'l/' then split_type = T_CHUNK_LINES; a = a:sub(3)
+      else split_type = T_CHUNK_BYTES end
+      local slash = a:find('/', 1, true)
+      if slash > 0 then
+        n_units = num(a:sub(slash + 1), 1, UMAX, '', 'invalid number of chunks')
+        if slash ~= 1 then
+          k_units = num(a:sub(1, slash - 1), 1, n_units, '', 'invalid chunk number')
+        end
+      else
+        n_units = num(a, 1, UMAX, '', 'invalid number of chunks')
+      end
+    elseif c == 117 then
+      unbuffered = true
+    elseif c == 116 then
+      local a = g.optarg
+      if #a == 0 then die('empty record separator') end
+      local neweol: integer = a:byte(1)
+      if #a > 1 then
+        if a == '\\0' then neweol = 0
+        else die('multi-character separator ' .. util.quote(a)) end
+      end
+      if eolchar >= 0 and neweol ~= eolchar then die('multiple separator characters specified') end
+      eolchar = neweol
+    elseif c >= 48 and c <= 57 then
+      if split_type == T_UNDEF then split_type = T_DIGITS; n_units = 0 end
+      if split_type ~= T_DIGITS then one_way() end
+      if digits_optind ~= 0 and digits_optind ~= g.arg_index then n_units = 0 end
+      digits_optind = g.arg_index
+      local d: uint64 = (@uint64)(c - 48)
+      if n_units > (UMAX - d) // 10 then
+        die('line count option -' .. tostring(n_units) .. string.char(c) .. '... is too large')
+      end
+      n_units = n_units * 10 + d
+    elseif c == 100 or c == 120 then
+      suffix_alphabet = c == 100 and '0123456789' or '0123456789abcdef'
+      if g.has_optarg then
+        local a = g.optarg
+        local okv = true
+        for i = 1, #a do
+          if suffix_alphabet:find(string.char(a:byte(i)), 1, true) == 0 then okv = false; break end
+        end
+        if not okv then
+          usage_fail(util.quote(a) .. (c == 100 and ': invalid start value for numerical suffix'
+            or ': invalid start value for hexadecimal suffix'))
+        end
+        local p = 1
+        while p < #a and a:byte(p) == 48 do p = p + 1 end
+        numeric_suffix_start = a:sub(p); have_start = true
+      end
+    elseif c == 101 then
+      elide_empty_files = true
+    elseif c == 257 then
+      filter_command = g.optarg; have_filter = true
+    elseif c == 258 then
+      in_blk_size = (@int64)(num(g.optarg, 1, (@uint64)(OFF_T_MAX) - 1, multipliers, 'invalid IO block size'))
+    elseif c == 256 then
+      verbose = true
+    end
+  end
+  if k_units ~= 0 and have_filter then usage_fail('--filter does not process a chunk extracted to stdout') end
+  if split_type == T_UNDEF then split_type = T_LINES; n_units = 1000 end
+  if n_units == 0 then usage_fail('invalid number of lines: ' .. util.quote('0')) end
+  if eolchar < 0 then eolchar = 10 end
+  set_suffix_length(n_units, split_type)
+  local ops = g:operands()
+  if #ops >= 1 then infile = ops[1] end
+  if #ops >= 2 then outbase = ops[2] end
+  if #ops >= 3 then usage_fail('extra operand ' .. util.quote(ops[3])) end
+  if have_start and (@uint64)(#numeric_suffix_start) > suffix_length then
+    usage_fail('numerical suffix start value is too large for the suffix length')
+  end
+  if infile ~= '-' then
+    local fd = sys.open(infile, sys.O_RDONLY, 0)
+    if fd < 0 then die_errno(sys.errno(), 'cannot open ' .. util.quoteaf(infile) .. ' for reading') end
+    if fd ~= 0 then sys.dup2(fd, 0); sys.close(fd) end
+  end
+  local st: sys.Stat
+  if sys.fstat(0, &st) ~= 0 then die_errno(sys.errno(), util.quotef(infile)) end
+  in_dev = st.st_dev; in_ino = st.st_ino
+  if in_blk_size == 0 then
+    in_blk_size = st.st_blksize > 128 * 1024 and st.st_blksize or 128 * 1024
+  end
+  local buf = (@*[0]byte)(c_malloc((@csize)(in_blk_size + 1)))
+  local initial_read: int64 = NOREAD
+  if split_type == T_CHUNK_BYTES or split_type == T_CHUNK_LINES then
+    local fsz, initial = input_file_size(&st, buf, in_blk_size)
+    if fsz < 0 then die_errno(sys.errno(), util.quotef(infile) .. ': cannot determine file size') end
+    file_size = fsz
+    initial_read = initial
+    if (@uint64)(OFF_T_MAX) < n_units then
+      die('invalid number of chunks: ' .. util.quote(tostring(n_units)) .. ': ' .. sys.strerror(EOVERFLOW))
+    end
+    if (@uint64)(file_size) < n_units then file_size = (@int64)(n_units) end
+  end
+  if have_filter then
+    local act: sys.Sigaction
+    c_sigemptyset(&newblocked)
+    sys.sigaction(sys.SIGPIPE, nilptr, &act)
+    if (@usize)((@pointer)(act.sa_handler)) ~= sys.SIG_IGN then c_sigaddset(&newblocked, sys.SIGPIPE) end
+    c_sigprocmask(SIG_BLOCK, &newblocked, &oldblocked)
+  end
+  if split_type == T_DIGITS or split_type == T_LINES then
+    lines_split(n_units, buf, in_blk_size)
+  elseif split_type == T_BYTES then
+    bytes_split(n_units, buf, in_blk_size, NOREAD, 0)
+  elseif split_type == T_BYTESLINES then
+    line_bytes_split(n_units, buf, in_blk_size)
+  elseif split_type == T_CHUNK_BYTES then
+    if k_units == 0 then
+      bytes_split((@uint64)(file_size) // n_units, buf, in_blk_size, initial_read, n_units)
+    else
+      bytes_chunk_extract(k_units, n_units, buf, in_blk_size, initial_read, file_size)
+    end
+  elseif split_type == T_CHUNK_LINES then
+    lines_chunk_split(k_units, n_units, buf, in_blk_size, initial_read, file_size)
+  else
+    lines_rr(k_units, n_units, buf, in_blk_size)
+  end
+  if sys.close(0) ~= 0 then die_errno(sys.errno(), util.quotef(infile)) end
+  closeout(output_desc, filter_pid, have_outfile and outname() or '')
+  if not util.flush() then die_errno(sys.errno(), 'write error') end
+  return 0
+end
