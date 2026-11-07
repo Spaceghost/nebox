@@ -1073,40 +1073,6 @@ global function applet_sort(args: sequence(string)): integer
   return 0
 end
 
-global function applet_uniq(args: sequence(string)): integer
-  local o = util.parsel(args, 'cdui', &longopts.uniq, #longopts.uniq)
-  if not o:ok() then return util.optfail(o) end
-  local inpath = #o.operands >= 1 and o.operands[1] or '-'
-  local data, ok = util.readfile(inpath)
-  if not ok then return 1 end
-  if #o.operands >= 2 then
-    local fd = sys.open(o.operands[2], sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
-    if fd < 0 then util.perror(o.operands[2]); return 1 end
-    util.setout(fd)
-  end
-  local lines = util.lines(data)
-  local fold, onlydup, onlyuniq, count = o:has('i'), o:has('d'), o:has('u'), o:has('c')
-  local i: integer = 1
-  while i <= #lines do
-    local j = i
-    while j + 1 <= #lines do
-      local same: boolean
-      if fold then same = cmp_fold(lines[j + 1], lines[i]) == 0 else same = lines[j + 1] == lines[i] end
-      if not same then break end
-      j = j + 1
-    end
-    local n = j - i + 1
-    local skip = (onlydup and n < 2) or (onlyuniq and n > 1)
-    if not skip then
-      if count then util.writef('%7d ', n) end
-      util.line(lines[i])
-    end
-    i = j + 1
-  end
-  util.flush()
-  util.setout(1)
-  return 0
-end
 
 global function applet_tee(args: sequence(string)): integer
   local o = util.parsel(args, 'ai', &longopts.tee, #longopts.tee)
@@ -1561,61 +1527,6 @@ local function inlist(list: sequence(Range), n: integer): boolean
   return false
 end
 
-global function applet_cut(args: sequence(string)): integer
-  local o = util.parsel(args, 'b:c:f:d:sn', &longopts.cut, #longopts.cut)
-  if not o:ok() then return util.optfail(o) end
-  local mode: string = ''
-  local spec: string
-  if o:has('f') then mode = 'f'; spec = o:get('f')
-  elseif o:has('c') then mode = 'c'; spec = o:get('c')
-  elseif o:has('b') then mode = 'c'; spec = o:get('b') end
-  if mode == '' then util.err('you must specify a list of bytes, characters, or fields'); return 1 end
-  local list, ok = parse_list(spec)
-  if not ok then util.err("invalid list '" .. spec .. "'"); return 1 end
-  local delim: byte = 9
-  if o:has('d') then
-    local d = o:get('d')
-    if d.size ~= 1 then util.err('the delimiter must be a single character'); return 1 end
-    delim = d:byte(1)
-  end
-  if #o.operands == 0 then o.operands:push('-') end
-  local rc: integer = 0
-  for _, path in ipairs(o.operands) do
-    local data, rok = util.readfile(path)
-    if not rok then rc = 1; continue end
-    for _, line in ipairs(util.lines(data)) do
-      if mode == 'c' then
-        for i: usize = 0, < line.size do
-          if inlist(list, (@integer)(i) + 1) then util.writebyte(line.data[i]) end
-        end
-        util.writebyte(10)
-      else
-        local hasdelim = false
-        for i: usize = 0, < line.size do if line.data[i] == delim then hasdelim = true; break end end
-        if not hasdelim then
-          if not o:has('s') then util.line(line) end
-          continue
-        end
-        local field: integer = 1
-        local start: usize = 0
-        local first = true
-        for i: usize = 0, line.size do
-          if i == line.size or line.data[i] == delim then
-            if inlist(list, field) then
-              if not first then util.writebyte(delim) end
-              util.writebytes(&line.data[start], i - start)
-              first = false
-            end
-            field = field + 1
-            start = i + 1
-          end
-        end
-        util.writebyte(10)
-      end
-    end
-  end
-  return rc
-end
 
 global function applet_rev(args: sequence(string)): integer
   if #args == 0 then args:push('-') end

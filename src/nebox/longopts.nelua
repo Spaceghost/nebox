@@ -13,22 +13,9 @@ global longopts.cat: []util.LongOpt = {
   {'show-nonprinting', 0, 118}, {'show-ends', 0, 69}, {'show-tabs', 0, 84}, {'show-all', 0, 65},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.cut: []util.LongOpt = {
-  {'bytes', 1, 98}, {'characters', 1, 99}, {'fields', 1, 102}, {'delimiter', 1, 100},
-  {'only-delimited', 0, 115}, {'output-delimiter', 1, util.UNSUPPORTED},
-  {'complement', 0, util.UNSUPPORTED}, {'zero-terminated', 0, util.UNSUPPORTED},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.wc: []util.LongOpt = {
   {'bytes', 0, 99}, {'chars', 0, 109}, {'lines', 0, 108}, {'words', 0, 119},
   {'debug', 0, util.UNSUPPORTED}, {'files0-from', 1, util.UNSUPPORTED}, {'max-line-length', 0, 76},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
-global longopts.uniq: []util.LongOpt = {
-  {'count', 0, 99}, {'repeated', 0, 100}, {'all-repeated', 2, util.UNSUPPORTED},
-  {'group', 2, util.UNSUPPORTED}, {'ignore-case', 0, 105}, {'unique', 0, 117},
-  {'skip-fields', 1, util.UNSUPPORTED}, {'skip-chars', 1, util.UNSUPPORTED},
-  {'check-chars', 1, util.UNSUPPORTED}, {'zero-terminated', 0, util.UNSUPPORTED},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
 global longopts.tee: []util.LongOpt = {
@@ -163,11 +150,6 @@ global longopts.shuf: []util.LongOpt = {
   {'echo', 0, 101}, {'input-range', 1, 105}, {'head-count', 1, 110}, {'output', 1, 111},
   {'random-source', 1, util.UNSUPPORTED}, {'repeat', 0, 114}, {'zero-terminated', 0, 122},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
-global longopts.tr: []util.LongOpt = {
-  {'complement', 0, 99}, {'delete', 0, 100}, {'squeeze-repeats', 0, 115},
-  {'truncate-set1', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
 }
 global longopts.truncate: []util.LongOpt = {
   {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},

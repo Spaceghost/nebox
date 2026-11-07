@@ -144,6 +144,25 @@ local function shell_escape(s: string, always: boolean, colon: boolean): string
   return sb:promote()
 end
 
+-- gnulib quote() in the C locale (locale_quoting_style): '...' with C escapes.
+function util.quote(s: string): string
+  local sb: stringbuilder
+  sb:writebyte(39)
+  for i = 1, #s do
+    local c = s:byte(i)
+    if c == 92 then sb:write('\\\\')
+    elseif c == 39 then sb:write("\\'")
+    elseif c == 7 then sb:write('\\a') elseif c == 8 then sb:write('\\b')
+    elseif c == 12 then sb:write('\\f') elseif c == 10 then sb:write('\\n')
+    elseif c == 13 then sb:write('\\r') elseif c == 9 then sb:write('\\t')
+    elseif c == 11 then sb:write('\\v')
+    elseif c < 32 or c > 126 then sb:writef('\\%03o', c)
+    else sb:writebyte(c) end
+  end
+  sb:writebyte(39)
+  return sb:promote()
+end
+
 function util.quoteaf(s: string): string return shell_escape(s, true, false) end
 function util.quotef(s: string): string return shell_escape(s, false, true) end
 

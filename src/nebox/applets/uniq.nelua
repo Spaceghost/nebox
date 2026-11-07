@@ -1,0 +1,349 @@
+-- uniq: a port of GNU coreutils 9.1 src/uniq.c in the C locale. -c -d -D[=
+-- none|prepend|separate] -u -i -f -s -w -z --group[=prepend|append|
+-- separate|both], the obsolete -N and +N forms, and the OUTPUT operand.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local SIZE_MAX: uint64 <comptime> = 0xffffffffffffffff
+
+local skip_fields: uint64
+local skip_chars: uint64
+local check_chars: uint64
+local output_unique: boolean
+local output_first_repeated: boolean
+local output_later_repeated: boolean
+local count_occurrences: boolean
+local ignore_case: boolean
+local DM_NONE: integer <comptime> = 0
+local DM_PREPEND: integer <comptime> = 1
+local DM_SEPARATE: integer <comptime> = 2
+local delimit_groups: integer
+local GM_NONE: integer <comptime> = 0
+local GM_PREPEND: integer <comptime> = 1
+local GM_APPEND: integer <comptime> = 2
+local GM_SEPARATE: integer <comptime> = 3
+local GM_BOTH: integer <comptime> = 4
+local grouping: integer
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail(msg: string): integer
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'uniq --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  return 1
+end
+
+local Reader = @record{fd: cint, buf: [65536]byte, pos: integer, len: integer, eof: boolean, err: cint}
+
+-- readlinebuffer_delim: the line with its delimiter (supplied at EOF).
+local function readline(r: *Reader, line: *sequence(byte), delim: byte): boolean
+  line:clear()
+  while true do
+    if r.pos >= r.len then
+      if r.eof then break end
+      local n: clong
+      repeat n = sys.read(r.fd, &r.buf[0], #r.buf) until not (n < 0 and sys.errno() == sys.EINTR)
+      if n <= 0 then
+        if n < 0 then r.err = sys.errno() end
+        r.eof = true
+        break
+      end
+      r.pos = 0; r.len = n
+    end
+    local c = r.buf[r.pos]
+    r.pos = r.pos + 1
+    line:push(c)
+    if c == delim then return true end
+  end
+  if #line == 0 then return false end
+  line:push(delim)
+  return true
+end
+
+local function field_sep(c: byte): boolean return c == 32 or c == 9 or c == 10 end
+
+-- find_field: offset (0-based) of the compared part.
+local function find_field(line: *sequence(byte)): integer
+  local t = $line
+  local size = #t - 1
+  local i = 0
+  local count: uint64 = 0
+  while count < skip_fields and i < size do
+    while i < size and field_sep(t[i + 1]) do i = i + 1 end
+    while i < size and not field_sep(t[i + 1]) do i = i + 1 end
+    count = count + 1
+  end
+  local rest = (@uint64)(size - i)
+  i = i + (@integer)(skip_chars < rest and skip_chars or rest)
+  return i
+end
+
+local function upper(c: byte): byte
+  if c >= 97 and c <= 122 then return c - 32 end
+  return c
+end
+
+local function different(a: *sequence(byte), aoff: integer, alen: integer, b: *sequence(byte), boff: integer, blen: integer): boolean
+  if check_chars < (@uint64)(alen) then alen = (@integer)(check_chars) end
+  if check_chars < (@uint64)(blen) then blen = (@integer)(check_chars) end
+  if alen ~= blen then return true end
+  local x, y = $a, $b
+  for k = 1, alen do
+    local p, q = x[aoff + k], y[boff + k]
+    if ignore_case then p = upper(p); q = upper(q) end
+    if p ~= q then return true end
+  end
+  return false
+end
+
+local function writeline(line: *sequence(byte), match: boolean, linecount: uint64)
+  local want: boolean
+  if linecount == 0 then want = output_unique
+  elseif not match then want = output_first_repeated
+  else want = output_later_repeated end
+  if not want then return end
+  if count_occurrences then util.writef('%7s ', tostring(linecount + 1)) end
+  local t = $line
+  util.writebytes(&t[1], #t)
+end
+
+local function check_file(infile: string, outfile: string, delimiter: byte)
+  local r: Reader
+  r.fd = 0
+  if infile ~= '-' then
+    local fd = sys.open(infile, sys.O_RDONLY, 0)
+    if fd < 0 then die(util.quotef(infile) .. ': ' .. sys.errstr()) end
+    r.fd = fd
+  end
+  if outfile ~= '-' then
+    local fd = sys.open(outfile, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
+    if fd < 0 then die(util.quotef(outfile) .. ': ' .. sys.errstr()) end
+    util.flush()
+    sys.dup2(fd, 1)
+    sys.close(fd)
+  end
+  local lb1: sequence(byte)
+  local lb2: sequence(byte)
+  local thisline = &lb1
+  local prevline = &lb2
+  if output_unique and output_first_repeated and not count_occurrences then
+    local have_prev = false
+    local prevoff, prevlen = 0, 0
+    local first_group_printed = false
+    while not r.eof or r.pos < r.len do
+      if not readline(&r, thisline, delimiter) then break end
+      local thisoff = find_field(thisline)
+      local thislen = #$thisline - 1 - thisoff
+      local new_group = not have_prev or different(thisline, thisoff, thislen, prevline, prevoff, prevlen)
+      if new_group and grouping ~= GM_NONE and (grouping == GM_PREPEND or grouping == GM_BOTH
+         or (first_group_printed and (grouping == GM_APPEND or grouping == GM_SEPARATE))) then
+        util.writebyte(delimiter)
+      end
+      if new_group or grouping ~= GM_NONE then
+        local t = $thisline
+        util.writebytes(&t[1], #t)
+        local tmp = prevline; prevline = thisline; thisline = tmp
+        prevoff = thisoff; prevlen = thislen
+        have_prev = true
+        first_group_printed = true
+      end
+    end
+    if (grouping == GM_BOTH or grouping == GM_APPEND) and first_group_printed then util.writebyte(delimiter) end
+  else
+    if readline(&r, prevline, delimiter) then
+      local prevoff = find_field(prevline)
+      local prevlen = #$prevline - 1 - prevoff
+      local match_count: uint64 = 0
+      local first_delimiter = true
+      while true do
+        if not readline(&r, thisline, delimiter) then break end
+        local thisoff = find_field(thisline)
+        local thislen = #$thisline - 1 - thisoff
+        local match = not different(thisline, thisoff, thislen, prevline, prevoff, prevlen)
+        if match then match_count = match_count + 1 end
+        if delimit_groups ~= DM_NONE then
+          if not match then
+            if match_count ~= 0 then first_delimiter = false end
+          elseif match_count == 1 then
+            if delimit_groups == DM_PREPEND or (delimit_groups == DM_SEPARATE and not first_delimiter) then
+              util.writebyte(delimiter)
+            end
+          end
+        end
+        if not match or output_later_repeated then
+          writeline(prevline, match, match_count)
+          local tmp = prevline; prevline = thisline; thisline = tmp
+          prevoff = thisoff; prevlen = thislen
+          if not match then match_count = 0 end
+        end
+      end
+      writeline(prevline, false, match_count)
+    end
+  end
+  if r.err ~= 0 then die('error reading ' .. util.quoteaf(infile)) end
+  if r.fd ~= 0 then sys.close(r.fd) end
+  lb1:destroy(); lb2:destroy()
+end
+
+-- xstrtoumax(opt, NULL, 10, &size, ""): OK or overflow (saturated).
+local function size_opt(opt: string, msg: string): uint64
+  local p = 1
+  while p <= #opt and (opt:byte(p) == 32 or (opt:byte(p) >= 9 and opt:byte(p) <= 13)) do p = p + 1 end
+  if p <= #opt and opt:byte(p) == 45 then die(opt .. ': ' .. msg) end
+  if p <= #opt and opt:byte(p) == 43 then p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while p <= #opt and opt:byte(p) >= 48 and opt:byte(p) <= 57 do
+    local d: uint64 = opt:byte(p) - 48
+    if v > (SIZE_MAX - d) // 10 then ovf = true end
+    if not ovf then v = v * 10 + d end
+    p = p + 1
+  end
+  if p == start or p <= #opt then die(opt .. ': ' .. msg) end
+  return ovf and SIZE_MAX or v
+end
+
+-- XARGMATCH: exact or unique-prefix match; -1 after reporting.
+local function argmatch(opt: string, arg: string, names: *[0]string, n: integer): integer
+  local found = -1
+  local ambiguous = false
+  for k = 0, < n do
+    if names[k] == arg then return k end
+    if #arg <= #names[k] and names[k]:sub(1, #arg) == arg then
+      if found < 0 then found = k else ambiguous = true end
+    end
+  end
+  if found >= 0 and not ambiguous then return found end
+  util.err((ambiguous and 'ambiguous' or 'invalid') .. " argument " .. util.quote(arg) .. " for '" .. opt .. "'")
+  util.flush()
+  local sb: stringbuilder
+  sb:write('Valid arguments are:')
+  for k = 0, < n do sb:write("\n  - '", names[k], "'") end
+  sb:write("\nTry 'uniq --help' for more information.\n")
+  local m = sb:promote()
+  sys.write(2, m.data, m.size)
+  return -1
+end
+
+local GROUP_OPTION: integer <comptime> = 200
+local uniq_longs: []util.LongOpt = {
+  {'count', 0, 99}, {'repeated', 0, 100}, {'all-repeated', 2, 68}, {'group', 2, GROUP_OPTION},
+  {'ignore-case', 0, 105}, {'unique', 0, 117}, {'skip-fields', 1, 102}, {'skip-chars', 1, 115},
+  {'check-chars', 1, 119}, {'zero-terminated', 0, 122},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
+global function applet_uniq(args: sequence(string)): integer
+  local posixly_correct = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  -- coreutils' strict_posix2: only POSIX 2001 (200112 <= version < 200809)
+  -- rejects +N; the default version (200809) accepts it
+  local strict_posix2 = false
+  do
+    local v = sys.getenv('_POSIX2_VERSION')
+    if v ~= nilptr then
+      local n, ok = util.toint((@string)(v))
+      if ok and n >= 200112 and n < 200809 then strict_posix2 = true end
+    end
+  end
+  local SFO_NONE, SFO_OBSOLETE, SFO_NEW = 0, 1, 2
+  local skip_type = SFO_NONE
+  local nfiles = 0
+  local files: [2]string = {'-', '-'}
+  local delimiter: byte = 10
+  local output_option_used = false
+  skip_chars = 0; skip_fields = 0; check_chars = SIZE_MAX
+  output_unique = true; output_first_repeated = true; output_later_repeated = false
+  count_occurrences = false; ignore_case = false
+  delimit_groups = DM_NONE; grouping = GM_NONE
+  local g = util.getopt(args, '-0123456789Dcdf:is:uw:z', &uniq_longs, #uniq_longs)
+  g.quiet = true
+  local getopt_done = false
+  while true do
+    local optc: integer = -1
+    if not getopt_done and not (posixly_correct and nfiles ~= 0) then
+      optc = g:next()
+      if optc == -1 then getopt_done = true end
+    end
+    if optc == -1 then
+      -- an operand after "--" (or any operand once POSIXLY_CORRECT has
+      -- seen a file) is taken as it is
+      if g.optind > #g.args then break end
+      local a = g.args[g.optind]
+      g.optind = g.optind + 1
+      if nfiles == 2 then return usage_fail('extra operand ' .. util.quote(a)) end
+      files[nfiles] = a
+      nfiles = nfiles + 1
+      continue
+    end
+    if optc == 63 then return usage_fail(g.errmsg) end
+    if optc == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if optc == 1 then
+      local a = g.optarg
+      local size: uint64 = 0
+      local plus_ok = false
+      if #a > 0 and a:byte(1) == 43 and not strict_posix2 then
+        local v = a:sub(2)
+        local okd = #v > 0
+        for k = 1, #v do if v:byte(k) < 48 or v:byte(k) > 57 then okd = false end end
+        if okd then size = size_opt(a, ''); plus_ok = true end
+      end
+      if plus_ok then skip_chars = size
+      elseif nfiles == 2 then return usage_fail('extra operand ' .. util.quote(a))
+      else files[nfiles] = a; nfiles = nfiles + 1 end
+    elseif optc >= 48 and optc <= 57 then
+      if skip_type == SFO_NEW then skip_fields = 0 end
+      local d: uint64 = optc - 48
+      if skip_fields > (SIZE_MAX - d) // 10 then skip_fields = SIZE_MAX else skip_fields = skip_fields * 10 + d end
+      skip_type = SFO_OBSOLETE
+    elseif optc == 99 then count_occurrences = true; output_option_used = true
+    elseif optc == 100 then output_unique = false; output_option_used = true
+    elseif optc == 68 then
+      output_unique = false
+      output_later_repeated = true
+      if not g.has_optarg then delimit_groups = DM_NONE
+      else
+        local names: []string = {'none', 'prepend', 'separate'}
+        local k = argmatch("--all-repeated", g.optarg, &names, 3)
+        if k < 0 then return 1 end
+        delimit_groups = k
+      end
+      output_option_used = true
+    elseif optc == GROUP_OPTION then
+      if not g.has_optarg then grouping = GM_SEPARATE
+      else
+        local names: []string = {'prepend', 'append', 'separate', 'both'}
+        local k = argmatch("--group", g.optarg, &names, 4)
+        if k < 0 then return 1 end
+        grouping = k + 1
+      end
+    elseif optc == 102 then
+      skip_type = SFO_NEW
+      skip_fields = size_opt(g.optarg, 'invalid number of fields to skip')
+    elseif optc == 105 then ignore_case = true
+    elseif optc == 115 then skip_chars = size_opt(g.optarg, 'invalid number of bytes to skip')
+    elseif optc == 117 then output_first_repeated = false; output_option_used = true
+    elseif optc == 119 then check_chars = size_opt(g.optarg, 'invalid number of bytes to compare')
+    elseif optc == 122 then delimiter = 0 end
+  end
+  if grouping ~= GM_NONE and output_option_used then return usage_fail('--group is mutually exclusive with -c/-d/-D/-u') end
+  if grouping ~= GM_NONE and count_occurrences then return usage_fail('grouping and printing repeat counts is meaningless') end
+  if count_occurrences and output_later_repeated then
+    return usage_fail('printing all duplicated lines and repeat counts is meaningless')
+  end
+  check_file(files[0], files[1], delimiter)
+  util.flush()
+  return 0
+end

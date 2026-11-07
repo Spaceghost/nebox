@@ -81,6 +81,11 @@ Stated here rather than worked around:
   -d -s -t`, string2 padding, `[:upper:]`/`[:lower:]` alignment and every
   validation message. `tests/tr_compare.py`: 6116 random specs against GNU,
   0 mismatches.
+- `cut` ports cut.c and set-fields.c (-b -c -f -d -s -n -z, --complement,
+  --output-delimiter, GNU's list syntax and messages, `-d $'\n'`); `uniq`
+  ports uniq.c (-c -d -D[=METHOD] -u -i -f -s -w -z, --group[=METHOD], the
+  obsolete -N and +N forms, the OUTPUT operand). `tests/cutuniq_compare.py`:
+  3045 random cases against GNU, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows

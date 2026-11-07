@@ -81,24 +81,7 @@ local function is_char_class_member(cls: integer, c: integer): boolean
   else return isdigit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102) end
 end
 
--- quote() in the C locale (locale_quoting_style).
-local function quote(s: string): string
-  local sb: stringbuilder
-  sb:writebyte(39)
-  for i = 1, #s do
-    local c = s:byte(i)
-    if c == 92 then sb:write('\\\\')
-    elseif c == 39 then sb:write("\\'")
-    elseif c == 7 then sb:write('\\a') elseif c == 8 then sb:write('\\b')
-    elseif c == 12 then sb:write('\\f') elseif c == 10 then sb:write('\\n')
-    elseif c == 13 then sb:write('\\r') elseif c == 9 then sb:write('\\t')
-    elseif c == 11 then sb:write('\\v')
-    elseif not isprint(c) then sb:writef('\\%03o', c)
-    else sb:writebyte(c) end
-  end
-  sb:writebyte(39)
-  return sb:promote()
-end
+local function quote(s: string): string return util.quote(s) end
 
 local function make_printable_char(c: byte): string
   if isprint(c) then return string.char(c) end
