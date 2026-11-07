@@ -856,6 +856,11 @@ same diff-N 'diff -N nosuch words.txt | head -1; echo $?'
 same diff-dir 'cp words.txt sub/; diff words.txt sub; echo $?'
 same diff-long 'seq 1000 > a; seq 1000 | sed "500s/.*/X/;700d;900a Y" > b; diff a b'
 same diff-all-diff 'seq 3 > a; seq 4 6 > b; diff a b'
+# date -d: gnulib parse-datetime's grammar, against GNU date 9.1 (fixed bases only)
+same date-d-abs "export TZ=America/New_York; for d in 2026-01-31 '2026-07-04 12:34:56' 2026-07-04T12:34:56 2026-07-04T12:34:56Z '2026-07-04 12:34:56.5 +0200' '2026-07-04 12:34 -05:30' '2026-07-04 12:34 UTC' 07/04/2026 7/4/26 '2026-07-04 3:04 pm' '2026-07-04 12:00 am' @0 @1767323045.25 @-1.5; do date -d \"\$d\" '+%F %T.%N %z'; done"
+same date-d-rel "export TZ=America/New_York; for d in '2026-01-31 +1 month' '2026-01-31 1 month ago' '2024-02-29 +1 year' '2026-07-04 +2 weeks' '2026-07-04 next day' '2026-07-04 last month' '2026-07-04 +1 fortnight' '2026-07-04 3 days ago' '2026-07-04 yesterday' '2026-07-04 tomorrow 10:00' '2026-11-07 13:00 14 days ago' '2026-03-08 12:00 1 day'; do date -d \"\$d\" '+%F %T %z'; done"
+same date-d-zone-quirk "export TZ=America/New_York; date -d '2026-03-08 01:30 +1 hour' '+%F %T %z'; date -d '2026-03-08 12:00 -1 day' '+%F %T %z'; date -d '2026-07-04 10:00 +90 minutes' 2>/dev/null; echo \$?"
+same date-d-invalid "for d in bogus 2026-13-01 2026-02-30 25:00 noon '2026-07-04 13:00 pm'; do date -d \"\$d\" 2>/dev/null; echo \$?; done"
 # local time: date, stat, ls -l, diff -u and touch against GNU with explicit TZ
 # values (zone files, POSIX TZ strings, odd names) and fixed instants
 same date-tz-zones 'for z in UTC Japan EST5EDT EST5 "<+0530>-5:30" :Asia/Kolkata Asia/Kolkata "" XYZ JST-9 Europe/Dublin Australia/Lord_Howe America/St_Johns Etc/GMT+5 "NZST-12NZDT,M9.5.0,M4.1.0/3" America "<+05>-5" "EST+5EDT,M3.2.0/2,M11.1.0/2" XYZ-3:30 Factory GMT0 :UTC; do for t in 0 1700000000; do TZ=$z date -d @$t "+[$z] %F %T %z %:z %::z %:::z %Z %s"; done; done'

@@ -7,6 +7,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.getdate'
 require 'nebox.clock'
 
 global function applet_true(args: sequence(string)): integer
@@ -296,10 +297,11 @@ global function applet_date(args: sequence(string)): integer
     t = st.st_mtim.tv_sec; ns = st.st_mtim.tv_nsec
   elseif o:has('d') then
     local d = o:get('d')
-    local v, ok = util.toint(d)
-    if d.size > 0 and d:byte(1) == 64 then v, ok = util.toint(d:sub(2)) end
-    if not ok then return util.die("invalid date '" .. d .. "' (only @SECONDS is understood)") end
-    t = v
+    local ts: sys.Timespec
+    sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
+    local v, vns, ok = util.getdate(d, ts.tv_sec, ts.tv_nsec)
+    if not ok then return util.die("invalid date '" .. d .. "'") end
+    t = v; ns = vns
   else
     local ts: sys.Timespec
     sys.clock_gettime(sys.CLOCK_REALTIME, &ts)

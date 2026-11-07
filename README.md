@@ -284,8 +284,18 @@ Stated here rather than worked around:
 - `date` formats with GNU's nstrftime rules in the C locale: every
   conversion, the `_ - 0 + ^ #` flags, widths, `E`/`O`, `%N` (and `%-N`),
   `%q`, `%P`, `%s`, `%:z %::z %:::z` (`date-fmt-*`). `-u`, `-R`, `-r FILE`;
-  `-d` understands only `@SECONDS`. No `-I`, `--rfc-3339`, `-f`, long
-  options, or setting the date.
+  `-d` reads a subset of gnulib's parse-datetime (`src/nebox/getdate.nelua`):
+  `@SECONDS[.FRAC]`, `YYYY-MM-DD`, `MM/DD[/YY[YY]]`, `HH:MM[:SS[.FRAC]]`
+  with `am`/`pm`, the ISO `T` form, zones `Z`/`UTC`/`UT`/`GMT`/`+HH[:MM]`
+  (a signed number right after a time is its zone, as in GNU, so
+  `01:30 +1 hour` means UTC+1 plus one hour), `now`/`today`/`yesterday`/
+  `tomorrow`, weekdays with `next`/`last`/`this`, and relative
+  `[+-]N unit [ago]` for years, months, fortnights, weeks, days, hours,
+  minutes and seconds, applied in parse-datetime's order (calendar units on
+  the broken-down time, then seconds; relative-only strings keep the current
+  DST flag). Against GNU date 9.1 (`date-d-*`). Not understood: month names,
+  ordinal words, `week` numbers, named zones other than UTC/GMT, `DST`. No
+  `-I`, `--rfc-3339`, `-f`, long options, or setting the date.
 - `ls` follows GNU ls 9.1 in the C locale with the options
   `-1 -a -A -B -c -C -d -F -g -G -h -i -I PATTERN -k -l -m -n -N -o -p -q
   -r -R -s -S -t -T COLS -u -v -w COLS -x -X`, permuted as getopt does:
