@@ -7,6 +7,10 @@ ZIG ?= zig
 ZIGFLAGS ?= -mcpu=x86_64
 NELIBC ?= ../nelibc
 NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-zig.a
+# Nelua's binary cache keys on the generated C and the command line, not on
+# the archive given in --ldflags: the archive's checksum goes into the C
+# flags so that a rebuilt nelibc is linked instead of a cached binary.
+NELIBC_STAMP = $(shell sha256sum $(NELIBC_LIB) 2>/dev/null | cut -c1-16)
 OUT ?= build
 NM ?= nm
 
@@ -14,7 +18,8 @@ SOURCES := src/nebox.nelua $(wildcard src/nebox/*.nelua) $(wildcard src/nebox/ap
 
 CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-protector \
   -ffreestanding -fno-builtin -fno-sanitize=all -Wl,-e,_start -Wl,--build-id=none \
-  -I$(NELIBC)/include
+  -I$(NELIBC)/include \
+  -DNEBOX_NELIBC_STAMP=$(NELIBC_STAMP)
 LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive -Wl,--strip-all
 
 .PHONY: all nebox test clean
