@@ -43,7 +43,7 @@ stdout, exit status, and the resulting directory tree.
 ```
 [ awk base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df
 dirname du echo env expand expr factor false find fold free grep groups head
-hexdump hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc nsh
+hexdump hostname id install join kill link ln ls md5sum mkdir mktemp mv nl nproc nsh
 od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
 sha256sum shuf sleep sort split stat strings sync tac tail tee test timeout
 touch tr true truncate tsort tty unexpand uname uniq unlink wc which whoami
@@ -212,6 +212,15 @@ Stated here rather than worked around:
   (only the timing part of the statistics is masked); SIGUSR1, SIGINT and
   progress output were compared by hand. `--help` is shorter than GNU's;
   the rate uses double rather than long double arithmetic.
+- `join` is a port of GNU coreutils 9.1 `src/join.c` in the C locale: byte
+  comparison (`-i` folds ASCII), blank-run or single-character (`-t`, `-t ''`,
+  `-t '\0'`) fields with GNU's empty trailing field, `-a -v -e -o` (with
+  `-o auto` and the obsolete `-j1 ARG` and `-o` list continuation operand
+  rules), `-1 -2 -j`, `--header`, `-z`, the order checks and GNU's
+  diagnostics. Long options go through `util.getopt`, a port of glibc's
+  `getopt_long` (abbreviations, ambiguity and argument errors, the three
+  operand orderings). `tests/join_compare.py` runs 96 fixed and random cases
+  against GNU join: 1596 cases, 0 mismatches.
 - `diff` follows GNU diffutils 3.8's algorithm step by step (`find_identical_ends`
   on bytes with horizon lines, `discard_confusing_lines`, the middle-snake
   `compareseq` with its cost cut-off, `shift_boundaries`), so its edit

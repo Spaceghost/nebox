@@ -1,0 +1,612 @@
+-- join: a port of GNU coreutils 9.1 src/join.c in the C locale (byte
+-- comparison; -i folds ASCII). Field splitting (blank runs, or exactly one
+-- -t character, or whole lines with -t ''), -a/-v/-e/-o (including
+-- "-o auto" and the obsolete "-j1 ARG"/-o list continuation rules), -1/-2/-j,
+-- --header, -z, the order checks (--check-order, --nocheck-order, and the
+-- default warning once unpairable lines are seen) and GNU's diagnostics.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'allocators.default'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local SIZE_MAX: uint64 <comptime> = 0xffffffffffffffff
+
+local Field = @record{beg: integer, len: integer}
+local Line = @record{buf: sequence(byte), fields: sequence(Field)}
+local Seq = @record{count: integer, lines: sequence(*Line)}
+
+local Reader = @record{fd: cint, buf: [65536]byte, pos: integer, len: integer, eof: boolean}
+
+-- State (reset by applet_join).
+local prevline: [2]*Line
+local spareline: [2]*Line
+local line_no: [2]uint64
+local g_names: [2]string
+local print_unpairables_1: boolean
+local print_unpairables_2: boolean
+local print_pairables: boolean
+local seen_unpairable: boolean
+local issued_disorder_warning: [2]boolean
+local empty_filler: string
+local have_filler: boolean
+local autoformat: boolean
+local autocount_1: uint64
+local autocount_2: uint64
+local join_field_1: uint64
+local join_field_2: uint64
+local out_file: sequence(integer)
+local out_field: sequence(uint64)
+local tab: integer
+local CHECK_DEFAULT: integer <comptime> = 0
+local CHECK_ENABLED: integer <comptime> = 1
+local CHECK_DISABLED: integer <comptime> = 2
+local check_input_order: integer
+local uni_blank: Line
+local ignore_case: boolean
+local join_header_lines: boolean
+local eolchar: byte
+
+local function die(msg: string, errnum: cint)
+  if errnum ~= 0 then util.err(msg .. ': ' .. sys.strerror(errnum)) else util.err(msg) end
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail()
+  util.flush()
+  local m = "Try 'join --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+-- readlinebuffer_delim: the line with its delimiter (one is supplied at EOF).
+local function readline(r: *Reader, line: *Line): boolean
+  line.buf:clear()
+  while true do
+    if r.pos >= r.len then
+      if r.eof then break end
+      local n: clong
+      repeat n = sys.read(r.fd, &r.buf[0], #r.buf) until not (n < 0 and sys.errno() == sys.EINTR)
+      if n < 0 then die('read error', sys.errno()) end
+      if n == 0 then r.eof = true; break end
+      r.pos = 0; r.len = n
+    end
+    local c = r.buf[r.pos]
+    r.pos = r.pos + 1
+    line.buf:push(c)
+    if c == eolchar then return true end
+  end
+  if #line.buf == 0 then return false end
+  line.buf:push(eolchar)
+  return true
+end
+
+local function field_sep(c: byte): boolean
+  return c == 32 or c == 9 or c == 10
+end
+
+local function extract_field(line: *Line, beg: integer, len: integer)
+  line.fields:push({beg = beg, len = len})
+end
+
+-- Offsets are 1-based positions in line.buf; lim is the delimiter's index.
+local function xfields(line: *Line)
+  local ptr: integer = 1
+  local lim: integer = #line.buf
+  if ptr == lim then return end
+  if 0 <= tab and tab ~= 10 then
+    local sep = ptr
+    while sep < lim do
+      if line.buf[sep] == (@byte)(tab) then
+        extract_field(line, ptr, sep - ptr)
+        ptr = sep + 1
+      end
+      sep = sep + 1
+    end
+  elseif tab < 0 then
+    while field_sep(line.buf[ptr]) do
+      ptr = ptr + 1
+      if ptr == lim then return end
+    end
+    repeat
+      local sep = ptr + 1
+      while sep ~= lim and not field_sep(line.buf[sep]) do sep = sep + 1 end
+      extract_field(line, ptr, sep - ptr)
+      if sep == lim then return end
+      ptr = sep + 1
+      while ptr ~= lim and field_sep(line.buf[ptr]) do ptr = ptr + 1 end
+    until ptr == lim
+  end
+  extract_field(line, ptr, lim - ptr)
+end
+
+local function upper(c: byte): byte
+  if c >= 97 and c <= 122 then return c - 32 end
+  return c
+end
+
+local function keycmp(line1: *Line, line2: *Line, jf_1: uint64, jf_2: uint64): integer
+  local beg1, len1, beg2, len2: integer = 0, 0, 0, 0
+  if jf_1 < (@uint64)(#line1.fields) then
+    local f = line1.fields[(@integer)(jf_1) + 1]; beg1 = f.beg; len1 = f.len
+  end
+  if jf_2 < (@uint64)(#line2.fields) then
+    local f = line2.fields[(@integer)(jf_2) + 1]; beg2 = f.beg; len2 = f.len
+  end
+  if len1 == 0 then return len2 == 0 and 0 or -1 end
+  if len2 == 0 then return 1 end
+  local n = len1 < len2 and len1 or len2
+  for i = 0, < n do
+    local a, b = line1.buf[beg1 + i], line2.buf[beg2 + i]
+    if ignore_case then a = upper(a); b = upper(b) end
+    if a ~= b then return (@integer)(a) - (@integer)(b) end
+  end
+  if len1 < len2 then return -1 end
+  return len1 ~= len2 and 1 or 0
+end
+
+local function check_order(prev: *Line, current: *Line, whatfile: integer)
+  if check_input_order ~= CHECK_DISABLED and (check_input_order == CHECK_ENABLED or seen_unpairable) then
+    if not issued_disorder_warning[whatfile - 1] then
+      local jf = whatfile == 1 and join_field_1 or join_field_2
+      if keycmp(prev, current, jf, jf) > 0 then
+        local len = #current.buf
+        if 0 < len and current.buf[len] == 10 then len = len - 1 end
+        local sb: stringbuilder
+        sb:writef('%s:%d: is not sorted: ', g_names[whatfile - 1], line_no[whatfile - 1])
+        for i = 1, len do
+          if current.buf[i] == 0 then break end
+          sb:writebyte(current.buf[i])
+        end
+        util.err(sb:promote())
+        if check_input_order == CHECK_ENABLED then util.flush(); c_exit(1) end
+        issued_disorder_warning[whatfile - 1] = true
+      end
+    end
+  end
+end
+
+local function get_line(r: *Reader, linep: **Line, which: integer): boolean
+  local line = $linep
+  if line ~= nilptr and line == prevline[which - 1] then
+    local tmp = line; line = spareline[which - 1]; spareline[which - 1] = tmp
+    $linep = line
+  end
+  if line == nilptr then
+    line = default_allocator:new(@Line)
+    $linep = line
+  end
+  line.fields:clear()
+  if not readline(r, line) then return false end
+  line_no[which - 1] = line_no[which - 1] + 1
+  xfields(line)
+  if prevline[which - 1] ~= nilptr then check_order(prevline[which - 1], line, which) end
+  prevline[which - 1] = line
+  return true
+end
+
+local function getseq(r: *Reader, seq: *Seq, whichfile: integer): boolean
+  if seq.count == #seq.lines then seq.lines:push(nilptr) end
+  local slot: *Line = seq.lines[seq.count + 1]
+  local ok = get_line(r, &slot, whichfile)
+  seq.lines[seq.count + 1] = slot
+  if ok then seq.count = seq.count + 1; return true end
+  return false
+end
+
+local function advance_seq(r: *Reader, seq: *Seq, first: boolean, whichfile: integer): boolean
+  if first then seq.count = 0 end
+  return getseq(r, seq, whichfile)
+end
+
+local function prfield(n: uint64, line: *Line)
+  if n < (@uint64)(#line.fields) then
+    local f = line.fields[(@integer)(n) + 1]
+    if f.len ~= 0 then
+      util.writebytes((@*[0]byte)(&line.buf[f.beg]), (@usize)(f.len))
+    elseif have_filler then util.write(empty_filler) end
+  elseif have_filler then
+    util.write(empty_filler)
+  end
+end
+
+local function output_separator(): byte
+  return tab < 0 and 32 or (@byte)(tab)
+end
+
+local function prfields(line: *Line, join_field: uint64, autocount: uint64)
+  local nfields: uint64 = autoformat and autocount or (@uint64)(#line.fields)
+  local sep = output_separator()
+  local i: uint64 = 0
+  while i < join_field and i < nfields do
+    util.writebyte(sep); prfield(i, line)
+    i = i + 1
+  end
+  i = join_field + 1
+  while i < nfields and i ~= 0 do
+    util.writebyte(sep); prfield(i, line)
+    i = i + 1
+  end
+end
+
+local function prjoin(line1: *Line, line2: *Line)
+  local sep = output_separator()
+  if #out_file > 0 then
+    for k = 1, #out_file do
+      local line: *Line
+      local field: uint64
+      if out_file[k] == 0 then
+        if line1 == &uni_blank then line = line2; field = join_field_2
+        else line = line1; field = join_field_1 end
+      else
+        line = out_file[k] == 1 and line1 or line2
+        field = out_field[k]
+      end
+      prfield(field, line)
+      if k < #out_file then util.writebyte(sep) end
+    end
+    util.writebyte(eolchar)
+  else
+    local line: *Line
+    local field: uint64
+    if line1 == &uni_blank then line = line2; field = join_field_2
+    else line = line1; field = join_field_1 end
+    prfield(field, line)
+    prfields(line1, join_field_1, autocount_1)
+    prfields(line2, join_field_2, autocount_2)
+    util.writebyte(eolchar)
+  end
+end
+
+local function swap(seq: *Seq, i: integer, j: integer)
+  local t = seq.lines[i]; seq.lines[i] = seq.lines[j]; seq.lines[j] = t
+end
+
+local function join(fp1: *Reader, fp2: *Reader)
+  local seq1: Seq
+  local seq2: Seq
+  getseq(fp1, &seq1, 1)
+  getseq(fp2, &seq2, 2)
+  if autoformat then
+    autocount_1 = seq1.count > 0 and (@uint64)(#seq1.lines[1].fields) or 0
+    autocount_2 = seq2.count > 0 and (@uint64)(#seq2.lines[1].fields) or 0
+  end
+  if join_header_lines and (seq1.count > 0 or seq2.count > 0) then
+    local h1: *Line = seq1.count > 0 and seq1.lines[1] or &uni_blank
+    local h2: *Line = seq2.count > 0 and seq2.lines[1] or &uni_blank
+    prjoin(h1, h2)
+    prevline[0] = nilptr; prevline[1] = nilptr
+    if seq1.count > 0 then advance_seq(fp1, &seq1, true, 1) end
+    if seq2.count > 0 then advance_seq(fp2, &seq2, true, 2) end
+  end
+  while seq1.count > 0 and seq2.count > 0 do
+    local diff = keycmp(seq1.lines[1], seq2.lines[1], join_field_1, join_field_2)
+    if diff < 0 then
+      if print_unpairables_1 then prjoin(seq1.lines[1], &uni_blank) end
+      advance_seq(fp1, &seq1, true, 1)
+      seen_unpairable = true
+      continue
+    end
+    if diff > 0 then
+      if print_unpairables_2 then prjoin(&uni_blank, seq2.lines[1]) end
+      advance_seq(fp2, &seq2, true, 2)
+      seen_unpairable = true
+      continue
+    end
+    local eof1 = false
+    repeat
+      if not advance_seq(fp1, &seq1, false, 1) then
+        eof1 = true
+        seq1.count = seq1.count + 1
+        break
+      end
+    until keycmp(seq1.lines[seq1.count], seq2.lines[1], join_field_1, join_field_2) ~= 0
+    local eof2 = false
+    repeat
+      if not advance_seq(fp2, &seq2, false, 2) then
+        eof2 = true
+        seq2.count = seq2.count + 1
+        break
+      end
+    until keycmp(seq1.lines[1], seq2.lines[seq2.count], join_field_1, join_field_2) ~= 0
+    if print_pairables then
+      for i = 1, seq1.count - 1 do
+        for j = 1, seq2.count - 1 do prjoin(seq1.lines[i], seq2.lines[j]) end
+      end
+    end
+    if not eof1 then swap(&seq1, 1, seq1.count); seq1.count = 1 else seq1.count = 0 end
+    if not eof2 then swap(&seq2, 1, seq2.count); seq2.count = 1 else seq2.count = 0 end
+  end
+  local line: *Line = nilptr
+  local checktail = check_input_order ~= CHECK_DISABLED
+    and not (issued_disorder_warning[0] and issued_disorder_warning[1])
+  if (print_unpairables_1 or checktail) and seq1.count > 0 then
+    if print_unpairables_1 then prjoin(seq1.lines[1], &uni_blank) end
+    if seq2.count > 0 then seen_unpairable = true end
+    while get_line(fp1, &line, 1) do
+      if print_unpairables_1 then prjoin(line, &uni_blank) end
+      if issued_disorder_warning[0] and not print_unpairables_1 then break end
+    end
+  end
+  if (print_unpairables_2 or checktail) and seq2.count > 0 then
+    if print_unpairables_2 then prjoin(&uni_blank, seq2.lines[1]) end
+    if seq1.count > 0 then seen_unpairable = true end
+    while get_line(fp2, &line, 2) do
+      if print_unpairables_2 then prjoin(&uni_blank, line) end
+      if issued_disorder_warning[1] and not print_unpairables_2 then break end
+    end
+  end
+end
+
+-- xstrtoumax(str, NULL, 10, &val, ""): (ok, overflow, value).
+local function strtou(s: string): (boolean, boolean, uint64)
+  local p = 1
+  while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
+  if p <= #s and s:byte(p) == 45 then return false, false, 0 end
+  if p <= #s and s:byte(p) == 43 then p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while p <= #s and s:byte(p) >= 48 and s:byte(p) <= 57 do
+    local d: uint64 = s:byte(p) - 48
+    if not ovf then
+      if v > (SIZE_MAX - d) // 10 then ovf = true; v = SIZE_MAX else v = v * 10 + d end
+    end
+    p = p + 1
+  end
+  if p == start then return false, false, 0 end
+  if p <= #s then return false, false, v end
+  return true, ovf, v
+end
+
+local function string_to_join_field(str: string): uint64
+  local ok, ovf, val = strtou(str)
+  if ok and ovf then val = SIZE_MAX
+  elseif not ok or val == 0 then die("invalid field number: '" .. str .. "'", 0) end
+  return val - 1
+end
+
+local function decode_field_spec(s: string): (integer, uint64)
+  local c: byte = #s > 0 and s:byte(1) or 0
+  if c == 48 then
+    if #s > 1 then die("invalid field specifier: '" .. s .. "'", 0) end
+    return 0, 0
+  elseif c == 49 or c == 50 then
+    if #s < 2 or s:byte(2) ~= 46 then die("invalid field specifier: '" .. s .. "'", 0) end
+    return c - 48, string_to_join_field(s:sub(3))
+  end
+  die("invalid file number in field spec: '" .. s .. "'", 0)
+  return 0, 0
+end
+
+local function add_field_list(str: string)
+  local p = 1
+  while true do
+    local q = p
+    while q <= #str and str:byte(q) ~= 44 and str:byte(q) ~= 32 and str:byte(q) ~= 9 do q = q + 1 end
+    local f, n = decode_field_spec(str:sub(p, q - 1))
+    out_file:push(f); out_field:push(n)
+    if q > #str then break end
+    p = q + 1
+  end
+end
+
+local function set_join_field(var: *uint64, val: uint64)
+  if $var ~= SIZE_MAX and $var ~= val then
+    die(string.format('incompatible join fields %s, %s', tostring($var + 1), tostring(val + 1)), 0)
+  end
+  $var = val
+end
+
+local MUST_BE_OPERAND: integer <comptime> = 0
+local MIGHT_BE_J1_ARG: integer <comptime> = 1
+local MIGHT_BE_J2_ARG: integer <comptime> = 2
+local MIGHT_BE_O_ARG: integer <comptime> = 3
+
+local nfiles: integer
+local operand_status: [2]integer
+local joption_count: [2]integer
+
+local function add_file_name(name: string, prev_optc_status: *integer, optc_status: *integer)
+  local n = nfiles
+  if n == 2 then
+    local op0: integer = operand_status[0] == MUST_BE_OPERAND and 1 or 0
+    local arg = g_names[op0]
+    local st = operand_status[op0]
+    if st == MUST_BE_OPERAND then
+      util.err('extra operand ' .. util.quoteaf(name))
+      usage_fail()
+    elseif st == MIGHT_BE_J1_ARG then
+      joption_count[0] = joption_count[0] - 1
+      set_join_field(&join_field_1, string_to_join_field(arg))
+    elseif st == MIGHT_BE_J2_ARG then
+      joption_count[1] = joption_count[1] - 1
+      set_join_field(&join_field_2, string_to_join_field(arg))
+    else
+      add_field_list(arg)
+    end
+    if op0 == 0 then
+      operand_status[0] = operand_status[1]
+      g_names[0] = g_names[1]
+    end
+    n = 1
+  end
+  operand_status[n] = $prev_optc_status
+  g_names[n] = name
+  nfiles = n + 1
+  if $prev_optc_status == MIGHT_BE_O_ARG then $optc_status = MIGHT_BE_O_ARG end
+end
+
+local function usage()
+  util.write([[
+Usage: join [OPTION]... FILE1 FILE2
+For each pair of input lines with identical join fields, write a line to
+standard output.  The default join field is the first, delimited by blanks.
+
+When FILE1 or FILE2 (not both) is -, read standard input.
+
+  -a FILENUM        also print unpairable lines from file FILENUM, where
+                      FILENUM is 1 or 2, corresponding to FILE1 or FILE2
+  -e STRING         replace missing (empty) input fields with STRING;
+                      I.e., missing fields specified with '-12jo' options
+  -i, --ignore-case  ignore differences in case when comparing fields
+  -j FIELD          equivalent to '-1 FIELD -2 FIELD'
+  -o FORMAT         obey FORMAT while constructing output line
+  -t CHAR           use CHAR as input and output field separator
+  -v FILENUM        like -a FILENUM, but suppress joined output lines
+  -1 FIELD          join on this FIELD of file 1
+  -2 FIELD          join on this FIELD of file 2
+      --check-order   check that the input is correctly sorted, even
+                      if all input lines are pairable
+      --nocheck-order  do not check that the input is correctly sorted
+      --header          treat the first line in each file as field headers,
+                          print them without trying to pair them
+  -z, --zero-terminated     line delimiter is NUL, not newline
+      --help        display this help and exit
+      --version     output version information and exit
+
+Unless -t CHAR is given, leading blanks separate fields and are ignored,
+else fields are separated by CHAR.  Any FIELD is a field number counted
+from 1.  FORMAT is one or more comma or blank separated specifications,
+each being 'FILENUM.FIELD' or '0'.  Default FORMAT outputs the join field,
+the remaining fields from FILE1, the remaining fields from FILE2, all
+separated by CHAR.  If FORMAT is the keyword 'auto', then the first
+line of each file determines the number of fields output for each line.
+
+Important: FILE1 and FILE2 must be sorted on the join fields.
+E.g., use "sort -k 1b,1" if 'join' has no options,
+or use "join -t ''" if 'sort' has no options.
+Note, comparisons honor the rules specified by 'LC_COLLATE'.
+If the input is not sorted and some lines cannot be joined, a
+warning message will be given.
+]])
+end
+
+local CHECK_ORDER_OPTION: integer <comptime> = 128
+local NOCHECK_ORDER_OPTION: integer <comptime> = 129
+local HEADER_LINE_OPTION: integer <comptime> = 130
+local HELP_OPTION: integer <comptime> = 131
+local VERSION_OPTION: integer <comptime> = 132
+
+local longopts: []util.LongOpt = {
+  {'ignore-case', 0, 105}, {'check-order', 0, CHECK_ORDER_OPTION},
+  {'nocheck-order', 0, NOCHECK_ORDER_OPTION}, {'zero-terminated', 0, 122},
+  {'header', 0, HEADER_LINE_OPTION}, {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+
+local function open_input(name: string, r: *Reader)
+  r.pos = 0; r.len = 0; r.eof = false
+  if name == '-' then r.fd = 0; return end
+  r.fd = sys.open(name, sys.O_RDONLY, 0)
+  if r.fd < 0 then die(util.quotef(name), sys.errno()) end
+end
+
+global function applet_join(args: sequence(string)): integer
+  prevline[0] = nilptr; prevline[1] = nilptr
+  spareline[0] = nilptr; spareline[1] = nilptr
+  line_no[0] = 0; line_no[1] = 0
+  print_unpairables_1 = false; print_unpairables_2 = false
+  print_pairables = true
+  seen_unpairable = false
+  issued_disorder_warning[0] = false; issued_disorder_warning[1] = false
+  have_filler = false; empty_filler = ''
+  autoformat = false; autocount_1 = 0; autocount_2 = 0
+  join_field_1 = SIZE_MAX; join_field_2 = SIZE_MAX
+  out_file:clear(); out_field:clear()
+  tab = -1
+  check_input_order = CHECK_DEFAULT
+  ignore_case = false; join_header_lines = false
+  eolchar = 10
+  nfiles = 0
+  joption_count[0] = 0; joption_count[1] = 0
+  local prev_optc_status: integer = MUST_BE_OPERAND
+  local g = util.getopt(args, '-a:e:i1:2:j:o:t:v:z', &longopts, #longopts)
+  while true do
+    local optc = g:next()
+    if optc == -1 then break end
+    local optc_status: integer = MUST_BE_OPERAND
+    if optc == 118 or optc == 97 then        -- -v / -a
+      if optc == 118 then print_pairables = false end
+      local ok, ovf, val = strtou(g.optarg)
+      if not ok or ovf or (val ~= 1 and val ~= 2) then die("invalid field number: '" .. g.optarg .. "'", 0) end
+      if val == 1 then print_unpairables_1 = true else print_unpairables_2 = true end
+    elseif optc == 101 then                  -- -e
+      if have_filler and empty_filler ~= g.optarg then die('conflicting empty-field replacement strings', 0) end
+      empty_filler = g.optarg; have_filler = true
+    elseif optc == 105 then ignore_case = true
+    elseif optc == 49 then set_join_field(&join_field_1, string_to_join_field(g.optarg))
+    elseif optc == 50 then set_join_field(&join_field_2, string_to_join_field(g.optarg))
+    elseif optc == 106 then                  -- -j
+      local a = g.optarg
+      local whole = g.args[g.optind - 1]
+      if (a == '1' or a == '2') and whole == '-j' .. a then
+        local is_j2: integer = a == '2' and 1 or 0
+        joption_count[is_j2] = joption_count[is_j2] + 1
+        optc_status = MIGHT_BE_J1_ARG + is_j2
+      else
+        set_join_field(&join_field_1, string_to_join_field(a))
+        set_join_field(&join_field_2, join_field_1)
+      end
+    elseif optc == 111 then                  -- -o
+      if g.optarg == 'auto' then autoformat = true
+      else
+        add_field_list(g.optarg)
+        optc_status = MIGHT_BE_O_ARG
+      end
+    elseif optc == 116 then                  -- -t
+      local a = g.optarg
+      local newtab: integer
+      if #a == 0 then newtab = 10
+      elseif #a > 1 then
+        if a == '\\0' then newtab = 0
+        else die("multi-character tab '" .. a .. "'", 0) end
+      else newtab = a:byte(1) end
+      if 0 <= tab and tab ~= newtab then die('incompatible tabs', 0) end
+      tab = newtab
+    elseif optc == 122 then eolchar = 0
+    elseif optc == NOCHECK_ORDER_OPTION then check_input_order = CHECK_DISABLED
+    elseif optc == CHECK_ORDER_OPTION then check_input_order = CHECK_ENABLED
+    elseif optc == 1 then add_file_name(g.optarg, &prev_optc_status, &optc_status)
+    elseif optc == HEADER_LINE_OPTION then join_header_lines = true
+    elseif optc == HELP_OPTION then usage(); util.flush(); return 0
+    elseif optc == VERSION_OPTION then util.line('join (nebox) after GNU coreutils 9.1'); util.flush(); return 0
+    else usage_fail() end
+    prev_optc_status = optc_status
+  end
+  prev_optc_status = MUST_BE_OPERAND
+  local dummy: integer = 0
+  local rest = g:operands()
+  for i = 1, #rest do add_file_name(rest[i], &prev_optc_status, &dummy) end
+  if nfiles ~= 2 then
+    if nfiles == 0 then util.err('missing operand')
+    else util.err("missing operand after '" .. args[#args] .. "'") end
+    usage_fail()
+  end
+  for i = 0, 1 do
+    if joption_count[i] ~= 0 then
+      set_join_field(&join_field_1, (@uint64)(i))
+      set_join_field(&join_field_2, (@uint64)(i))
+    end
+  end
+  if join_field_1 == SIZE_MAX then join_field_1 = 0 end
+  if join_field_2 == SIZE_MAX then join_field_2 = 0 end
+  local fp1: Reader
+  local fp2: Reader
+  open_input(g_names[0], &fp1)
+  open_input(g_names[1], &fp2)
+  if g_names[0] == '-' and g_names[1] == '-' then die('both files cannot be standard input', 0) end
+  join(&fp1, &fp2)
+  if fp1.fd ~= 0 then sys.close(fp1.fd) end
+  if fp2.fd ~= 0 then sys.close(fp2.fd) end
+  util.flush()
+  if issued_disorder_warning[0] or issued_disorder_warning[1] then
+    die('input is not in sorted order', 0)
+  end
+  return 0
+end

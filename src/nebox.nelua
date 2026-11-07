@@ -19,6 +19,7 @@ require 'nebox.applets.sed'
 require 'nebox.applets.fs3'
 require 'nebox.applets.text3'
 require 'nebox.applets.dd'
+require 'nebox.applets.join'
 require 'nebox.applets.awk'
 require 'nebox.applets.sh'
 require 'nebox.applets.diff'
@@ -36,7 +37,7 @@ local applets: []Applet = {
   {'factor', applet_factor}, {'false', applet_false}, {'find', applet_find},
   {'fold', applet_fold}, {'free', applet_free}, {'grep', applet_grep},
   {'groups', applet_groups}, {'head', applet_head}, {'hexdump', applet_hexdump},
-  {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install},
+  {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install}, {'join', applet_join},
   {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
   {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
   {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},

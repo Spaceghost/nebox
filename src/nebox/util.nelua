@@ -147,6 +147,148 @@ end
 function util.quoteaf(s: string): string return shell_escape(s, true, false) end
 function util.quotef(s: string): string return shell_escape(s, false, true) end
 
+-- GNU getopt_long, as glibc implements it: clustered short options, "x:"
+-- required and "x::" optional arguments, long options with unique-prefix
+-- abbreviation, "--name=value", and the three orderings (a leading '+' or
+-- POSIXLY_CORRECT stops at the first operand; a leading '-' returns
+-- operands in place as code 1; otherwise operands are set aside and
+-- `operands()` returns them after the options). Errors are reported with
+-- glibc's wording and returned as '?' (63).
+global util.LongOpt = @record{name: string, has_arg: integer, val: integer}
+
+global util.Getopt = @record{
+  args: sequence(string),
+  optind: integer,
+  nextchar: string,
+  optarg: string,
+  has_optarg: boolean,
+  shortopts: string,
+  longopts: *[0]util.LongOpt,
+  nlong: integer,
+  mode: integer,       -- 0 permute, 1 require order, 2 return in order
+  skipped: sequence(string),
+  arg_index: integer,  -- index in args of the element the last option came from
+}
+
+function util.getopt(args: sequence(string), shortopts: string, longopts: *[0]util.LongOpt, nlong: integer): util.Getopt
+  local g: util.Getopt
+  for i = 1, #args do g.args:push(args[i]) end
+  g.optind = 1
+  g.longopts = longopts
+  g.nlong = nlong
+  g.mode = 0
+  local s = shortopts
+  if #s > 0 and s:byte(1) == 45 then g.mode = 2; s = s:sub(2)
+  elseif #s > 0 and s:byte(1) == 43 then g.mode = 1; s = s:sub(2)
+  elseif sys.getenv('POSIXLY_CORRECT') ~= nilptr then g.mode = 1 end
+  g.shortopts = s
+  return g
+end
+
+-- The operands left after the last option.
+function util.Getopt:operands(): sequence(string)
+  local out: sequence(string)
+  for i = 1, #self.skipped do out:push(self.skipped[i]) end
+  for i = self.optind, #self.args do out:push(self.args[i]) end
+  return out
+end
+
+local function getopt_err(s: string): integer
+  util.err(s)
+  return 63
+end
+
+function util.Getopt:next(): integer
+  self.optarg = ''
+  self.has_optarg = false
+  if #self.nextchar == 0 then
+    local a: string
+    while true do
+      if self.optind > #self.args then return -1 end
+      a = self.args[self.optind]
+      if a == '--' then
+        self.optind = self.optind + 1
+        -- everything after "--" is an operand, after any set aside
+        return -1
+      end
+      if #a < 2 or a:byte(1) ~= 45 then
+        if self.mode == 2 then
+          self.optind = self.optind + 1
+          self.optarg = a; self.has_optarg = true
+          return 1
+        elseif self.mode == 1 then
+          return -1
+        end
+        self.skipped:push(a)
+        self.optind = self.optind + 1
+      else
+        break
+      end
+    end
+    self.arg_index = self.optind
+    if a:byte(2) == 45 and self.nlong > 0 then
+      self.optind = self.optind + 1
+      local body = a:sub(3)
+      local eq = body:find('=', 1, true)
+      local name = eq > 0 and body:sub(1, eq - 1) or body
+      local found = -1
+      local exact = false
+      local ambig = false
+      for i = 0, < self.nlong do
+        local ln = self.longopts[i].name
+        if ln == name then found = i; exact = true; break end
+        if #name <= #ln and ln:sub(1, #name) == name then
+          if found < 0 then found = i
+          elseif self.longopts[found].has_arg ~= self.longopts[i].has_arg
+                 or self.longopts[found].val ~= self.longopts[i].val then ambig = true end
+        end
+      end
+      if ambig and not exact then
+        local sb: stringbuilder
+        sb:write("option '", a, "' is ambiguous; possibilities:")
+        for i = 0, < self.nlong do
+          local ln = self.longopts[i].name
+          if #name <= #ln and ln:sub(1, #name) == name then sb:write(" '--", ln, "'") end
+        end
+        return getopt_err(sb:promote())
+      end
+      if found < 0 then return getopt_err("unrecognized option '" .. a .. "'") end
+      local o = self.longopts[found]
+      if eq > 0 then
+        if o.has_arg == 0 then return getopt_err("option '--" .. o.name .. "' doesn't allow an argument") end
+        self.optarg = body:sub(eq + 1); self.has_optarg = true
+      elseif o.has_arg == 1 then
+        if self.optind > #self.args then return getopt_err("option '--" .. o.name .. "' requires an argument") end
+        self.optarg = self.args[self.optind]; self.has_optarg = true
+        self.optind = self.optind + 1
+      end
+      return o.val
+    end
+    self.nextchar = a:sub(2)
+    self.optind = self.optind + 1
+  end
+  local c = self.nextchar:byte(1)
+  self.nextchar = self.nextchar:sub(2)
+  local pos = c ~= 58 and self.shortopts:find(string.char(c), 1, true) or 0
+  if pos <= 0 then
+    return getopt_err("invalid option -- '" .. string.char(c) .. "'")
+  end
+  if pos < #self.shortopts and self.shortopts:byte(pos + 1) == 58 then
+    local optional = pos + 1 < #self.shortopts and self.shortopts:byte(pos + 2) == 58
+    if #self.nextchar > 0 then
+      self.optarg = self.nextchar; self.has_optarg = true
+      self.nextchar = ''
+    elseif not optional then
+      if self.optind > #self.args then
+        return getopt_err("option requires an argument -- '" .. string.char(c) .. "'")
+      end
+      self.optarg = self.args[self.optind]; self.has_optarg = true
+      self.optind = self.optind + 1
+    end
+  end
+  return c
+end
+
 -- Option parsing: short flags only, POSIX style. `spec` lists the accepted
 -- letters; a letter followed by ':' takes a value. Parsing stops at the first
 -- operand, at "--", or at "-" (which is an operand).
