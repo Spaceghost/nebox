@@ -1,0 +1,721 @@
+-- sh lexer: character sources (strings, descriptors, alias text), token
+-- recognition per POSIX.1-2017 XCU 2.3 "Token Recognition", word scanning
+-- with the quoting rules of 2.2, here-document bodies, and alias
+-- substitution. Command substitutions are parsed on the spot through
+-- hooks the parser installs, so `$(case x in x) ;; esac)` nests properly.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'allocators.default'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sh.ast'
+
+## local function B(c) return string.byte(c) end
+
+global shlex = @record{}
+
+-- Token kinds.
+global shlex.T_EOF: byte <comptime> = 0
+global shlex.T_NEWLINE: byte <comptime> = 1
+global shlex.T_WORD: byte <comptime> = 2
+global shlex.T_IO_NUMBER: byte <comptime> = 3
+global shlex.T_AMP: byte <comptime> = 4        -- &
+global shlex.T_SEMI: byte <comptime> = 5       -- ;
+global shlex.T_PIPE: byte <comptime> = 6       -- |
+global shlex.T_LPAREN: byte <comptime> = 7
+global shlex.T_RPAREN: byte <comptime> = 8
+global shlex.T_AND_IF: byte <comptime> = 9     -- &&
+global shlex.T_OR_IF: byte <comptime> = 10     -- ||
+global shlex.T_DSEMI: byte <comptime> = 11     -- ;;
+global shlex.T_LESS: byte <comptime> = 12
+global shlex.T_GREAT: byte <comptime> = 13
+global shlex.T_DLESS: byte <comptime> = 14     -- <<
+global shlex.T_DGREAT: byte <comptime> = 15    -- >>
+global shlex.T_LESSAND: byte <comptime> = 16   -- <&
+global shlex.T_GREATAND: byte <comptime> = 17  -- >&
+global shlex.T_LESSGREAT: byte <comptime> = 18 -- <>
+global shlex.T_DLESSDASH: byte <comptime> = 19 -- <<-
+global shlex.T_CLOBBER: byte <comptime> = 20   -- >|
+
+global shlex.Token = @record{
+  kind: byte,
+  word: integer,     -- word index for T_WORD
+  text: string,      -- operator spelling, or the digits of an IO_NUMBER
+  line: integer,
+}
+
+local CHUNK: usize <comptime> = 65536
+
+global shlex.Src = @record{
+  data: *[0]byte,
+  cap: usize,
+  size: usize,
+  pos: usize,
+  fd: cint,          -- -1 for in-memory text
+  eof: boolean,
+  bytewise: boolean, -- read one byte at a time (shared, unseekable stdin)
+  seekable: boolean,
+  share: boolean,    -- stdin shared with the commands we run: seek back before running
+  alias: string,     -- alias being substituted, "" for real input
+  trailing_blank: boolean,
+  line: integer,
+  owned: boolean,
+}
+
+global shlex.Lexer = @record{
+  srcs: sequence(shlex.Src),
+  tok: shlex.Token,
+  has_tok: boolean,
+  heredocs: sequence(integer),   -- redirs awaiting a body at the next newline
+  next_alias_ok: boolean,
+}
+
+-- Installed by the parser: parse a list up to ')' on this lexer, and parse a
+-- whole string (backquotes) returning a node (-1 for an empty program).
+global shlex.parse_sub: function(lx: *shlex.Lexer): integer
+global shlex.parse_text: function(text: string, line: integer): integer
+-- Installed by the interpreter: report a syntax error and exit the shell.
+global shlex.on_error: function(msg: string, line: integer)
+-- Alias table, owned by the interpreter.
+global shlex.aliases: hashmap(string, string)
+-- Verbose (-v): echo input as it is read.
+global shlex.verbose: boolean = false
+
+function shlex.is_reserved(s: string): boolean
+  return s == 'if' or s == 'then' or s == 'else' or s == 'elif' or s == 'fi' or s == 'do' or s == 'done'
+    or s == 'case' or s == 'esac' or s == 'while' or s == 'until' or s == 'for' or s == '{' or s == '}'
+    or s == '!' or s == 'in'
+end
+
+function shlex.Lexer:line(): integer
+  if #self.srcs == 0 then return 1 end
+  return self.srcs[1].line
+end
+
+function shlex.Lexer:fatal(msg: string) <noreturn>
+  shlex.on_error(msg, self:line())
+  sys._exit(2)
+end
+
+local function text_src(text: string, line: integer): shlex.Src
+  local s: shlex.Src
+  s.data = text.data
+  s.cap = text.size
+  s.size = text.size
+  s.fd = -1
+  s.line = line
+  return s
+end
+
+function shlex.Lexer:push_text(text: string, line: integer)
+  self.srcs:push(text_src(text, line))
+end
+
+function shlex.Lexer:push_fd(fd: cint, share: boolean)
+  local s: shlex.Src
+  s.fd = fd
+  s.share = share
+  s.line = 1
+  s.cap = CHUNK
+  s.data = (@*[0]byte)(default_allocator:alloc(CHUNK))
+  s.owned = true
+  if share then
+    local off = sys.lseek(fd, 0, sys.SEEK_CUR)
+    if off >= 0 then s.seekable = true else s.bytewise = true end
+  end
+  self.srcs:push(s)
+end
+
+function shlex.Lexer:init_text(text: string)
+  self.srcs:clear()
+  self:push_text(text, 1)
+  self.has_tok = false
+  self.heredocs:clear()
+  self.next_alias_ok = false
+end
+
+function shlex.Lexer:init_fd(fd: cint, share: boolean)
+  self.srcs:clear()
+  self:push_fd(fd, share)
+  self.has_tok = false
+  self.heredocs:clear()
+  self.next_alias_ok = false
+end
+
+-- Before running a command read from shared seekable stdin, hand the unread
+-- bytes back to the file offset so the command sees them.
+function shlex.Lexer:sync()
+  if #self.srcs == 0 then return end
+  local s = &self.srcs[1]
+  if s.fd < 0 or not s.share or not s.seekable then return end
+  if s.pos < s.size then
+    sys.lseek(s.fd, -(@clong)(s.size - s.pos), sys.SEEK_CUR)
+    s.size = 0
+    s.pos = 0
+  end
+end
+
+-- Pull more bytes from a descriptor source, keeping the unread tail.
+local function src_fill(s: *shlex.Src): boolean
+  if s.fd < 0 or s.eof then return false end
+  if s.pos > 0 then
+    local n = s.size - s.pos
+    for i: usize = 0, < n do s.data[i] = s.data[s.pos + i] end
+    s.size = n
+    s.pos = 0
+  end
+  if s.size >= s.cap then return false end
+  local want: usize = s.bytewise and 1 or (s.cap - s.size)
+  while true do
+    local r = sys.read(s.fd, &s.data[s.size], want)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      s.eof = true
+      return false
+    end
+    if r == 0 then s.eof = true; return false end
+    if shlex.verbose then
+      util.flush()
+      sys.write(2, &s.data[s.size], (@usize)(r))
+    end
+    s.size = s.size + (@usize)(r)
+    return true
+  end
+  return false
+end
+
+-- Current byte of the top source, or -1 when that source is exhausted.
+function shlex.Lexer:peek(): integer
+  local s = &self.srcs[#self.srcs]
+  if s.pos >= s.size then
+    if not src_fill(s) then return -1 end
+  end
+  return s.data[s.pos]
+end
+
+function shlex.Lexer:advance()
+  local s = &self.srcs[#self.srcs]
+  if s.pos < s.size then
+    if s.data[s.pos] == 10 then s.line = s.line + 1 end
+    s.pos = s.pos + 1
+  end
+end
+
+function shlex.Lexer:next(): integer
+  local c = self:peek()
+  if c >= 0 then self:advance() end
+  return c
+end
+
+-- Byte after the current one (same source), or -1.
+function shlex.Lexer:peek2(): integer
+  local s = &self.srcs[#self.srcs]
+  if s.pos + 1 >= s.size then
+    if not src_fill(s) then return -1 end
+    if s.pos + 1 >= s.size then return -1 end
+  end
+  return s.data[s.pos + 1]
+end
+
+-- Drop exhausted alias sources.
+function shlex.Lexer:pop_exhausted()
+  while #self.srcs > 1 do
+    local s = &self.srcs[#self.srcs]
+    if s.pos < s.size then return end
+    if s.trailing_blank then self.next_alias_ok = true end
+    self.srcs:pop()
+  end
+end
+
+local function is_blank(c: integer): boolean return c == 32 or c == 9 end
+
+local function is_meta(c: integer): boolean
+  return c < 0 or c == 32 or c == 9 or c == 10 or c == #[B';']# or c == #[B'&']# or c == #[B'|']#
+    or c == #[B'(']# or c == #[B')']# or c == #[B'<']# or c == #[B'>']#
+end
+
+local function is_digit(c: integer): boolean return c >= 48 and c <= 57 end
+local function is_name_start(c: integer): boolean
+  return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95
+end
+local function is_name_char(c: integer): boolean return is_name_start(c) or is_digit(c) end
+local function is_special_param(c: integer): boolean
+  return c == #[B'@']# or c == #[B'*']# or c == #[B'#']# or c == #[B'?']# or c == #[B'-']#
+    or c == #[B'$']# or c == #[B'!']# or is_digit(c)
+end
+
+-- Word scanning modes.
+local M_NORMAL: byte <comptime> = 0   -- a command word; ends at a metacharacter
+local M_BRACE: byte <comptime> = 1    -- inside ${name op ...}; ends at the matching '}'
+local M_HEREDOC: byte <comptime> = 2  -- an unquoted here-document body; whole source
+local M_ARITH: byte <comptime> = 3    -- inside $(( )); ends at the closing '))'
+
+local Scan = @record{
+  parts: sequence(shast.Part),
+  lit: stringbuilder,
+  lit_quoted: boolean,
+  lit_open: boolean,
+}
+
+local function scan_flush(sc: *Scan)
+  if sc.lit_open then
+    local p: shast.Part
+    p.kind = shast.PT_LIT
+    p.quoted = sc.lit_quoted
+    p.text = sc.lit:promote()
+    sc.parts:push(p)
+    sc.lit_open = false
+  end
+end
+
+local function scan_lit(sc: *Scan, c: byte, quoted: boolean)
+  if sc.lit_open and sc.lit_quoted ~= quoted then scan_flush(sc) end
+  if not sc.lit_open then
+    sc.lit_open = true
+    sc.lit_quoted = quoted
+    sc.lit:clear()
+  end
+  sc.lit:writebyte(c)
+end
+
+-- A quoted empty string still produces a field: open an empty quoted literal.
+local function scan_empty_quoted(sc: *Scan)
+  if sc.lit_open and sc.lit_quoted then return end
+  scan_flush(sc)
+  sc.lit_open = true
+  sc.lit_quoted = true
+  sc.lit:clear()
+end
+
+local function scan_word(lx: *shlex.Lexer, mode: byte, outer: boolean, prefix: string): sequence(shast.Part) <forwarddecl> end
+
+-- Parse the text after "${": name, operator, argument word.
+local function scan_brace_param(lx: *shlex.Lexer, sc: *Scan, q: boolean)
+  local p: shast.Part
+  p.kind = shast.PT_PARAM
+  p.quoted = q
+  p.a = shast.OP_NONE
+  p.b = 0
+  p.c = 0
+  local name: stringbuilder
+  local c = lx:peek()
+  if c == #[B'#']# then
+    lx:advance()
+    if lx:peek() == #[B'}']# then
+      name:writebyte(#[B'#']#)
+    else
+      p.c = 1
+    end
+    c = lx:peek()
+  end
+  if #name == 0 then
+    if is_name_start(c) then
+      while is_name_char(lx:peek()) do name:writebyte((@byte)(lx:next())) end
+    elseif is_digit(c) then
+      while is_digit(lx:peek()) do name:writebyte((@byte)(lx:next())) end
+    elseif is_special_param(c) then
+      name:writebyte((@byte)(lx:next()))
+    else
+      lx:fatal('Bad substitution')
+    end
+  end
+  p.text = name:promote()
+  c = lx:peek()
+  if c == #[B'}']# then
+    lx:advance()
+    sc.parts:push(p)
+    return
+  end
+  if p.c == 1 then lx:fatal('Bad substitution') end
+  local colon = false
+  if c == #[B':']# then colon = true; lx:advance(); c = lx:peek() end
+  local consumed = false
+  if c == #[B'-']# then p.a = colon and shast.OP_CMINUS or shast.OP_MINUS
+  elseif c == #[B'=']# then p.a = colon and shast.OP_CEQ or shast.OP_EQ
+  elseif c == #[B'?']# then p.a = colon and shast.OP_CQUEST or shast.OP_QUEST
+  elseif c == #[B'+']# then p.a = colon and shast.OP_CPLUS or shast.OP_PLUS
+  elseif not colon and c == #[B'#']# then
+    lx:advance()
+    if lx:peek() == #[B'#']# then lx:advance(); p.a = shast.OP_HASH2 else p.a = shast.OP_HASH end
+    consumed = true
+  elseif not colon and c == #[B'%']# then
+    lx:advance()
+    if lx:peek() == #[B'%']# then lx:advance(); p.a = shast.OP_PERCENT2 else p.a = shast.OP_PERCENT end
+    consumed = true
+  else
+    lx:fatal('Bad substitution')
+  end
+  if not consumed then lx:advance() end
+  local parts = scan_word(lx, M_BRACE, q, '')
+  p.b = shast.word(parts, lx:line())
+  sc.parts:push(p)
+end
+
+-- Collect backquoted text up to the closing backquote, applying the
+-- backslash rules of 2.6.3, and parse it as a program.
+local function scan_backquote(lx: *shlex.Lexer, sc: *Scan, q: boolean)
+  local text: stringbuilder
+  local line = lx:line()
+  while true do
+    local c = lx:next()
+    if c < 0 then lx:fatal('EOF in backquote substitution') end
+    if c == #[B'`']# then break end
+    if c == #[B'\\']# then
+      local n = lx:peek()
+      if n == #[B'$']# or n == #[B'`']# or n == #[B'\\']# or (q and n == #[B'"']#) then
+        text:writebyte((@byte)(lx:next()))
+      else
+        text:writebyte(92)
+      end
+    else
+      text:writebyte((@byte)(c))
+    end
+  end
+  scan_flush(sc)
+  local p: shast.Part
+  p.kind = shast.PT_CMDSUB
+  p.quoted = q
+  p.a = shlex.parse_text(text:promote(), line)
+  sc.parts:push(p)
+end
+
+-- Handle a '$' (already consumed) in a word.
+local function scan_dollar(lx: *shlex.Lexer, sc: *Scan, q: boolean)
+  local c = lx:peek()
+  if c == #[B'{']# then
+    lx:advance()
+    scan_flush(sc)
+    scan_brace_param(lx, sc, q)
+  elseif c == #[B'(']# then
+    lx:advance()
+    scan_flush(sc)
+    if lx:peek() == #[B'(']# then
+      lx:advance()
+      local inner = scan_word(lx, M_ARITH, true, '')
+      local p: shast.Part
+      p.kind = shast.PT_ARITH
+      p.quoted = q
+      p.b = shast.word(inner, lx:line())
+      sc.parts:push(p)
+    else
+      local saved = lx.heredocs
+      lx.heredocs = (@sequence(integer))()
+      local saved_tok = lx.has_tok
+      lx.has_tok = false
+      local node = shlex.parse_sub(lx)
+      lx.heredocs = saved
+      lx.has_tok = saved_tok
+      local p: shast.Part
+      p.kind = shast.PT_CMDSUB
+      p.quoted = q
+      p.a = node
+      sc.parts:push(p)
+    end
+  elseif is_name_start(c) then
+    scan_flush(sc)
+    local name: stringbuilder
+    while is_name_char(lx:peek()) do name:writebyte((@byte)(lx:next())) end
+    local p: shast.Part
+    p.kind = shast.PT_PARAM
+    p.quoted = q
+    p.text = name:promote()
+    sc.parts:push(p)
+  elseif is_special_param(c) then
+    scan_flush(sc)
+    lx:advance()
+    local p: shast.Part
+    p.kind = shast.PT_PARAM
+    p.quoted = q
+    p.text = string.char((@byte)(c))
+    sc.parts:push(p)
+  else
+    scan_lit(sc, #[B'$']#, q)
+  end
+end
+
+-- Scan one word. `outer` is the quoting inherited from an enclosing
+-- double-quoted string (${...} inside "..."); `dq` below toggles with the
+-- double quotes seen in this scan. In M_NORMAL the word ends at an
+-- unquoted metacharacter, which is left unconsumed.
+function scan_word(lx: *shlex.Lexer, mode: byte, outer: boolean, prefix: string): sequence(shast.Part)
+  local sc: Scan
+  local dq = false
+  local depth: integer = 0   -- brace depth (M_BRACE) or paren depth (M_ARITH)
+  local inner_q = mode == M_HEREDOC or mode == M_ARITH
+  for i: usize = 1, prefix.size do scan_lit(&sc, prefix:byte(i), false) end
+  while true do
+    local q = outer or dq or inner_q
+    local c = lx:peek()
+    if c < 0 then
+      if mode == M_BRACE then lx:fatal("Missing '}'") end
+      if mode == M_ARITH then lx:fatal("Missing '))'") end
+      if dq then lx:fatal('Unterminated quoted string') end
+      break
+    end
+    if mode == M_NORMAL and not dq and is_meta(c) then break end
+    if mode == M_BRACE and not dq then
+      if c == #[B'}']# then
+        if depth == 0 then lx:advance(); break end
+        depth = depth - 1
+        lx:advance(); scan_lit(&sc, (@byte)(c), q)
+        continue
+      elseif c == #[B'{']# then
+        depth = depth + 1
+      end
+    end
+    if mode == M_ARITH then
+      if c == #[B'(']# then depth = depth + 1 end
+      if c == #[B')']# then
+        if depth == 0 then
+          if lx:peek2() == #[B')']# then lx:advance(); lx:advance(); break end
+          lx:fatal("Missing '))'")
+        end
+        depth = depth - 1
+      end
+    end
+    if c == #[B'\\']# then
+      lx:advance()
+      local n = lx:peek()
+      if n < 0 then
+        scan_lit(&sc, 92, true)
+      elseif n == 10 then
+        lx:advance()  -- line continuation
+      elseif q then
+        local special = n == #[B'$']# or n == #[B'`']# or n == #[B'\\']#
+          or (n == #[B'"']# and not inner_q)
+          or (n == #[B'}']# and mode == M_BRACE)
+        if special then
+          lx:advance(); scan_lit(&sc, (@byte)(n), true)
+        else
+          scan_lit(&sc, 92, true)
+        end
+      else
+        lx:advance(); scan_lit(&sc, (@byte)(n), true)
+      end
+    elseif c == #[B"'"]# and not q then
+      lx:advance()
+      scan_empty_quoted(&sc)
+      while true do
+        local ch = lx:next()
+        if ch < 0 then lx:fatal('Unterminated quoted string') end
+        if ch == #[B"'"]# then break end
+        scan_lit(&sc, (@byte)(ch), true)
+      end
+    elseif c == #[B'"']# and not inner_q then
+      lx:advance()
+      if dq then
+        dq = false
+      else
+        dq = true
+        scan_empty_quoted(&sc)
+      end
+    elseif c == #[B'$']# then
+      lx:advance()
+      scan_dollar(lx, &sc, q)
+    elseif c == #[B'`']# then
+      lx:advance()
+      scan_backquote(lx, &sc, q)
+    else
+      lx:advance()
+      scan_lit(&sc, (@byte)(c), q)
+    end
+  end
+  scan_flush(&sc)
+  return sc.parts
+end
+
+-- Quote-removed text of a word made only of literals (here-doc delimiters).
+local function literal_text(w: *shast.Word): (string, boolean)
+  local sb: stringbuilder
+  local quoted = false
+  for i = 1, w.count do
+    local p = shast.part(w, i)
+    if p.kind == shast.PT_LIT then
+      sb:write(p.text)
+      if p.quoted then quoted = true end
+    else
+      quoted = true
+    end
+  end
+  return sb:promote(), quoted
+end
+
+-- Read the here-document bodies pending at this newline.
+local function read_heredocs(lx: *shlex.Lexer)
+  for i = 1, #lx.heredocs do
+    local ri = lx.heredocs[i]
+    local r = &shprog.redirs[ri]
+    local delim, quoted = literal_text(shast.W(r.target))
+    local strip = r.op == shast.R_HEREDOC_STRIP
+    local body: stringbuilder
+    local line = lx:line()
+    while true do
+      local ln: stringbuilder
+      local c = lx:peek()
+      if c < 0 then break end
+      if strip then
+        while lx:peek() == 9 do lx:advance() end
+      end
+      local saw_nl = false
+      while true do
+        c = lx:next()
+        if c < 0 then break end
+        if c == 10 then saw_nl = true; break end
+        ln:writebyte((@byte)(c))
+      end
+      local text = ln:view()
+      if text == delim then break end
+      body:write(text)
+      if saw_nl then body:writebyte(10) end
+      if c < 0 then break end
+    end
+    local parts: sequence(shast.Part)
+    if quoted then
+      local p: shast.Part
+      p.kind = shast.PT_LIT
+      p.quoted = true
+      p.text = body:promote()
+      parts:push(p)
+    else
+      local sub: shlex.Lexer
+      sub:init_text(body:promote())
+      sub.srcs[1].line = line
+      parts = scan_word(&sub, M_HEREDOC, false, '')
+    end
+    r.body = shast.word(parts, line)
+    r.quoted_delim = quoted
+  end
+  lx.heredocs:clear()
+end
+
+function shlex.Lexer:add_heredoc(redir: integer)
+  self.heredocs:push(redir)
+end
+
+local function op_token(kind: byte, text: string, line: integer): shlex.Token
+  return (@shlex.Token){kind = kind, text = text, line = line}
+end
+
+-- Read the next token. `alias_ok` says the word is in command position.
+local function read_token(lx: *shlex.Lexer, alias_ok: boolean): shlex.Token
+  while true do
+    -- skip blanks, comments and line continuations; pop finished alias text
+    while true do
+      local c = lx:peek()
+      if c < 0 then
+        if #lx.srcs > 1 then lx:pop_exhausted(); continue end
+        break
+      end
+      if is_blank(c) then lx:advance()
+      elseif c == #[B'\\']# and lx:peek2() == 10 then lx:advance(); lx:advance()
+      elseif c == #[B'#']# then
+        while true do
+          local d = lx:peek()
+          if d < 0 or d == 10 then break end
+          lx:advance()
+        end
+      else break end
+    end
+    local line = lx:line()
+    local c = lx:peek()
+    if c < 0 then return op_token(shlex.T_EOF, '', line) end
+    if c == 10 then
+      lx:advance()
+      if #lx.heredocs > 0 then read_heredocs(lx) end
+      return op_token(shlex.T_NEWLINE, '', line)
+    end
+    if c == #[B'&']# then
+      lx:advance()
+      if lx:peek() == #[B'&']# then lx:advance(); return op_token(shlex.T_AND_IF, '&&', line) end
+      return op_token(shlex.T_AMP, '&', line)
+    elseif c == #[B'|']# then
+      lx:advance()
+      if lx:peek() == #[B'|']# then lx:advance(); return op_token(shlex.T_OR_IF, '||', line) end
+      return op_token(shlex.T_PIPE, '|', line)
+    elseif c == #[B';']# then
+      lx:advance()
+      if lx:peek() == #[B';']# then lx:advance(); return op_token(shlex.T_DSEMI, ';;', line) end
+      return op_token(shlex.T_SEMI, ';', line)
+    elseif c == #[B'(']# then lx:advance(); return op_token(shlex.T_LPAREN, '(', line)
+    elseif c == #[B')']# then lx:advance(); return op_token(shlex.T_RPAREN, ')', line)
+    elseif c == #[B'<']# then
+      lx:advance()
+      local n = lx:peek()
+      if n == #[B'<']# then
+        lx:advance()
+        if lx:peek() == #[B'-']# then lx:advance(); return op_token(shlex.T_DLESSDASH, '<<-', line) end
+        return op_token(shlex.T_DLESS, '<<', line)
+      elseif n == #[B'&']# then lx:advance(); return op_token(shlex.T_LESSAND, '<&', line)
+      elseif n == #[B'>']# then lx:advance(); return op_token(shlex.T_LESSGREAT, '<>', line) end
+      return op_token(shlex.T_LESS, '<', line)
+    elseif c == #[B'>']# then
+      lx:advance()
+      local n = lx:peek()
+      if n == #[B'>']# then lx:advance(); return op_token(shlex.T_DGREAT, '>>', line)
+      elseif n == #[B'&']# then lx:advance(); return op_token(shlex.T_GREATAND, '>&', line)
+      elseif n == #[B'|']# then lx:advance(); return op_token(shlex.T_CLOBBER, '>|', line) end
+      return op_token(shlex.T_GREAT, '>', line)
+    end
+    -- IO_NUMBER: digits immediately followed by < or >
+    local prefix: string = ''
+    if is_digit(c) then
+      local digits: stringbuilder
+      while is_digit(lx:peek()) do digits:writebyte((@byte)(lx:next())) end
+      local n = lx:peek()
+      if n == #[B'<']# or n == #[B'>']# then
+        return (@shlex.Token){kind = shlex.T_IO_NUMBER, text = digits:promote(), line = line}
+      end
+      prefix = digits:promote()
+    end
+    local parts = scan_word(lx, M_NORMAL, false, prefix)
+    local wi = shast.word(parts, line)
+    local w = shast.W(wi)
+    -- alias substitution
+    local want_alias = alias_ok or lx.next_alias_ok
+    lx.next_alias_ok = false
+    if want_alias and w.is_plain and w.plain.size > 0 and shlex.aliases:has(w.plain) and not shlex.is_reserved(w.plain) then
+      local active = false
+      for i = 1, #lx.srcs do
+        if lx.srcs[i].alias == w.plain then active = true end
+      end
+      if not active then
+        local value = shlex.aliases[w.plain]
+        local s = text_src(value, line)
+        s.alias = w.plain
+        s.trailing_blank = value.size > 0 and is_blank(value:byte(value.size))
+        lx.srcs:push(s)
+        continue
+      end
+    end
+    return (@shlex.Token){kind = shlex.T_WORD, word = wi, line = line}
+  end
+  return op_token(shlex.T_EOF, '', 0)
+end
+
+function shlex.Lexer:peek_token(alias_ok: boolean): *shlex.Token
+  if not self.has_tok then
+    self.tok = read_token(self, alias_ok)
+    self.has_tok = true
+  end
+  return &self.tok
+end
+
+function shlex.Lexer:take(): shlex.Token
+  local t = self:peek_token(false)
+  self.has_tok = false
+  return $t
+end
+
+-- Scan a string as an unquoted here-document body (used for trap actions
+-- and the like is not needed; kept for the expander's pattern words).
+function shlex.scan_text(text: string, line: integer): integer
+  local sub: shlex.Lexer
+  sub:init_text(text)
+  sub.srcs[1].line = line
+  local parts = scan_word(&sub, M_HEREDOC, false, '')
+  return shast.word(parts, line)
+end

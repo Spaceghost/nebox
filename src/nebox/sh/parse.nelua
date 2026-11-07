@@ -1,0 +1,510 @@
+-- sh parser: recursive descent over the grammar of POSIX.1-2017 XCU 2.10,
+-- one complete command at a time so aliases and `read` see the input the
+-- way the standard describes. Reserved words are recognized only in
+-- command position (rule 1), `in`/`do` after `for name` and `case word`.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sh.ast'
+require 'nebox.sh.lex'
+
+global shparse = @record{}
+
+local T = shlex
+local N = shast
+
+local function tok_text(t: *shlex.Token): string
+  if t.kind == T.T_EOF then return 'end of file' end
+  if t.kind == T.T_NEWLINE then return 'newline' end
+  if t.kind == T.T_WORD then
+    local w = N.W(t.word)
+    if w.is_plain then return '"' .. w.plain .. '"' end
+    return 'word'
+  end
+  if t.kind == T.T_IO_NUMBER then return '"' .. t.text .. '"' end
+  return '"' .. t.text .. '"'
+end
+
+local function unexpected(lx: *shlex.Lexer, t: *shlex.Token, expecting: string) <noreturn>
+  local msg = 'Syntax error: ' .. tok_text(t) .. ' unexpected'
+  if expecting.size > 0 then msg = msg .. ' (expecting ' .. expecting .. ')' end
+  shlex.on_error(msg, t.line > 0 and t.line or lx:line())
+  sys._exit(2)
+end
+
+-- Is the lookahead the plain reserved word `s`?
+local function is_word(t: *shlex.Token, s: string): boolean
+  if t.kind ~= T.T_WORD then return false end
+  local w = N.W(t.word)
+  return w.is_plain and w.plain == s
+end
+
+local function is_redir_tok(k: byte): boolean
+  return k == T.T_IO_NUMBER or k == T.T_LESS or k == T.T_GREAT or k == T.T_DLESS or k == T.T_DGREAT
+    or k == T.T_LESSAND or k == T.T_GREATAND or k == T.T_LESSGREAT or k == T.T_DLESSDASH or k == T.T_CLOBBER
+end
+
+local function linebreak(lx: *shlex.Lexer)
+  while lx:peek_token(true).kind == T.T_NEWLINE do lx:take() end
+end
+
+local function expect_word(lx: *shlex.Lexer, s: string)
+  local t = lx:peek_token(true)
+  if not is_word(t, s) then unexpected(lx, t, '"' .. s .. '"') end
+  lx:take()
+end
+
+local function expect_kind(lx: *shlex.Lexer, k: byte, what: string)
+  local t = lx:peek_token(false)
+  if t.kind ~= k then unexpected(lx, t, what) end
+  lx:take()
+end
+
+-- Does the word start with name= (unquoted '=')?
+local function mark_assignment(wi: integer)
+  local w = N.W(wi)
+  if w.count == 0 then return end
+  local p = N.part(w, 1)
+  if p.kind ~= N.PT_LIT or p.quoted then return end
+  local eq = p.text:find('=', 1, true)
+  if eq <= 1 then return end
+  if N.is_name(p.text:sub(1, eq - 1)) then w.assign = true end
+end
+
+local function parse_compound_list(lx: *shlex.Lexer): integer <forwarddecl> end
+local function parse_command(lx: *shlex.Lexer): integer <forwarddecl> end
+
+-- One redirection; the lookahead is a redirection token.
+local function parse_redir(lx: *shlex.Lexer): integer
+  local t = lx:take()
+  local r: N.Redir
+  r.body = -1
+  r.fd = -1
+  r.line = t.line
+  if t.kind == T.T_IO_NUMBER then
+    local v, ok = util.toint(t.text)
+    if not ok or v > 1000000 then
+      shlex.on_error('Syntax error: Bad fd number', t.line); sys._exit(2)
+    end
+    r.fd = v
+    t = lx:take()
+  end
+  local k = t.kind
+  if k == T.T_LESS then r.op = N.R_IN
+  elseif k == T.T_GREAT then r.op = N.R_OUT
+  elseif k == T.T_CLOBBER then r.op = N.R_CLOBBER
+  elseif k == T.T_DGREAT then r.op = N.R_APPEND
+  elseif k == T.T_LESSGREAT then r.op = N.R_RDWR
+  elseif k == T.T_LESSAND then r.op = N.R_DUPIN
+  elseif k == T.T_GREATAND then r.op = N.R_DUPOUT
+  elseif k == T.T_DLESS then r.op = N.R_HEREDOC
+  elseif k == T.T_DLESSDASH then r.op = N.R_HEREDOC_STRIP
+  else unexpected(lx, &t, '') end
+  if r.fd < 0 then
+    if r.op == N.R_IN or r.op == N.R_RDWR or r.op == N.R_DUPIN or r.op == N.R_HEREDOC or r.op == N.R_HEREDOC_STRIP then
+      r.fd = 0
+    else
+      r.fd = 1
+    end
+  end
+  local w = lx:peek_token(false)
+  if w.kind ~= T.T_WORD then unexpected(lx, w, '') end
+  r.target = w.word
+  lx:take()
+  shprog.redirs:push(r)
+  local idx = #shprog.redirs
+  if r.op == N.R_HEREDOC or r.op == N.R_HEREDOC_STRIP then lx:add_heredoc(idx) end
+  return idx
+end
+
+-- Trailing redirections after a compound command.
+local function parse_redir_list(lx: *shlex.Lexer, node: integer)
+  local redirs: sequence(integer)
+  while is_redir_tok(lx:peek_token(false).kind) do
+    redirs:push(parse_redir(lx))
+  end
+  if #redirs > 0 then
+    local n = N.at(node)
+    n.r0, n.r1 = N.list(redirs)
+  end
+end
+
+local SPECIAL_NAMES: []string = {'break', ':', 'continue', '.', 'eval', 'exec', 'exit', 'export',
+  'readonly', 'return', 'set', 'shift', 'times', 'trap', 'unset'}
+
+local function is_special_name(s: string): boolean
+  for i: integer = 0, < #SPECIAL_NAMES do
+    if SPECIAL_NAMES[i] == s then return true end
+  end
+  return false
+end
+
+-- simple_command, or a function definition when NAME is followed by '('.
+local function parse_simple(lx: *shlex.Lexer): integer
+  local words: sequence(integer)
+  local redirs: sequence(integer)
+  local line = lx:peek_token(true).line
+  local have_cmd = false
+  local first = true
+  while true do
+    local t = lx:peek_token(not have_cmd)
+    if is_redir_tok(t.kind) then
+      redirs:push(parse_redir(lx))
+      first = false
+    elseif t.kind == T.T_WORD then
+      local wi = t.word
+      lx:take()
+      if not have_cmd then
+        mark_assignment(wi)
+        if N.W(wi).assign then
+          words:push(wi)
+          first = false
+          continue
+        end
+      end
+      if first and not have_cmd then
+        -- function definition?
+        local w = N.W(wi)
+        local nt = lx:peek_token(false)
+        if nt.kind == T.T_LPAREN and w.is_plain and N.is_name(w.plain) then
+          lx:take()
+          expect_kind(lx, T.T_RPAREN, '")"')
+          if is_special_name(w.plain) then
+            shlex.on_error('Syntax error: Bad function name', line); sys._exit(2)
+          end
+          linebreak(lx)
+          local body = parse_command(lx)
+          local fn = N.node(N.N_FUNC, body, 0, 0, 0, line)
+          N.at(fn).s = w.plain
+          return fn
+        end
+      end
+      have_cmd = true
+      first = false
+      words:push(wi)
+    else
+      break
+    end
+  end
+  if #words == 0 and #redirs == 0 then
+    unexpected(lx, lx:peek_token(true), '')
+  end
+  local node = N.node(N.N_SIMPLE, 0, 0, 0, 0, line)
+  local n = N.at(node)
+  n.a, n.b = N.list(words)
+  if #redirs > 0 then n.r0, n.r1 = N.list(redirs) end
+  return node
+end
+
+local function parse_if_rest(lx: *shlex.Lexer, line: integer): integer <forwarddecl> end
+
+-- After 'if' or 'elif': condition, then-part, and an optional elif/else chain.
+function parse_if_rest(lx: *shlex.Lexer, line: integer): integer
+  local cond = parse_compound_list(lx)
+  expect_word(lx, 'then')
+  local body = parse_compound_list(lx)
+  local node = N.node(N.N_IF, cond, body, -1, 0, line)
+  local t = lx:peek_token(true)
+  if is_word(t, 'elif') then
+    local eline = lx:take().line
+    N.at(node).c = parse_if_rest(lx, eline)
+  elseif is_word(t, 'else') then
+    lx:take()
+    N.at(node).c = parse_compound_list(lx)
+  end
+  return node
+end
+
+local function parse_if(lx: *shlex.Lexer): integer
+  local line = lx:take().line
+  local node = parse_if_rest(lx, line)
+  expect_word(lx, 'fi')
+  return node
+end
+
+local function parse_loop(lx: *shlex.Lexer, kind: byte): integer
+  local line = lx:take().line
+  local cond = parse_compound_list(lx)
+  expect_word(lx, 'do')
+  local body = parse_compound_list(lx)
+  expect_word(lx, 'done')
+  return N.node(kind, cond, body, 0, 0, line)
+end
+
+local function parse_for(lx: *shlex.Lexer): integer
+  local line = lx:take().line
+  local t = lx:peek_token(false)
+  if t.kind ~= T.T_WORD or not N.W(t.word).is_plain or not N.is_name(N.W(t.word).plain) then
+    shlex.on_error('Syntax error: Bad for loop variable', t.line); sys._exit(2)
+  end
+  local name = N.W(t.word).plain
+  lx:take()
+  linebreak(lx)
+  local words: sequence(integer)
+  local no_in: integer = 1
+  t = lx:peek_token(true)
+  if is_word(t, 'in') then
+    lx:take()
+    no_in = 0
+    while true do
+      t = lx:peek_token(false)
+      if t.kind ~= T.T_WORD then break end
+      words:push(t.word)
+      lx:take()
+    end
+    t = lx:peek_token(false)
+    if t.kind == T.T_SEMI or t.kind == T.T_NEWLINE then lx:take()
+    else unexpected(lx, t, '') end
+    linebreak(lx)
+  elseif t.kind == T.T_SEMI then
+    lx:take()
+    linebreak(lx)
+  end
+  expect_word(lx, 'do')
+  local body = parse_compound_list(lx)
+  expect_word(lx, 'done')
+  local node = N.node(N.N_FOR, 0, 0, body, no_in, line)
+  local n = N.at(node)
+  n.s = name
+  n.a, n.b = N.list(words)
+  return node
+end
+
+local function parse_case(lx: *shlex.Lexer): integer
+  local line = lx:take().line
+  local t = lx:peek_token(false)
+  if t.kind ~= T.T_WORD then unexpected(lx, t, '') end
+  local word = t.word
+  lx:take()
+  linebreak(lx)
+  expect_word(lx, 'in')
+  local items: sequence(integer)
+  while true do
+    linebreak(lx)
+    t = lx:peek_token(true)
+    if is_word(t, 'esac') then lx:take(); break end
+    if t.kind == T.T_LPAREN then lx:take() end
+    local pats: sequence(integer)
+    while true do
+      t = lx:peek_token(false)
+      if t.kind ~= T.T_WORD then unexpected(lx, t, '') end
+      pats:push(t.word)
+      lx:take()
+      t = lx:peek_token(false)
+      if t.kind == T.T_PIPE then lx:take() else break end
+    end
+    local iline = lx:peek_token(false).line
+    expect_kind(lx, T.T_RPAREN, '")"')
+    local body = parse_compound_list(lx)
+    local item = N.node(N.N_CASEITEM, 0, 0, body, 0, iline)
+    local n = N.at(item)
+    n.a, n.b = N.list(pats)
+    items:push(item)
+    t = lx:peek_token(true)
+    if t.kind == T.T_DSEMI then
+      lx:take()
+    elseif is_word(t, 'esac') then
+      lx:take()
+      break
+    else
+      unexpected(lx, t, '";;"')
+    end
+  end
+  local node = N.node(N.N_CASE, word, 0, 0, 0, line)
+  local n = N.at(node)
+  n.b, n.c = N.list(items)
+  return node
+end
+
+function parse_command(lx: *shlex.Lexer): integer
+  local t = lx:peek_token(true)
+  local node: integer = -1
+  if t.kind == T.T_LPAREN then
+    local line = lx:take().line
+    local body = parse_compound_list(lx)
+    expect_kind(lx, T.T_RPAREN, '")"')
+    node = N.node(N.N_SUBSHELL, body, 0, 0, 0, line)
+  elseif is_word(t, '{') then
+    local line = lx:take().line
+    local body = parse_compound_list(lx)
+    expect_word(lx, '}')
+    node = N.node(N.N_BRACE, body, 0, 0, 0, line)
+  elseif is_word(t, 'if') then node = parse_if(lx)
+  elseif is_word(t, 'while') then node = parse_loop(lx, N.N_WHILE)
+  elseif is_word(t, 'until') then node = parse_loop(lx, N.N_UNTIL)
+  elseif is_word(t, 'for') then node = parse_for(lx)
+  elseif is_word(t, 'case') then node = parse_case(lx)
+  elseif t.kind == T.T_WORD and N.W(t.word).is_plain and shlex.is_reserved(N.W(t.word).plain)
+    and N.W(t.word).plain ~= '!' then
+    unexpected(lx, t, '')
+  else
+    return parse_simple(lx)
+  end
+  parse_redir_list(lx, node)
+  return node
+end
+
+local function parse_pipeline(lx: *shlex.Lexer): integer
+  local t = lx:peek_token(true)
+  local bang: integer = 0
+  local line = t.line
+  if is_word(t, '!') then
+    lx:take()
+    bang = 1
+    t = lx:peek_token(true)
+    if is_word(t, '!') then unexpected(lx, t, '') end
+  end
+  local cmds: sequence(integer)
+  cmds:push(parse_command(lx))
+  while lx:peek_token(false).kind == T.T_PIPE do
+    lx:take()
+    linebreak(lx)
+    cmds:push(parse_command(lx))
+  end
+  if #cmds == 1 and bang == 0 then return cmds[1] end
+  local node = N.node(N.N_PIPE, 0, 0, bang, 0, line)
+  local n = N.at(node)
+  n.a, n.b = N.list(cmds)
+  return node
+end
+
+local function parse_and_or(lx: *shlex.Lexer): integer
+  local left = parse_pipeline(lx)
+  while true do
+    local t = lx:peek_token(false)
+    if t.kind == T.T_AND_IF or t.kind == T.T_OR_IF then
+      local kind = t.kind == T.T_AND_IF and N.N_AND or N.N_OR
+      local line = lx:take().line
+      linebreak(lx)
+      local right = parse_pipeline(lx)
+      left = N.node(kind, left, right, 0, 0, line)
+    else
+      return left
+    end
+  end
+  return left
+end
+
+-- Can this token start a command? (Terminators of a compound list cannot.)
+local function starts_command(t: *shlex.Token): boolean
+  if t.kind == T.T_WORD then
+    local w = N.W(t.word)
+    if w.is_plain then
+      local s = w.plain
+      if s == 'then' or s == 'else' or s == 'elif' or s == 'fi' or s == 'do' or s == 'done'
+        or s == 'esac' or s == '}' or s == 'in' then
+        return false
+      end
+    end
+    return true
+  end
+  return t.kind == T.T_LPAREN or is_redir_tok(t.kind)
+end
+
+local function wrap_list(items: sequence(integer), line: integer): integer
+  if #items == 0 then return N.node(N.N_EMPTY, 0, 0, 0, 0, line) end
+  if #items == 1 then return items[1] end
+  local node = N.node(N.N_SEQ, 0, 0, 0, 0, line)
+  local n = N.at(node)
+  n.a, n.b = N.list(items)
+  return node
+end
+
+-- term with newlines allowed between and around commands.
+function parse_compound_list(lx: *shlex.Lexer): integer
+  local items: sequence(integer)
+  linebreak(lx)
+  local line = lx:peek_token(true).line
+  while true do
+    local t = lx:peek_token(true)
+    if not starts_command(t) then break end
+    local cmd = parse_and_or(lx)
+    t = lx:peek_token(false)
+    if t.kind == T.T_AMP then
+      lx:take()
+      cmd = N.node(N.N_ASYNC, cmd, 0, 0, 0, t.line)
+      items:push(cmd)
+      linebreak(lx)
+    elseif t.kind == T.T_SEMI or t.kind == T.T_NEWLINE then
+      lx:take()
+      items:push(cmd)
+      linebreak(lx)
+    else
+      items:push(cmd)
+      break
+    end
+  end
+  return wrap_list(items, line)
+end
+
+-- One line's worth of input: list up to and including a NEWLINE (or EOF).
+-- Returns -1 when the input is exhausted. A blank line yields N_EMPTY.
+function shparse.next_command(lx: *shlex.Lexer): integer
+  local items: sequence(integer)
+  local t = lx:peek_token(true)
+  if t.kind == T.T_EOF then return -1 end
+  local line = t.line
+  if t.kind == T.T_NEWLINE then lx:take(); return N.node(N.N_EMPTY, 0, 0, 0, 0, line) end
+  while true do
+    t = lx:peek_token(true)
+    if t.kind == T.T_NEWLINE or t.kind == T.T_EOF then
+      if t.kind == T.T_NEWLINE then lx:take() end
+      break
+    end
+    if not starts_command(t) then unexpected(lx, t, '') end
+    local cmd = parse_and_or(lx)
+    t = lx:peek_token(false)
+    if t.kind == T.T_AMP then
+      lx:take()
+      items:push(N.node(N.N_ASYNC, cmd, 0, 0, 0, t.line))
+    elseif t.kind == T.T_SEMI then
+      lx:take()
+      items:push(cmd)
+    elseif t.kind == T.T_NEWLINE or t.kind == T.T_EOF then
+      items:push(cmd)
+      if t.kind == T.T_NEWLINE then lx:take() end
+      break
+    else
+      unexpected(lx, t, '')
+    end
+  end
+  return wrap_list(items, line)
+end
+
+-- Whole program from a lexer (backquotes, eval text). -1 when empty.
+function shparse.program(lx: *shlex.Lexer): integer
+  local items: sequence(integer)
+  local line = lx:line()
+  while true do
+    local node = shparse.next_command(lx)
+    if node < 0 then break end
+    if N.at(node).kind ~= N.N_EMPTY then items:push(node) end
+  end
+  if #items == 0 then return -1 end
+  return wrap_list(items, line)
+end
+
+local function hook_parse_sub(lx: *shlex.Lexer): integer
+  local body = parse_compound_list(lx)
+  local t = lx:peek_token(true)
+  if t.kind ~= T.T_RPAREN then unexpected(lx, t, '")"') end
+  lx:take()
+  if N.at(body).kind == N.N_EMPTY then return -1 end
+  return body
+end
+
+local function hook_parse_text(text: string, line: integer): integer
+  local lx: shlex.Lexer
+  lx:init_text(text)
+  lx.srcs[1].line = line
+  return shparse.program(&lx)
+end
+
+function shparse.init()
+  shlex.parse_sub = hook_parse_sub
+  shlex.parse_text = hook_parse_text
+end

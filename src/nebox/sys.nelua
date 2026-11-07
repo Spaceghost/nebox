@@ -186,3 +186,47 @@ end
 function sys.cstr(buf: *[0]cchar): string
   return (@cstring)(buf)
 end
+
+-- Signals, descriptors and process accounting for the shell applet.
+global sys.Sigaction: type <cimport 'nebox_sigaction', cinclude '<signal.h>', nodecl, ctypedef 'sigaction'> = @record{
+  sa_handler: function(cint): void,
+  sa_mask: [16]culong,
+  sa_flags: cint,
+  sa_restorer: pointer,
+}
+global sys.Tms: type <cimport 'nebox_tms', cinclude '<sys/times.h>', nodecl, ctypedef 'tms'> = @record{
+  tms_utime: clong, tms_stime: clong, tms_cutime: clong, tms_cstime: clong,
+}
+global sys.SIG_DFL: usize <comptime> = 0
+global sys.SIG_IGN: usize <comptime> = 1
+global sys.SIGINT: cint <comptime> = 2
+global sys.SIGQUIT: cint <comptime> = 3
+global sys.SIGPIPE: cint <comptime> = 13
+global sys.SIGCHLD: cint <comptime> = 17
+global sys.SIGTSTP: cint <comptime> = 20
+global sys.SIGTTIN: cint <comptime> = 21
+global sys.SIGTTOU: cint <comptime> = 22
+global sys.NSIG: integer <comptime> = 65
+global sys.F_DUPFD: cint <comptime> = 0
+global sys.F_GETFD: cint <comptime> = 1
+global sys.F_SETFD: cint <comptime> = 2
+global sys.F_GETFL: cint <comptime> = 3
+global sys.F_DUPFD_CLOEXEC: cint <comptime> = 1030
+global sys.FD_CLOEXEC: cint <comptime> = 1
+global sys.O_CLOEXEC: cint <comptime> = 0x80000
+global sys.SEEK_SET: cint <comptime> = 0
+global sys.SEEK_CUR: cint <comptime> = 1
+global sys.EBADF: cint <comptime> = 9
+global sys.EACCES: cint <comptime> = 13
+global sys.ENOEXEC: cint <comptime> = 8
+global sys.ECHILD: cint <comptime> = 10
+global sys.EISDIR: cint <comptime> = 21
+global sys.ESPIPE: cint <comptime> = 29
+global sys.EPIPE: cint <comptime> = 32
+global sys._SC_CLK_TCK: cint <comptime> = 2
+function sys.sigaction(sig: cint, act: *sys.Sigaction, old: *sys.Sigaction): cint <cimport 'sigaction', cinclude '<signal.h>'> end
+function sys.fcntl(fd: cint, cmd: cint, arg: cint): cint <cimport 'fcntl', cinclude '<fcntl.h>'> end
+function sys.dup(fd: cint): cint <cimport 'dup', cinclude '<unistd.h>'> end
+function sys.times(buf: *sys.Tms): clong <cimport 'times', cinclude '<sys/times.h>'> end
+function sys.sysconf(name: cint): clong <cimport 'sysconf', cinclude '<unistd.h>'> end
+function sys.getpgrp(): cint <cimport 'getpgrp', cinclude '<unistd.h>'> end

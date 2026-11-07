@@ -10,7 +10,7 @@ NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-zig.a
 OUT ?= build
 NM ?= nm
 
-SOURCES := src/nebox.nelua $(wildcard src/nebox/*.nelua) $(wildcard src/nebox/applets/*.nelua)
+SOURCES := src/nebox.nelua $(wildcard src/nebox/*.nelua) $(wildcard src/nebox/applets/*.nelua) $(wildcard src/nebox/awk/*.nelua) $(wildcard src/nebox/sh/*.nelua)
 
 CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-protector \
   -ffreestanding -fno-builtin -fno-sanitize=all -Wl,-e,_start -Wl,--build-id=none \

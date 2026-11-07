@@ -1,0 +1,654 @@
+-- sh word expansion (POSIX.1-2017 XCU 2.6): tilde expansion, parameter
+-- expansion, command substitution, arithmetic expansion, field splitting,
+-- pathname expansion and quote removal, plus the pattern matcher used by
+-- case, ${x#pat} and globbing. Expanded text carries one flag byte per
+-- character so quoting survives until quote removal.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sh.ast'
+require 'nebox.sh.arith'
+
+## local function B(c) return string.byte(c) end
+
+global shexp = @record{}
+
+global shexp.F_Q: byte <comptime> = 1      -- quoted: literal in patterns, never split
+global shexp.F_S: byte <comptime> = 2      -- from an unquoted expansion: subject to field splitting
+global shexp.F_SEP: byte <comptime> = 4    -- hard field boundary (between the fields of $@)
+global shexp.F_EMPTY: byte <comptime> = 8  -- zero-width quoted null: the field exists
+
+global shexp.Buf = @record{
+  bytes: sequence(byte),
+  flags: sequence(byte),
+}
+
+function shexp.Buf:add(b: byte, f: byte)
+  self.bytes:push(b)
+  self.flags:push(f)
+end
+
+function shexp.Buf:addstr(s: string, f: byte)
+  for i: usize = 0, < s.size do self:add(s.data[i], f) end
+end
+
+-- Quote removal: the plain text.
+function shexp.Buf:text(): string
+  local sb: stringbuilder
+  for i = 1, #self.bytes do
+    if self.flags[i] & shexp.F_EMPTY == 0 then sb:writebyte(self.bytes[i]) end
+  end
+  return sb:promote()
+end
+
+-- Hooks installed by the interpreter.
+global shexp.getvar: function(name: string): (string, boolean)
+global shexp.setvar: function(name: string, value: string)
+global shexp.params: function(): *sequence(string)
+global shexp.special: function(c: byte): string      -- $? $$ $! $- $0
+global shexp.cmdsub: function(node: integer): string
+global shexp.fatal: function(msg: string)            -- expansion error: exits
+global shexp.homedir: function(user: string): (string, boolean)
+global shexp.noglob: boolean = false
+global shexp.nounset: boolean = false
+
+local N = shast
+
+local function ifs(): string
+  local v, set = shexp.getvar('IFS')
+  if not set then return ' \t\n' end
+  return v
+end
+
+local function is_ifs_ws(c: byte, s: string): boolean
+  if c ~= 32 and c ~= 9 and c ~= 10 then return false end
+  return s:find(string.char(c), 1, true) > 0
+end
+
+local function in_ifs(c: byte, s: string): boolean
+  return s:find(string.char(c), 1, true) > 0
+end
+
+----------------------------------------------------------------------
+-- Pattern matching
+----------------------------------------------------------------------
+
+local function class_match(name: string, b: byte): (boolean, boolean)
+  local ok = false
+  if name == 'alpha' then ok = (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+  elseif name == 'digit' then ok = b >= 48 and b <= 57
+  elseif name == 'alnum' then ok = (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57)
+  elseif name == 'upper' then ok = b >= 65 and b <= 90
+  elseif name == 'lower' then ok = b >= 97 and b <= 122
+  elseif name == 'space' then ok = b == 32 or (b >= 9 and b <= 13)
+  elseif name == 'blank' then ok = b == 32 or b == 9
+  elseif name == 'punct' then ok = (b >= 33 and b <= 47) or (b >= 58 and b <= 64) or (b >= 91 and b <= 96) or (b >= 123 and b <= 126)
+  elseif name == 'print' then ok = b >= 32 and b <= 126
+  elseif name == 'graph' then ok = b >= 33 and b <= 126
+  elseif name == 'cntrl' then ok = b < 32 or b == 127
+  elseif name == 'xdigit' then ok = (b >= 48 and b <= 57) or (b >= 65 and b <= 70) or (b >= 97 and b <= 102)
+  else return false, false end
+  return ok, true
+end
+
+-- Bracket expression starting at pat[pi] == '['. Returns (matched, end
+-- index after ']', valid). Quoted characters inside are literal.
+local function bracket(p: *shexp.Buf, pi: integer, b: byte): (boolean, integer, boolean)
+  local n = #p.bytes
+  local j = pi + 1
+  local negate = false
+  if j <= n and p.flags[j] & shexp.F_Q == 0 and (p.bytes[j] == #[B'!']# or p.bytes[j] == #[B'^']#) then
+    negate = true
+    j = j + 1
+  end
+  local matched = false
+  local first = true
+  while j <= n do
+    local d = p.bytes[j]
+    local dq = p.flags[j] & shexp.F_Q ~= 0
+    if d == #[B']']# and not dq and not first then
+      return matched ~= negate, j + 1, true
+    end
+    first = false
+    if d == #[B'[']# and not dq and j + 1 <= n and p.bytes[j + 1] == #[B':']# then
+      -- character class
+      local k = j + 2
+      local name: stringbuilder
+      local closed = false
+      while k + 1 <= n do
+        if p.bytes[k] == #[B':']# and p.bytes[k + 1] == #[B']']# then closed = true; break end
+        name:writebyte(p.bytes[k])
+        k = k + 1
+      end
+      if closed then
+        local ok, known = class_match(name:view(), b)
+        if ok then matched = true end
+        j = k + 2
+        continue
+      end
+    end
+    local lo = d
+    local hi = d
+    if j + 2 <= n and p.bytes[j + 1] == #[B'-']# and p.flags[j + 1] & shexp.F_Q == 0 and p.bytes[j + 2] ~= #[B']']# then
+      hi = p.bytes[j + 2]
+      j = j + 2
+    end
+    if b >= lo and b <= hi then matched = true end
+    j = j + 1
+  end
+  return false, pi, false
+end
+
+local function match_at(p: *shexp.Buf, pi: integer, s: string, si: usize): boolean
+  local n = #p.bytes
+  while pi <= n do
+    local c = p.bytes[pi]
+    local q = p.flags[pi] & shexp.F_Q ~= 0
+    if p.flags[pi] & shexp.F_EMPTY ~= 0 then pi = pi + 1; continue end
+    if not q and c == #[B'*']# then
+      while pi <= n and p.bytes[pi] == #[B'*']# and p.flags[pi] & shexp.F_Q == 0 do pi = pi + 1 end
+      if pi > n then return true end
+      for k = si, s.size + 1 do
+        if match_at(p, pi, s, k) then return true end
+      end
+      return false
+    end
+    if si > s.size then return false end
+    local b = s:byte(si)
+    if not q and c == #[B'?']# then
+      pi = pi + 1; si = si + 1
+    elseif not q and c == #[B'[']# then
+      local ok, after, valid = bracket(p, pi, b)
+      if valid then
+        if not ok then return false end
+        pi = after; si = si + 1
+      else
+        if b ~= #[B'[']# then return false end
+        pi = pi + 1; si = si + 1
+      end
+    else
+      if b ~= c then return false end
+      pi = pi + 1; si = si + 1
+    end
+  end
+  return si > s.size
+end
+
+function shexp.match(p: *shexp.Buf, s: string): boolean
+  return match_at(p, 1, s, 1)
+end
+
+-- Does the buffer hold an unquoted pattern character?
+function shexp.has_glob(p: *shexp.Buf): boolean
+  for i = 1, #p.bytes do
+    if p.flags[i] & shexp.F_Q == 0 then
+      local c = p.bytes[i]
+      if c == #[B'*']# or c == #[B'?']# or c == #[B'[']# then return true end
+    end
+  end
+  return false
+end
+
+----------------------------------------------------------------------
+-- Expansion of parts into a buffer
+----------------------------------------------------------------------
+
+local function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boolean) <forwarddecl> end
+
+-- Text of a word without splitting or globbing (quote removal applied).
+local function word_text(wi: integer, assign: boolean): string
+  if wi <= 0 then return '' end
+  local b: shexp.Buf
+  expand_parts(N.W(wi), &b, false, assign)
+  return b:text()
+end
+
+-- Tilde prefix: returns the replacement and the number of bytes consumed.
+local function tilde(text: string, start: usize, stop_colon: boolean): (string, usize, boolean)
+  local j = start + 1
+  while j <= text.size and text:byte(j) ~= #[B'/']# and not (stop_colon and text:byte(j) == #[B':']#) do j = j + 1 end
+  local user = text:sub(start + 1, j - 1)
+  local home, ok = shexp.homedir(user)
+  if not ok then return '', 0, false end
+  return home, j - start, true
+end
+
+local function remove_pattern(value: string, pat: *shexp.Buf, prefix: boolean, longest: boolean): string
+  local n = value.size
+  if prefix then
+    if longest then
+      for k = n, 0, -1 do
+        if shexp.match(pat, value:subview(1, k)) then return value:sub(k + 1) end
+      end
+    else
+      for k = 0, n do
+        if shexp.match(pat, value:subview(1, k)) then return value:sub(k + 1) end
+      end
+    end
+  else
+    if longest then
+      for k = 1, n + 1 do
+        if shexp.match(pat, value:subview(k, n)) then return value:sub(1, k - 1) end
+      end
+    else
+      for k = n + 1, 1, -1 do
+        if shexp.match(pat, value:subview(k, n)) then return value:sub(1, k - 1) end
+      end
+    end
+  end
+  return value
+end
+
+local function is_digits(s: string): boolean
+  if s.size == 0 then return false end
+  for i: usize = 1, s.size do
+    if s:byte(i) < 48 or s:byte(i) > 57 then return false end
+  end
+  return true
+end
+
+-- Value of a parameter and whether it is set.
+local function param_value(name: string): (string, boolean)
+  if is_digits(name) then
+    local n = (@integer)(util.toint(name))
+    if n == 0 then return shexp.special(#[B'0']#), true end
+    local ps = shexp.params()
+    if n <= #ps then return ps[n], true end
+    return '', false
+  end
+  if name.size == 1 then
+    local c = name:byte(1)
+    if c == #[B'#']# then return string.format('%d', #shexp.params()), true end
+    if c == #[B'?']# or c == #[B'$']# or c == #[B'!']# or c == #[B'-']# then return shexp.special(c), true end
+    if c == #[B'@']# or c == #[B'*']# then
+      local ps = shexp.params()
+      local sb: stringbuilder
+      for i = 1, #ps do
+        if i > 1 then sb:writebyte(32) end
+        sb:write(ps[i])
+      end
+      return sb:promote(), #ps > 0
+    end
+  end
+  return shexp.getvar(name)
+end
+
+-- Append the positional parameters for $@ / $*.
+local function expand_at(star: boolean, quoted: boolean, out: *shexp.Buf, split: boolean)
+  local ps = shexp.params()
+  if star and quoted then
+    local sepstr = ifs()
+    local v, set = shexp.getvar('IFS')
+    for i = 1, #ps do
+      if i > 1 then
+        if not set then out:add(32, shexp.F_Q)
+        elseif sepstr.size > 0 then out:add(sepstr:byte(1), shexp.F_Q) end
+      end
+      out:addstr(ps[i], shexp.F_Q)
+    end
+    if #ps == 0 then out:add(0, shexp.F_EMPTY) end
+    return
+  end
+  if quoted and #ps == 0 then
+    -- "$@" with no parameters: zero fields; drop the opening-quote marker
+    local n = #out.bytes
+    if n > 0 and out.flags[n] & shexp.F_EMPTY ~= 0 then
+      out.bytes:pop()
+      out.flags:pop()
+    end
+    return
+  end
+  for i = 1, #ps do
+    if i > 1 then out:add(32, shexp.F_SEP) end
+    if quoted then
+      if ps[i].size == 0 then out:add(0, shexp.F_EMPTY) else out:addstr(ps[i], shexp.F_Q) end
+    else
+      out:addstr(ps[i], split and shexp.F_S or 0)
+    end
+  end
+end
+
+local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
+  local name = p.text
+  local f: byte = p.quoted and shexp.F_Q or (split and shexp.F_S or 0)
+  local is_at = name == '@' or name == '*'
+  if p.c == 1 then
+    local v, set = param_value(name)
+    local len: usize = v.size
+    if is_at then len = (@usize)(#shexp.params()) end
+    if not set and shexp.nounset and not is_at then shexp.fatal(name .. ': parameter not set') end
+    out:addstr(string.format('%d', len), f)
+    return
+  end
+  local v, set = param_value(name)
+  local null = set and v.size == 0
+  local op = p.a
+  if op == N.OP_NONE then
+    if not set and shexp.nounset and not is_at then shexp.fatal(name .. ': parameter not set') end
+    if is_at then expand_at(name == '*', p.quoted, out, split) return end
+    if set then
+      if v.size == 0 then
+        if p.quoted then out:add(0, shexp.F_EMPTY) end
+      else
+        out:addstr(v, f)
+      end
+    end
+    return
+  end
+  if op == N.OP_MINUS or op == N.OP_CMINUS then
+    if (not set) or (op == N.OP_CMINUS and null) then
+      if p.b > 0 then expand_parts(N.W(p.b), out, split, false) end
+    elseif is_at then
+      expand_at(name == '*', p.quoted, out, split)
+    else
+      if v.size == 0 then
+        if p.quoted then out:add(0, shexp.F_EMPTY) end
+      else
+        out:addstr(v, f)
+      end
+    end
+    return
+  end
+  if op == N.OP_PLUS or op == N.OP_CPLUS then
+    if set and not (op == N.OP_CPLUS and null) then
+      if p.b > 0 then expand_parts(N.W(p.b), out, split, false) end
+    end
+    return
+  end
+  if op == N.OP_EQ or op == N.OP_CEQ then
+    if (not set) or (op == N.OP_CEQ and null) then
+      if is_digits(name) or (name.size == 1 and not N.is_name(name)) then
+        shexp.fatal(name .. ': cannot assign in this way')
+      end
+      v = word_text(p.b, false)
+      shexp.setvar(name, v)
+    end
+    if v.size == 0 then
+      if p.quoted then out:add(0, shexp.F_EMPTY) end
+    else
+      out:addstr(v, f)
+    end
+    return
+  end
+  if op == N.OP_QUEST or op == N.OP_CQUEST then
+    if (not set) or (op == N.OP_CQUEST and null) then
+      local msg = word_text(p.b, false)
+      if msg.size == 0 then
+        msg = set and 'parameter not set or null' or 'parameter not set'
+      end
+      shexp.fatal(name .. ': ' .. msg)
+    end
+    if is_at then expand_at(name == '*', p.quoted, out, split) return end
+    if v.size == 0 then
+      if p.quoted then out:add(0, shexp.F_EMPTY) end
+    else
+      out:addstr(v, f)
+    end
+    return
+  end
+  -- pattern removal
+  if not set and shexp.nounset and not is_at then shexp.fatal(name .. ': parameter not set') end
+  local pat: shexp.Buf
+  if p.b > 0 then expand_parts(N.W(p.b), &pat, false, false) end
+  local prefix = op == N.OP_HASH or op == N.OP_HASH2
+  local longest = op == N.OP_HASH2 or op == N.OP_PERCENT2
+  if is_at then
+    local ps = shexp.params()
+    for i = 1, #ps do
+      if i > 1 then out:add(32, p.quoted and shexp.F_Q or shexp.F_SEP) end
+      out:addstr(remove_pattern(ps[i], &pat, prefix, longest), f)
+    end
+    return
+  end
+  local r = remove_pattern(v, &pat, prefix, longest)
+  if r.size == 0 then
+    if p.quoted then out:add(0, shexp.F_EMPTY) end
+  else
+    out:addstr(r, f)
+  end
+end
+
+function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boolean)
+  local after_eq = not assign  -- in assignment mode, tilde applies after '=' and each ':'
+  for i = 1, w.count do
+    local p = N.part(w, i)
+    if p.kind == N.PT_LIT then
+      local text = p.text
+      local j: usize = 1
+      if not p.quoted then
+        -- tilde expansion at the start of the word
+        if i == 1 and text.size > 0 and text:byte(1) == #[B'~']# then
+          local eqpos: isize = 0
+          if assign then eqpos = text:find('=', 1, true) end
+          if eqpos == 0 then
+            local stop = text:find('/', 1, true)
+            local whole = stop > 0 or w.count == 1
+            if assign then whole = true end
+            if whole then
+              local home, used, ok = tilde(text, 1, assign)
+              if ok then
+                out:addstr(home, shexp.F_Q)
+                j = used + 1
+              end
+            end
+          end
+        end
+      end
+      while j <= text.size do
+        local c = text:byte(j)
+        if not p.quoted and assign and (c == #[B'=']# or c == #[B':']#) and j < text.size and text:byte(j + 1) == #[B'~']#
+          and (c == #[B':']# or i == 1) then
+          out:add(c, 0)
+          local home, used, ok = tilde(text, j + 1, true)
+          if ok then
+            out:addstr(home, shexp.F_Q)
+            j = j + 1 + used
+            continue
+          end
+          j = j + 1
+          continue
+        end
+        out:add(c, p.quoted and shexp.F_Q or 0)
+        j = j + 1
+      end
+      if text.size == 0 and p.quoted then out:add(0, shexp.F_EMPTY) end
+    elseif p.kind == N.PT_PARAM then
+      expand_param(p, out, split)
+    elseif p.kind == N.PT_CMDSUB then
+      local v = shexp.cmdsub(p.a)
+      if v.size == 0 then
+        if p.quoted then out:add(0, shexp.F_EMPTY) end
+      else
+        out:addstr(v, p.quoted and shexp.F_Q or (split and shexp.F_S or 0))
+      end
+    elseif p.kind == N.PT_ARITH then
+      local text = word_text(p.b, false)
+      local v, err = sharith.eval(text)
+      if err.size > 0 then shexp.fatal(err) end
+      out:addstr(string.format('%d', v), p.quoted and shexp.F_Q or (split and shexp.F_S or 0))
+    end
+  end
+end
+
+----------------------------------------------------------------------
+-- Field splitting and pathname expansion
+----------------------------------------------------------------------
+
+local function split_fields(b: *shexp.Buf): sequence(shexp.Buf)
+  local out: sequence(shexp.Buf)
+  local sep = ifs()
+  local cur: shexp.Buf
+  local has = false
+  local after_ws = false
+  for i = 1, #b.bytes do
+    local c = b.bytes[i]
+    local f = b.flags[i]
+    if f & shexp.F_SEP ~= 0 then
+      if has then out:push(cur); cur = (@shexp.Buf)() end
+      has = false
+      after_ws = false
+    elseif f & shexp.F_EMPTY ~= 0 then
+      has = true
+      after_ws = false
+    elseif f & shexp.F_S ~= 0 and sep.size > 0 and in_ifs(c, sep) then
+      if is_ifs_ws(c, sep) then
+        if has then
+          out:push(cur); cur = (@shexp.Buf)()
+          has = false
+          after_ws = true
+        end
+      else
+        if after_ws then
+          after_ws = false
+        else
+          out:push(cur); cur = (@shexp.Buf)()
+          has = false
+        end
+      end
+    else
+      cur:add(c, f)
+      has = true
+      after_ws = false
+    end
+  end
+  if has then out:push(cur) end
+  return out
+end
+
+local function name_less(a: string, b: string): boolean return a < b end
+
+local function is_dir(path: string): boolean
+  local st: sys.Stat
+  if sys.stat(path, &st) ~= 0 then return false end
+  return (st.st_mode & sys.S_IFMT) == sys.S_IFDIR
+end
+
+local function glob_rec(prefix: string, comps: *sequence(shexp.Buf), idx: integer, results: *sequence(string))
+  local comp = &comps[idx]
+  local last = idx == #comps
+  if not shexp.has_glob(comp) then
+    local text = comp:text()
+    local path = prefix .. text
+    if last then
+      if util.exists(path) then results:push(path) end
+    else
+      glob_rec(path .. '/', comps, idx + 1, results)
+    end
+    return
+  end
+  local dir = prefix.size > 0 and prefix or '.'
+  local names, ok = util.readnames(dir, true)
+  if not ok then return end
+  local dot_ok = #comp.bytes > 0 and comp.bytes[1] == #[B'.']#
+  for _, name in ipairs(names) do
+    if name:byte(1) == #[B'.']# and not dot_ok then continue end
+    if shexp.match(comp, name) then
+      if last then
+        results:push(prefix .. name)
+      elseif is_dir(prefix .. name) then
+        glob_rec(prefix .. name .. '/', comps, idx + 1, results)
+      end
+    end
+  end
+end
+
+-- Pathname expansion of one field; the field itself when nothing matches.
+local function glob_field(b: *shexp.Buf): sequence(string)
+  local out: sequence(string)
+  if shexp.noglob or not shexp.has_glob(b) then
+    out:push(b:text())
+    return out
+  end
+  -- split into components on '/'
+  local comps: sequence(shexp.Buf)
+  local cur: shexp.Buf
+  local prefix: string = ''
+  local trailing_slash = false
+  local i: integer = 1
+  while i <= #b.bytes and b.bytes[i] == #[B'/']# do i = i + 1 end
+  if i > 1 then prefix = '/' end
+  while i <= #b.bytes do
+    local c = b.bytes[i]
+    if c == #[B'/']# then
+      comps:push(cur); cur = (@shexp.Buf)()
+      while i <= #b.bytes and b.bytes[i] == #[B'/']# do i = i + 1 end
+      if i > #b.bytes then trailing_slash = true end
+    else
+      cur:add(c, b.flags[i])
+      i = i + 1
+    end
+  end
+  if #cur.bytes > 0 then comps:push(cur) end
+  local results: sequence(string)
+  if #comps > 0 then glob_rec(prefix, &comps, 1, &results) end
+  if trailing_slash then
+    local dirs: sequence(string)
+    for _, r in ipairs(results) do
+      if is_dir(r) then dirs:push(r .. '/') end
+    end
+    results = dirs
+  end
+  if #results == 0 then
+    out:push(b:text())
+    return out
+  end
+  util.sort(results, name_less)
+  return results
+end
+
+----------------------------------------------------------------------
+-- Entry points
+----------------------------------------------------------------------
+
+-- Full expansion of a word into fields.
+function shexp.expand_word(wi: integer): sequence(string)
+  local b: shexp.Buf
+  expand_parts(N.W(wi), &b, true, false)
+  local fields = split_fields(&b)
+  local out: sequence(string)
+  for i = 1, #fields do
+    local g = glob_field(&fields[i])
+    for j = 1, #g do out:push(g[j]) end
+  end
+  return out
+end
+
+-- Full expansion of several words (a word list).
+function shexp.expand_words(start: integer, count: integer): sequence(string)
+  local out: sequence(string)
+  for i = 0, < count do
+    local f = shexp.expand_word(N.L(start + i))
+    for j = 1, #f do out:push(f[j]) end
+  end
+  return out
+end
+
+-- Expansion without splitting or globbing: redirection targets, case words,
+-- here-document bodies.
+function shexp.expand_one(wi: integer): string
+  return word_text(wi, false)
+end
+
+-- Expansion of an assignment word: returns (name, value), with tilde
+-- expansion after '=' and ':'.
+function shexp.expand_assign(wi: integer): (string, string)
+  local w = N.W(wi)
+  local p1 = N.part(w, 1)
+  local eq = p1.text:find('=', 1, true)
+  local name = p1.text:sub(1, eq - 1)
+  local b: shexp.Buf
+  expand_parts(w, &b, false, true)
+  local full = b:text()
+  return name, full:sub(eq + 1)
+end
+
+-- Pattern for case: expanded without splitting; quoted characters stay literal.
+function shexp.expand_pattern(wi: integer): shexp.Buf
+  local b: shexp.Buf
+  expand_parts(N.W(wi), &b, false, false)
+  return b
+end

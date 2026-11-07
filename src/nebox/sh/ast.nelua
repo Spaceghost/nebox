@@ -1,0 +1,178 @@
+-- sh syntax tree: words are lists of parts (literal text, parameter
+-- expansions, command substitutions, arithmetic), commands are nodes in a
+-- flat arena indexed by integers, as in the awk applet. The arena is global
+-- and grows for the life of the shell: functions keep their bodies alive.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+
+global shast = @record{}
+
+-- Word part kinds.
+global shast.PT_LIT: byte <comptime> = 1      -- text; quoted = no splitting, no globbing
+global shast.PT_PARAM: byte <comptime> = 2    -- text = name, a = op, b = argument word (0 none), c = 1 for ${#name}
+global shast.PT_CMDSUB: byte <comptime> = 3   -- a = command node (-1 for an empty substitution)
+global shast.PT_ARITH: byte <comptime> = 4    -- b = inner word (parsed as if double-quoted)
+
+-- Parameter expansion operators (Part.a).
+global shast.OP_NONE: integer <comptime> = 0
+global shast.OP_MINUS: integer <comptime> = 1      -- ${x-w}
+global shast.OP_CMINUS: integer <comptime> = 2     -- ${x:-w}
+global shast.OP_EQ: integer <comptime> = 3         -- ${x=w}
+global shast.OP_CEQ: integer <comptime> = 4        -- ${x:=w}
+global shast.OP_QUEST: integer <comptime> = 5      -- ${x?w}
+global shast.OP_CQUEST: integer <comptime> = 6     -- ${x:?w}
+global shast.OP_PLUS: integer <comptime> = 7       -- ${x+w}
+global shast.OP_CPLUS: integer <comptime> = 8      -- ${x:+w}
+global shast.OP_HASH: integer <comptime> = 9       -- ${x#p}
+global shast.OP_HASH2: integer <comptime> = 10     -- ${x##p}
+global shast.OP_PERCENT: integer <comptime> = 11   -- ${x%p}
+global shast.OP_PERCENT2: integer <comptime> = 12  -- ${x%%p}
+
+global shast.Part = @record{
+  kind: byte,
+  quoted: boolean,
+  text: string,
+  a: integer, b: integer, c: integer,
+}
+
+-- A word is a slice of the parts arena. `plain` holds the text when the
+-- word is one unquoted literal (reserved words, names, aliases); `assign`
+-- is set when the word has the form name=... with an unquoted '='.
+global shast.Word = @record{
+  first: integer,
+  count: integer,
+  plain: string,
+  is_plain: boolean,
+  assign: boolean,
+  line: integer,
+}
+
+-- Redirection operators.
+global shast.R_IN: byte <comptime> = 1        -- <
+global shast.R_OUT: byte <comptime> = 2       -- >
+global shast.R_CLOBBER: byte <comptime> = 3   -- >|
+global shast.R_APPEND: byte <comptime> = 4    -- >>
+global shast.R_RDWR: byte <comptime> = 5      -- <>
+global shast.R_DUPIN: byte <comptime> = 6     -- <&
+global shast.R_DUPOUT: byte <comptime> = 7    -- >&
+global shast.R_HEREDOC: byte <comptime> = 8   -- <<
+global shast.R_HEREDOC_STRIP: byte <comptime> = 9 -- <<-
+
+global shast.Redir = @record{
+  op: byte,
+  fd: integer,
+  target: integer,     -- word index (the delimiter for here-documents)
+  body: integer,       -- here-document body word, or -1
+  quoted_delim: boolean,
+  line: integer,
+}
+
+-- Command node kinds.
+global shast.N_SIMPLE: byte <comptime> = 1    -- a/b = words (assignments first), r0/r1 = redirs
+global shast.N_PIPE: byte <comptime> = 2      -- a/b = list of command nodes, c = 1 when negated
+global shast.N_AND: byte <comptime> = 3       -- a && b
+global shast.N_OR: byte <comptime> = 4        -- a || b
+global shast.N_SEQ: byte <comptime> = 5       -- a/b = list of nodes run in order
+global shast.N_ASYNC: byte <comptime> = 6     -- a = node run in the background
+global shast.N_IF: byte <comptime> = 7        -- a cond, b then, c else or -1
+global shast.N_WHILE: byte <comptime> = 8     -- a cond, b body
+global shast.N_UNTIL: byte <comptime> = 9
+global shast.N_FOR: byte <comptime> = 10      -- s = name, a/b = words, c = body, d = 1 when "in" was absent
+global shast.N_CASE: byte <comptime> = 11     -- a = word, b/c = list of N_CASEITEM
+global shast.N_CASEITEM: byte <comptime> = 12 -- a/b = pattern words, c = body or -1
+global shast.N_BRACE: byte <comptime> = 13    -- a = body
+global shast.N_SUBSHELL: byte <comptime> = 14 -- a = body
+global shast.N_FUNC: byte <comptime> = 15     -- s = name, a = body
+global shast.N_EMPTY: byte <comptime> = 16    -- nothing (an empty substitution)
+
+global shast.Node = @record{
+  kind: byte,
+  a: integer, b: integer, c: integer, d: integer,
+  r0: integer, r1: integer,   -- redirections: start and count in `lists`
+  s: string,
+  line: integer,
+}
+
+global shast.Program = @record{
+  nodes: sequence(shast.Node),
+  lists: sequence(integer),
+  parts: sequence(shast.Part),
+  words: sequence(shast.Word),
+  redirs: sequence(shast.Redir),
+}
+
+global shprog: shast.Program
+
+function shast.node(kind: byte, a: integer, b: integer, c: integer, d: integer, line: integer): integer
+  shprog.nodes:push((@shast.Node){kind = kind, a = a, b = b, c = c, d = d, r0 = 0, r1 = 0, line = line})
+  return #shprog.nodes
+end
+
+function shast.list(items: sequence(integer)): (integer, integer)
+  local start = #shprog.lists + 1
+  for i = 1, #items do shprog.lists:push(items[i]) end
+  return start, #items
+end
+
+function shast.at(i: integer): *shast.Node
+  return &shprog.nodes[i]
+end
+
+function shast.L(i: integer): integer
+  return shprog.lists[i]
+end
+
+-- Store a word built from a local part list.
+function shast.word(parts: sequence(shast.Part), line: integer): integer
+  local w: shast.Word
+  w.first = #shprog.parts + 1
+  w.count = #parts
+  w.line = line
+  for i = 1, #parts do shprog.parts:push(parts[i]) end
+  if #parts == 1 and parts[1].kind == shast.PT_LIT and not parts[1].quoted then
+    w.is_plain = true
+    w.plain = parts[1].text
+  elseif #parts == 0 then
+    w.is_plain = true
+    w.plain = ''
+  end
+  shprog.words:push(w)
+  return #shprog.words
+end
+
+function shast.W(i: integer): *shast.Word
+  return &shprog.words[i]
+end
+
+function shast.part(w: *shast.Word, i: integer): *shast.Part
+  return &shprog.parts[w.first + i - 1]
+end
+
+-- Mark where the arena stands so eval/. can drop nodes they no longer need.
+global shast.Mark = @record{ nodes: integer, lists: integer, parts: integer, words: integer, redirs: integer }
+
+function shast.mark(): shast.Mark
+  return (@shast.Mark){nodes = #shprog.nodes, lists = #shprog.lists, parts = #shprog.parts,
+    words = #shprog.words, redirs = #shprog.redirs}
+end
+
+function shast.release(m: shast.Mark)
+  shprog.nodes:resize((@usize)(m.nodes))
+  shprog.lists:resize((@usize)(m.lists))
+  shprog.parts:resize((@usize)(m.parts))
+  shprog.words:resize((@usize)(m.words))
+  shprog.redirs:resize((@usize)(m.redirs))
+end
+
+-- Is `s` a valid shell name?
+function shast.is_name(s: string): boolean
+  if s.size == 0 then return false end
+  for i: usize = 1, s.size do
+    local c = s:byte(i)
+    local ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95 or (i > 1 and c >= 48 and c <= 57)
+    if not ok then return false end
+  end
+  return true
+end

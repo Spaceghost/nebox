@@ -88,6 +88,14 @@ Stated here rather than worked around:
   xorshift64* generator, so its sequence matches no other awk. Memory for
   string temporaries is not reclaimed until exit; records and fields are
   views into a reused buffer.
+- `sh` is in progress on branch `sh` and is **not an applet yet**: it is
+  not in the applet list, `nebox --list` does not show it, nothing in
+  `tests/run.sh` exercises it, and the sources under `src/nebox/sh/` (word
+  and token lexer with here-documents and aliases, POSIX grammar parser,
+  arithmetic evaluator, word expander with field splitting and pathname
+  expansion) have only been type-checked by the Nelua compiler. There is no
+  interpreter, no builtins and no `tests/sh.sh`; none of the shell behavior
+  described in those files has been observed running.
 - `grep`, `sed`, `expr` and `find -regex` use nebox's own regex engine
   (`src/nebox/regex.nelua`): POSIX BRE and ERE with brackets, named classes,
   intervals, groups, alternation, back-references, and the GNU
