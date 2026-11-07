@@ -208,7 +208,16 @@ Stated here rather than worked around:
 - `printf` (the applet and the `sh` builtin) has `%s %b %c %d %i %u %o
   %x %X %f %F %e %E %g %G %%` with flags, width and precision; no `*`
   width or precision, no `%a`, and arguments are reused until consumed.
-- `seq` is integer-only.
+- `seq` follows GNU seq 9.1: long double operands (decimal, exponent, hex,
+  `inf`), output precision from the fraction digits of FIRST and INCREMENT
+  (`%Lg` for hex operands), the extra last number when it prints as LAST
+  (`seq 0 0.1 1` ends with `1.0`), `-w` widths for floating operands, `-f`
+  with one `e f g a E F G A` conversion and `%%`, `-s` strings, the long
+  options, and exact decimal counting for integer operands with a step up
+  to 200 (`seq 18446744073709551614 18446744073709551617`, `seq 1 inf`)
+  (`seq-*`). Differences, both from nelibc's printf: negative zero prints as
+  `0` where GNU prints `-0` (`seq-negzero`), and `-f %a` prints `0x1p+0`
+  where glibc prints `0x8p-3` (`seq-f-hexfloat`). No `--help`/`--version`.
 - `chmod` takes octal modes and `[ugoa][+-=][rwxXst]` lists.
 - `test` has no parentheses; `-a`/`-o` bind loosest, in that order.
 - `mv` across filesystems copies then removes; `cp -a` is `-rp`.

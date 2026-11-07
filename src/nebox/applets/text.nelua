@@ -1428,71 +1428,6 @@ global function applet_yes(args: sequence(string)): integer
   return 0
 end
 
-global function applet_seq(args: sequence(string)): integer
-  -- options by hand: "-2" is a number, not an option
-  local sep: string = '\n'
-  local pad = false
-  local operands: sequence(string)
-  local i: integer = 1
-  while i <= #args do
-    local a = args[i]
-    if a == '--' then i = i + 1; break end
-    if a.size >= 2 and a:byte(1) == 45 and (a:byte(2) == 115 or a:byte(2) == 119) then
-      if a:byte(2) == 119 then pad = true
-      elseif a.size > 2 then sep = a:sub(3)
-      else
-        i = i + 1
-        if i > #args then return util.die("option requires an argument -- 's'") end
-        sep = args[i]
-      end
-    elseif a.size >= 2 and a:byte(1) == 45 and not (a:byte(2) >= 48 and a:byte(2) <= 57) and a:byte(2) ~= 46 then
-      return util.die("invalid option -- '" .. a:sub(2, 2) .. "'")
-    else
-      break
-    end
-    i = i + 1
-  end
-  while i <= #args do operands:push(args[i]); i = i + 1 end
-  local n = #operands
-  if n < 1 or n > 3 then util.err(n == 0 and 'missing operand' or 'extra operand'); return 1 end
-  local first, inc, last: integer = 1, 1, 0
-  local ok: boolean
-  if n == 1 then last, ok = util.toint(operands[1])
-  elseif n == 2 then
-    first, ok = util.toint(operands[1]); if not ok then util.err("invalid argument: '" .. operands[1] .. "'"); return 1 end
-    last, ok = util.toint(operands[2])
-  else
-    first, ok = util.toint(operands[1]); if not ok then util.err("invalid argument: '" .. operands[1] .. "'"); return 1 end
-    inc, ok = util.toint(operands[2]); if not ok then util.err("invalid argument: '" .. operands[2] .. "'"); return 1 end
-    last, ok = util.toint(operands[3])
-  end
-  if not ok then util.err("invalid argument: '" .. operands[n] .. "'"); return 1 end
-  if inc == 0 then util.err('invalid zero increment value'); return 1 end
-  local width: integer = 0
-  if pad then
-    local a, b = string.format('%d', first), string.format('%d', last)
-    width = (@integer)(a.size > b.size and a.size or b.size)
-  end
-  local v = first
-  local any = false
-  while (inc > 0 and v <= last) or (inc < 0 and v >= last) do
-    if any then util.write(sep) end
-    if width > 0 then
-      local s = string.format('%d', v)
-      local neg = v < 0
-      if neg then util.writebyte(45); s = s:sub(2) end
-      for _ = (@integer)(s.size) + (neg and 1 or 0), width - 1 do util.writebyte(48) end
-      util.write(s)
-    else
-      util.writef('%d', v)
-    end
-    any = true
-    v = v + inc
-  end
-  if any then util.writebyte(10) end
-  return 0
-end
-
 local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
 
 -- One floating conversion through the C library.
@@ -1519,6 +1454,391 @@ local function printf_tofloat(a: string): (float64, boolean)
   local ok = used == a.size and (@isize)(endp) ~= (@isize)(c.data)
   c:destroy()
   return v, ok
+end
+
+-- seq, after GNU seq 9.1: operands are long doubles, the default format is
+-- %.PLf with P the larger number of fraction digits of FIRST and INCREMENT
+-- (%Lg for hex or 'p' operands), -w pads to the widest operand, -f takes one
+-- e/f/g/a conversion. All-digit operands (and integral ones that print as
+-- plain digits) with a small positive step count in decimal strings, so
+-- they stay exact past 2^64 and `seq N inf` runs forever, as GNU's fast
+-- path does.
+local SEQ_NOPREC: integer <comptime> = 0x7fffffff
+
+local SeqOperand = @record{value: clongdouble, width: integer, precision: integer}
+
+local function seq_isdigit(c: byte): boolean return c >= '0'_b and c <= '9'_b end
+local function seq_isspace(c: byte): boolean return c == 32 or (c >= 9 and c <= 13) end
+local function seq_finite(v: clongdouble): boolean return v == v and v - v == 0 end
+
+-- Format one long double; returns the bytes in buf, or an allocated
+-- string when they do not fit.
+local function seq_fmt(fmt: string, v: clongdouble, buf: *[512]byte): string
+  local n = c_snprintf((@cstring)(&buf[0]), 512, fmt, v)
+  if n < 0 then return '' end
+  if n < 512 then return (@string){data = &buf[0], size = (@usize)(n)} end
+  local s = string.create((@usize)(n))
+  c_snprintf((@cstring)(s.data), (@usize)(n) + 1, fmt, v)
+  return s
+end
+
+-- gnulib xstrtold: the whole operand must be a number; overflow is an
+-- error, underflow is not.
+local function seq_strtold(a: string): (clongdouble, boolean)
+  local c = string.copy(a)
+  local endp: cstring
+  local v = sys.strtold(c, &endp)
+  local used = (@usize)((@isize)(endp) - (@isize)(c.data))
+  local ok = used > 0 and used == a.size
+  if ok and v == v and not seq_finite(v) then
+    -- an infinity is fine only when it was written as one
+    local i: usize = 1
+    while i <= a.size and (seq_isspace(a:byte(i)) or a:byte(i) == '+'_b or a:byte(i) == '-'_b) do i = i + 1 end
+    ok = i <= a.size and (a:byte(i) == 'i'_b or a:byte(i) == 'I'_b)
+  end
+  c:destroy()
+  return v, ok
+end
+
+local function seq_usage_fail(msg: string): integer
+  util.err(msg)
+  util.err("Try 'seq --help' for more information.")
+  return 1
+end
+
+-- strspn-style count of bytes from `set` starting at i
+local function seq_span(s: string, i: usize, set: string): usize
+  local j = i
+  while j <= s.size and set:find(string.char(s:byte(j)), 1, true) > 0 do j = j + 1 end
+  return j
+end
+
+-- coreutils scan_arg: value plus the width and precision the operand's
+-- spelling implies.
+local function seq_scan(arg: string): (SeqOperand, boolean)
+  local r: SeqOperand = {value = 0, width = 0, precision = SEQ_NOPREC}
+  local v, ok = seq_strtold(arg)
+  if not ok then
+    seq_usage_fail("invalid floating point argument: '" .. arg .. "'"); return r, false
+  end
+  if v ~= v then
+    seq_usage_fail("invalid 'not-a-number' argument: '" .. arg .. "'"); return r, false
+  end
+  r.value = v
+  local k: usize = 1
+  while k <= arg.size and (seq_isspace(arg:byte(k)) or arg:byte(k) == '+'_b) do k = k + 1 end
+  local s = arg:sub(k)
+  local dp = s:find('.', 1, true)
+  if dp == 0 and s:find('p', 1, true) == 0 then r.precision = 0 end
+  if s:find('x', 1, true) == 0 and s:find('X', 1, true) == 0 and seq_finite(v) then
+    local fraction_len: integer = 0
+    r.width = (@integer)(s.size)
+    if dp > 0 then
+      local j = dp + 1
+      while j <= (@isize)(s.size) and s:byte(j) ~= 'e'_b and s:byte(j) ~= 'E'_b do j = j + 1 end
+      fraction_len = (@integer)(j - dp - 1)
+      r.precision = fraction_len
+      if fraction_len == 0 then r.width = r.width - 1
+      elseif dp == 1 or not seq_isdigit(s:byte(dp - 1)) then r.width = r.width + 1 end
+    end
+    local e = s:find('e', 1, true)
+    if e == 0 then e = s:find('E', 1, true) end
+    if e > 0 then
+      -- strtol of the exponent
+      local j = e + 1
+      while j <= (@isize)(s.size) and seq_isspace(s:byte(j)) do j = j + 1 end
+      local eneg = false
+      if j <= (@isize)(s.size) and (s:byte(j) == '-'_b or s:byte(j) == '+'_b) then eneg = s:byte(j) == '-'_b; j = j + 1 end
+      local exponent: integer = 0
+      while j <= (@isize)(s.size) and seq_isdigit(s:byte(j)) do
+        if exponent < 0x7fffffff then exponent = exponent * 10 + (s:byte(j) - '0'_b) end
+        j = j + 1
+      end
+      if eneg then exponent = -exponent end
+      if exponent < 0 then r.precision = r.precision - exponent
+      else r.precision = r.precision - (r.precision < exponent and r.precision or exponent) end
+      r.width = r.width - ((@integer)(s.size) - (@integer)(e - 1))
+      if exponent < 0 then
+        if dp > 0 then
+          if e == dp + 1 then r.width = r.width + 1 end
+        else
+          r.width = r.width + 1
+        end
+        exponent = -exponent
+      else
+        if dp > 0 and r.precision == 0 and fraction_len > 0 then r.width = r.width - 1 end
+        exponent = exponent - (fraction_len < exponent and fraction_len or exponent)
+      end
+      r.width = r.width + exponent
+    end
+  end
+  return r, true
+end
+
+local function at(s: string, i: usize): byte
+  if i > s.size then return 0 end
+  return s:byte(i)
+end
+
+-- coreutils long_double_format: check -f's FORMAT and add the L modifier.
+-- Returns the format, the output length of its prefix and suffix, and an
+-- error message.
+local function seq_ldformat(fmt: string): (string, integer, integer, string)
+  local i: usize = 1
+  local prefix: integer = 0
+  while not (at(fmt, i) == '%'_b and at(fmt, i + 1) ~= '%'_b) do
+    if at(fmt, i) == 0 then return '', 0, 0, "format '" .. fmt .. "' has no % directive" end
+    prefix = prefix + 1
+    i = i + (at(fmt, i) == '%'_b and 2 or 1)
+  end
+  i = i + 1
+  local flags_start = i
+  i = seq_span(fmt, i, "-+#0 '")
+  local flags = fmt:sub(flags_start, i - 1)
+  local rest_start = i
+  i = seq_span(fmt, i, '0123456789')
+  if at(fmt, i) == '.'_b then i = seq_span(fmt, i + 1, '0123456789') end
+  local lmo = i
+  local hasL = at(fmt, i) == 'L'_b
+  if hasL then i = i + 1 end
+  local conv = at(fmt, i)
+  if conv == 0 then return '', 0, 0, "format '" .. fmt .. "' ends in %" end
+  if ('efgaEFGA'):find(string.char(conv), 1, true) == 0 then
+    return '', 0, 0, "format '" .. fmt .. "' has unknown %" .. string.char(conv) .. ' directive'
+  end
+  i = i + 1
+  local suffix: integer = 0
+  while at(fmt, i) ~= 0 do
+    if at(fmt, i) == '%'_b and at(fmt, i + 1) ~= '%'_b then
+      return '', 0, 0, "format '" .. fmt .. "' has too many % directives"
+    end
+    suffix = suffix + 1
+    i = i + (at(fmt, i) == '%'_b and 2 or 1)
+  end
+  -- the ' flag (thousands grouping) does nothing in the C locale
+  local sb: stringbuilder
+  for k: usize = 1, flags.size do if flags:byte(k) ~= 39 then sb:writebyte(flags:byte(k)) end end
+  local ldfmt = fmt:sub(1, flags_start - 1) .. sb:promote() .. fmt:sub(rest_start, lmo - 1) .. 'L' ..
+    fmt:sub(lmo + (hasL and 1 or 0))
+  return ldfmt, prefix, suffix, ''
+end
+
+local function seq_print(fmt: string, prefix: integer, suffix: integer, first: clongdouble, step: clongdouble,
+    last: clongdouble, sep: string)
+  local out_of_range: boolean
+  if step < 0 then out_of_range = first < last else out_of_range = last < first end
+  if out_of_range then return end
+  local buf: [512]byte
+  local x = first
+  local i: clongdouble = 1
+  while true do
+    local x0 = x
+    util.write(seq_fmt(fmt, x, &buf))
+    if out_of_range then break end
+    x = first + i * step
+    i = i + 1
+    if step < 0 then out_of_range = x < last else out_of_range = last < x end
+    if out_of_range then
+      -- print one more number when it prints as LAST and differently from
+      -- the previous one (rounding: seq 0 0.1 1 ends with 1.0)
+      local extra = false
+      local xs = string.copy(seq_fmt(fmt, x, &buf))
+      local xv, ok = seq_strtold(xs:sub((@usize)(prefix) + 1, xs.size - (@usize)(suffix)))
+      if ok and xv == last then
+        local x0s = seq_fmt(fmt, x0, &buf)
+        extra = x0s:sub(1, x0s.size - (@usize)(suffix)) ~= xs:sub(1, xs.size - (@usize)(suffix))
+      end
+      if not extra then break end
+    end
+    util.write(sep)
+    if (@integer)(i) & 1023 == 0 and not util.flush() then return end
+  end
+  util.writebyte(10)
+end
+
+local function seq_all_digits(s: string): boolean
+  if s.size == 0 then return false end
+  for i: usize = 1, s.size do if not seq_isdigit(s:byte(i)) then return false end end
+  return true
+end
+
+-- Compare two digit strings without leading zeros.
+local function seq_cmp(a: sequence(byte), b: string): integer
+  if (@usize)(#a) ~= b.size then return #a < (@integer)(b.size) and -1 or 1 end
+  for i: usize = 1, b.size do
+    if a[i] ~= b:byte(i) then return a[i] < b:byte(i) and -1 or 1 end
+  end
+  return 0
+end
+
+-- coreutils seq_fast: decimal strings from A to B (or "inf") by STEP.
+local function seq_fast(a: string, b: string, step: integer, sep: string)
+  local inf = b == 'inf'
+  local ia: usize = 1
+  while ia < a.size and a:byte(ia) == '0'_b do ia = ia + 1 end
+  local ib: usize = 1
+  while ib < b.size and b:byte(ib) == '0'_b do ib = ib + 1 end
+  local q = b:sub(ib)
+  local p: sequence(byte)
+  for k: usize = ia, a.size do p:push(a:byte(k)) end
+  if not inf and seq_cmp(p, q) > 0 then return end
+  for k = 1, #p do util.writebyte(p[k]) end
+  local count: integer = 0
+  while true do
+    -- p += step
+    local carry: integer = step
+    local k = #p
+    while carry > 0 and k >= 1 do
+      local d = (p[k] - '0'_b) + carry
+      p[k] = (@byte)('0'_b + d % 10)
+      carry = d // 10
+      k = k - 1
+    end
+    while carry > 0 do p:insert(1, (@byte)('0'_b + carry % 10)); carry = carry // 10 end
+    if not inf and seq_cmp(p, q) > 0 then break end
+    util.write(sep)
+    for j = 1, #p do util.writebyte(p[j]) end
+    count = count + 1
+    if count & 1023 == 0 and not util.flush() then return end
+  end
+  util.writebyte(10)
+end
+
+global function applet_seq(args: sequence(string)): integer
+  local sep: string = '\n'
+  local fmt: string = ''
+  local has_fmt = false
+  local equal = false
+  local i: integer = 1
+  -- getopt "+f:s:w" with long options; "-5" and "-.5" are operands
+  while i <= #args do
+    local a = args[i]
+    if a.size < 2 or a:byte(1) ~= '-'_b then break end
+    if a:byte(2) == '.'_b or seq_isdigit(a:byte(2)) then break end
+    if a == '--' then i = i + 1; break end
+    if a:byte(2) == '-'_b then
+      local body = a:sub(3)
+      local name, value = body, ''
+      local eq = body:find('=', 1, true)
+      local has_value = eq > 0
+      if has_value then name = body:sub(1, eq - 1); value = body:sub(eq + 1) end
+      local longs: [3]string = {'equal-width', 'format', 'separator'}
+      local match: string = ''
+      local count = 0
+      for _, l in ipairs(longs) do
+        if l == name then match = l; count = 1; break end
+        if name.size > 0 and l:sub(1, name.size) == name then match = l; count = count + 1 end
+      end
+      if count ~= 1 then
+        return seq_usage_fail((count == 0 and "unrecognized option '" or "option '") .. a ..
+          (count == 0 and "'" or "' is ambiguous"))
+      end
+      if match == 'equal-width' then
+        if has_value then return seq_usage_fail("option '--equal-width' doesn't allow an argument") end
+        equal = true
+      else
+        if not has_value then
+          i = i + 1
+          if i > #args then return seq_usage_fail("option '--" .. match .. "' requires an argument") end
+          value = args[i]
+        end
+        if match == 'format' then fmt = value; has_fmt = true else sep = value end
+      end
+      i = i + 1
+      continue
+    end
+    local j: usize = 2
+    while j <= a.size do
+      local c = a:byte(j)
+      if c == 'w'_b then
+        equal = true; j = j + 1
+      elseif c == 'f'_b or c == 's'_b then
+        local v: string
+        if j < a.size then v = a:sub(j + 1)
+        else
+          i = i + 1
+          if i > #args then return seq_usage_fail("option requires an argument -- '" .. string.char(c) .. "'") end
+          v = args[i]
+        end
+        if c == 'f'_b then fmt = v; has_fmt = true else sep = v end
+        break
+      else
+        return seq_usage_fail("invalid option -- '" .. string.char(c) .. "'")
+      end
+    end
+    i = i + 1
+  end
+  local ops: sequence(string)
+  while i <= #args do ops:push(args[i]); i = i + 1 end
+  local n = #ops
+  if n < 1 then return seq_usage_fail('missing operand') end
+  if n > 3 then return seq_usage_fail("extra operand '" .. ops[4] .. "'") end
+  if has_fmt and equal then
+    return seq_usage_fail('format string may not be specified when printing equal width strings')
+  end
+  local plain = not equal and not has_fmt and sep.size == 1
+  -- fast path for digit-only operands
+  local fast_step_ok = true
+  if n == 3 then
+    local sv, sok = seq_strtold(ops[2])
+    fast_step_ok = seq_all_digits(ops[2]) and sok and 0 < sv and sv <= 200
+  end
+  if plain and seq_all_digits(ops[1]) and (n == 1 or seq_all_digits(ops[2])) and
+      (n < 3 or (fast_step_ok and seq_all_digits(ops[3]))) then
+    local stepv: integer = 1
+    if n == 3 then local sv, _ = util.toint(ops[2]); stepv = sv end
+    seq_fast(n == 1 and '1' or ops[1], ops[n], stepv, sep)
+    return util.flush() and 0 or 1
+  end
+  local first: SeqOperand = {value = 1, width = 1, precision = 0}
+  local step: SeqOperand = {value = 1, width = 1, precision = 0}
+  local last: SeqOperand
+  local ok: boolean
+  if n == 1 then
+    last, ok = seq_scan(ops[1]); if not ok then return 1 end
+  else
+    first, ok = seq_scan(ops[1]); if not ok then return 1 end
+    if n == 3 then
+      step, ok = seq_scan(ops[2]); if not ok then return 1 end
+      if step.value == 0 then return seq_usage_fail("invalid Zero increment value: '" .. ops[2] .. "'") end
+    end
+    last, ok = seq_scan(ops[n]); if not ok then return 1 end
+  end
+  -- fast path for integral values that print as plain digits
+  if plain and seq_finite(first.value) and first.precision == 0 and step.precision == 0 and
+      last.precision == 0 and 0 <= first.value and 0 <= last.value and 0 < step.value and step.value <= 200 then
+    local buf: [512]byte
+    local s1 = string.copy(seq_fmt('%0.Lf', first.value, &buf))
+    local s2: string = 'inf'
+    if seq_finite(last.value) then s2 = string.copy(seq_fmt('%0.Lf', last.value, &buf)) end
+    if s1:byte(1) ~= '-'_b and s2:byte(1) ~= '-'_b then
+      seq_fast(s1, s2, (@integer)(step.value), sep)
+      return util.flush() and 0 or 1
+    end
+  end
+  local prefix, suffix: integer = 0, 0
+  if has_fmt then
+    local err: string
+    fmt, prefix, suffix, err = seq_ldformat(fmt)
+    if err.size > 0 then return util.die(err) end
+  else
+    local prec = first.precision > step.precision and first.precision or step.precision
+    fmt = '%Lg'
+    if prec ~= SEQ_NOPREC and last.precision ~= SEQ_NOPREC then
+      if equal then
+        local fw = first.width + (prec - first.precision)
+        local lw = last.width + (prec - last.precision)
+        if last.precision ~= 0 and prec == 0 then lw = lw - 1 end
+        if last.precision == 0 and prec ~= 0 then lw = lw + 1 end
+        if first.precision == 0 and prec ~= 0 then fw = fw + 1 end
+        fmt = string.format('%%0%d.%dLf', fw > lw and fw or lw, prec)
+      else
+        fmt = string.format('%%.%dLf', prec)
+      end
+    end
+  end
+  seq_print(fmt, prefix, suffix, first.value, step.value, last.value, sep)
+  return util.flush() and 0 or 1
 end
 
 -- printf with %s %b %c %d %i %u %x %X %o %f %F %e %E %g %G %% and

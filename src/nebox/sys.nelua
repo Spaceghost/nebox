@@ -143,6 +143,7 @@ function sys.truncate(path: cstring, len: clong): cint <cimport 'truncate', cinc
 function sys.getrandom(buf: pointer, n: csize, flags: cuint): clong <cimport 'getrandom', cinclude '<sys/random.h>'> end
 function sys.getgroups(n: cint, list: *[0]cuint): cint <cimport 'getgroups', cinclude '<unistd.h>'> end
 function sys.strtod(s: cstring, endp: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
+function sys.strtold(s: cstring, endp: *cstring): clongdouble <cimport 'strtold', cinclude '<stdlib.h>'> end
 function sys.pipe(fds: *[2]cint): cint <cimport 'pipe', cinclude '<unistd.h>'> end
 function sys.dup2(oldfd: cint, newfd: cint): cint <cimport 'dup2', cinclude '<unistd.h>'> end
 function sys.execve(path: cstring, argv: *[0]cstring, envp: *[0]cstring): cint <cimport 'execve', cinclude '<unistd.h>'> end

@@ -787,6 +787,28 @@ exit=0' 'TZ=Foo/Bar date -d @0 "+%z %Z"; TZ=:Foo date -d @0 "+%z %Z"'
 # GNU treats the name as a POSIX string (Asia, +0000)
 expect date-tz-tzdir-missing '09:00:00 JST
 exit=0' 'TZDIR=/nonexistent TZ=Asia/Tokyo date -d @0 "+%T %Z"'
+# seq: floating operands, precision, -w, -f, separators, big integers
+same seq-float 'seq 0 0.1 1; seq 1 0.5 3; seq 5 -1.5 0; seq .5 3; seq 1.5; seq 0.1 0.2 0.5; seq 1 0.3 2.2; seq 0 0.01 0.03; seq 1 0.000001 1.000003; seq 1.1 1.1 7.7; seq 100 -0.1 99.5; seq -1 0.1 0; seq 0.000001 0.0000005 0.000003'
+seq_cases='seq 1 0.1 1.3; seq 0 0.2 1; seq 0.3 0.3 1.8; seq 2 -1 -2; seq 10 -3 -3; seq -1 -0.5 0; seq 3 1; seq 1 1; seq 0; seq 1.000000000000000000001 2'
+same seq-float-2 "$seq_cases"
+same seq-exp 'seq 1e2 | tail -2; seq 1e-2 1e-2 5e-2; seq 1.0e1 12; seq 1.25e1 1 14; seq 1 1e2 300; seq 1e3 1e3 3e3; seq 1E2 1E2 3E2; seq 1e-1 2e-1 9e-1'
+same seq-w-float 'seq -w 1 0.5 3; seq -w -1 1; seq -w 0.1 0.1 1; seq -w .5 3; seq -w +1 03; seq -w 1. 3; seq -w 001 3; seq -w 1e1 1e2 120; seq -w 1.5e1 17; seq -w 1E-1 0.1 0.3; seq -w 1 -0.5 -1; seq -w -5 -2.5 5; seq -w -0.5 0.25 1; seq -w 1e-3 1 3; seq -w -.5 .5; seq -w 9 11; seq -w 8 1 12; seq -w -- -3 1; seq -w 0x1 3'
+same seq-f 'seq -f "%.3e" 1 3; seq -f "x%%%gy" 1 2; seq -f "%5.1f|" 1 2; seq -f "%-8g|" 1 2; seq -f "%+08.2f" -1 1; seq -f "%#g" 1 2; seq -f "%'"'"'g" 1000 1001; seq -f %Lg 1 2; seq -f %E 1 2; seq -f %G 1e-10 1e-10 2e-10; seq -f %F 1 2; seq -f %g 999998 1000001; seq --format=%.2f 1 2; seq -f%03.0f 8 10'
+same seq-f-bad 'for f in % %d a %g%g "%%" "%5" "%-" "%.f%" "%Q"; do seq -f "$f" 1; echo $?; done; seq -w -f %g 1 2; echo $?'
+same seq-sep 'seq -s "" 1 3; seq -s ", " 1 3; seq -s "\n" 1 3; seq -ws, 1 3; seq -s: 0018 20; seq --sep=: 1 3; seq --separator ": " 1 3; seq -s "" -f "%04.1f" 1 0.5 2; seq -s, 0.5 2'
+same seq-opts 'seq --equal-width 8 10; seq --e 8 10; seq -- -3 -1; seq +1 3; seq " 1" 2; seq 0x10 0x12; seq 0x1p1 1 4; seq 1 0x1.8 5; seq 1 1 0x10 | tail -1'
+same seq-bad 'for a in "1 0 2" "1 -0 2" nan "1 nan" "1e5000" "1 2 3 4" "" "4 -s, 6" "-inf 1" "--bogus 1" "--format 1" "-f" "-s" "--s 1" "1x" "x"; do seq $a; echo $?; done; seq ""; echo $?; seq "1 " 2; echo $?'
+same seq-big 'seq 18446744073709551614 18446744073709551617; seq 99999999999999999999999 1 100000000000000000000001; seq 2e19 20000000000000000002; seq 18446744073709551615 2 18446744073709551620; seq 18446744073709551615 201 18446744073709552020; seq 2e19 1 20000000000000000003.0; seq 000 2'
+same seq-inf 'seq 1 inf | head -3; seq 1 inf inf | head -2; seq inf | head -2; seq 5 1 inf | head -2'
+same seq-tiny 'seq 1e-5000 1 | cksum'
+# nelibc printf limits pinned (README): negative zero loses its sign and
+# %La prints 0x1p+0 where glibc prints 0x8p-3
+expect seq-negzero '0
+1
+exit=0' 'seq -0 1'
+expect seq-f-hexfloat '0x1p+0
+0X1P+1
+exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
 # awk
 . "$(dirname -- "$0")/awk.sh"
 # sh
