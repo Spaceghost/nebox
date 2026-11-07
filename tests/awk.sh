@@ -247,4 +247,29 @@ same awk-long-line "head -c 100000 /dev/zero | tr '\\0' 'x' | awk '{ print lengt
 same awk-binary-safe "printf 'a\\0b\\n' | awk '{ print length(\$0) }'"
 same awk-string-compare-locale-c "printf 'B\\na\\nA\\nb\\n' | awk '\$1 > \"A\" && \$1 < \"b\" { print }'"
 
+# Choices that differ from gawk --posix (see README "Known limits") are pinned.
+expect awk-posix-cmd-getline-nr '2 3
+exit=0' "awk 'BEGIN { \"echo a\" | getline; \"echo b\" | getline v; print NR, NR + 1 }'"
+expect awk-posix-system-status '3 0
+exit=0' "awk 'BEGIN { print system(\"exit 3\"), system(\"true\") }'"
+expect awk-posix-close-pipe-status '4
+exit=0' "awk 'BEGIN { print \"x\" | \"cat >/dev/null; exit 4\"; print close(\"cat >/dev/null; exit 4\") }'"
+expect awk-posix-error-exit-2 '2 2 2
+exit=0' "awk 'BEGIN { print ( }' 2>/dev/null; a=\$?; awk 'BEGIN { z = 0; print 1 / z }' 2>/dev/null; b=\$?; awk 'BEGIN { \$(-1) }' 2>/dev/null; c=\$?; echo \$a \$b \$c"
+expect awk-posix-length-array '3
+exit=0' "awk 'BEGIN { a[1]; a[2]; a[\"x\"]; print length(a) }'"
+expect awk-posix-rs-first-char '1:a
+2:
+3:b
+4:c
+exit=0' "printf 'aXXbXc' | awk 'BEGIN { RS = \"XX\" } { print NR \":\" \$0 }'"
+expect awk-posix-fs-empty '3 b
+exit=0' "printf 'abc\\n' | awk 'BEGIN { FS = \"\" } { print NF, \$2 }'"
+expect awk-posix-hex-not-numeric '0 0 1
+exit=0' "printf '0x1A\\n' | awk '{ print \$1 + 0, (\$1 == 26), (\$1 < 3) }'"
+expect awk-posix-regex-slash-in-bracket 'failed
+exit=0' "awk '/[/]/' /dev/null 2>/dev/null || echo failed"
+expect awk-posix-srand-first '1 42
+exit=0' "awk 'BEGIN { print srand(42), srand() }'"
+
 REFPATH=""
