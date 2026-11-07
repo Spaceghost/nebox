@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.modechange'
 require 'nebox.longopts'
 require 'nebox.applets.fs'
 require 'nebox.applets.proc2'
@@ -174,9 +175,10 @@ function Find.parse_primary(): integer
     local body = v
     if v:byte(1) == 45 then find.nodes[n].permkind = 1; body = v:sub(2)
     elseif v:byte(1) == 47 then find.nodes[n].permkind = 2; body = v:sub(2) end
-    local m, mok = parse_mode(body)
+    -- GNU find: an octal or symbolic mode, mode_adjust(0, false, 0, MODE)
+    local ch, mok = modechange.compile(body)
     if not mok then find.err = "invalid mode `" .. v .. "'"; return -1 end
-    find.nodes[n].mode = m
+    find.nodes[n].mode = modechange.adjust(0, false, 0, ch)
     return n
   elseif a == '-user' or a == '-group' then
     local v, ok = need(a); if not ok then return -1 end
@@ -411,11 +413,14 @@ end
 global function applet_install(args: sequence(string)): integer
   local o = util.parsel(args, 'dDm:o:g:t:pcsv', &longopts.install, #longopts.install)
   if not o:ok() then return util.optfail(o) end
+  -- GNU install: mode_adjust(0, false, 0, MODE) for files, (0, true, ...) for -d
   local mode: cuint = 0x1ED
+  local dir_mode: cuint = 0x1ED
   if o:has('m') then
-    local m, ok = parse_mode(o:get("m"))
+    local ch, ok = modechange.compile(o:get('m'))
     if not ok then return util.die("invalid mode '" .. o:get('m') .. "'") end
-    mode = m
+    mode = modechange.adjust(0, false, 0, ch)
+    dir_mode = modechange.adjust(0, true, 0, ch)
   end
   local uid: integer, gid: integer = -1, -1
   if o:has('o') then
@@ -433,7 +438,7 @@ global function applet_install(args: sequence(string)): integer
     if #o.operands == 0 then return util.die('missing operand') end
     for _, d in ipairs(o.operands) do
       if not mkdir_p(d, 0x1FF) then rc = 1; continue end
-      sys.chmod(d, mode)
+      sys.chmod(d, dir_mode)
       if uid >= 0 or gid >= 0 then sys.chown(d, uid >= 0 and (@cuint)(uid) or 0xFFFFFFFF, gid >= 0 and (@cuint)(gid) or 0xFFFFFFFF) end
       if o:has('v') then util.line("creating directory '" .. d .. "'") end
     end

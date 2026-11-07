@@ -66,6 +66,15 @@ Stated here rather than worked around:
   '--x' is not supported") rather than misparsed. No applet has `--help` or
   `--version` except the coreutils ports. `tests/opts_compare.py` checks 233
   invocations against GNU (output, status, first diagnostic line).
+- `chmod` follows GNU chmod.c over a port of gnulib's `modechange.c`
+  (`src/nebox/modechange.nelua`): octal and symbolic modes with the umask
+  applied when no "who" is given, `u=g`-style copies, `X`, `s`, `t`,
+  "-w"-style modes mixed with options, `--reference`, `-R` (readdir order,
+  symlinks untouched), `-c`, `-f`, `-v` messages and the "new permissions
+  are ..." warning. `mkdir -m` follows mkdir.c and gnulib make_dir_parents
+  (umask handling, special bits, `-p` ancestors with u+wx); `install -m` and
+  `find -perm` take symbolic modes too. `tests/mode_compare.py`: 4118 random
+  cases against GNU, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
@@ -414,7 +423,6 @@ Stated here rather than worked around:
   (`seq-*`). One difference, from nelibc's printf: `-f %a` prints the
   normalized `0x1p+0` where glibc prints `0x8p-3` (`seq-f-hexfloat`); both
   are valid C. No `--help`/`--version`.
-- `chmod` takes octal modes and `[ugoa][+-=][rwxXst]` lists.
 - `test` has no parentheses; `-a`/`-o` bind loosest, in that order.
 - `mv` across filesystems copies then removes; `cp -a` is `-rp`.
 

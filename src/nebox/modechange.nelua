@@ -1,0 +1,167 @@
+-- gnulib modechange.c: mode_compile turns "755", "u+x,go-w", "a=rX",
+-- "g=u", "-w" ... into change operations; mode_adjust applies them to a
+-- file mode given the umask; strmode renders "rwxr-sr-t".
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+
+global modechange = @record{}
+
+local MODE_ORDINARY_CHANGE: integer <comptime> = 1
+local MODE_X_IF_ANY_X: integer <comptime> = 2
+local MODE_COPY_EXISTING: integer <comptime> = 3
+
+local S_ISUID: cuint <comptime> = 0x800
+local S_ISGID: cuint <comptime> = 0x400
+local S_ISVTX: cuint <comptime> = 0x200
+local S_IRWXU: cuint <comptime> = 0x1C0
+local S_IRWXG: cuint <comptime> = 0x38
+local S_IRWXO: cuint <comptime> = 0x7
+local S_IRWXUGO: cuint <comptime> = 0x1FF
+local CHMOD_MODE_BITS: cuint <comptime> = 0xFFF
+local ALLR: cuint <comptime> = 0x124
+local ALLW: cuint <comptime> = 0x92
+local ALLX: cuint <comptime> = 0x49
+
+global modechange.Change = @record{op: byte, flag: integer, affected: cuint, value: cuint, mentioned: cuint}
+
+-- Returns the changes and true, or false for an invalid mode string.
+function modechange.compile(s: string): (sequence(modechange.Change), boolean)
+  local mc: sequence(modechange.Change)
+  local function at(i: integer): byte
+    if i >= 1 and i <= #s then return s:byte(i) end
+    return 0
+  end
+  local c0 = at(1)
+  if c0 >= 48 and c0 < 56 then
+    local octal: cuint = 0
+    local p = 1
+    repeat
+      octal = 8 * octal + (at(p) - 48)
+      p = p + 1
+      if octal > 0xFFF then return mc, false end
+    until not (at(p) >= 48 and at(p) < 56)
+    if at(p) ~= 0 then return mc, false end
+    local mode = octal
+    local mentioned: cuint
+    if p - 1 < 5 then mentioned = (mode & (S_ISUID | S_ISGID)) | S_ISVTX | S_IRWXUGO
+    else mentioned = CHMOD_MODE_BITS end
+    mc:push({op = 61, flag = MODE_ORDINARY_CHANGE, affected = CHMOD_MODE_BITS, value = mode, mentioned = mentioned})
+    return mc, true
+  end
+  local p = 1
+  while true do
+    local affected: cuint = 0
+    while true do
+      local c = at(p)
+      if c == 117 then affected = affected | S_ISUID | S_IRWXU
+      elseif c == 103 then affected = affected | S_ISGID | S_IRWXG
+      elseif c == 111 then affected = affected | S_ISVTX | S_IRWXO
+      elseif c == 97 then affected = affected | CHMOD_MODE_BITS
+      elseif c == 61 or c == 43 or c == 45 then break
+      else mc:clear(); return mc, false end
+      p = p + 1
+    end
+    repeat
+      local op = at(p)
+      p = p + 1
+      local value: cuint = 0
+      local mentioned: cuint = 0
+      local flag = MODE_COPY_EXISTING
+      local c = at(p)
+      if c >= 48 and c < 56 then
+        local octal: cuint = 0
+        repeat
+          octal = 8 * octal + (at(p) - 48)
+          p = p + 1
+          if octal > 0xFFF then mc:clear(); return mc, false end
+        until not (at(p) >= 48 and at(p) < 56)
+        if affected ~= 0 or (at(p) ~= 0 and at(p) ~= 44) then mc:clear(); return mc, false end
+        affected = CHMOD_MODE_BITS; mentioned = CHMOD_MODE_BITS
+        value = octal
+        flag = MODE_ORDINARY_CHANGE
+      elseif c == 117 then value = S_IRWXU; p = p + 1
+      elseif c == 103 then value = S_IRWXG; p = p + 1
+      elseif c == 111 then value = S_IRWXO; p = p + 1
+      else
+        value = 0
+        flag = MODE_ORDINARY_CHANGE
+        while true do
+          local v = at(p)
+          if v == 114 then value = value | ALLR
+          elseif v == 119 then value = value | ALLW
+          elseif v == 120 then value = value | ALLX
+          elseif v == 88 then flag = MODE_X_IF_ANY_X
+          elseif v == 115 then value = value | S_ISUID | S_ISGID
+          elseif v == 116 then value = value | S_ISVTX
+          else break end
+          p = p + 1
+        end
+      end
+      local m: cuint
+      if mentioned ~= 0 then m = mentioned elseif affected ~= 0 then m = affected & value else m = value end
+      mc:push({op = op, flag = flag, affected = affected, value = value, mentioned = m})
+    until not (at(p) == 61 or at(p) == 43 or at(p) == 45)
+    if at(p) ~= 44 then break end
+    p = p + 1
+  end
+  if at(p) == 0 then return mc, true end
+  mc:clear()
+  return mc, false
+end
+
+-- A change that sets the mode of a reference file.
+function modechange.from_mode(mode: cuint): sequence(modechange.Change)
+  local mc: sequence(modechange.Change)
+  mc:push({op = 61, flag = MODE_ORDINARY_CHANGE, affected = CHMOD_MODE_BITS, value = mode, mentioned = CHMOD_MODE_BITS})
+  return mc
+end
+
+-- mode_adjust: the new mode bits and the bits the changes touched.
+function modechange.adjust(oldmode: cuint, dir: boolean, umask_value: cuint, changes: sequence(modechange.Change)): (cuint, cuint)
+  local newmode = oldmode & CHMOD_MODE_BITS
+  local mode_bits: cuint = 0
+  for _, ch in ipairs(changes) do
+    local affected = ch.affected
+    local omit_change: cuint = (dir and (S_ISUID | S_ISGID) or 0) & ~ch.mentioned
+    local value = ch.value
+    if ch.flag == MODE_COPY_EXISTING then
+      value = value & newmode
+      local r: cuint = (value & ALLR) ~= 0 and ALLR or 0
+      local w: cuint = (value & ALLW) ~= 0 and ALLW or 0
+      local x: cuint = (value & ALLX) ~= 0 and ALLX or 0
+      value = value | r | w | x
+    elseif ch.flag == MODE_X_IF_ANY_X then
+      if (newmode & ALLX) ~= 0 or dir then value = value | ALLX end
+    end
+    value = value & ((affected ~= 0 and affected or ~umask_value) & ~omit_change)
+    if ch.op == 61 then
+      local preserved: cuint = (affected ~= 0 and ~affected or 0) | omit_change
+      mode_bits = mode_bits | (CHMOD_MODE_BITS & ~preserved)
+      newmode = (newmode & preserved) | value
+    elseif ch.op == 43 then
+      mode_bits = mode_bits | value
+      newmode = newmode | value
+    else
+      mode_bits = mode_bits | value
+      newmode = newmode & ~value
+    end
+  end
+  return newmode, mode_bits
+end
+
+-- gnulib strmode without the file type letter: "rwxr-xr-x".
+function modechange.strmode9(mode: cuint): string
+  local b: [9]byte
+  b[0] = (mode & 0x100) ~= 0 and 114 or 45
+  b[1] = (mode & 0x80) ~= 0 and 119 or 45
+  if (mode & S_ISUID) ~= 0 then b[2] = (mode & 0x40) ~= 0 and 115 or 83 else b[2] = (mode & 0x40) ~= 0 and 120 or 45 end
+  b[3] = (mode & 0x20) ~= 0 and 114 or 45
+  b[4] = (mode & 0x10) ~= 0 and 119 or 45
+  if (mode & S_ISGID) ~= 0 then b[5] = (mode & 0x8) ~= 0 and 115 or 83 else b[5] = (mode & 0x8) ~= 0 and 120 or 45 end
+  b[6] = (mode & 0x4) ~= 0 and 114 or 45
+  b[7] = (mode & 0x2) ~= 0 and 119 or 45
+  if (mode & S_ISVTX) ~= 0 then b[8] = (mode & 0x1) ~= 0 and 116 or 84 else b[8] = (mode & 0x1) ~= 0 and 120 or 45 end
+  return string.copy((@string){data = &b[0], size = 9})
+end

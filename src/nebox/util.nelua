@@ -739,6 +739,20 @@ function util.name_less(a: string, b: string): boolean
   return a < b
 end
 
+-- Directory entries in readdir order (what fts without a comparator sees).
+function util.readnames_raw(dir: string): (sequence(string), boolean)
+  local names: sequence(string)
+  local d = sys.opendir(dir)
+  if d == nilptr then return names, false end
+  while true do
+    local de = sys.readdir(d)
+    if de == nilptr then break end
+    names:push(string.copy(sys.cstr(&de.d_name)))
+  end
+  sys.closedir(d)
+  return names, true
+end
+
 function util.readnames(dir: string, all: boolean): (sequence(string), boolean)
   local names: sequence(string)
   local d = sys.opendir(dir)

@@ -6,6 +6,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.modechange'
 require 'nebox.longopts'
 require 'nebox.clock'
 
@@ -671,24 +672,62 @@ global function applet_mkdir(args: sequence(string)): integer
   local o = util.parsel(args, 'pm:v', &longopts.mkdir, #longopts.mkdir)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
+  local umask_value = sys.umask(0)
+  sys.umask(umask_value)
+  -- GNU mkdir -m: mode_adjust(0777, dir, umask, MODE); the bits the mode
+  -- mentions are set exactly after mkdir(2), whatever the umask did
   local mode: cuint = 0x1FF
+  local mode_bits: cuint = 0
+  local umask_self = umask_value
   if o:has('m') then
-    local m, ok = parse_mode(o:get('m'))
+    local ch, ok = modechange.compile(o:get('m'))
     if not ok then return util.die("invalid mode '" .. o:get('m') .. "'") end
-    mode = m
+    mode, mode_bits = modechange.adjust(0x1FF, true, umask_value, ch)
+    umask_self = umask_value & ~mode
   end
+  -- ancestors made by -p always get u+wx (GNU's make_ancestor)
+  local umask_ancestor: cuint = umask_value & ~(@cuint)(0xC0)
   local rc: integer = 0
   local verbose = o:has('v')
   for _, p in ipairs(o.operands) do
     if o:has('p') then
-      if not mkdir_pv(p, 0x1FF, verbose) then rc = 1
-      elseif o:has('m') then sys.chmod(p, mode) end
-    elseif sys.mkdir(p, mode) ~= 0 then
+      if util.isdir(p) then continue end
+      local parent = util.dirname(p)
+      if parent ~= p and parent ~= '.' and parent ~= '/' then
+        sys.umask(umask_ancestor)
+        local pok = mkdir_pv(parent, 0x1FF, verbose)
+        sys.umask(umask_value)
+        if not pok then rc = 1; continue end
+      end
+    end
+    -- gnulib make_dir_parents for the final component: with special mode
+    -- bits in play the directory starts without group/other write, and
+    -- dirchownmod then sets exactly the bits the mode mentions
+    local keep_special = ((mode_bits & 0xC00) | (mode & 0x200)) == 0
+    local mkdir_mode = mode
+    if not keep_special then mkdir_mode = mkdir_mode & ~(@cuint)(0x12) end
+    sys.umask(umask_self)
+    local made = sys.mkdir(p, mkdir_mode)
+    local merr = sys.errno()
+    sys.umask(umask_value)
+    sys.seterrno(merr)
+    if made ~= 0 then
+      if o:has('p') and sys.errno() == sys.EEXIST and util.isdir(p) then continue end
       util.err('cannot create directory ' .. util.quoteaf(p) .. ': ' .. sys.errstr())
       rc = 1
-    else
-      if verbose then util.line(util.applet .. ': created directory ' .. util.quoteaf(p)) end
-      if o:has('m') then sys.chmod(p, mode) end
+      continue
+    end
+    if verbose then util.line(util.applet .. ': created directory ' .. util.quoteaf(p)) end
+    local umask_must_be_ok = (mode & mode_bits & 0x1FF) == 0
+    if not (keep_special and umask_must_be_ok) then
+      local st: sys.Stat
+      if sys.stat(p, &st) == 0 and ((st.st_mode ~ mode) & mode_bits) ~= 0 then
+        local chmod_mode: cuint = mode | (st.st_mode & 0xFFF & ~mode_bits)
+        if sys.chmod(p, chmod_mode) ~= 0 then
+          util.err('cannot set permissions of ' .. util.quoteaf(p) .. ': ' .. sys.errstr())
+          rc = 1
+        end
+      end
     end
   end
   return rc
@@ -1181,89 +1220,196 @@ global function applet_dirname(args: sequence(string)): integer
   return 0
 end
 
--- chmod: octal modes and the simple symbolic forms [ugoa][+-=][rwxst]
-local function apply_symbolic(mode: cuint, spec: string): (cuint, boolean)
-  local i: usize = 1
-  while i <= spec.size do
-    local who: cuint = 0
-    while i <= spec.size do
-      local c = spec:byte(i)
-      if c == 117 then who = who | 0x1C0 elseif c == 103 then who = who | 0x38
-      elseif c == 111 then who = who | 0x7 elseif c == 97 then who = who | 0x1FF
-      else break end
-      i = i + 1
-    end
-    if who == 0 then who = 0x1FF end
-    if i > spec.size then return mode, false end
-    local op = spec:byte(i)
-    if op ~= 43 and op ~= 45 and op ~= 61 then return mode, false end
-    i = i + 1
-    local bits: cuint = 0
-    local special: cuint = 0
-    while i <= spec.size and spec:byte(i) ~= 44 do
-      local c = spec:byte(i)
-      if c == 114 then bits = bits | 0x124 elseif c == 119 then bits = bits | 0x92
-      elseif c == 120 then bits = bits | 0x49 elseif c == 115 then special = special | 0xC00
-      elseif c == 116 then special = special | 0x200
-      elseif c == 88 then if (mode & sys.S_IFMT) == sys.S_IFDIR or (mode & 0x49) ~= 0 then bits = bits | 0x49 end
-      else return mode, false end
-      i = i + 1
-    end
-    bits = bits & who
-    if (who & 0x1C0) == 0 then special = special & ~(@cuint)(0x800) end
-    if (who & 0x38) == 0 then special = special & ~(@cuint)(0x400) end
-    if op == 43 then mode = mode | bits | special
-    elseif op == 45 then mode = mode & ~(bits | special)
-    else mode = (mode & ~who) | bits | special end
-    if i <= spec.size then i = i + 1 end
+-- chmod: GNU coreutils 9.1 chmod.c over gnulib modechange: octal and
+-- symbolic modes (with the umask when no "who" is given), "-w"-style modes
+-- mixed with options, --reference, -R, -c, -f, -v, --preserve-root.
+local chmod_change: sequence(modechange.Change)
+local chmod_umask: cuint
+local chmod_recurse: boolean
+local chmod_force: boolean
+local chmod_verbosity: integer   -- 0 off, 1 changes only, 2 high
+local chmod_surprises: boolean
+local chmod_root_dev: culong
+local chmod_root_ino: culong
+local chmod_preserve_root: boolean
+
+-- GNU's Change_status order matters: ok means NOT_APPLIED or better.
+local CH_NO_STAT: integer <comptime> = 0
+local CH_FAILED: integer <comptime> = 1
+local CH_NOT_APPLIED: integer <comptime> = 2
+local CH_NO_CHANGE_REQUESTED: integer <comptime> = 3
+local CH_SUCCEEDED: integer <comptime> = 4
+
+local function chmod_describe(file: string, status: integer, old_mode: cuint, new_mode: cuint)
+  local q = util.quoteaf(file)
+  if status == CH_NOT_APPLIED then util.line('neither symbolic link ' .. q .. ' nor referent has been changed'); return end
+  if status == CH_NO_STAT then util.line(q .. ' could not be accessed'); return end
+  local m = new_mode & 0xFFF
+  if status == CH_NO_CHANGE_REQUESTED then
+    util.writef('mode of %s retained as %04o (%s)\n', q, m, modechange.strmode9(new_mode))
+    return
   end
-  return mode, true
+  local fmt = status == CH_SUCCEEDED and 'mode of %s changed from %04o (%s) to %04o (%s)\n'
+                                      or 'failed to change mode of %s from %04o (%s) to %04o (%s)\n'
+  util.writef(fmt, q, old_mode & 0xFFF, modechange.strmode9(old_mode), m, modechange.strmode9(new_mode))
 end
 
-local function chmod_path(path: string, spec: string, recursive: boolean, verbose: boolean): boolean
-  local st: sys.Stat
-  if sys.lstat(path, &st) ~= 0 then util.err("cannot access '" .. path .. "': " .. sys.errstr()); return false end
-  if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then return true end
-  local mode: cuint
-  local ok: boolean
-  mode, ok = parse_mode(spec)
-  if not ok then mode, ok = apply_symbolic(st.st_mode, spec) end
-  if not ok then util.err("invalid mode: '" .. spec .. "'"); return false end
-  mode = mode & 0xFFF
-  if sys.chmod(path, mode) ~= 0 then util.err("changing permissions of '" .. path .. "': " .. sys.errstr()); return false end
-  if verbose then util.line(string.format("mode of '%s' changed to %04o", path, (@integer)(mode))) end
-  local all = true
-  if recursive and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
-    local names, rok = util.readnames(path, true)
-    if not rok then util.perror(path); return false end
-    for _, n in ipairs(names) do
-      if n ~= '.' and n ~= '..' then
-        if not chmod_path(util.join(path, n), spec, true, verbose) then all = false end
+-- process_file for one entry; st is nilptr when it could not be stat'ed
+-- (the error was already reported).
+local function chmod_one(path: string, st: *sys.Stat): boolean
+  local status: integer = CH_NO_STAT
+  local old_mode: cuint = 0
+  local new_mode: cuint = 0
+  if st ~= nilptr then
+    status = CH_NOT_APPLIED
+    if (st.st_mode & sys.S_IFMT) ~= sys.S_IFLNK then
+      old_mode = st.st_mode
+      new_mode = modechange.adjust(old_mode, (old_mode & sys.S_IFMT) == sys.S_IFDIR, chmod_umask, chmod_change)
+      if sys.chmod(path, new_mode) == 0 then status = CH_SUCCEEDED
+      else
+        if not chmod_force then util.err('changing permissions of ' .. util.quoteaf(path) .. ': ' .. sys.errstr()) end
+        status = CH_FAILED
       end
     end
   end
-  return all
+  if chmod_verbosity ~= 0 then
+    if status == CH_SUCCEEDED then
+      local nm = new_mode
+      local changed = true
+      if (nm & 0xE00) ~= 0 then
+        local nst: sys.Stat
+        if sys.stat(path, &nst) ~= 0 then
+          if not chmod_force then util.err('getting new attributes of ' .. util.quoteaf(path) .. ': ' .. sys.errstr()) end
+          changed = false
+        else nm = nst.st_mode end
+      end
+      if changed then changed = ((old_mode ~ nm) & 0xFFF) ~= 0 end
+      if not changed then status = CH_NO_CHANGE_REQUESTED end
+    end
+    if status == CH_SUCCEEDED or chmod_verbosity == 2 then chmod_describe(path, status, old_mode, new_mode) end
+  end
+  if CH_NO_CHANGE_REQUESTED <= status and chmod_surprises then
+    local naive = modechange.adjust(old_mode, (old_mode & sys.S_IFMT) == sys.S_IFDIR, 0, chmod_change)
+    if (new_mode & ~naive) ~= 0 then
+      util.err(util.quotef(path) .. ': new permissions are ' .. modechange.strmode9(new_mode) .. ', not '
+        .. modechange.strmode9(naive))
+      status = CH_FAILED
+    end
+  end
+  return CH_NOT_APPLIED <= status
 end
 
+local function chmod_tree(path: string, top: boolean): boolean
+  local st: sys.Stat
+  local r: cint
+  if top then r = sys.stat(path, &st) else r = sys.lstat(path, &st) end
+  if r ~= 0 then
+    local e = sys.errno()
+    if top and sys.lstat(path, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
+      if not chmod_force then util.err('cannot operate on dangling symlink ' .. util.quoteaf(path)) end
+    elseif not chmod_force then
+      util.err('cannot access ' .. util.quoteaf(path) .. ': ' .. sys.strerror(e))
+    end
+    return chmod_one(path, nilptr)
+  end
+  if chmod_recurse and chmod_preserve_root and st.st_dev == chmod_root_dev and st.st_ino == chmod_root_ino then
+    if path == '/' then util.err("it is dangerous to operate recursively on '/'")
+    else util.err("it is dangerous to operate recursively on " .. util.quoteaf(path) .. " (same as '/')") end
+    util.err('use --no-preserve-root to override this failsafe')
+    return false
+  end
+  local ok = chmod_one(path, &st)
+  if chmod_recurse and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    local names, rok = util.readnames_raw(path)
+    if not rok then
+      if not chmod_force then util.err('cannot read directory ' .. util.quoteaf(path) .. ': ' .. sys.errstr()) end
+      if chmod_verbosity == 2 then chmod_describe(path, CH_NO_STAT, 0, 0) end
+      return false
+    end
+    for _, n in ipairs(names) do
+      if n ~= '.' and n ~= '..' then
+        local child = path:byte(#path) == 47 and path .. n or path .. '/' .. n
+        if not chmod_tree(child, false) then ok = false end
+      end
+    end
+  end
+  return ok
+end
+
+local CHMOD_NO_PRESERVE_ROOT: integer <comptime> = 200
+local CHMOD_PRESERVE_ROOT: integer <comptime> = 201
+local CHMOD_REFERENCE: integer <comptime> = 202
+local chmod_longs: []util.LongOpt = {
+  {'changes', 0, 99}, {'recursive', 0, 82}, {'no-preserve-root', 0, CHMOD_NO_PRESERVE_ROOT},
+  {'preserve-root', 0, CHMOD_PRESERVE_ROOT}, {'quiet', 0, 102}, {'reference', 1, CHMOD_REFERENCE},
+  {'silent', 0, 102}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
 global function applet_chmod(args: sequence(string)): integer
-  -- the mode may look like an option (-x), so parse by hand
-  local recursive, verbose = false, false
-  local i: integer = 1
-  while i <= #args do
-    local a = args[i]
-    if a == '-R' then recursive = true
-    elseif a == '-v' then verbose = true
-    elseif a == '--' then i = i + 1; break
-    else break end
-    i = i + 1
+  local g = util.getopt(args, 'Rcfvr::w::x::X::s::t::u::g::o::a::,::+::=::0::1::2::3::4::5::6::7::', &chmod_longs, #chmod_longs)
+  g.quiet = true
+  local mode: string = ''
+  local have_mode = false
+  local reference: string = ''
+  local have_ref = false
+  chmod_recurse = false; chmod_force = false; chmod_verbosity = 0; chmod_surprises = false
+  chmod_preserve_root = false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then util.err(g.errmsg); return 1 end
+    if c == util.UNSUPPORTED then util.err("option '--" .. g.longname .. "' is not supported"); return 1 end
+    if c == 114 or c == 119 or c == 120 or c == 88 or c == 115 or c == 116 or c == 117 or c == 103
+       or c == 111 or c == 97 or c == 44 or c == 43 or c == 61 or (c >= 48 and c <= 55) then
+      local arg = g.args[g.optind - 1]
+      if have_mode then mode = mode .. ',' .. arg else mode = arg end
+      have_mode = true
+      chmod_surprises = true
+    elseif c == CHMOD_NO_PRESERVE_ROOT then chmod_preserve_root = false
+    elseif c == CHMOD_PRESERVE_ROOT then chmod_preserve_root = true
+    elseif c == CHMOD_REFERENCE then reference = g.optarg; have_ref = true
+    elseif c == 82 then chmod_recurse = true
+    elseif c == 99 then chmod_verbosity = 1
+    elseif c == 102 then chmod_force = true
+    elseif c == 118 then chmod_verbosity = 2 end
   end
-  if #args - i + 1 < 2 then return util.die('missing operand') end
-  local spec = args[i]
-  local rc: integer = 0
-  for j: integer = i + 1, #args do
-    if not chmod_path(args[j], spec, recursive, verbose) then rc = 1 end
+  local operands = g:operands()
+  local oi = 1
+  local mode_from_operand = false
+  if have_ref then
+    if have_mode then util.err('cannot combine mode and --reference options'); return 1 end
+  elseif not have_mode then
+    if oi <= #operands then mode = operands[oi]; oi = oi + 1; have_mode = true; mode_from_operand = true end
   end
-  return rc
+  if oi > #operands then
+    if not mode_from_operand then util.err('missing operand')
+    else util.err("missing operand after '" .. args[#args] .. "'") end
+    return 1
+  end
+  if have_ref then
+    local rst: sys.Stat
+    if sys.stat(reference, &rst) ~= 0 then
+      util.err('failed to get attributes of ' .. util.quoteaf(reference) .. ': ' .. sys.errstr())
+      return 1
+    end
+    chmod_change = modechange.from_mode(rst.st_mode)
+    chmod_umask = 0
+  else
+    local ok: boolean
+    chmod_change, ok = modechange.compile(mode)
+    if not ok then util.err("invalid mode: '" .. mode .. "'"); return 1 end
+    chmod_umask = sys.umask(0)
+  end
+  if chmod_recurse and chmod_preserve_root then
+    local rst: sys.Stat
+    if sys.stat('/', &rst) ~= 0 then util.err("failed to get attributes of '/': " .. sys.errstr()); return 1 end
+    chmod_root_dev = rst.st_dev; chmod_root_ino = rst.st_ino
+  end
+  local ok = true
+  for k = oi, #operands do
+    if not chmod_tree(operands[k], true) then ok = false end
+  end
+  return ok and 0 or 1
 end
 
 -- test / [ : the POSIX subset with -a/-o and parentheses left out.
