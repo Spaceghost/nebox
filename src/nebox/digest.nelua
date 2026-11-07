@@ -1,0 +1,411 @@
+-- Streaming message digests for the checksum applets: MD5 (RFC 1321),
+-- SHA-1, SHA-224/256, SHA-384/512 (FIPS 180-4), BLAKE2b (RFC 7693, any
+-- output length in bytes), SM3 (GB/T 32905-2016), the POSIX cksum CRC, and
+-- the BSD and System V sums. init, update any number of times, final.
+## pragmas.nogc = true
+
+global digest = @record{}
+
+global digest.MD5: integer <comptime> = 1
+global digest.SHA1: integer <comptime> = 2
+global digest.SHA224: integer <comptime> = 3
+global digest.SHA256: integer <comptime> = 4
+global digest.SHA384: integer <comptime> = 5
+global digest.SHA512: integer <comptime> = 6
+global digest.BLAKE2B: integer <comptime> = 7
+global digest.SM3: integer <comptime> = 8
+
+global digest.Ctx = @record{
+  algo: integer,
+  h32: [8]uint32,
+  h64: [8]uint64,
+  buf: [128]byte,
+  buflen: integer,
+  total: uint64,
+  outlen: integer,  -- BLAKE2b output bytes
+}
+
+local function rotl(x: uint32, n: uint32): uint32 return (x << n) | (x >> ((32 - n) & 31)) end
+local function rotr(x: uint32, n: uint32): uint32 return (x >> n) | (x << ((32 - n) & 31)) end
+local function rotr64(x: uint64, n: uint64): uint64 return (x >> n) | (x << ((64 - n) & 63)) end
+
+local function be32(p: *[0]byte, i: integer): uint32
+  return ((@uint32)(p[i]) << 24) | ((@uint32)(p[i + 1]) << 16) | ((@uint32)(p[i + 2]) << 8) | (@uint32)(p[i + 3])
+end
+local function le32(p: *[0]byte, i: integer): uint32
+  return ((@uint32)(p[i + 3]) << 24) | ((@uint32)(p[i + 2]) << 16) | ((@uint32)(p[i + 1]) << 8) | (@uint32)(p[i])
+end
+local function be64(p: *[0]byte, i: integer): uint64
+  local v: uint64 = 0
+  for k = 0, 7 do v = (v << 8) | (@uint64)(p[i + k]) end
+  return v
+end
+local function le64(p: *[0]byte, i: integer): uint64
+  local v: uint64 = 0
+  for k = 7, 0, -1 do v = (v << 8) | (@uint64)(p[i + k]) end
+  return v
+end
+
+-- MD5 ----------------------------------------------------------------------
+local md5_s: [64]uint32 = {
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+}
+local md5_k: [64]uint32 = {
+  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+}
+
+local function md5_block(c: *digest.Ctx, p: *[0]byte)
+  local m: [16]uint32
+  for i = 0, 15 do m[i] = le32(p, i * 4) end
+  local a, b, cc, d = c.h32[0], c.h32[1], c.h32[2], c.h32[3]
+  for i = 0, 63 do
+    local f: uint32
+    local g: integer
+    if i < 16 then f = (b & cc) | (~b & d); g = i
+    elseif i < 32 then f = (d & b) | (~d & cc); g = (5 * i + 1) % 16
+    elseif i < 48 then f = b ~ cc ~ d; g = (3 * i + 5) % 16
+    else f = cc ~ (b | ~d); g = (7 * i) % 16 end
+    f = f + a + md5_k[i] + m[g]
+    a = d; d = cc; cc = b
+    b = b + rotl(f, md5_s[i])
+  end
+  c.h32[0] = c.h32[0] + a; c.h32[1] = c.h32[1] + b
+  c.h32[2] = c.h32[2] + cc; c.h32[3] = c.h32[3] + d
+end
+
+-- SHA-1 --------------------------------------------------------------------
+local function sha1_block(c: *digest.Ctx, p: *[0]byte)
+  local w: [80]uint32
+  for i = 0, 15 do w[i] = be32(p, i * 4) end
+  for i = 16, 79 do w[i] = rotl(w[i - 3] ~ w[i - 8] ~ w[i - 14] ~ w[i - 16], 1) end
+  local a, b, cc, d, e = c.h32[0], c.h32[1], c.h32[2], c.h32[3], c.h32[4]
+  for i = 0, 79 do
+    local f, k: uint32, uint32
+    if i < 20 then f = (b & cc) | (~b & d); k = 0x5a827999
+    elseif i < 40 then f = b ~ cc ~ d; k = 0x6ed9eba1
+    elseif i < 60 then f = (b & cc) | (b & d) | (cc & d); k = 0x8f1bbcdc
+    else f = b ~ cc ~ d; k = 0xca62c1d6 end
+    local t = rotl(a, 5) + f + e + k + w[i]
+    e = d; d = cc; cc = rotl(b, 30); b = a; a = t
+  end
+  c.h32[0] = c.h32[0] + a; c.h32[1] = c.h32[1] + b; c.h32[2] = c.h32[2] + cc
+  c.h32[3] = c.h32[3] + d; c.h32[4] = c.h32[4] + e
+end
+
+-- SHA-256 ------------------------------------------------------------------
+local k256: [64]uint32 = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+
+local function sha256_block(c: *digest.Ctx, p: *[0]byte)
+  local w: [64]uint32
+  for i = 0, 15 do w[i] = be32(p, i * 4) end
+  for i = 16, 63 do
+    local s0 = rotr(w[i - 15], 7) ~ rotr(w[i - 15], 18) ~ (w[i - 15] >> 3)
+    local s1 = rotr(w[i - 2], 17) ~ rotr(w[i - 2], 19) ~ (w[i - 2] >> 10)
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1
+  end
+  local a, b, cc, d = c.h32[0], c.h32[1], c.h32[2], c.h32[3]
+  local e, f, g, h = c.h32[4], c.h32[5], c.h32[6], c.h32[7]
+  for i = 0, 63 do
+    local S1 = rotr(e, 6) ~ rotr(e, 11) ~ rotr(e, 25)
+    local ch = (e & f) ~ (~e & g)
+    local t1 = h + S1 + ch + k256[i] + w[i]
+    local S0 = rotr(a, 2) ~ rotr(a, 13) ~ rotr(a, 22)
+    local maj = (a & b) ~ (a & cc) ~ (b & cc)
+    local t2 = S0 + maj
+    h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2
+  end
+  c.h32[0] = c.h32[0] + a; c.h32[1] = c.h32[1] + b; c.h32[2] = c.h32[2] + cc; c.h32[3] = c.h32[3] + d
+  c.h32[4] = c.h32[4] + e; c.h32[5] = c.h32[5] + f; c.h32[6] = c.h32[6] + g; c.h32[7] = c.h32[7] + h
+end
+
+-- SHA-512 ------------------------------------------------------------------
+local k512: [80]uint64 = {
+  0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc, 0x3956c25bf348b538,
+  0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118, 0xd807aa98a3030242, 0x12835b0145706fbe,
+  0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2, 0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235,
+  0xc19bf174cf692694, 0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+  0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5, 0x983e5152ee66dfab,
+  0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4, 0xc6e00bf33da88fc2, 0xd5a79147930aa725,
+  0x06ca6351e003826f, 0x142929670a0e6e70, 0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed,
+  0x53380d139d95b3df, 0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+  0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30, 0xd192e819d6ef5218,
+  0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8, 0x19a4c116b8d2d0c8, 0x1e376c085141ab53,
+  0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8, 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373,
+  0x682e6ff3d6b2b8a3, 0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+  0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b, 0xca273eceea26619c,
+  0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178, 0x06f067aa72176fba, 0x0a637dc5a2c898a6,
+  0x113f9804bef90dae, 0x1b710b35131c471b, 0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc,
+  0x431d67c49c100d4c, 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+}
+
+local function sha512_block(c: *digest.Ctx, p: *[0]byte)
+  local w: [80]uint64
+  for i = 0, 15 do w[i] = be64(p, i * 8) end
+  for i = 16, 79 do
+    local s0 = rotr64(w[i - 15], 1) ~ rotr64(w[i - 15], 8) ~ (w[i - 15] >> 7)
+    local s1 = rotr64(w[i - 2], 19) ~ rotr64(w[i - 2], 61) ~ (w[i - 2] >> 6)
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1
+  end
+  local a, b, cc, d = c.h64[0], c.h64[1], c.h64[2], c.h64[3]
+  local e, f, g, h = c.h64[4], c.h64[5], c.h64[6], c.h64[7]
+  for i = 0, 79 do
+    local S1 = rotr64(e, 14) ~ rotr64(e, 18) ~ rotr64(e, 41)
+    local ch = (e & f) ~ (~e & g)
+    local t1 = h + S1 + ch + k512[i] + w[i]
+    local S0 = rotr64(a, 28) ~ rotr64(a, 34) ~ rotr64(a, 39)
+    local maj = (a & b) ~ (a & cc) ~ (b & cc)
+    local t2 = S0 + maj
+    h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2
+  end
+  c.h64[0] = c.h64[0] + a; c.h64[1] = c.h64[1] + b; c.h64[2] = c.h64[2] + cc; c.h64[3] = c.h64[3] + d
+  c.h64[4] = c.h64[4] + e; c.h64[5] = c.h64[5] + f; c.h64[6] = c.h64[6] + g; c.h64[7] = c.h64[7] + h
+end
+
+-- SM3 ----------------------------------------------------------------------
+local function sm3_p0(x: uint32): uint32 return x ~ rotl(x, 9) ~ rotl(x, 17) end
+local function sm3_p1(x: uint32): uint32 return x ~ rotl(x, 15) ~ rotl(x, 23) end
+
+local function sm3_block(c: *digest.Ctx, p: *[0]byte)
+  local w: [68]uint32
+  local w1: [64]uint32
+  for i = 0, 15 do w[i] = be32(p, i * 4) end
+  for j = 16, 67 do
+    w[j] = sm3_p1(w[j - 16] ~ w[j - 9] ~ rotl(w[j - 3], 15)) ~ rotl(w[j - 13], 7) ~ w[j - 6]
+  end
+  for j = 0, 63 do w1[j] = w[j] ~ w[j + 4] end
+  local a, b, cc, d = c.h32[0], c.h32[1], c.h32[2], c.h32[3]
+  local e, f, g, h = c.h32[4], c.h32[5], c.h32[6], c.h32[7]
+  for j = 0, 63 do
+    local t: uint32 = j < 16 and 0x79cc4519 or 0x7a879d8a
+    local ss1 = rotl(rotl(a, 12) + e + rotl(t, (@uint32)(j % 32)), 7)
+    local ss2 = ss1 ~ rotl(a, 12)
+    local ff, gg: uint32, uint32
+    if j < 16 then ff = a ~ b ~ cc; gg = e ~ f ~ g
+    else ff = (a & b) | (a & cc) | (b & cc); gg = (e & f) | (~e & g) end
+    local tt1 = ff + d + ss2 + w1[j]
+    local tt2 = gg + h + ss1 + w[j]
+    d = cc; cc = rotl(b, 9); b = a; a = tt1
+    h = g; g = rotl(f, 19); f = e; e = sm3_p0(tt2)
+  end
+  c.h32[0] = c.h32[0] ~ a; c.h32[1] = c.h32[1] ~ b; c.h32[2] = c.h32[2] ~ cc; c.h32[3] = c.h32[3] ~ d
+  c.h32[4] = c.h32[4] ~ e; c.h32[5] = c.h32[5] ~ f; c.h32[6] = c.h32[6] ~ g; c.h32[7] = c.h32[7] ~ h
+end
+
+-- BLAKE2b ------------------------------------------------------------------
+local b2_iv: [8]uint64 = {
+  0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+  0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+}
+local b2_sigma: [12][16]byte = {
+  {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+  {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+  {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4},
+  {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+  {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13},
+  {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+  {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11},
+  {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+  {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
+  {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0},
+  {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+  {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+}
+
+local function b2_compress(c: *digest.Ctx, p: *[0]byte, last: boolean)
+  local m: [16]uint64
+  local v: [16]uint64
+  for i = 0, 15 do m[i] = le64(p, i * 8) end
+  for i = 0, 7 do v[i] = c.h64[i]; v[i + 8] = b2_iv[i] end
+  v[12] = v[12] ~ c.total
+  if last then v[14] = ~v[14] end
+  for r = 0, 11 do
+    local s = &b2_sigma[r]
+    for k = 0, 7 do
+      local ia: integer, ib: integer, ic: integer, id: integer
+      if k < 4 then ia = k; ib = k + 4; ic = k + 8; id = k + 12
+      elseif k == 4 then ia = 0; ib = 5; ic = 10; id = 15
+      elseif k == 5 then ia = 1; ib = 6; ic = 11; id = 12
+      elseif k == 6 then ia = 2; ib = 7; ic = 8; id = 13
+      else ia = 3; ib = 4; ic = 9; id = 14 end
+      local x = m[s[2 * k]]
+      local y = m[s[2 * k + 1]]
+      v[ia] = v[ia] + v[ib] + x; v[id] = rotr64(v[id] ~ v[ia], 32)
+      v[ic] = v[ic] + v[id]; v[ib] = rotr64(v[ib] ~ v[ic], 24)
+      v[ia] = v[ia] + v[ib] + y; v[id] = rotr64(v[id] ~ v[ia], 16)
+      v[ic] = v[ic] + v[id]; v[ib] = rotr64(v[ib] ~ v[ic], 63)
+    end
+  end
+  for i = 0, 7 do c.h64[i] = c.h64[i] ~ v[i] ~ v[i + 8] end
+end
+
+-- Generic interface ----------------------------------------------------------
+function digest.init(c: *digest.Ctx, algo: integer, outlen: integer)
+  $c = {}
+  c.algo = algo
+  if algo == digest.MD5 then
+    c.h32[0] = 0x67452301; c.h32[1] = 0xefcdab89; c.h32[2] = 0x98badcfe; c.h32[3] = 0x10325476
+  elseif algo == digest.SHA1 then
+    c.h32[0] = 0x67452301; c.h32[1] = 0xefcdab89; c.h32[2] = 0x98badcfe; c.h32[3] = 0x10325476
+    c.h32[4] = 0xc3d2e1f0
+  elseif algo == digest.SHA256 then
+    c.h32 = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
+  elseif algo == digest.SHA224 then
+    c.h32 = {0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4}
+  elseif algo == digest.SHA512 then
+    c.h64 = {0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+             0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179}
+  elseif algo == digest.SHA384 then
+    c.h64 = {0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+             0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4}
+  elseif algo == digest.SM3 then
+    c.h32 = {0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600, 0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e}
+  elseif algo == digest.BLAKE2B then
+    for i = 0, 7 do c.h64[i] = b2_iv[i] end
+    c.h64[0] = c.h64[0] ~ (0x01010000 ~ (@uint64)(outlen))
+    c.outlen = outlen
+  end
+end
+
+local function block_size(algo: integer): integer
+  if algo == digest.SHA384 or algo == digest.SHA512 or algo == digest.BLAKE2B then return 128 end
+  return 64
+end
+
+local function process(c: *digest.Ctx, p: *[0]byte)
+  local a = c.algo
+  if a == digest.MD5 then md5_block(c, p)
+  elseif a == digest.SHA1 then sha1_block(c, p)
+  elseif a == digest.SHA224 or a == digest.SHA256 then sha256_block(c, p)
+  elseif a == digest.SHA384 or a == digest.SHA512 then sha512_block(c, p)
+  elseif a == digest.SM3 then sm3_block(c, p) end
+end
+
+function digest.update(c: *digest.Ctx, data: *[0]byte, n: integer)
+  local bs = block_size(c.algo)
+  local i: integer = 0
+  if c.algo == digest.BLAKE2B then
+    -- the last block is compressed by final, so keep a full block buffered
+    while i < n do
+      if c.buflen == bs then
+        c.total = c.total + (@uint64)(bs)
+        b2_compress(c, &c.buf, false)
+        c.buflen = 0
+      end
+      local take = bs - c.buflen
+      if take > n - i then take = n - i end
+      for k = 0, < take do c.buf[c.buflen + k] = data[i + k] end
+      c.buflen = c.buflen + take
+      i = i + take
+    end
+    return
+  end
+  c.total = c.total + (@uint64)(n)
+  if c.buflen > 0 then
+    local take = bs - c.buflen
+    if take > n then take = n end
+    for k = 0, < take do c.buf[c.buflen + k] = data[k] end
+    c.buflen = c.buflen + take
+    i = take
+    if c.buflen < bs then return end
+    process(c, &c.buf)
+    c.buflen = 0
+  end
+  while n - i >= bs do
+    process(c, (@*[0]byte)(&data[i]))
+    i = i + bs
+  end
+  for k = 0, < n - i do c.buf[k] = data[i + k] end
+  c.buflen = n - i
+end
+
+-- Writes the digest into out and returns its length in bytes.
+function digest.final(c: *digest.Ctx, out: *[64]byte): integer
+  local a = c.algo
+  if a == digest.BLAKE2B then
+    c.total = c.total + (@uint64)(c.buflen)
+    for k = c.buflen, 127 do c.buf[k] = 0 end
+    b2_compress(c, &c.buf, true)
+    for i = 0, < c.outlen do out[i] = (@byte)((c.h64[i // 8] >> (8 * (i % 8))) & 0xff) end
+    return c.outlen
+  end
+  local bs = block_size(a)
+  local lenbytes = bs == 128 and 16 or 8
+  local bits = c.total * 8
+  local pad: [128]byte
+  pad[0] = 0x80
+  local padlen = c.buflen < bs - lenbytes and (bs - lenbytes - c.buflen) or (2 * bs - lenbytes - c.buflen)
+  local zero: [256]byte
+  digest.update(c, &pad, 1)
+  if padlen > 1 then digest.update(c, &zero, padlen - 1) end
+  local lb: [16]byte
+  if a == digest.MD5 then
+    for i = 0, 7 do lb[i] = (@byte)((bits >> (8 * i)) & 0xff) end
+  else
+    for i = 0, 7 do lb[lenbytes - 1 - i] = (@byte)((bits >> (8 * i)) & 0xff) end
+  end
+  digest.update(c, &lb, lenbytes)
+  local n: integer
+  if a == digest.MD5 then
+    for i = 0, 15 do out[i] = (@byte)((c.h32[i // 4] >> (8 * (i % 4))) & 0xff) end
+    return 16
+  elseif a == digest.SHA1 then n = 20
+  elseif a == digest.SHA224 then n = 28
+  elseif a == digest.SHA256 or a == digest.SM3 then n = 32
+  elseif a == digest.SHA384 then n = 48
+  else n = 64 end
+  if bs == 128 then
+    for i = 0, < n do out[i] = (@byte)((c.h64[i // 8] >> (56 - 8 * (i % 8))) & 0xff) end
+  else
+    for i = 0, < n do out[i] = (@byte)((c.h32[i // 4] >> (24 - 8 * (i % 4))) & 0xff) end
+  end
+  return n
+end
+
+-- POSIX cksum CRC (polynomial 0x04C11DB7, MSB first) -------------------------
+global digest.crctab: [256]uint32
+local crc_ready = false
+function digest.crc_init()
+  if crc_ready then return end
+  for i = 0, 255 do
+    local c: uint32 = (@uint32)(i) << 24
+    for _ = 1, 8 do
+      if (c & 0x80000000) ~= 0 then c = (c << 1) ~ 0x04C11DB7 else c = c << 1 end
+    end
+    digest.crctab[i] = c
+  end
+  crc_ready = true
+end
+
+function digest.crc_update(crc: uint32, data: *[0]byte, n: integer): uint32
+  for i = 0, < n do
+    crc = (crc << 8) ~ digest.crctab[((crc >> 24) ~ data[i]) & 0xff]
+  end
+  return crc
+end
+
+function digest.crc_final(crc: uint32, total: uint64): uint32
+  while total ~= 0 do
+    crc = (crc << 8) ~ digest.crctab[((crc >> 24) ~ (@uint32)(total & 0xff)) & 0xff]
+    total = total >> 8
+  end
+  return ~crc
+end

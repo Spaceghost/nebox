@@ -41,13 +41,13 @@ stdout, exit status, and the resulting directory tree.
 ## Applets
 
 ```
-[ awk base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df
-dirname du echo env expand expr factor false find fold free grep groups head
-hexdump hostname id install join kill link ln ls md5sum mkdir mktemp mv nl nproc nsh
-od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
-sha256sum shuf sleep sort split stat strings sync tac tail tee test timeout
-touch tr true truncate tsort tty unexpand uname uniq unlink wc which whoami
-xargs yes
+[ awk b2sum base64 basename cat chgrp chmod chown cksum cmp comm cp cut date
+df dirname du echo env expand expr factor false find fold free grep groups
+head hexdump hostname id install join kill link ln ls md5sum mkdir mktemp mv
+nl nproc nsh od paste patch printenv printf pwd readlink realpath rev rm rmdir
+sed seq sh sha1sum sha224sum sha256sum sha384sum sha512sum shuf sleep sort
+split stat strings sum sync tac tail tee test timeout touch tr true truncate
+tsort tty uname unexpand uniq unlink wc which whoami xargs yes
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
@@ -221,6 +221,17 @@ Stated here rather than worked around:
   `getopt_long` (abbreviations, ambiguity and argument errors, the three
   operand orderings). `tests/join_compare.py` runs 96 fixed and random cases
   against GNU join: 1596 cases, 0 mismatches.
+- `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`,
+  `b2sum`, `cksum` and `sum` are one port of GNU coreutils 9.1 `src/digest.c`
+  (with `sum.c` and `cksum.c`'s output), over streaming MD5, SHA-1, SHA-2,
+  BLAKE2b (any `-l` length), SM3, CRC and BSD/System V sums in
+  `src/nebox/digest.nelua`: `--tag`, `-z`, file-name escaping, check mode with
+  GNU's line parser (untagged, tagged, OpenSSL-style, reversed BSD, escaped
+  names, BLAKE2b lengths), `--ignore-missing --quiet --status --strict -w`,
+  `cksum -a`/`--untagged`, `sum -r`/`-s`. Like coreutils 9.1, `cksum`'s CRC
+  treats a read error (a directory) as end of file. `cksum --debug` is
+  accepted and prints nothing (GNU names its CRC implementation).
+  `tests/digest_compare.py`: 1989 cases against GNU, 0 mismatches.
 - `diff` follows GNU diffutils 3.8's algorithm step by step (`find_identical_ends`
   on bytes with horizon lines, `discard_confusing_lines`, the middle-snake
   `compareseq` with its cost cut-off, `shift_boundaries`), so its edit

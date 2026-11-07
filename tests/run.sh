@@ -921,7 +921,7 @@ exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
 # sh
 . "$(dirname -- "$0")/sh.sh"
 # dispatch
-expect list-count '90
+expect list-count '95
 exit=0' "$BIN --list | wc -l"
 
 echo "nebox tests: $pass passed, $fail failed"

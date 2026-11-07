@@ -1,0 +1,825 @@
+-- md5sum, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, b2sum, cksum
+-- and sum: a port of GNU coreutils 9.1 src/digest.c (with sum.c and
+-- cksum.c's output functions). Output with --tag/-z and file-name escaping,
+-- check mode with GNU's line parser (untagged, tagged, OpenSSL-style
+-- "ALGO(file)= hex", reversed BSD lines, escaped names, BLAKE2b length
+-- detection), --ignore-missing/--quiet/--status/--strict/--warn, cksum -a
+-- and --untagged, b2sum and cksum -l, sum -r/-s. Files are read in blocks.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.digest'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local PROG_SUM: integer <comptime> = 0
+local PROG_CKSUM: integer <comptime> = 1
+local PROG_MD5: integer <comptime> = 2
+local PROG_BLAKE2: integer <comptime> = 3
+local PROG_SHA1: integer <comptime> = 4
+local PROG_SHA256: integer <comptime> = 5
+local PROG_SHA224: integer <comptime> = 6
+local PROG_SHA512: integer <comptime> = 7
+local PROG_SHA384: integer <comptime> = 8
+
+-- cksum algorithms, in GNU's order.
+local A_BSD: integer <comptime> = 0
+local A_SYSV: integer <comptime> = 1
+local A_CRC: integer <comptime> = 2
+local A_MD5: integer <comptime> = 3
+local A_SHA1: integer <comptime> = 4
+local A_SHA224: integer <comptime> = 5
+local A_SHA256: integer <comptime> = 6
+local A_SHA384: integer <comptime> = 7
+local A_SHA512: integer <comptime> = 8
+local A_BLAKE2B: integer <comptime> = 9
+local A_SM3: integer <comptime> = 10
+
+local algorithm_args: []string = {'bsd', 'sysv', 'crc', 'md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512', 'blake2b', 'sm3'}
+local algorithm_tags: []string = {'BSD', 'SYSV', 'CRC', 'MD5', 'SHA1', 'SHA224', 'SHA256', 'SHA384', 'SHA512', 'BLAKE2b', 'SM3'}
+local algorithm_bits: []integer = {16, 16, 32, 128, 160, 224, 256, 384, 512, 512, 256}
+local BLAKE2B_MAX_LEN: integer <comptime> = 64
+
+-- State.
+local prog: integer
+local progname: string
+local algorithm: integer
+local algorithm_specified: boolean
+local min_digest_line_length: integer
+local digest_hex_bytes: integer
+local status_only: boolean
+local warn: boolean
+local ignore_missing: boolean
+local quiet: boolean
+local strict: boolean
+local bsd_reversed: integer
+local digest_delim: byte
+local digest_length: uint64
+
+local function type_string(): string
+  if prog == PROG_SUM then return 'BSD'
+  elseif prog == PROG_CKSUM then return algorithm_tags[algorithm]
+  elseif prog == PROG_MD5 then return 'MD5'
+  elseif prog == PROG_BLAKE2 then return 'BLAKE2b'
+  elseif prog == PROG_SHA1 then return 'SHA1'
+  elseif prog == PROG_SHA256 then return 'SHA256'
+  elseif prog == PROG_SHA224 then return 'SHA224'
+  elseif prog == PROG_SHA512 then return 'SHA512'
+  else return 'SHA384' end
+end
+
+local function current_algo(): integer
+  if prog == PROG_CKSUM or prog == PROG_SUM then return algorithm
+  elseif prog == PROG_MD5 then return A_MD5
+  elseif prog == PROG_BLAKE2 then return A_BLAKE2B
+  elseif prog == PROG_SHA1 then return A_SHA1
+  elseif prog == PROG_SHA256 then return A_SHA256
+  elseif prog == PROG_SHA224 then return A_SHA224
+  elseif prog == PROG_SHA512 then return A_SHA512
+  else return A_SHA384 end
+end
+
+local function report(msg: string, errnum: cint)
+  if errnum ~= 0 then util.err(msg .. ': ' .. sys.strerror(errnum)) else util.err(msg) end
+end
+
+local function die(msg: string, errnum: cint)
+  report(msg, errnum)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail()
+  util.flush()
+  local m = "Try '" .. progname .. " --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+-- Digest a file; returns ok, missing, digest bytes (or sum value), length.
+local Result = @record{bytes: [64]byte, n: integer, value: uint32, length: uint64}
+
+local function digest_file(filename: string, res: *Result): (boolean, boolean)
+  local fd: cint = 0
+  local is_stdin = filename == '-'
+  if not is_stdin then
+    fd = sys.open(filename, sys.O_RDONLY, 0)
+    if fd < 0 then
+      if ignore_missing and sys.errno() == sys.ENOENT then return true, true end
+      report(util.quotef(filename), sys.errno())
+      return false, false
+    end
+  end
+  local algo = current_algo()
+  local ctx: digest.Ctx
+  local crc: uint32 = 0
+  local bsd: uint32 = 0
+  local sysv: uint32 = 0
+  if algo == A_CRC then digest.crc_init()
+  elseif algo > A_CRC then
+    local da: integer
+    if algo == A_MD5 then da = digest.MD5 elseif algo == A_SHA1 then da = digest.SHA1
+    elseif algo == A_SHA224 then da = digest.SHA224 elseif algo == A_SHA256 then da = digest.SHA256
+    elseif algo == A_SHA384 then da = digest.SHA384 elseif algo == A_SHA512 then da = digest.SHA512
+    elseif algo == A_BLAKE2B then da = digest.BLAKE2B else da = digest.SM3 end
+    digest.init(&ctx, da, (@integer)(digest_length // 8))
+  end
+  local buf: [65536]byte
+  local total: uint64 = 0
+  local err: cint = 0
+  while true do
+    local n = sys.read(fd, &buf, #buf)
+    if n < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      -- coreutils 9.1's CRC loops test ferror only after a successful read,
+      -- so cksum's default algorithm treats a read error as end of file
+      if algo ~= A_CRC then err = sys.errno() end
+      break
+    end
+    if n == 0 then break end
+    total = total + (@uint64)(n)
+    if algo == A_BSD then
+      for i = 0, < n do
+        bsd = (bsd >> 1) + ((bsd & 1) << 15)
+        bsd = (bsd + buf[i]) & 0xffff
+      end
+    elseif algo == A_SYSV then
+      for i = 0, < n do sysv = sysv + buf[i] end
+    elseif algo == A_CRC then
+      crc = digest.crc_update(crc, &buf, n)
+    else
+      digest.update(&ctx, &buf, n)
+    end
+  end
+  if not is_stdin then sys.close(fd) end
+  if err ~= 0 then
+    report(util.quotef(filename), err)
+    return false, false
+  end
+  res.length = total
+  if algo == A_BSD then res.value = bsd
+  elseif algo == A_SYSV then
+    local r = (sysv & 0xffff) + (sysv >> 16)
+    res.value = (r & 0xffff) + (r >> 16)
+  elseif algo == A_CRC then res.value = digest.crc_final(crc, total)
+  else res.n = digest.final(&ctx, &res.bytes) end
+  return true, false
+end
+
+local function print_filename(file: string, escape: boolean)
+  if not escape then util.write(file); return end
+  for i = 1, #file do
+    local c = file:byte(i)
+    if c == 10 then util.write('\\n')
+    elseif c == 13 then util.write('\\r')
+    elseif c == 92 then util.write('\\\\')
+    else util.writebyte(c) end
+  end
+end
+
+local hexd = '0123456789abcdef'
+
+local function ceil_blocks(n: uint64, bs: uint64): uint64
+  return n // bs + ((n % bs ~= 0) and 1 or 0)
+end
+
+local function output(file: string, binary_file: boolean, res: *Result, tagged: boolean, args: boolean)
+  local algo = current_algo()
+  if algo == A_BSD then
+    util.writef('%05d %5s', res.value, tostring(ceil_blocks(res.length, 1024)))
+    if args then util.write(' '); util.write(file) end
+    util.writebyte(digest_delim)
+    return
+  elseif algo == A_SYSV then
+    util.writef('%d %s', res.value, tostring(ceil_blocks(res.length, 512)))
+    if args then util.write(' '); util.write(file) end
+    util.writebyte(digest_delim)
+    return
+  elseif algo == A_CRC then
+    util.writef('%s %s', tostring(res.value), tostring(res.length))
+    if args then util.write(' '); util.write(file) end
+    util.writebyte(digest_delim)
+    return
+  end
+  local needs_escape = digest_delim == 10 and (file:find('\\', 1, true) > 0 or file:find('\n', 1, true) > 0
+                                                or file:find('\r', 1, true) > 0)
+  if needs_escape then util.writebyte(92) end
+  if tagged then
+    util.write(type_string())
+    if algo == A_BLAKE2B and digest_length < (@uint64)(BLAKE2B_MAX_LEN * 8) then
+      util.write('-' .. tostring(digest_length))
+    end
+    util.write(' (')
+    print_filename(file, needs_escape)
+    util.write(') = ')
+  end
+  for i = 0, < digest_hex_bytes // 2 do
+    util.writebyte(hexd:byte((res.bytes[i] >> 4) + 1))
+    util.writebyte(hexd:byte((res.bytes[i] & 15) + 1))
+  end
+  if not tagged then
+    util.writebyte(32)
+    if prog == PROG_CKSUM then util.writebyte(32)
+    else util.writebyte(binary_file and 42 or 32) end
+    print_filename(file, needs_escape)
+  end
+  util.writebyte(digest_delim)
+end
+
+-- Check-file parsing. s is the line as C sees it: bytes then a 0.
+local function at(s: *sequence(byte), i: integer): byte
+  local t = $s
+  if i < 0 or i >= #t then return 0 end
+  return t[i + 1]
+end
+
+local function cstr(s: *sequence(byte), i: integer): string
+  local sb: stringbuilder
+  while at(s, i) ~= 0 do sb:writebyte(at(s, i)); i = i + 1 end
+  return sb:promote()
+end
+
+local function iswhite(c: byte): boolean return c == 32 or c == 9 end
+local function isxdigit(c: byte): boolean
+  return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+end
+
+-- filename_unescape over s[from, from+len); false if invalid.
+local function filename_unescape(s: *sequence(byte), from: integer, len: integer): (boolean, string)
+  local sb: stringbuilder
+  local i = 0
+  while i < len do
+    local c = at(s, from + i)
+    if c == 92 then
+      if i == len - 1 then return false, '' end
+      i = i + 1
+      local d = at(s, from + i)
+      if d == 110 then sb:writebyte(10)
+      elseif d == 114 then sb:writebyte(13)
+      elseif d == 92 then sb:writebyte(92)
+      else return false, '' end
+    elseif c == 0 then
+      return false, ''
+    else
+      sb:writebyte(c)
+    end
+    i = i + 1
+  end
+  return true, sb:promote()
+end
+
+local function hex_digits(s: *sequence(byte), i: integer): boolean
+  for k = 0, < digest_hex_bytes do
+    if not isxdigit(at(s, i + k)) then return false end
+  end
+  return at(s, i + digest_hex_bytes) == 0
+end
+
+-- bsd_split_3 on s from index start, s_len bytes.
+local function bsd_split_3(s: *sequence(byte), start: integer, s_len: integer, escaped: boolean): (boolean, integer, string)
+  if s_len == 0 then return false, 0, '' end
+  local i = s_len - 1
+  while i > 0 and at(s, start + i) ~= 41 do i = i - 1 end
+  if at(s, start + i) ~= 41 then return false, 0, '' end
+  local name: string
+  if escaped then
+    local ok, nm = filename_unescape(s, start, i)
+    if not ok then return false, 0, '' end
+    name = nm
+  else
+    local sb: stringbuilder
+    for k = 0, < i do
+      local c = at(s, start + k)
+      if c == 0 then break end
+      sb:writebyte(c)
+    end
+    name = sb:promote()
+  end
+  i = i + 1
+  while iswhite(at(s, start + i)) do i = i + 1 end
+  if at(s, start + i) ~= 61 then return false, 0, '' end
+  i = i + 1
+  while iswhite(at(s, start + i)) do i = i + 1 end
+  return hex_digits(s, start + i), start + i, name
+end
+
+local function algorithm_from_tag(s: *sequence(byte), i0: integer): integer
+  local max_tag_len = 7
+  local i = 0
+  while i <= max_tag_len do
+    local c = at(s, i0 + i)
+    if c == 0 or iswhite(c) or c == 45 or c == 40 then break end
+    i = i + 1
+  end
+  if i > max_tag_len then return -1 end
+  local sb: stringbuilder
+  for k = 0, < i do sb:writebyte(at(s, i0 + k)) end
+  local tag = sb:promote()
+  for k = 0, < #algorithm_tags do
+    if algorithm_tags[k] == tag then return k end
+  end
+  return -1
+end
+
+-- strtoumax base 0, any suffix: (ok, value, end index).
+local function strtou0(s: *sequence(byte), i: integer): (boolean, uint64, integer)
+  while at(s, i) == 32 or (at(s, i) >= 9 and at(s, i) <= 13) do i = i + 1 end
+  if at(s, i) == 45 then return false, 0, i end
+  if at(s, i) == 43 then i = i + 1 end
+  local base: uint64 = 10
+  if at(s, i) == 48 and (at(s, i + 1) == 120 or at(s, i + 1) == 88) and isxdigit(at(s, i + 2)) then
+    base = 16; i = i + 2
+  elseif at(s, i) == 48 then base = 8 end
+  local start = i
+  local v: uint64 = 0
+  local ovf = false
+  while true do
+    local c = at(s, i)
+    local d: uint64
+    if c >= 48 and c <= 57 then d = c - 48
+    elseif c >= 97 and c <= 102 then d = c - 87
+    elseif c >= 65 and c <= 70 then d = c - 55
+    else break end
+    if d >= base then break end
+    if v > (0xffffffffffffffff - d) // base then ovf = true end
+    v = v * base + d
+    i = i + 1
+  end
+  if i == start then return false, 0, i end
+  return not ovf, v, i
+end
+
+-- split_3: (ok, hex start index, binary, file name)
+local function split_3(s: *sequence(byte), s_len: integer): (boolean, integer, boolean, string)
+  local escaped = false
+  local i = 0
+  while iswhite(at(s, i)) do i = i + 1 end
+  if at(s, i) == 92 then i = i + 1; escaped = true end
+  if prog == PROG_CKSUM and not algorithm_specified then
+    local tag = algorithm_from_tag(s, i)
+    if tag >= 0 then
+      if tag <= A_CRC then return false, 0, false, '' end
+      algorithm = tag
+    else
+      return false, 0, false, ''
+    end
+  end
+  local ts = type_string()
+  local tl = #ts
+  local match = true
+  for k = 0, < tl do
+    if at(s, i + k) ~= ts:byte(k + 1) then match = false; break end
+  end
+  if match then
+    i = i + tl
+    if prog == PROG_BLAKE2 or prog == PROG_CKSUM then
+      local length_specified = at(s, i) == 45
+      local openssl = at(s, i) == 40
+      i = i + 1
+      if openssl then i = i - 1 end
+      if prog == PROG_BLAKE2 then digest_length = BLAKE2B_MAX_LEN * 8
+      else digest_length = (@uint64)(algorithm_bits[algorithm]) end
+      if length_specified then
+        local ok, length, e = strtou0(s, i)
+        if not (ok and 0 < length and length <= digest_length and length % 8 == 0) then
+          return false, 0, false, ''
+        end
+        i = e
+        digest_length = length
+      end
+      digest_hex_bytes = (@integer)(digest_length // 4)
+    end
+    if at(s, i) == 32 then i = i + 1 end
+    if at(s, i) == 40 then
+      i = i + 1
+      local ok, hexstart, name = bsd_split_3(s, i, s_len - i, escaped)
+      return ok, hexstart, false, name
+    end
+    return false, 0, false, ''
+  end
+  if s_len - i < min_digest_line_length + (at(s, i) == 92 and 1 or 0) then return false, 0, false, '' end
+  local hexstart = i
+  if prog == PROG_BLAKE2 or (prog == PROG_CKSUM and algorithm == A_BLAKE2B) then
+    local hp = hexstart
+    digest_hex_bytes = 0
+    while isxdigit(at(s, hp)) do digest_hex_bytes = digest_hex_bytes + 1; hp = hp + 1 end
+    if digest_hex_bytes < 2 or digest_hex_bytes % 2 ~= 0 or BLAKE2B_MAX_LEN * 2 < digest_hex_bytes then
+      return false, 0, false, ''
+    end
+    digest_length = (@uint64)(digest_hex_bytes * 4)
+  end
+  i = i + digest_hex_bytes
+  if not iswhite(at(s, i)) then return false, 0, false, '' end
+  local t = $s
+  t[i + 1] = 0
+  i = i + 1
+  if not hex_digits(s, hexstart) then return false, 0, false, '' end
+  local binary = false
+  if s_len - i == 1 or (at(s, i) ~= 32 and at(s, i) ~= 42) then
+    if bsd_reversed == 0 then return false, 0, false, '' end
+    bsd_reversed = 1
+  elseif bsd_reversed ~= 1 then
+    bsd_reversed = 0
+    binary = at(s, i) == 42
+    i = i + 1
+  end
+  if escaped then
+    local ok, nm = filename_unescape(s, i, s_len - i)
+    return ok, hexstart, binary, nm
+  end
+  return true, hexstart, binary, cstr(s, i)
+end
+
+local function plural(n: integer, one: string, many: string): string
+  return n == 1 and one or many
+end
+
+local function digest_check(checkfile_name: string): boolean
+  local n_misformatted: integer = 0
+  local n_improper: integer = 0
+  local n_mismatched: integer = 0
+  local n_open_fail: integer = 0
+  local properly_formatted = false
+  local matched = false
+  local is_stdin = checkfile_name == '-'
+  local fd: cint = 0
+  if is_stdin then
+    checkfile_name = 'standard input'
+  else
+    fd = sys.open(checkfile_name, sys.O_RDONLY, 0)
+    if fd < 0 then report(util.quotef(checkfile_name), sys.errno()); return false end
+  end
+  -- read the whole check file (lines are processed in order)
+  local data: sequence(byte)
+  local rbuf: [65536]byte
+  local rerr: cint = 0
+  while true do
+    local n = sys.read(fd, &rbuf, #rbuf)
+    if n < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      rerr = sys.errno(); break
+    end
+    if n == 0 then break end
+    for k = 0, < n do data:push(rbuf[k]) end
+  end
+  if not is_stdin then sys.close(fd) end
+  local line_number: integer = 0
+  local pos: integer = 1
+  while pos <= #data do
+    line_number = line_number + 1
+    local e = pos
+    while e <= #data and data[e] ~= 10 do e = e + 1 end
+    local line: sequence(byte)
+    local stop = e <= #data and e or #data
+    for k = pos, stop do line:push(data[k]) end
+    pos = e + 1
+    if line[1] == 35 then line:destroy(); continue end
+    local line_length = #line
+    if line[line_length] == 10 then line_length = line_length - 1 end
+    if line_length > 0 and line[line_length] == 13 then line_length = line_length - 1
+    elseif line_length == 0 and line[1] == 13 then end
+    if line_length == 0 then line:destroy(); continue end
+    line:resize((@usize)(line_length))
+    local ok, hexstart, binary, filename = split_3(&line, line_length)
+    if not (ok and not (is_stdin and filename == '-')) then
+      n_misformatted = n_misformatted + 1
+      if warn then
+        report(string.format('%s: %d: improperly formatted %s checksum line', util.quotef(checkfile_name),
+          line_number, type_string()), 0)
+      end
+      n_improper = n_improper + 1
+    else
+      local needs_escape = not status_only and filename:find('\n', 1, true) > 0
+      properly_formatted = true
+      local res: Result
+      local fok, missing = digest_file(filename, &res)
+      if not fok then
+        n_open_fail = n_open_fail + 1
+        if not status_only then
+          if needs_escape then util.writebyte(92) end
+          print_filename(filename, needs_escape)
+          util.write(': FAILED open or read\n')
+        end
+      elseif ignore_missing and missing then
+      else
+        local nbytes = digest_hex_bytes // 2
+        local cnt = 0
+        local algo = current_algo()
+        while cnt < nbytes do
+          local hc1 = at(&line, hexstart + 2 * cnt)
+          local hc2 = at(&line, hexstart + 2 * cnt + 1)
+          if hc1 >= 65 and hc1 <= 90 then hc1 = hc1 + 32 end
+          if hc2 >= 65 and hc2 <= 90 then hc2 = hc2 + 32 end
+          if hc1 ~= hexd:byte((res.bytes[cnt] >> 4) + 1) or hc2 ~= hexd:byte((res.bytes[cnt] & 15) + 1) then break end
+          cnt = cnt + 1
+        end
+        if cnt ~= nbytes then n_mismatched = n_mismatched + 1 else matched = true end
+        if not status_only then
+          if cnt ~= nbytes or not quiet then
+            if needs_escape then util.writebyte(92) end
+            print_filename(filename, needs_escape)
+          end
+          if cnt ~= nbytes then util.write(': FAILED\n')
+          elseif not quiet then util.write(': OK\n') end
+        end
+      end
+    end
+    line:destroy()
+  end
+  data:destroy()
+  if rerr ~= 0 then
+    report(util.quotef(checkfile_name) .. ': read error', 0)
+    return false
+  end
+  if not properly_formatted then
+    report(util.quotef(checkfile_name) .. ': no properly formatted checksum lines found', 0)
+  elseif not status_only then
+    if n_misformatted ~= 0 then
+      report(string.format(plural(n_misformatted, 'WARNING: %d line is improperly formatted',
+        'WARNING: %d lines are improperly formatted'), n_misformatted), 0)
+    end
+    if n_open_fail ~= 0 then
+      report(string.format(plural(n_open_fail, 'WARNING: %d listed file could not be read',
+        'WARNING: %d listed files could not be read'), n_open_fail), 0)
+    end
+    if n_mismatched ~= 0 then
+      report(string.format(plural(n_mismatched, 'WARNING: %d computed checksum did NOT match',
+        'WARNING: %d computed checksums did NOT match'), n_mismatched), 0)
+    end
+    if ignore_missing and not matched then
+      report(util.quotef(checkfile_name) .. ': no file was verified', 0)
+    end
+  end
+  return properly_formatted and matched and n_mismatched == 0 and n_open_fail == 0
+    and (not strict or n_improper == 0)
+end
+
+local IGNORE_MISSING_OPTION: integer <comptime> = 128
+local STATUS_OPTION: integer <comptime> = 129
+local QUIET_OPTION: integer <comptime> = 130
+local STRICT_OPTION: integer <comptime> = 131
+local TAG_OPTION: integer <comptime> = 132
+local UNTAG_OPTION: integer <comptime> = 133
+local DEBUG_PROGRAM_OPTION: integer <comptime> = 134
+local HELP_OPTION: integer <comptime> = 135
+local VERSION_OPTION: integer <comptime> = 136
+
+local opts_sum: []util.LongOpt = {
+  {'sysv', 0, 115}, {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+local opts_cksum: []util.LongOpt = {
+  {'length', 1, 108}, {'check', 0, 99}, {'ignore-missing', 0, IGNORE_MISSING_OPTION},
+  {'quiet', 0, QUIET_OPTION}, {'status', 0, STATUS_OPTION}, {'warn', 0, 119},
+  {'strict', 0, STRICT_OPTION}, {'tag', 0, TAG_OPTION}, {'zero', 0, 122},
+  {'algorithm', 1, 97}, {'debug', 0, DEBUG_PROGRAM_OPTION}, {'untagged', 0, UNTAG_OPTION},
+  {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+local opts_b2: []util.LongOpt = {
+  {'length', 1, 108}, {'check', 0, 99}, {'ignore-missing', 0, IGNORE_MISSING_OPTION},
+  {'quiet', 0, QUIET_OPTION}, {'status', 0, STATUS_OPTION}, {'warn', 0, 119},
+  {'strict', 0, STRICT_OPTION}, {'tag', 0, TAG_OPTION}, {'zero', 0, 122},
+  {'binary', 0, 98}, {'text', 0, 116},
+  {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+local opts_plain: []util.LongOpt = {
+  {'check', 0, 99}, {'ignore-missing', 0, IGNORE_MISSING_OPTION},
+  {'quiet', 0, QUIET_OPTION}, {'status', 0, STATUS_OPTION}, {'warn', 0, 119},
+  {'strict', 0, STRICT_OPTION}, {'tag', 0, TAG_OPTION}, {'zero', 0, 122},
+  {'binary', 0, 98}, {'text', 0, 116},
+  {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+}
+
+-- xdectoumax(optarg, 0, UINTMAX_MAX, "", "invalid length", 0)
+local function parse_length(a: string): uint64
+  local p = 1
+  while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+  if p <= #a and a:byte(p) == 45 then die("invalid length: '" .. a .. "'", 0) end
+  if p <= #a and a:byte(p) == 43 then p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while p <= #a and a:byte(p) >= 48 and a:byte(p) <= 57 do
+    local d: uint64 = a:byte(p) - 48
+    if v > (0xffffffffffffffff - d) // 10 then ovf = true; v = 0xffffffffffffffff
+    elseif not ovf then v = v * 10 + d end
+    p = p + 1
+  end
+  if p == start or p <= #a then die("invalid length: '" .. a .. "'", 0) end
+  if ovf then die("invalid length: '" .. a .. "'", 75) end
+  return v
+end
+
+local function usage()
+  if prog == PROG_SUM then
+    util.write([[
+Usage: sum [OPTION]... [FILE]...
+Print or check BSD (16-bit) checksums.
+
+With no FILE, or when FILE is -, read standard input.
+
+  -r              use BSD sum algorithm (the default), use 1K blocks
+  -s, --sysv      use System V sum algorithm, use 512 bytes blocks
+      --help        display this help and exit
+      --version     output version information and exit
+]])
+    return
+  end
+  util.write('Usage: ' .. progname .. ' [OPTION]... [FILE]...\n')
+  if prog == PROG_CKSUM then
+    util.write('Print or verify checksums.\nBy default use the 32 bit CRC algorithm.\n')
+  else
+    util.write('Print or check ' .. type_string() .. ' checksums.\n')
+  end
+  util.write([[
+
+With no FILE, or when FILE is -, read standard input.
+]])
+  if prog == PROG_CKSUM then
+    util.write([[
+  -a, --algorithm=TYPE  select the digest type to use.  See DIGEST below.
+]])
+  else
+    util.write([[
+  -b, --binary         read in binary mode
+]])
+  end
+  util.write([[
+  -c, --check          read checksums from the FILEs and check them
+]])
+  if prog == PROG_CKSUM or prog == PROG_BLAKE2 then
+    util.write([[
+  -l, --length=BITS    digest length in bits; must not exceed the max for
+                         the blake2 algorithm and must be a multiple of 8
+]])
+  end
+  if prog == PROG_CKSUM then
+    util.write([[
+      --tag            create a BSD-style checksum (the default)
+      --untagged       create a reversed style checksum, without digest type
+]])
+  else
+    util.write([[
+      --tag            create a BSD-style checksum
+  -t, --text           read in text mode (default)
+]])
+  end
+  util.write([[
+  -z, --zero           end each output line with NUL, not newline,
+                         and disable file name escaping
+
+The following five options are useful only when verifying checksums:
+      --ignore-missing  don't fail or report status for missing files
+      --quiet          don't print OK for each successfully verified file
+      --status         don't output anything, status code shows success
+      --strict         exit non-zero for improperly formatted checksum lines
+  -w, --warn           warn about improperly formatted checksum lines
+
+      --help        display this help and exit
+      --version     output version information and exit
+]])
+end
+
+local function run(args: sequence(string), which: integer, name: string): integer
+  prog = which
+  progname = name
+  algorithm = prog == PROG_CKSUM and A_CRC or A_BSD
+  algorithm_specified = false
+  status_only = false; warn = false; ignore_missing = false; quiet = false; strict = false
+  bsd_reversed = -1
+  digest_delim = 10
+  digest_length = 0
+  local do_check = false
+  local binary: integer = prog == PROG_CKSUM and 1 or -1
+  local prefix_tag = prog == PROG_CKSUM
+  local digest_length_str = ''
+  local g: util.Getopt
+  if prog == PROG_SUM then g = util.getopt(args, 'rs', &opts_sum, #opts_sum)
+  elseif prog == PROG_CKSUM then g = util.getopt(args, 'a:l:bctwz', &opts_cksum, #opts_cksum)
+  elseif prog == PROG_BLAKE2 then g = util.getopt(args, 'l:bctwz', &opts_b2, #opts_b2)
+  else g = util.getopt(args, 'bctwz', &opts_plain, #opts_plain) end
+  while true do
+    local opt = g:next()
+    if opt == -1 then break end
+    if prog == PROG_CKSUM and opt == 97 then
+      local found = -1
+      for k = 0, < #algorithm_args do
+        if algorithm_args[k] == g.optarg then found = k end
+      end
+      if found < 0 then
+        util.err("invalid argument '" .. g.optarg .. "' for '--algorithm'")
+        local sb: stringbuilder
+        sb:write('Valid arguments are:')
+        for k = 0, < #algorithm_args do sb:write("\n  - '", algorithm_args[k], "'") end
+        sb:write('\n')
+        local m = sb:promote()
+        sys.write(2, m.data, m.size)
+        usage_fail()
+      end
+      algorithm = found
+      algorithm_specified = true
+    elseif prog == PROG_CKSUM and opt == DEBUG_PROGRAM_OPTION then
+    elseif (prog == PROG_CKSUM or prog == PROG_BLAKE2) and opt == 108 then
+      digest_length = parse_length(g.optarg)
+      digest_length_str = g.optarg
+      if digest_length % 8 ~= 0 then
+        report("invalid length: '" .. digest_length_str .. "'", 0)
+        die('length is not a multiple of 8', 0)
+      end
+    elseif prog ~= PROG_SUM and opt == 99 then do_check = true
+    elseif prog ~= PROG_SUM and opt == STATUS_OPTION then status_only = true; warn = false; quiet = false
+    elseif prog ~= PROG_SUM and prog ~= PROG_CKSUM and opt == 98 then binary = 1
+    elseif prog ~= PROG_SUM and prog ~= PROG_CKSUM and opt == 116 then binary = 0
+    elseif prog ~= PROG_SUM and opt == 119 then status_only = false; warn = true; quiet = false
+    elseif prog ~= PROG_SUM and opt == IGNORE_MISSING_OPTION then ignore_missing = true
+    elseif prog ~= PROG_SUM and opt == QUIET_OPTION then status_only = false; warn = false; quiet = true
+    elseif prog ~= PROG_SUM and opt == STRICT_OPTION then strict = true
+    elseif prog == PROG_CKSUM and opt == UNTAG_OPTION then prefix_tag = false
+    elseif prog ~= PROG_SUM and opt == TAG_OPTION then prefix_tag = true; binary = 1
+    elseif prog ~= PROG_SUM and opt == 122 then digest_delim = 0
+    elseif prog == PROG_SUM and opt == 114 then algorithm = A_BSD
+    elseif prog == PROG_SUM and opt == 115 then algorithm = A_SYSV
+    elseif opt == HELP_OPTION then usage(); util.flush(); return 0
+    elseif opt == VERSION_OPTION then util.line(progname .. ' (nebox) after GNU coreutils 9.1'); util.flush(); return 0
+    else usage_fail() end
+  end
+  if prog == PROG_BLAKE2 or prog == PROG_CKSUM then min_digest_line_length = 3
+  else min_digest_line_length = algorithm_bits[current_algo()] // 4 + 2 end
+  if prog == PROG_BLAKE2 or prog == PROG_CKSUM then
+    if prog == PROG_CKSUM and digest_length ~= 0 and algorithm ~= A_BLAKE2B then
+      die('--length is only supported with --algorithm=blake2b', 0)
+    end
+    if digest_length > (@uint64)(BLAKE2B_MAX_LEN * 8) then
+      report("invalid length: '" .. digest_length_str .. "'", 0)
+      die("maximum digest length for 'BLAKE2b' is 512 bits", 0)
+    end
+    if digest_length == 0 then
+      if prog == PROG_BLAKE2 then digest_length = BLAKE2B_MAX_LEN * 8
+      else digest_length = (@uint64)(algorithm_bits[algorithm]) end
+    end
+    digest_hex_bytes = (@integer)(digest_length // 4)
+  else
+    digest_hex_bytes = algorithm_bits[current_algo()] // 4
+    if prog ~= PROG_SUM then digest_length = (@uint64)(algorithm_bits[current_algo()]) end
+  end
+  if prog == PROG_CKSUM and algorithm <= A_CRC and do_check and algorithm_specified then
+    die('--check is not supported with --algorithm={bsd,sysv,crc}', 0)
+  end
+  if prefix_tag and binary == 0 then
+    util.err('--tag does not support --text mode'); usage_fail()
+  end
+  if digest_delim ~= 10 and do_check then
+    util.err('the --zero option is not supported when verifying checksums'); usage_fail()
+  end
+  if prog ~= PROG_CKSUM and prefix_tag and do_check then
+    util.err('the --tag option is meaningless when verifying checksums'); usage_fail()
+  end
+  if prog ~= PROG_CKSUM and binary >= 0 and do_check then
+    util.err('the --binary and --text options are meaningless when verifying checksums'); usage_fail()
+  end
+  if ignore_missing and not do_check then
+    util.err('the --ignore-missing option is meaningful only when verifying checksums'); usage_fail()
+  end
+  if status_only and not do_check then
+    util.err('the --status option is meaningful only when verifying checksums'); usage_fail()
+  end
+  if warn and not do_check then
+    util.err('the --warn option is meaningful only when verifying checksums'); usage_fail()
+  end
+  if quiet and not do_check then
+    util.err('the --quiet option is meaningful only when verifying checksums'); usage_fail()
+  end
+  if strict and not do_check then
+    util.err('the --strict option is meaningful only when verifying checksums'); usage_fail()
+  end
+  if binary < 0 then binary = 0 end
+  local operands = g:operands()
+  local have_args = #operands > 0
+  if not have_args then operands:push('-') end
+  local ok = true
+  for _, file in ipairs(operands) do
+    if do_check then
+      if not digest_check(file) then ok = false end
+    else
+      local res: Result
+      local fok, missing = digest_file(file, &res)
+      if not fok then ok = false
+      else output(file, binary == 1, &res, prefix_tag, have_args) end
+    end
+  end
+  util.flush()
+  return ok and 0 or 1
+end
+
+global function applet_md5sum(args: sequence(string)): integer return run(args, PROG_MD5, 'md5sum') end
+global function applet_sha1sum(args: sequence(string)): integer return run(args, PROG_SHA1, 'sha1sum') end
+global function applet_sha224sum(args: sequence(string)): integer return run(args, PROG_SHA224, 'sha224sum') end
+global function applet_sha256sum(args: sequence(string)): integer return run(args, PROG_SHA256, 'sha256sum') end
+global function applet_sha384sum(args: sequence(string)): integer return run(args, PROG_SHA384, 'sha384sum') end
+global function applet_sha512sum(args: sequence(string)): integer return run(args, PROG_SHA512, 'sha512sum') end
+global function applet_b2sum(args: sequence(string)): integer return run(args, PROG_BLAKE2, 'b2sum') end
+global function applet_cksum(args: sequence(string)): integer return run(args, PROG_CKSUM, 'cksum') end
+global function applet_sum(args: sequence(string)): integer return run(args, PROG_SUM, 'sum') end

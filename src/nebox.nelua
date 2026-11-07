@@ -20,6 +20,7 @@ require 'nebox.applets.fs3'
 require 'nebox.applets.text3'
 require 'nebox.applets.dd'
 require 'nebox.applets.join'
+require 'nebox.applets.digest'
 require 'nebox.applets.awk'
 require 'nebox.applets.sh'
 require 'nebox.applets.diff'
@@ -28,7 +29,7 @@ require 'nebox.applets.patch'
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
 local applets: []Applet = {
-  {'[', applet_test}, {'awk', applet_awk}, {'base64', applet_base64}, {'basename', applet_basename},
+  {'[', applet_test}, {'awk', applet_awk}, {'b2sum', applet_b2sum}, {'base64', applet_base64}, {'basename', applet_basename},
   {'cat', applet_cat}, {'chgrp', applet_chgrp}, {'chmod', applet_chmod},
   {'chown', applet_chown}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
   {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'dd', applet_dd},
@@ -44,9 +45,10 @@ local applets: []Applet = {
   {'paste', applet_paste}, {'patch', applet_patch}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
-  {'seq', applet_seq}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha256sum', applet_sha256sum},
+  {'seq', applet_seq}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha224sum', applet_sha224sum}, {'sha256sum', applet_sha256sum},
+  {'sha384sum', applet_sha384sum}, {'sha512sum', applet_sha512sum},
   {'shuf', applet_shuf}, {'sleep', applet_sleep}, {'sort', applet_sort},
-  {'split', applet_split}, {'stat', applet_stat}, {'strings', applet_strings},
+  {'split', applet_split}, {'stat', applet_stat}, {'strings', applet_strings}, {'sum', applet_sum},
   {'sync', applet_sync}, {'tac', applet_tac}, {'tail', applet_tail}, {'tee', applet_tee},
   {'test', applet_test}, {'timeout', applet_timeout}, {'touch', applet_touch},
   {'tr', applet_tr}, {'true', applet_true}, {'truncate', applet_truncate},

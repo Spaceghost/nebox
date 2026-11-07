@@ -46,6 +46,7 @@ test: $(OUT)/nebox
 	python3 tests/patch_fuzz.py $(abspath $(OUT)/nebox) 200 < /dev/null
 	python3 tests/dd_compare.py $(abspath $(OUT)/nebox) 300
 	python3 tests/join_compare.py $(abspath $(OUT)/nebox) 400
+	python3 tests/digest_compare.py $(abspath $(OUT)/nebox) 300
 
 clean:
 	rm -rf $(OUT)
