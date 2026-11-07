@@ -359,6 +359,22 @@ same grep-E-empty 'grep -E "" nonl.txt'
 same grep-E-brace-literal 'echo "a{b" | grep -E "a{b"'
 same grep-w-regex 'grep -w "fiv." spaces.txt; echo $?'
 same grep-two-e 'grep -e alpha -e beta words.txt'
+# grep context (GNU grep 3.8 prtext/prpending): -A -B -C -NUM, "--" between
+# groups and between files, and how context combines with the other options.
+GR='printf "a\nb\nx\nc\nd\ne\nx\nf\nx\ng\nh\ni\nj\nx\n" > f; seq 1 20 > n;'
+same grep-ctx-C "$GR grep -n -C1 x f; grep -C 2 x f; grep -C0 x f; grep -nC 9 x f"
+same grep-ctx-A-B "$GR grep -A1 x f; grep -B2 -n x f; grep -A 1 -B 2 -n 1 n; grep -A0 -n x f; grep -B0 x f; grep -A 100 j f"
+same grep-ctx-num "$GR grep -2 -n 5 n; grep -1 -A3 -n 5 n; grep -A1 -C3 -n 5 n; grep -12 x f | head -3; grep -1 -0 -n 5 n; grep -C1 -A0 -n 10 n; grep -12 -3 -n 10 n; grep -n2 5 n; grep -2n 15 n; grep -C1 -2 -n 9 n; grep -2 -C1 -n 9 n; grep -00 -n 5 n"
+same grep-ctx-b "$GR grep -b -A1 x f; grep -nb -B1 -A1 g f; grep -bo -C1 x f; printf \"ab\nxx\nab\n\" | grep -o -b -A1 b"
+same grep-ctx-files "$GR grep -H -n -C1 x f n; grep -C1 x f n; grep -A1 x f f; grep -C1 -n 1 n f; grep -h -B1 x f f | head -6; grep -c -C2 x f n"
+same grep-ctx-v "$GR grep -v -A1 \"[a-h]\" f; grep -vn -m2 -A1 \"[a-e]\" f; grep -vc -A1 x f; grep -v -C1 -n \"[a-j]\" f"
+same grep-ctx-m "$GR grep -m2 -A3 x f; grep -n -m2 -A3 x f; grep -m1 -A2 -c x f; grep -m0 -A1 x f; echo \$?; grep -m1 -B5 -n x f; grep -m 3 -C1 -n x f n"
+same grep-ctx-o "$GR grep -o -C1 x f; grep -on -B1 x f; grep -ov -C1 x f; echo \$?; grep -onv -C1 x f; grep -on -A1 \"x\\|c\" f; grep -o -A1 -n \"[cx]\" f"
+same grep-ctx-quiet "$GR grep -l -C1 x f n; grep -q -C1 x f; echo \$?; grep -c -A5 x f"
+same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -C 1x x f; echo \$?; grep -B \"\" x f; echo \$?; grep -A \" +1\" x f; echo \$?; grep -A 99999999999999999999 x f | wc -l"
+same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
+same grep-F-o "printf \"a.c abc a.c\n[x]*\n\" | grep -Fo a.c; printf \"[x]*\n\" | grep -F -o \"[x]*\"; printf \"A.C\n\" | grep -Fio a.c; printf \"a\\\\\\\\b\n\" | grep -Fc \"a\\\\\\\\b\""
+same grep-b "grep -b a words.txt; grep -bn -e alpha -e delta words.txt; grep -bo l words.txt; grep -bc a words.txt"
 # regex leftmost-longest (GNU grep/sed/expr semantics; src/nebox/regex.nelua)
 same re-alt-prefix-o 'echo abcd | grep -oE "ab|abc"'
 same re-alt-prefix-ladder 'echo abcd | grep -oE "a|ab|abc|abcd"; echo "xyz xy x" | grep -oE "x|xy|xyz"'

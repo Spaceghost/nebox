@@ -144,7 +144,22 @@ Stated here rather than worked around:
   Not implemented: multibyte locales (bytes only; `-i` folds ASCII; the test
   harness runs in the C locale, so this has no case), equivalence classes
   `[=a=]` and collating symbols `[.a.]` (`re-equiv-unsupported` pins the
-  current non-matching behavior). `grep` has no `-A/-B/-C` context or `-z`.
+  current non-matching behavior).
+- `grep` takes -i -v -n -b -c -l -q -H -h -r -F -E -G -w -x -o -e -m and
+  the context options -A, -B, -C and -NUM, following GNU grep 3.8's prtext:
+  `--` before a group that is not adjacent to the previous output (also
+  across files), -C and -NUM as a default that -A/-B override whatever the
+  order (the last -C/-NUM wins; digits accumulate within one argument),
+  trailing context still printed after -m stops (matching lines there are
+  context lines), `-o` printing the matches of matching lines (under -v
+  those are the context lines) and the separators but no other context,
+  `-b` giving the offset of the line or, with -o, of the match, and no
+  context for -c/-l/-q (`grep-ctx-*`). -F strings are matched as quoted
+  BREs, so -F works with -o (`grep-F-o`). Not supported: -z, -L, -Z, -T,
+  -f, long options (`--group-separator` and the rest), binary-file
+  detection (a NUL byte does not make grep report "binary file matches"),
+  `-o -w`, which prints the delimiting characters with the word, and -s,
+  which is accepted but does not silence errors.
 - `sed` covers -n -e -f -E -s -i[SUFFIX], every address form, and the
   commands `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F`.
   `s` flags: g p N i/I w; replacement escapes `& \1..\9 \n \U \L \u \l \E`.

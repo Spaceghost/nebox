@@ -1025,42 +1025,6 @@ global function applet_tee(args: sequence(string)): integer
   return rc
 end
 
--- grep: fixed-string matching only (no regular expressions yet).
-local function find_fold(hay: string, needle: string): boolean
-  if needle.size == 0 then return true end
-  if needle.size > hay.size then return false end
-  for i: usize = 0, hay.size - needle.size do
-    local ok = true
-    for j: usize = 0, < needle.size do
-      if lower(hay.data[i + j]) ~= lower(needle.data[j]) then ok = false; break end
-    end
-    if ok then return true end
-  end
-  return false
-end
-
-local function isword(b: byte): boolean
-  return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
-end
-
-local function find_word(hay: string, needle: string, fold: boolean): boolean
-  if needle.size == 0 or needle.size > hay.size then return false end
-  for i: usize = 0, hay.size - needle.size do
-    local ok = true
-    for j: usize = 0, < needle.size do
-      local a, b = hay.data[i + j], needle.data[j]
-      if fold then a, b = lower(a), lower(b) end
-      if a ~= b then ok = false; break end
-    end
-    if ok then
-      local before = i == 0 or not isword(hay.data[i - 1])
-      local after = i + needle.size >= hay.size or not isword(hay.data[i + needle.size])
-      if before and after then return true end
-    end
-  end
-  return false
-end
-
 -- Build one regex covering every pattern, honouring -w / -x by wrapping.
 local function grep_compile(patterns: sequence(string), ere: boolean, icase: boolean, word: boolean, whole: boolean): (regex.Prog, string)
   local sb: stringbuilder
@@ -1078,9 +1042,136 @@ local function grep_compile(patterns: sequence(string), ere: boolean, icase: boo
   return regex.compile(body, ere, icase)
 end
 
+-- grep -F: a fixed string as a BRE that matches it literally.
+local function bre_quote(s: string): string
+  local sb: stringbuilder
+  for i: usize = 0, < s.size do
+    local c = s.data[i]
+    if c == 92 or c == 46 or c == 91 or c == 93 or c == 42 or c == 94 or c == 36 then sb:writebyte(92) end
+    sb:writebyte(c)
+  end
+  return sb:promote()
+end
+
+-- A context length as GNU grep's context_length_arg reads it: a decimal
+-- intmax_t, at least 0; an overflow means "unlimited".
+local function grep_context(s: string): (integer, boolean)
+  local i: usize = 1
+  while i <= s.size and (s:byte(i) == 32 or (s:byte(i) >= 9 and s:byte(i) <= 13)) do i = i + 1 end
+  if i <= s.size and (s:byte(i) == 43 or s:byte(i) == 45) then
+    if s:byte(i) == 45 then return 0, false end
+    i = i + 1
+  end
+  if i > s.size then return 0, false end
+  local v: integer = 0
+  while i <= s.size do
+    local c = s:byte(i)
+    if c < 48 or c > 57 then return 0, false end
+    if v > (0x7fffffffffffffff - (c - 48)) // 10 then v = 0x7fffffffffffffff else v = v * 10 + (c - 48) end
+    i = i + 1
+  end
+  return v, true
+end
+
+-- Output state shared by every file, as in GNU grep's prtext/prline.
+local Grep = @record{
+  prog: regex.Prog, caps: regex.Caps,
+  invert: boolean, only: boolean, withname: boolean, lineno: boolean, byteoff: boolean,
+  before: integer, after: integer, -- -1 when unset
+  used: boolean,                   -- some group has been output (for "--")
+  path: string,
+}
+
+function Grep:head(sep: byte, n: integer, off: integer)
+  if self.withname then util.write(self.path); util.writebyte(sep) end
+  if self.lineno then util.writef('%d', n); util.writebyte(sep) end
+  if self.byteoff then util.writef('%d', off); util.writebyte(sep) end
+end
+
+-- prline: `selected` lines get ':', context lines '-'. With -o only the
+-- matches of lines that do match the pattern are printed.
+function Grep:prline(line: string, n: integer, off: integer, selected: boolean): boolean
+  if not self.only then
+    self:head(selected and 58 or 45, n, off)
+    util.line(line)
+    return true
+  end
+  if selected ~= self.invert then
+    local sep: byte = self.invert and 45 or 58
+    local pos: isize = 0
+    while pos <= (@isize)(line.size) and self.prog:search(line, pos, &self.caps) do
+      if self.caps.at[1] > self.caps.at[0] then
+        self:head(sep, n, off + self.caps.at[0])
+        util.line(line:sub(self.caps.at[0] + 1, self.caps.at[1]))
+        pos = self.caps.at[1]
+      else
+        pos = self.caps.at[0] + 1
+      end
+    end
+    if self.prog.toocomplex then return false end
+  end
+  return true
+end
+
 global function applet_grep(args: sequence(string)): integer
-  local o = util.parse(args, 'ivnclqHhFEGwxe:srom:')
+  -- -NUM context options: digits inside an option cluster accumulate per
+  -- argument (GNU grep); everything else goes to the ordinary parser.
+  local rest: sequence(string)
+  do
+    local i: integer = 1
+    local stop = false
+    while i <= #args do
+      local a = args[i]
+      if stop or a.size < 2 or a:byte(1) ~= 45 then
+        stop = true; rest:push(a); i = i + 1; continue
+      end
+      if a == '--' then stop = true; rest:push(a); i = i + 1; continue end
+      local sb: stringbuilder
+      sb:writebyte(45)
+      local digits: string = ''
+      local takes = false
+      local j: usize = 2
+      while j <= a.size do
+        local c = a:byte(j)
+        if c >= 48 and c <= 57 then
+          if digits == '0' then digits = '' end
+          digits = digits .. string.char(c)
+        else
+          sb:writebyte(c)
+          if c == 101 or c == 109 or c == 65 or c == 66 or c == 67 then
+            takes = true
+            for k: usize = j + 1, a.size do sb:writebyte(a:byte(k)) end
+            break
+          end
+        end
+        j = j + 1
+      end
+      -- the digits become a -C option, before a value-taking option that
+      -- ends the cluster (its value follows them) and after anything else
+      local opt = sb:promote()
+      if digits.size > 0 and takes then rest:push('-C' .. digits) end
+      if opt.size > 1 then rest:push(opt) end
+      if takes and j == a.size and i < #args then i = i + 1; rest:push(args[i]) end
+      if digits.size > 0 and not takes then rest:push('-C' .. digits) end
+      i = i + 1
+    end
+  end
+  local o = util.parse(rest, 'ivnclqHhFEGwxe:srom:A:B:C:b')
   if not o:ok() then return util.optfail(o) + 1 end
+  local g: Grep = {before = -1, after = -1, invert = o:has('v'), only = o:has('o'),
+    lineno = o:has('n'), byteoff = o:has('b')}
+  -- -C and -NUM set a default that an explicit -A or -B overrides; the
+  -- last of them wins, as in GNU grep.
+  local defctx: integer = -1
+  for idx, k in ipairs(o.keys) do
+    if k == 65 or k == 66 or k == 67 then
+      local v, ok = grep_context(o.vals[idx])
+      if not ok then util.err(o.vals[idx] .. ': invalid context length argument'); return 2 end
+      if k == 65 then g.after = v elseif k == 66 then g.before = v else defctx = v end
+    end
+  end
+  if g.after < 0 then g.after = defctx end
+  if g.before < 0 then g.before = defctx end
   local patterns: sequence(string)
   local operands = o.operands
   if o:has('e') then
@@ -1089,21 +1180,21 @@ global function applet_grep(args: sequence(string)): integer
       if e.size == 0 then patterns:push('') end
     end
   else
-    if #operands == 0 then util.err('usage: grep [-ivnclqHhFEGwxors] [-e] PATTERN [FILE...]'); return 2 end
+    if #operands == 0 then util.err('usage: grep [-ivnclqHhFEGwxorsb] [-A N] [-B N] [-C N] [-e] PATTERN [FILE...]'); return 2 end
     for _, p in ipairs(util.lines(operands[1])) do patterns:push(p) end
     if operands[1].size == 0 then patterns:push('') end
     operands:remove(1)
   end
   if o:has('r') and #operands == 0 then operands:push('.') end
   if #operands == 0 then operands:push('-') end
-  local fold, invert = o:has('i'), o:has('v')
-  local fixed = o:has('F')
-  local prog: regex.Prog
-  if not fixed then
-    local err: string
-    prog, err = grep_compile(patterns, o:has('E'), fold, o:has('w'), o:has('x'))
-    if err.size > 0 then util.err(err); return 2 end
+  local ere = o:has('E')
+  if o:has('F') then
+    for i = 1, #patterns do patterns[i] = bre_quote(patterns[i]) end
+    ere = false
   end
+  local err: string
+  g.prog, err = grep_compile(patterns, ere, o:has('i'), o:has('w'), o:has('x'))
+  if err.size > 0 then util.err(err); return 2 end
   local maxcount: integer = -1
   if o:has('m') then
     local v, ok = util.toint(o:get('m'))
@@ -1132,67 +1223,68 @@ global function applet_grep(args: sequence(string)): integer
     end
     operands = expanded
   end
-  local withname = (#operands > 1 or o:has('H') or o:has('r')) and not o:has('h')
+  g.withname = (#operands > 1 or o:has('H') or o:has('r')) and not o:has('h')
+  -- -c, -l and -q print no lines, so they take no context
+  local quiet = o:has('c') or o:has('l') or o:has('q')
+  local ctx = g.before >= 0 or g.after >= 0
   local anymatch = false
   local rc: integer = 0
-  local caps: regex.Caps
   for _, path in ipairs(operands) do
     local data, ok = util.readfile(path)
     if not ok then rc = 2; continue end
+    g.path = path
     local count: integer = 0
-    local n: integer = 0
-    for _, line in ipairs(util.lines(data)) do
-      n = n + 1
-      local m = false
-      if fixed then
-        for _, p in ipairs(patterns) do
-          if o:has('x') then
-            m = fold and cmp_fold(line, p) == 0 or line == p
-          elseif o:has('w') then
-            m = find_word(line, p, fold)
-          elseif fold then
-            m = find_fold(line, p)
-          else
-            m = line:find(p, 1, true) > 0
-          end
-          if m then break end
-        end
-      else
-        m = prog:search(line, 0, &caps)
-        if prog.toocomplex then util.err('pattern too complex'); return 2 end
+    local outleft = maxcount
+    local lastout: integer = 0  -- last line printed in this file, 0 for none
+    local pending: integer = 0  -- trailing context still to print
+    local lines = util.lines(data)
+    local offs: sequence(integer)
+    local off: integer = 0
+    for _, line in ipairs(lines) do offs:push(off); off = off + (@integer)(line.size) + 1 end
+    for n = 1, #lines do
+      local line = lines[n]
+      if outleft == 0 then
+        -- -m reached: only the trailing context of the last match remains
+        if pending <= 0 or quiet then break end
+        if not g:prline(line, n, offs[n], false) then util.err('pattern too complex'); return 2 end
+        lastout = n; pending = pending - 1
+        continue
       end
-      if m ~= invert then
-        count = count + 1
-        anymatch = true
-        if o:has('q') then return 0 end
-        if o:has('l') then break end
-        if not o:has('c') then
-          if o:has('o') and not fixed and not invert then
-            local pos: isize = 0
-            while pos <= (@isize)(line.size) and prog:search(line, pos, &caps) do
-              if caps.at[1] > caps.at[0] then
-                if withname then util.write(path); util.writebyte(58) end
-                if o:has('n') then util.writef('%d:', n) end
-                util.line(line:sub(caps.at[0] + 1, caps.at[1]))
-                pos = caps.at[1]
-              else
-                pos = caps.at[0] + 1
-              end
-            end
-            if prog.toocomplex then util.err('pattern too complex'); return 2 end
-          else
-            if withname then util.write(path); util.writebyte(58) end
-            if o:has('n') then util.writef('%d:', n) end
-            util.line(line)
-          end
+      local m = g.prog:search(line, 0, &g.caps)
+      if g.prog.toocomplex then util.err('pattern too complex'); return 2 end
+      if m == g.invert then
+        if pending > 0 and not quiet then
+          if not g:prline(line, n, offs[n], false) then util.err('pattern too complex'); return 2 end
+          lastout = n; pending = pending - 1
         end
-        if maxcount >= 0 and count >= maxcount then break end
+        continue
       end
+      count = count + 1
+      anymatch = true
+      if o:has('q') then return 0 end
+      if o:has('l') then break end
+      if not quiet then
+        local p = n
+        if g.before > 0 then
+          p = n - g.before
+          if p < lastout + 1 then p = lastout + 1 end
+          if p < 1 then p = 1 end
+        end
+        if ctx and g.used and (lastout == 0 or p ~= lastout + 1) then util.line('--') end
+        for k = p, n - 1 do
+          if not g:prline(lines[k], k, offs[k], false) then util.err('pattern too complex'); return 2 end
+        end
+        if not g:prline(line, n, offs[n], true) then util.err('pattern too complex'); return 2 end
+        lastout = n
+        pending = g.after > 0 and g.after or 0
+        g.used = true
+      end
+      if outleft > 0 then outleft = outleft - 1 end
     end
     if o:has('l') then
       if count > 0 then util.line(path) end
     elseif o:has('c') then
-      if withname then util.write(path); util.writebyte(58) end
+      if g.withname then util.write(path); util.writebyte(58) end
       util.writef('%d\n', count)
     end
   end
