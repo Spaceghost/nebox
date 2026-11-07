@@ -1493,8 +1493,37 @@ global function applet_seq(args: sequence(string)): integer
   return 0
 end
 
--- printf with %s %d %i %u %x %X %o %c %% and width/precision flags; the
--- format is reused while arguments remain, as coreutils does.
+local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
+
+-- One floating conversion through the C library.
+local function printf_float(spec: string, v: float64): string
+  local buf: [512]byte
+  local n = c_snprintf((@cstring)(&buf[0]), 512, spec, v)
+  if n < 0 then return '' end
+  if n < 512 then return string.copy((@string){data = &buf[0], size = (@usize)(n)}) end
+  local s = string.create((@usize)(n))
+  c_snprintf((@cstring)(s.data), (@usize)(n) + 1, spec, v)
+  return s
+end
+
+-- Floating operand: a strtod number (leading/trailing blanks aside), or a
+-- 'c / "c character constant.
+local function printf_tofloat(a: string): (float64, boolean)
+  if a.size == 0 then return 0, true end
+  if a:byte(1) == 39 or a:byte(1) == 34 then return a.size > 1 and a:byte(2) or 0, true end
+  local c = string.copy(a)
+  local endp: cstring
+  local v = sys.strtod(c, &endp)
+  local used = (@usize)((@isize)(endp) - (@isize)(c.data))
+  while used < a.size and (a:byte(used + 1) == 32 or a:byte(used + 1) == 9) do used = used + 1 end
+  local ok = used == a.size and (@isize)(endp) ~= (@isize)(c.data)
+  c:destroy()
+  return v, ok
+end
+
+-- printf with %s %b %c %d %i %u %x %X %o %f %F %e %E %g %G %% and
+-- width/precision flags; the format is reused while arguments remain, as
+-- coreutils does.
 global function applet_printf(args: sequence(string)): integer
   if #args == 0 then util.err('usage: printf FORMAT [ARGUMENT...]'); return 1 end
   local fmt = args[1]
@@ -1529,6 +1558,15 @@ global function applet_printf(args: sequence(string)): integer
         if ai <= #args then a = args[ai]; ai = ai + 1 end
         if conv == 115 then
           util.write(string.format(spec .. 's', a))
+        elseif conv == 98 then
+          -- %b: the operand's backslash escapes; \c ends all output
+          local e, stop = util.unescape(a)
+          util.write(string.format(spec .. 's', e))
+          if stop then return rc end
+        elseif conv == 102 or conv == 70 or conv == 101 or conv == 69 or conv == 103 or conv == 71 then
+          local v, ok = printf_tofloat(a)
+          if not ok then util.err("'" .. a .. "': expected a numeric value"); rc = 1 end
+          util.write(printf_float(spec .. string.char(conv), v))
         elseif conv == 99 then
           util.write(string.format(spec .. 's', a.size > 0 and a:sub(1, 1) or ''))
         elseif conv == 100 or conv == 105 or conv == 117 or conv == 120 or conv == 88 or conv == 111 then
