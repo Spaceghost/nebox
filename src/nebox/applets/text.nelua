@@ -269,6 +269,7 @@ local SortKey = @record{
   eword: integer, echar: integer,   -- 0-based end field / char; eword -1 = line end
   skipsblanks: boolean, skipeblanks: boolean,
   numeric: boolean, human: boolean, version: boolean,
+  general: boolean, month: boolean, -- -g, -M
   fold: boolean,                    -- -f: translate to upper case
   ignore: integer,                  -- 0 none, 1 nonprinting (-i), 2 nondictionary (-d)
   reverse: boolean,
@@ -594,13 +595,85 @@ local function bytecmp(a: string, b: string): integer
   return a.size < b.size and -1 or 1
 end
 
+local function c_strtold(s: cstring, e: *cstring): clongdouble <cimport 'strtold', cinclude '<stdlib.h>'> end
+local function c_memcmp(a: pointer, b: pointer, n: csize): cint <cimport 'memcmp', cinclude '<string.h>'> end
+
+-- A NUL-terminated copy of a key for the C conversions.
+local function key_cstr(k: string, buf: *[4096]byte): (cstring, boolean)
+  if k.size < 4096 then
+    for i: usize = 0, < k.size do buf[i] = k.data[i] end
+    buf[k.size] = 0
+    return (@cstring)(&buf[0]), false
+  end
+  return (@cstring)(k:copy().data), true
+end
+
+-- sort.c general_numcompare: conversion errors first, then NaNs (by bit
+-- pattern), then numbers, with -0 == +0.
+local function general_numcompare(a: string, b: string): integer
+  local ba: [4096]byte
+  local bb: [4096]byte
+  local sa, fa = key_cstr(a, &ba)
+  local sb, fb = key_cstr(b, &bb)
+  local ea: cstring
+  local eb: cstring
+  local x = c_strtold(sa, &ea)
+  local y = c_strtold(sb, &eb)
+  local r: integer
+  if sa == ea then r = sb == eb and 0 or -1
+  elseif sb == eb then r = 1
+  elseif x < y then r = -1
+  elseif x > y then r = 1
+  elseif x == y then r = 0
+  elseif y == y then r = -1
+  elseif x == x then r = 1
+  else
+    local na: [2]uint64
+    local nb: [2]uint64
+    $(@*clongdouble)(&na) = c_strtold(sa, nilptr)
+    $(@*clongdouble)(&nb) = c_strtold(sb, nilptr)
+    na[1] = na[1] & 0xffff; nb[1] = nb[1] & 0xffff
+    r = c_memcmp(&na, &nb, 16)
+  end
+  if fa then (@string){data = (@*[0]byte)(sa), size = a.size}:destroy() end
+  if fb then (@string){data = (@*[0]byte)(sb), size = b.size}:destroy() end
+  return r
+end
+
+-- sort.c getmonth over the C locale's abbreviated month names.
+local month_names: [12]string = {'APR', 'AUG', 'DEC', 'FEB', 'JAN', 'JUL', 'JUN', 'MAR', 'MAY', 'NOV', 'OCT', 'SEP'}
+local month_vals: [12]integer = {4, 8, 12, 2, 1, 7, 6, 3, 5, 11, 10, 9}
+
+local function getmonth(m: string): integer
+  local i: integer = 0
+  while sblank(at(m, i)) do i = i + 1 end
+  local lo, hi = 0, 12
+  repeat
+    local ix = (lo + hi) // 2
+    local n = month_names[ix]
+    local j = 0
+    while true do
+      if j >= #n then return month_vals[ix] end
+      local c = at(m, i + j)
+      if c >= 97 and c <= 122 then c = c - 32 end
+      local nc = n:byte(j + 1)
+      if c < nc then hi = ix; break
+      elseif c > nc then lo = ix + 1; break end
+      j = j + 1
+    end
+  until not (lo < hi)
+  return 0
+end
+
 local function compare_key(a: string, b: string, k: SortKey): integer
   local ka, kb = key_view(a, k), key_view(b, k)
   local diff: integer = 0
-  if k.numeric or k.human or k.version then
+  if k.numeric or k.human or k.version or k.general or k.month then
     if k.ignore ~= 0 or k.fold then ka = key_filtered(ka, k); kb = key_filtered(kb, k) end
     if k.numeric then diff = numcompare(ka, kb)
+    elseif k.general then diff = general_numcompare(ka, kb)
     elseif k.human then diff = human_numcompare(ka, kb)
+    elseif k.month then diff = getmonth(ka) - getmonth(kb)
     else diff = filevercmp(ka, kb) end
   elseif k.ignore ~= 0 then
     local na, nb = (@integer)(ka.size), (@integer)(kb.size)
@@ -679,8 +752,10 @@ local function set_ordering(k: *SortKey, c: integer, where: integer): boolean
     if where ~= 1 then k.skipeblanks = true end
   elseif c == 100 then k.ignore = 2
   elseif c == 102 then k.fold = true
+  elseif c == 103 then k.general = true
   elseif c == 104 then k.human = true
   elseif c == 105 then if k.ignore == 0 then k.ignore = 1 end
+  elseif c == 77 then k.month = true
   elseif c == 110 then k.numeric = true
   elseif c == 114 then k.reverse = true
   elseif c == 86 then k.version = true
@@ -689,7 +764,8 @@ local function set_ordering(k: *SortKey, c: integer, where: integer): boolean
 end
 
 local function default_key_compare(k: SortKey): boolean
-  return not (k.ignore ~= 0 or k.fold or k.skipsblanks or k.skipeblanks or k.numeric or k.human or k.version)
+  return not (k.ignore ~= 0 or k.fold or k.skipsblanks or k.skipeblanks or k.numeric or k.human or k.version
+              or k.general or k.month)
 end
 
 local function keynum(spec: string, start: integer): (integer, integer, boolean)
@@ -745,7 +821,7 @@ local function sort_emit(l: string)
 end
 
 global function applet_sort(args: sequence(string)): integer
-  local o = util.parsel(args, 'bcCdfhimnrsuVzo:k:t:', &longopts.sort, #longopts.sort)
+  local o = util.parsel(args, 'bcCdfghiMmnrsuVzo:k:t:', &longopts.sort, #longopts.sort)
   if not o:ok() then util.optfail(o); return 2 end
   if o.set[200] then
     -- --check[=quiet|silent|diagnose-first]: the last of -c, -C, --check wins
@@ -769,9 +845,25 @@ global function applet_sort(args: sequence(string)): integer
     end
     o.set[letter] = true
   end
+  -- --sort=WORD is the matching ordering letter (no 'random' in nebox)
+  for idx, k in ipairs(o.keys) do
+    if k == 204 then
+      local names: []string = {'general-numeric', 'human-numeric', 'month', 'numeric', 'random', 'version'}
+      local values: []integer = {103, 104, 77, 110, 82, 86}
+      local v = util.argmatch('--sort', o.vals[idx], &names, &values, 6)
+      if v < 0 then
+        util.flush()
+        local m = "Try 'sort --help' for more information.\n"
+        sys.write(2, m.data, m.size)
+        return 1
+      end
+      if v == 82 then util.err("option '--sort=random' is not supported"); return 2 end
+      o.set[v] = true
+    end
+  end
   local gkey: SortKey
   gkey.sword = -1; gkey.eword = -1
-  local flags = 'bdfhinrV'
+  local flags = 'bdfghiMnrV'
   for i: usize = 1, flags.size do
     if o:has(flags:sub(i, i)) then set_ordering(&gkey, (@integer)(flags:byte(i)), 0) end
   end
@@ -799,15 +891,21 @@ global function applet_sort(args: sequence(string)): integer
       k.ignore = gkey.ignore; k.fold = gkey.fold
       k.skipsblanks = gkey.skipsblanks; k.skipeblanks = gkey.skipeblanks
       k.numeric = gkey.numeric; k.human = gkey.human; k.version = gkey.version
+      k.general = gkey.general; k.month = gkey.month
       k.reverse = gkey.reverse
     end
   end
   if #sort_keys == 0 and not default_key_compare(gkey) then sort_keys:push(gkey) end
+  -- sort.c check_ordering_compatibility: one of n g h M and (V or an
+  -- ignore option); the message lists key_to_opts without b and r
   for i = 1, #sort_keys do
     local k = sort_keys[i]
-    local kinds = (k.numeric and 1 or 0) + (k.human and 1 or 0) + (k.version and 1 or 0)
+    local kinds = (k.numeric and 1 or 0) + (k.general and 1 or 0) + (k.human and 1 or 0) + (k.month and 1 or 0)
+      + ((k.version or k.ignore ~= 0) and 1 or 0)
     if kinds > 1 then
-      local s: string = (k.numeric and 'n' or '') .. (k.human and 'h' or '') .. (k.version and 'V' or '')
+      local s: string = (k.ignore == 2 and 'd' or '') .. (k.fold and 'f' or '') .. (k.general and 'g' or '')
+        .. (k.human and 'h' or '') .. (k.ignore == 1 and 'i' or '') .. (k.month and 'M' or '')
+        .. (k.numeric and 'n' or '') .. (k.version and 'V' or '')
       util.err("options '-" .. s .. "' are incompatible"); return 2
     end
   end

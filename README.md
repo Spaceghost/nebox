@@ -386,9 +386,13 @@ Stated here rather than worked around:
   `F[.C][OPTS][,F[.C][OPTS]]` positions and the modifiers b d f h i n r V,
   following GNU's key inheritance, last-resort and -u/-c rules in the C locale
   (bytes, no collation). -n compares digit strings like GNU, -h knows the
-  suffixes k K M G T P E Z Y, -V implements gnulib filevercmp. Long options
-  follow GNU's table, including `--check[=quiet|silent|diagnose-first]`. No
-  -M, -g, -R, --parallel, or locales.
+  suffixes k K M G T P E Z Y, -V implements gnulib filevercmp, -g is
+  general_numcompare (strtold; conversion errors, then NaNs by bit pattern,
+  then numbers) and -M is getmonth over the C locale's month names. Long
+  options follow GNU's table, including `--check[=quiet|silent|diagnose-first]`
+  and `--sort=WORD`; GNU's ordering-compatibility check (one of n g h M,
+  V, or an ignore option) applies. `tests/sort_compare.py`: 2011 random
+  cases against GNU. No -R/--random-source, --parallel, -S, -T, or locales.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
 - `tsort` reproduces GNU's output order (sorted zero-degree queue, successors
