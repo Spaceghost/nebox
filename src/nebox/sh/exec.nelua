@@ -435,6 +435,8 @@ end
 local function argv_of(args: sequence(string)): sequence(cstring)
   local out: sequence(cstring)
   for i = 1, #args do
+    -- an empty string has no data pointer; it must still be an argument
+    if args[i].size == 0 then out:push(''); continue end
     local s = string.copy(args[i])
     out:push((@cstring)(s.data))
   end

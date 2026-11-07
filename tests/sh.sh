@@ -735,6 +735,7 @@ shf sh-applets-env-vars 'FOO=bar env | grep "^FOO="; export BAZ=1; printenv BAZ;
 shf sh-applets-xargs-sh 'printf "1\n2\n3\n" | xargs -n1 sh -c "echo arg:\$0"; printf "a b\n" | xargs sh -c "echo \$# \$1 \$2" x'
 shf sh-applets-sh-nested 'sh -c "sh -c \"sh -c \\\"echo deep \\\$((1+1))\\\"\""; echo $(sh -c "echo \$(sh -c \"echo inner\")")'
 shf sh-applets-dd-head 'head -c 100 big.bin | wc -c; dd if=big.bin bs=1000 count=2 2>/dev/null | wc -c; printf "abc" | od -c | head -1'
+shf sh-exec-empty-arg 'set -- a "" b; env printf "<%s>" "$@"; echo; seq -s "" 1 3; x=""; env printf "[%s]" "$x" "" "$x"; echo; f() { env printf "{%s}" "$@"; echo; }; f "" x ""'
 shf sh-applets-timeout 'timeout 5 sh -c "exit 3"; echo $?; timeout 1 sh -c "sleep 5"; echo $?'
 shf sh-applets-script-file 'cat > prog.sh <<EOF
 #!/bin/sh
