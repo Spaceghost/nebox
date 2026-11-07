@@ -44,7 +44,7 @@ stdout, exit status, and the resulting directory tree.
 [ awk base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df
 dirname du echo env expand expr factor false find fold free grep groups head
 hexdump hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc od
-paste printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum
+paste printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
 sha256sum shuf sleep sort split stat strings sync tac tail tee test timeout
 touch tr true truncate tsort tty unexpand uname uniq unlink wc which whoami
 xargs yes
@@ -88,14 +88,41 @@ Stated here rather than worked around:
   xorshift64* generator, so its sequence matches no other awk. Memory for
   string temporaries is not reclaimed until exit; records and fields are
   views into a reused buffer.
-- `sh` is in progress on branch `sh` and is **not an applet yet**: it is
-  not in the applet list, `nebox --list` does not show it, nothing in
-  `tests/run.sh` exercises it, and the sources under `src/nebox/sh/` (word
-  and token lexer with here-documents and aliases, POSIX grammar parser,
-  arithmetic evaluator, word expander with field splitting and pathname
-  expansion) have only been type-checked by the Nelua compiler. There is no
-  interpreter, no builtins and no `tests/sh.sh`; none of the shell behavior
-  described in those files has been observed running.
+- `sh` is a non-interactive POSIX.1-2017 shell (`src/nebox/sh/`: lexer,
+  parser to a tree, tree-walking interpreter). `tests/sh.sh` compares it
+  with dash 0.5.12 and pins, as `expect`/`shx` cases, the places where
+  nebox follows POSIX or a deliberate choice instead. Implemented: `-c`,
+  `-s`, script operands and scripts on standard input (read no further
+  than the command being run); options `-a -b -C -e -f -h -n -u -v -x` and
+  their `-o` names (`-b`, `-h`, `ignoreeof` and `nolog` are accepted and
+  have no effect; dash rejects `-h`); the whole
+  grammar (pipelines, `!`, `&&`/`||`, `&`, subshells, brace groups, `if`,
+  `while`, `until`, `for`, `case`, functions, here-documents including
+  `<<-`, every redirection operator and `noclobber`); aliases; every
+  parameter expansion form (`${x:-w}` ... `${x%%p}`, `${#x}`, applied per
+  field to `$@`), command substitution in both forms, 64-bit arithmetic
+  expansion with all C operators and assignments, tilde expansion, field
+  splitting and pathname expansion; the special built-ins (`: . break
+  continue eval exec exit export readonly return set shift times trap
+  unset`) and the regular ones a shell must provide (`alias cd command
+  echo false getopts hash kill pwd read test [ true type umask unalias
+  wait`, plus `printf` through the `printf` applet); traps, `set -e`
+  exceptions, `$!`/`wait` for asynchronous lists, `LINENO`, and
+  diagnostics as `sh: line N: ...`. Unimplemented: interactive use (`-i`
+  is refused; no prompts, history, `fc`, line editing or `ENV`); job control (`-m`/`set -o monitor`, `%job`
+  operands, `jobs`, `bg`, `fg` report an error with status 2); `ulimit`;
+  locales and multibyte characters (bytes only, C-locale classes and byte
+  order for globbing). Not POSIX and refused: `local`, `;&` in `case`,
+  `${!name}` and other bash expansions (an invalid `${...}` is reported
+  when it is expanded, as dash does). Choices where dash differs:
+  `"${@#p}"`/`"${@%p}"` apply to every positional parameter (dash: only the
+  first); `command -v ./x` prints an absolute pathname; `read` without a
+  name is an error and there is no `REPLY`; `kill -l` lists names from HUP
+  and accepts several operands; traps on KILL and STOP are refused; `\x`
+  in a `printf` format is a hexadecimal escape; `cd` with HOME unset or
+  empty does nothing and succeeds (implementation-defined; dash does the
+  same); OPTIND inside a group like `-ab` already names the next argument,
+  as in dash. `echo` is the XSI echo (escapes always, `-n` only first).
 - `grep`, `sed`, `expr` and `find -regex` use nebox's own regex engine
   (`src/nebox/regex.nelua`): POSIX BRE and ERE with brackets, named classes,
   intervals, groups, alternation, back-references, and the GNU
@@ -157,6 +184,9 @@ Stated here rather than worked around:
 - `id` lists supplementary groups from `getgroups`; `-G` is supported.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `tr` has ranges, `[:class:]`, `[c*n]`, `-c`, `-d`, `-s`, and escapes; no equivalence classes.
+- `printf` (the applet and the `sh` builtin) has `%s %b %c %d %i %u %o
+  %x %X %f %F %e %E %g %G %%` with flags, width and precision; no `*`
+  width or precision, no `%a`, and arguments are reused until consumed.
 - `seq` is integer-only.
 - `chmod` takes octal modes and `[ugoa][+-=][rwxXst]` lists.
 - `test` has no parentheses; `-a`/`-o` bind loosest, in that order.
