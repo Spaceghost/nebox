@@ -167,19 +167,20 @@ local function parse_simple(lx: *shlex.Lexer): integer
         end
       end
       if first and not have_cmd then
-        -- function definition?
-        local w = N.W(wi)
+        -- function definition? (copy the word: peeking may grow the arena)
+        local plain = N.W(wi).plain
+        local is_plain = N.W(wi).is_plain
         local nt = lx:peek_token(false)
-        if nt.kind == T.T_LPAREN and w.is_plain and N.is_name(w.plain) then
+        if nt.kind == T.T_LPAREN and is_plain and N.is_name(plain) then
           lx:take()
           expect_kind(lx, T.T_RPAREN, '")"')
-          if is_special_name(w.plain) then
+          if is_special_name(plain) then
             shlex.on_error('Syntax error: Bad function name', line); sys._exit(2)
           end
           linebreak(lx)
           local body = parse_command(lx)
           local fn = N.node(N.N_FUNC, body, 0, 0, 0, line)
-          N.at(fn).s = w.plain
+          N.at(fn).s = plain
           return fn
         end
       end
@@ -211,10 +212,12 @@ function parse_if_rest(lx: *shlex.Lexer, line: integer): integer
   local t = lx:peek_token(true)
   if is_word(t, 'elif') then
     local eline = lx:take().line
-    N.at(node).c = parse_if_rest(lx, eline)
+    local rest = parse_if_rest(lx, eline)
+    N.at(node).c = rest
   elseif is_word(t, 'else') then
     lx:take()
-    N.at(node).c = parse_compound_list(lx)
+    local rest = parse_compound_list(lx)
+    N.at(node).c = rest
   end
   return node
 end

@@ -64,13 +64,21 @@ local function ifs(): string
   return v
 end
 
+-- Byte search (string.find's plain mode is not reliable for every byte).
+function shexp.has_byte(s: string, c: byte): boolean
+  for i: usize = 0, < s.size do
+    if s.data[i] == c then return true end
+  end
+  return false
+end
+
 local function is_ifs_ws(c: byte, s: string): boolean
   if c ~= 32 and c ~= 9 and c ~= 10 then return false end
-  return s:find(string.char(c), 1, true) > 0
+  return shexp.has_byte(s, c)
 end
 
 local function in_ifs(c: byte, s: string): boolean
-  return s:find(string.char(c), 1, true) > 0
+  return shexp.has_byte(s, c)
 end
 
 ----------------------------------------------------------------------
@@ -101,7 +109,7 @@ local function bracket(p: *shexp.Buf, pi: integer, b: byte): (boolean, integer, 
   local n = #p.bytes
   local j = pi + 1
   local negate = false
-  if j <= n and p.flags[j] & shexp.F_Q == 0 and (p.bytes[j] == #[B'!']# or p.bytes[j] == #[B'^']#) then
+  if j <= n and p.flags[j] & shexp.F_Q == 0 and p.bytes[j] == #[B'!']# then
     negate = true
     j = j + 1
   end
@@ -197,13 +205,13 @@ end
 -- Expansion of parts into a buffer
 ----------------------------------------------------------------------
 
-local function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boolean) <forwarddecl> end
+local function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boolean, lit_split: boolean) <forwarddecl> end
 
 -- Text of a word without splitting or globbing (quote removal applied).
 local function word_text(wi: integer, assign: boolean): string
   if wi <= 0 then return '' end
   local b: shexp.Buf
-  expand_parts(N.W(wi), &b, false, assign)
+  expand_parts(N.W(wi), &b, false, assign, false)
   return b:text()
 end
 
@@ -341,7 +349,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   end
   if op == N.OP_MINUS or op == N.OP_CMINUS then
     if (not set) or (op == N.OP_CMINUS and null) then
-      if p.b > 0 then expand_parts(N.W(p.b), out, split, false) end
+      if p.b > 0 then expand_parts(N.W(p.b), out, split, false, split) end
     elseif is_at then
       expand_at(name == '*', p.quoted, out, split)
     else
@@ -355,7 +363,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   end
   if op == N.OP_PLUS or op == N.OP_CPLUS then
     if set and not (op == N.OP_CPLUS and null) then
-      if p.b > 0 then expand_parts(N.W(p.b), out, split, false) end
+      if p.b > 0 then expand_parts(N.W(p.b), out, split, false, split) end
     end
     return
   end
@@ -393,7 +401,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   -- pattern removal
   if not set and shexp.nounset and not is_at then shexp.fatal(name .. ': parameter not set') end
   local pat: shexp.Buf
-  if p.b > 0 then expand_parts(N.W(p.b), &pat, false, false) end
+  if p.b > 0 then expand_parts(N.W(p.b), &pat, false, false, false) end
   local prefix = op == N.OP_HASH or op == N.OP_HASH2
   local longest = op == N.OP_HASH2 or op == N.OP_PERCENT2
   if is_at then
@@ -412,7 +420,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   end
 end
 
-function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boolean)
+function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boolean, lit_split: boolean)
   local after_eq = not assign  -- in assignment mode, tilde applies after '=' and each ':'
   for i = 1, w.count do
     local p = N.part(w, i)
@@ -444,6 +452,7 @@ function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boole
           and (c == #[B':']# or i == 1) then
           out:add(c, 0)
           local home, used, ok = tilde(text, j + 1, true)
+          if ok and j + used >= text.size and i < w.count then ok = false end
           if ok then
             out:addstr(home, shexp.F_Q)
             j = j + 1 + used
@@ -452,7 +461,7 @@ function expand_parts(w: *N.Word, out: *shexp.Buf, split: boolean, assign: boole
           j = j + 1
           continue
         end
-        out:add(c, p.quoted and shexp.F_Q or 0)
+        out:add(c, p.quoted and shexp.F_Q or (lit_split and shexp.F_S or 0))
         j = j + 1
       end
       if text.size == 0 and p.quoted then out:add(0, shexp.F_EMPTY) end
@@ -607,7 +616,7 @@ end
 -- Full expansion of a word into fields.
 function shexp.expand_word(wi: integer): sequence(string)
   local b: shexp.Buf
-  expand_parts(N.W(wi), &b, true, false)
+  expand_parts(N.W(wi), &b, true, false, false)
   local fields = split_fields(&b)
   local out: sequence(string)
   for i = 1, #fields do
@@ -641,7 +650,7 @@ function shexp.expand_assign(wi: integer): (string, string)
   local eq = p1.text:find('=', 1, true)
   local name = p1.text:sub(1, eq - 1)
   local b: shexp.Buf
-  expand_parts(w, &b, false, true)
+  expand_parts(w, &b, false, true, false)
   local full = b:text()
   return name, full:sub(eq + 1)
 end
@@ -649,6 +658,6 @@ end
 -- Pattern for case: expanded without splitting; quoted characters stay literal.
 function shexp.expand_pattern(wi: integer): shexp.Buf
   local b: shexp.Buf
-  expand_parts(N.W(wi), &b, false, false)
+  expand_parts(N.W(wi), &b, false, false, false)
   return b
 end

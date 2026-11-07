@@ -253,6 +253,7 @@ local M_NORMAL: byte <comptime> = 0   -- a command word; ends at a metacharacter
 local M_BRACE: byte <comptime> = 1    -- inside ${name op ...}; ends at the matching '}'
 local M_HEREDOC: byte <comptime> = 2  -- an unquoted here-document body; whole source
 local M_ARITH: byte <comptime> = 3    -- inside $(( )); ends at the closing '))'
+local M_BRACE_PAT: byte <comptime> = 4 -- ${name#pat}/${name%pat}: backslash quotes any character
 
 local Scan = @record{
   parts: sequence(shast.Part),
@@ -350,7 +351,7 @@ local function scan_brace_param(lx: *shlex.Lexer, sc: *Scan, q: boolean)
     lx:fatal('Bad substitution')
   end
   if not consumed then lx:advance() end
-  local parts = scan_word(lx, M_BRACE, q, '')
+  local parts = scan_word(lx, consumed and M_BRACE_PAT or M_BRACE, q, '')
   p.b = shast.word(parts, lx:line())
   sc.parts:push(p)
 end
@@ -446,6 +447,8 @@ function scan_word(lx: *shlex.Lexer, mode: byte, outer: boolean, prefix: string)
   local dq = false
   local depth: integer = 0   -- brace depth (M_BRACE) or paren depth (M_ARITH)
   local inner_q = mode == M_HEREDOC or mode == M_ARITH
+  local pat = mode == M_BRACE_PAT
+  if pat then mode = M_BRACE end
   for i: usize = 1, prefix.size do scan_lit(&sc, prefix:byte(i), false) end
   while true do
     local q = outer or dq or inner_q
@@ -488,6 +491,7 @@ function scan_word(lx: *shlex.Lexer, mode: byte, outer: boolean, prefix: string)
         local special = n == #[B'$']# or n == #[B'`']# or n == #[B'\\']#
           or (n == #[B'"']# and not inner_q)
           or (n == #[B'}']# and mode == M_BRACE)
+          or pat
         if special then
           lx:advance(); scan_lit(&sc, (@byte)(n), true)
         else

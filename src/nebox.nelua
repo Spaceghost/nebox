@@ -19,6 +19,7 @@ require 'nebox.applets.fs3'
 require 'nebox.applets.text3'
 require 'nebox.applets.misc'
 require 'nebox.applets.awk'
+require 'nebox.applets.sh'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
@@ -39,7 +40,7 @@ local applets: []Applet = {
   {'paste', applet_paste}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
-  {'seq', applet_seq}, {'sha1sum', applet_sha1sum}, {'sha256sum', applet_sha256sum},
+  {'seq', applet_seq}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha256sum', applet_sha256sum},
   {'shuf', applet_shuf}, {'sleep', applet_sleep}, {'sort', applet_sort},
   {'split', applet_split}, {'stat', applet_stat}, {'strings', applet_strings},
   {'sync', applet_sync}, {'tac', applet_tac}, {'tail', applet_tail}, {'tee', applet_tee},

@@ -2,7 +2,8 @@
 # nebox conformance tests. Each `same` case runs one shell command twice from
 # identical fixture directories: once with the host's own utilities, once with
 # nebox's applet links first on PATH. stdout, exit status, and the resulting
-# directory tree must match. `expect` cases pin an exact output where the host
+# directory tree must match. The driver is the host's /bin/sh explicitly, so
+# nebox's own sh applet is exercised only where a case invokes `sh`. `expect` cases pin an exact output where the host
 # reference is not comparable.
 set -u
 BIN=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd)/$(basename -- "$1")
@@ -35,7 +36,7 @@ snapshot() {
 
 run_in() { # dir path-prefix command
   rm -rf "$1"; cp -a "$W/fixture" "$1"
-  (cd "$1" && LC_ALL=C PATH="$2$PATH" timeout 20 sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
+  (cd "$1" && LC_ALL=C PATH="$2$PATH" timeout 20 /bin/sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
 }
 
 # Reference implementations that are not the host's default go in $W/refbin
@@ -289,7 +290,7 @@ same env-list 'env -i A=1 B=2 env | sort'
 same env-u 'FOO=1 env -u FOO sh -c "echo [\$FOO]"'
 same printenv-1 'FOO=bar printenv FOO'
 same printenv-missing 'printenv NEBOX_NOPE; echo $?'
-same which-sh 'which sh'
+same which-sh 'which sh | sed "s,.*/,,"'
 same which-missing 'which nebox-nope-cmd; echo $?'
 same id-u 'id -u'
 same id-g 'id -g'
@@ -756,8 +757,10 @@ same diff-long 'seq 1000 > a; seq 1000 | sed "500s/.*/X/;700d;900a Y" > b; diff 
 same diff-all-diff 'seq 3 > a; seq 4 6 > b; diff a b'
 # awk
 . "$(dirname -- "$0")/awk.sh"
+# sh
+. "$(dirname -- "$0")/sh.sh"
 # dispatch
-expect list-count '86
+expect list-count '87
 exit=0' "$BIN --list | wc -l"
 
 echo "nebox tests: $pass passed, $fail failed"

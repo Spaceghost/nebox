@@ -1,0 +1,1176 @@
+-- sh interpreter core: shell state, variables and the environment,
+-- redirections, processes (pipelines, subshells, asynchronous lists,
+-- command substitution), traps, `set -e`, and the execution of the tree
+-- built by the parser. Builtins live in builtins.nelua and reach the core
+-- through shexec; the core reaches them through two hooks.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'allocators.default'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sh.ast'
+require 'nebox.sh.lex'
+require 'nebox.sh.parse'
+require 'nebox.sh.arith'
+require 'nebox.sh.expand'
+
+## local function B(c) return string.byte(c) end
+
+global shexec = @record{}
+
+local N = shast
+
+global shexec.Var = @record{
+  value: string,
+  set: boolean,
+  exported: boolean,
+  readonly: boolean,
+}
+
+global shexec.Job = @record{
+  pid: cint,
+  status: integer,
+  done: boolean,
+}
+
+global shexec.FLOW_NONE: integer <comptime> = 0
+global shexec.FLOW_BREAK: integer <comptime> = 1
+global shexec.FLOW_CONTINUE: integer <comptime> = 2
+global shexec.FLOW_RETURN: integer <comptime> = 3
+
+global shexec.State = @record{
+  vars: hashmap(string, shexec.Var),
+  funcs: hashmap(string, integer),
+  func_defs: integer,
+  params: sequence(string),
+  arg0: string,
+  status: integer,
+  cmdsub_status: integer,
+  shell_pid: cint,
+  last_bg: cint,
+  has_bg: boolean,
+  -- options
+  o_allexport: boolean, o_errexit: boolean, o_noclobber: boolean, o_noglob: boolean,
+  o_noexec: boolean, o_nounset: boolean, o_verbose: boolean, o_xtrace: boolean,
+  o_notify: boolean, o_hashall: boolean,
+  -- control flow
+  flow: integer,
+  flow_n: integer,
+  loop_depth: integer,
+  func_depth: integer,
+  dot_depth: integer,
+  in_subshell: boolean,
+  errexit_ignore: integer,
+  lineno: integer,
+  -- traps
+  traps: [65]string,
+  trap_set: [65]boolean,
+  pending: [65]boolean,
+  got_signal: boolean,
+  ignored_on_entry: [65]boolean,
+  in_trap: boolean,
+  exit_trap_running: boolean,
+  -- jobs
+  jobs: sequence(shexec.Job),
+  -- getopts
+  optind_seen: integer,
+  optpos: integer,
+  -- command path cache
+  cmd_hash: hashmap(string, string),
+  -- the top-level input (for `sh -c`, scripts and stdin)
+  main_lexer: *shlex.Lexer,
+}
+
+global shst: shexec.State
+
+-- Hooks installed by builtins.nelua.
+global shexec.builtin_lookup: function(name: string): (integer, boolean)
+global shexec.builtin_call: function(idx: integer, args: sequence(string)): integer
+
+----------------------------------------------------------------------
+-- Diagnostics and exit
+----------------------------------------------------------------------
+
+function shexec.errmsg(msg: string)
+  util.flush()
+  local s = 'sh: line ' .. string.format('%d', shst.lineno) .. ': ' .. msg .. '\n'
+  sys.write(2, s.data, s.size)
+end
+
+-- Diagnostic without the line prefix (builtin usage errors print as "sh: cmd: ...").
+function shexec.errplain(msg: string)
+  util.flush()
+  local s = 'sh: ' .. msg .. '\n'
+  sys.write(2, s.data, s.size)
+end
+
+local function run_string(text: string, line: integer): integer <forwarddecl> end
+
+function shexec.exit_shell(code: integer) <noreturn>
+  code = code & 255
+  if shst.trap_set[0] and shst.traps[0].size > 0 and not shst.exit_trap_running then
+    shst.exit_trap_running = true
+    local action = shst.traps[0]
+    shst.trap_set[0] = false
+    shst.status = code
+    run_string(action, shst.lineno)
+  end
+  util.flush()
+  sys._exit((@cint)(code))
+end
+
+function shexec.fatal(msg: string) <noreturn>
+  shexec.errmsg(msg)
+  shexec.exit_shell(2)
+end
+
+local function on_syntax_error(msg: string, line: integer)
+  shst.lineno = line
+  shexec.errmsg(msg)
+  shexec.exit_shell(2)
+end
+
+local function on_expand_error(msg: string)
+  shexec.fatal(msg)
+end
+
+----------------------------------------------------------------------
+-- Signals
+----------------------------------------------------------------------
+
+local SIGNAMES: []string = {'', 'HUP', 'INT', 'QUIT', 'ILL', 'TRAP', 'ABRT', 'BUS', 'FPE', 'KILL',
+  'USR1', 'SEGV', 'USR2', 'PIPE', 'ALRM', 'TERM', 'STKFLT', 'CHLD', 'CONT', 'STOP', 'TSTP',
+  'TTIN', 'TTOU', 'URG', 'XCPU', 'XFSZ', 'VTALRM', 'PROF', 'WINCH', 'IO', 'PWR', 'SYS'}
+
+function shexec.signame(n: integer): string
+  if n > 0 and n <= 31 then return SIGNAMES[n] end
+  return ''
+end
+
+-- Signal number for a name ("TERM", "SIGTERM", "15", "EXIT" -> 0); -1 if unknown.
+function shexec.signum(name: string): integer
+  local up = name:upper()
+  if up == 'EXIT' then return 0 end
+  local v, ok = util.toint(name)
+  if ok then
+    if v >= 0 and v < sys.NSIG then return v end
+    return -1
+  end
+  if up.size > 3 and up:sub(1, 3) == 'SIG' then up = up:sub(4) end
+  for i: integer = 1, 31 do
+    if SIGNAMES[i] == up then return i end
+  end
+  return -1
+end
+
+local function on_signal(sig: cint): void
+  if sig > 0 and sig < 65 then
+    shst.pending[sig] = true
+    shst.got_signal = true
+  end
+end
+
+function shexec.set_handler(sig: integer, mode: integer)  -- 0 default, 1 ignore, 2 catch
+  local sa: sys.Sigaction
+  if mode == 0 then sa.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+  elseif mode == 1 then sa.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_IGN))
+  else sa.sa_handler = on_signal end
+  sa.sa_flags = 0
+  sys.sigaction((@cint)(sig), &sa, nilptr)
+end
+
+local function note_ignored_signals()
+  for sig: integer = 1, 31 do
+    local old: sys.Sigaction
+    if sys.sigaction((@cint)(sig), nilptr, &old) == 0 then
+      if (@usize)((@pointer)(old.sa_handler)) == sys.SIG_IGN then shst.ignored_on_entry[sig] = true end
+    end
+  end
+end
+
+-- Run the actions of pending caught signals.
+function shexec.run_traps()
+  if not shst.got_signal or shst.in_trap then return end
+  shst.got_signal = false
+  shst.in_trap = true
+  for sig: integer = 1, 64 do
+    if shst.pending[sig] then
+      shst.pending[sig] = false
+      if shst.trap_set[sig] and shst.traps[sig].size > 0 then
+        local saved = shst.status
+        local line = shst.lineno
+        run_string(shst.traps[sig], line)
+        shst.status = saved
+        shst.lineno = line
+      end
+    end
+  end
+  shst.in_trap = false
+end
+
+----------------------------------------------------------------------
+-- Variables
+----------------------------------------------------------------------
+
+function shexec.getvar(name: string): (string, boolean)
+  if name == 'LINENO' then return string.format('%d', shst.lineno), true end
+  local p = shst.vars:peek(name)
+  if p == nilptr or not p.set then return '', false end
+  return p.value, true
+end
+
+function shexec.var(name: string): *shexec.Var
+  local p = shst.vars:peek(name)
+  if p ~= nilptr then return p end
+  local k = string.copy(name)
+  shst.vars[k] = (@shexec.Var){}
+  return shst.vars:peek(k)
+end
+
+function shexec.setvar(name: string, value: string)
+  local v = shexec.var(name)
+  if v.readonly then shexec.fatal(name .. ': is read only') end
+  v.value = string.copy(value)
+  v.set = true
+  if shst.o_allexport then v.exported = true end
+  if name == 'PATH' then shst.cmd_hash:clear() end
+end
+
+function shexec.unsetvar(name: string): boolean
+  local p = shst.vars:peek(name)
+  if p == nilptr then return true end
+  if p.readonly then return false end
+  p.set = false
+  p.value = ''
+  p.exported = false
+  return true
+end
+
+local function option_string(): string
+  local sb: stringbuilder
+  if shst.o_allexport then sb:writebyte(#[B'a']#) end
+  if shst.o_notify then sb:writebyte(#[B'b']#) end
+  if shst.o_noclobber then sb:writebyte(#[B'C']#) end
+  if shst.o_errexit then sb:writebyte(#[B'e']#) end
+  if shst.o_noglob then sb:writebyte(#[B'f']#) end
+  if shst.o_hashall then sb:writebyte(#[B'h']#) end
+  if shst.o_noexec then sb:writebyte(#[B'n']#) end
+  if shst.o_nounset then sb:writebyte(#[B'u']#) end
+  if shst.o_verbose then sb:writebyte(#[B'v']#) end
+  if shst.o_xtrace then sb:writebyte(#[B'x']#) end
+  return sb:promote()
+end
+
+function shexec.options(): string return option_string() end
+
+local function special_param(c: byte): string
+  if c == #[B'?']# then return string.format('%d', shst.status) end
+  if c == #[B'$']# then return string.format('%d', shst.shell_pid) end
+  if c == #[B'!']# then
+    if not shst.has_bg then return '' end
+    return string.format('%d', shst.last_bg)
+  end
+  if c == #[B'-']# then return option_string() end
+  if c == #[B'0']# then return shst.arg0 end
+  return ''
+end
+
+local function params_hook(): *sequence(string) return &shst.params end
+
+-- Home directory of a user from /etc/passwd ("" means $HOME).
+local function homedir(user: string): (string, boolean)
+  if user.size == 0 then
+    local h, set = shexec.getvar('HOME')
+    if not set then return '', false end
+    return h, true
+  end
+  local data, ok = util.readfile('/etc/passwd')
+  if not ok then return '', false end
+  for _, line in ipairs(util.lines(data)) do
+    local c1 = line:find(':', 1, true)
+    if c1 <= 0 or line:sub(1, c1 - 1) ~= user then continue end
+    local fields: sequence(string)
+    local start: isize = 1
+    while true do
+      local c = line:find(':', start, true)
+      if c <= 0 then fields:push(line:sub(start)); break end
+      fields:push(line:sub(start, c - 1))
+      start = c + 1
+    end
+    if #fields >= 6 then return string.copy(fields[6]), true end
+    return '', false
+  end
+  return '', false
+end
+
+-- Environment for a child: exported variables plus command assignments.
+function shexec.build_env(extra: sequence(string)): sequence(string)
+  local out: sequence(string)
+  for k, v in pairs(shst.vars) do
+    if v.set and v.exported then
+      local skip = false
+      for i = 1, #extra do
+        local e = extra[i]
+        local eq = e:find('=', 1, true)
+        if eq > 0 and e:sub(1, eq - 1) == k then skip = true end
+      end
+      if not skip then out:push(k .. '=' .. v.value) end
+    end
+  end
+  for i = 1, #extra do out:push(extra[i]) end
+  return out
+end
+
+----------------------------------------------------------------------
+-- Command lookup
+----------------------------------------------------------------------
+
+local function default_path(): string
+  local p, set = shexec.getvar('PATH')
+  if set then return p end
+  return '/usr/local/bin:/usr/bin:/bin'
+end
+
+local function executable(path: string): boolean
+  if sys.access(path, sys.X_OK) ~= 0 then return false end
+  return not util.isdir(path)
+end
+
+-- Find `name` on PATH; returns the path or "" and whether an unexecutable
+-- candidate was seen. `pathstr` overrides PATH (command -p).
+function shexec.find_command(name: string, pathstr: string, use_cache: boolean): (string, boolean)
+  if name:find('/', 1, true) > 0 then return name, false end
+  if use_cache then
+    local c = shst.cmd_hash:peek(name)
+    if c ~= nilptr then return $c, false end
+  end
+  local denied = false
+  local start: usize = 1
+  for i: usize = 1, pathstr.size + 1 do
+    if i > pathstr.size or pathstr:byte(i) == #[B':']# then
+      local dir = i > start and pathstr:sub(start, i - 1) or '.'
+      local full = util.join(dir, name)
+      local st: sys.Stat
+      if sys.stat(full, &st) == 0 and (st.st_mode & sys.S_IFMT) ~= sys.S_IFDIR then
+        if sys.access(full, sys.X_OK) == 0 then
+          if use_cache then shst.cmd_hash[string.copy(name)] = full end
+          return full, denied
+        end
+        denied = true
+      end
+      start = i + 1
+    end
+  end
+  return '', denied
+end
+
+function shexec.search_path(): string return default_path() end
+
+----------------------------------------------------------------------
+-- Processes
+----------------------------------------------------------------------
+
+local function wait_status(status: cint): integer
+  if (status & 0x7F) == 0 then return (status >> 8) & 0xFF end
+  return 128 + (status & 0x7F)
+end
+
+-- Wait for a specific child; returns its status. With `interruptible`, a
+-- caught signal interrupts the wait and -1 is returned.
+function shexec.wait_pid(pid: cint, interruptible: boolean): integer
+  local status: cint = 0
+  while true do
+    local r = sys.waitpid(pid, &status, 0)
+    if r == pid then break end
+    if r < 0 then
+      if sys.errno() == sys.EINTR then
+        if interruptible and shst.got_signal then return -1 end
+        continue
+      end
+      return 127
+    end
+  end
+  return wait_status(status)
+end
+
+-- Reset what a subshell must not inherit.
+local function reset_child()
+  shst.in_subshell = true
+  for sig: integer = 1, 64 do
+    if shst.trap_set[sig] and shst.traps[sig].size > 0 then
+      shexec.set_handler(sig, 0)
+    end
+    if shst.traps[sig].size > 0 then
+      shst.trap_set[sig] = false
+      shst.traps[sig] = ''
+    end
+    shst.pending[sig] = false
+  end
+  shst.trap_set[0] = false
+  shst.traps[0] = ''
+  shst.got_signal = false
+  shst.jobs:clear()
+  shst.exit_trap_running = false
+end
+
+function shexec.fork_child(): cint
+  util.flush()
+  local pid = sys.fork()
+  if pid == 0 then reset_child() end
+  return pid
+end
+
+local function exec_node(node: integer): integer <forwarddecl> end
+
+-- Exit from a child after running a node.
+local function child_exit(status: integer) <noreturn>
+  shexec.exit_shell(status)
+end
+
+local function argv_of(args: sequence(string)): sequence(cstring)
+  local out: sequence(cstring)
+  for i = 1, #args do
+    local s = string.copy(args[i])
+    out:push((@cstring)(s.data))
+  end
+  out:push(nilptr)
+  return out
+end
+
+-- Replace the process with an external command (never returns on success).
+-- Reports and exits with 126/127 on failure.
+function shexec.exec_external(args: sequence(string), extra: sequence(string), pathstr: string) <noreturn>
+  local env = shexec.build_env(extra)
+  local argv = argv_of(args)
+  local envp = argv_of(env)
+  local name = args[1]
+  util.flush()
+  local path = name
+  local denied = false
+  if name:find('/', 1, true) <= 0 then
+    path, denied = shexec.find_command(name, pathstr, false)
+    if path.size == 0 then
+      if denied then
+        shexec.errmsg(name .. ': Permission denied')
+        sys._exit(126)
+      end
+      shexec.errmsg(name .. ': not found')
+      sys._exit(127)
+    end
+  end
+  local cpath = string.copy(path)
+  sys.execve(cpath, (@*[0]cstring)(&argv[1]), (@*[0]cstring)(&envp[1]))
+  local e = sys.errno()
+  if e == sys.ENOEXEC then
+    -- not a binary: run it as a shell script with this binary
+    local sargs: sequence(string)
+    sargs:push('sh')
+    sargs:push(path)
+    for i = 2, #args do sargs:push(args[i]) end
+    local sargv = argv_of(sargs)
+    sys.execve('/proc/self/exe', (@*[0]cstring)(&sargv[1]), (@*[0]cstring)(&envp[1]))
+  end
+  if e == sys.ENOENT or e == sys.ENOTDIR then
+    shexec.errmsg(name .. ': not found')
+    sys._exit(127)
+  end
+  shexec.errmsg(name .. ': ' .. sys.strerror(e))
+  sys._exit(126)
+end
+
+----------------------------------------------------------------------
+-- Redirections
+----------------------------------------------------------------------
+
+global shexec.Saved = @record{ fd: cint, saved: cint }
+
+local function write_all(fd: cint, s: string): boolean
+  local done: usize = 0
+  while done < s.size do
+    local r = sys.write(fd, &s.data[done], s.size - done)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return false
+    end
+    done = done + (@usize)(r)
+  end
+  return true
+end
+
+-- Descriptor delivering a here-document body.
+local function heredoc_fd(body: string): cint
+  local fds: [2]cint
+  if sys.pipe(&fds) ~= 0 then return -1 end
+  if body.size <= 65536 then
+    write_all(fds[1], body)
+    sys.close(fds[1])
+    return fds[0]
+  end
+  util.flush()
+  local pid = sys.fork()
+  if pid == 0 then
+    sys.close(fds[0])
+    shexec.set_handler(sys.SIGPIPE, 1)
+    write_all(fds[1], body)
+    sys._exit(0)
+  end
+  sys.close(fds[1])
+  return fds[0]
+end
+
+-- Open the source/target of one redirection. Returns the descriptor to
+-- install, -2 to close the fd, or -1 after reporting an error.
+local function open_redir(r: *N.Redir): cint
+  if r.op == N.R_HEREDOC or r.op == N.R_HEREDOC_STRIP then
+    local body = r.body > 0 and shexp.expand_one(r.body) or ''
+    local fd = heredoc_fd(body)
+    if fd < 0 then shexec.errmsg('cannot create here-document: ' .. sys.errstr()) end
+    return fd
+  end
+  local target = shexp.expand_one(r.target)
+  if r.op == N.R_DUPIN or r.op == N.R_DUPOUT then
+    if target == '-' then return -2 end
+    local n, ok = util.toint(target)
+    if not ok or n < 0 then
+      shexec.errmsg('Syntax error: Bad fd number')
+      return -1
+    end
+    if sys.fcntl((@cint)(n), sys.F_GETFD, 0) < 0 then
+      shexec.errmsg(target .. ': Bad file descriptor')
+      return -1
+    end
+    local fd = sys.fcntl((@cint)(n), sys.F_DUPFD_CLOEXEC, 10)
+    if fd < 0 then
+      shexec.errmsg(target .. ': ' .. sys.errstr())
+      return -1
+    end
+    return fd
+  end
+  local flags: cint = 0
+  local creating = false
+  if r.op == N.R_IN then flags = sys.O_RDONLY
+  elseif r.op == N.R_OUT then
+    creating = true
+    if shst.o_noclobber then
+      local fd = sys.open(target, sys.O_WRONLY | sys.O_CREAT | sys.O_EXCL, 0x1B6)
+      if fd >= 0 then return fd end
+      if sys.errno() == sys.EEXIST then
+        local st: sys.Stat
+        if sys.stat(target, &st) == 0 and (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG then
+          flags = sys.O_WRONLY
+        else
+          shexec.errmsg('cannot create ' .. target .. ': File exists')
+          return -1
+        end
+      else
+        shexec.errmsg('cannot create ' .. target .. ': ' .. sys.errstr())
+        return -1
+      end
+    else
+      flags = sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC
+    end
+  elseif r.op == N.R_CLOBBER then creating = true; flags = sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC
+  elseif r.op == N.R_APPEND then creating = true; flags = sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND
+  elseif r.op == N.R_RDWR then creating = true; flags = sys.O_RDWR | sys.O_CREAT end
+  local fd = sys.open(target, flags, 0x1B6)
+  if fd < 0 then
+    if creating then shexec.errmsg('cannot create ' .. target .. ': ' .. sys.errstr())
+    else shexec.errmsg('cannot open ' .. target .. ': ' .. sys.errstr()) end
+    return -1
+  end
+  return fd
+end
+
+-- Apply the redirections of a node. With `save`, the previous state of each
+-- descriptor is recorded for restore_redirs. Returns false on error.
+function shexec.apply_redirs(r0: integer, r1: integer, save: *sequence(shexec.Saved)): boolean
+  for i = 0, < r1 do
+    local r = &shprog.redirs[N.L(r0 + i)]
+    local fd = open_redir(r)
+    if fd == -1 then return false end
+    local target: cint = (@cint)(r.fd)
+    util.flush()
+    if save ~= nilptr then
+      local s: shexec.Saved
+      s.fd = target
+      s.saved = sys.fcntl(target, sys.F_DUPFD_CLOEXEC, 10)
+      if s.saved < 0 then s.saved = -1 end
+      save:push(s)
+    end
+    if fd == -2 then
+      sys.close(target)
+    else
+      if fd ~= target then
+        if sys.dup2(fd, target) < 0 then
+          shexec.errmsg(string.format('%d', r.fd) .. ': ' .. sys.errstr())
+          sys.close(fd)
+          return false
+        end
+        sys.close(fd)
+      else
+        -- the new fd happens to be the target already: clear close-on-exec
+        sys.fcntl(target, sys.F_SETFD, 0)
+      end
+    end
+  end
+  return true
+end
+
+function shexec.restore_redirs(save: *sequence(shexec.Saved))
+  util.flush()
+  for i = #save, 1, -1 do
+    local s = save[i]
+    if s.saved >= 0 then
+      sys.dup2(s.saved, s.fd)
+      sys.close(s.saved)
+    else
+      sys.close(s.fd)
+    end
+  end
+  save:clear()
+end
+
+----------------------------------------------------------------------
+-- Command substitution
+----------------------------------------------------------------------
+
+local function cmdsub(node: integer): string
+  if node < 0 then shst.cmdsub_status = 0; return '' end
+  local fds: [2]cint
+  if sys.pipe(&fds) ~= 0 then shexec.fatal('cannot create pipe: ' .. sys.errstr()) end
+  local pid = shexec.fork_child()
+  if pid < 0 then shexec.fatal('cannot fork: ' .. sys.errstr()) end
+  if pid == 0 then
+    sys.close(fds[0])
+    sys.dup2(fds[1], 1)
+    sys.close(fds[1])
+    local st = exec_node(node)
+    child_exit(st)
+  end
+  sys.close(fds[1])
+  local data, ok = util.readfd(fds[0])
+  sys.close(fds[0])
+  shst.cmdsub_status = shexec.wait_pid(pid, false)
+  local n = data.size
+  while n > 0 and data.data[n - 1] == 10 do n = n - 1 end
+  return (@string){data = data.data, size = n}
+end
+
+----------------------------------------------------------------------
+-- Execution
+----------------------------------------------------------------------
+
+local function check_errexit(status: integer)
+  if status ~= 0 and shst.o_errexit and shst.errexit_ignore == 0 then
+    shexec.exit_shell(status)
+  end
+end
+
+local function xtrace(assigns: sequence(string), args: sequence(string))
+  if not shst.o_xtrace then return end
+  local ps4, set = shexec.getvar('PS4')
+  if not set then ps4 = '+ ' end
+  local sb: stringbuilder
+  sb:write(ps4)
+  local first = true
+  for i = 1, #assigns do
+    if not first then sb:writebyte(32) end
+    sb:write(assigns[i])
+    first = false
+  end
+  for i = 1, #args do
+    if not first then sb:writebyte(32) end
+    sb:write(args[i])
+    first = false
+  end
+  sb:writebyte(10)
+  util.flush()
+  local s = sb:promote()
+  sys.write(2, s.data, s.size)
+end
+
+local function do_assign(a: string, export_it: boolean)
+  local eq = a:find('=', 1, true)
+  local name = a:sub(1, eq - 1)
+  shexec.setvar(name, a:sub(eq + 1))
+  if export_it then shexec.var(name).exported = true end
+end
+
+-- Temporarily assign for a builtin or function call; returns the old cells.
+local TempVar = @record{ name: string, old: shexec.Var, existed: boolean }
+
+local function temp_assign(assigns: sequence(string)): sequence(TempVar)
+  local saved: sequence(TempVar)
+  for i = 1, #assigns do
+    local a = assigns[i]
+    local eq = a:find('=', 1, true)
+    local name = a:sub(1, eq - 1)
+    local t: TempVar
+    t.name = name
+    local p = shst.vars:peek(name)
+    if p ~= nilptr then t.old = $p; t.existed = true end
+    saved:push(t)
+    shexec.setvar(name, a:sub(eq + 1))
+    shexec.var(name).exported = true
+  end
+  return saved
+end
+
+local function temp_restore(saved: sequence(TempVar))
+  for i = #saved, 1, -1 do
+    local t = saved[i]
+    if t.existed then
+      shst.vars[t.name] = t.old
+    else
+      shst.vars:remove(t.name)
+    end
+  end
+end
+
+-- Call a shell function with arguments.
+function shexec.call_function(body: integer, args: sequence(string)): integer
+  local saved_params = shst.params
+  local np: sequence(string)
+  for i = 2, #args do np:push(args[i]) end
+  shst.params = np
+  shst.func_depth = shst.func_depth + 1
+  local saved_loops = shst.loop_depth
+  shst.loop_depth = 0
+  local st = exec_node(body)
+  shst.loop_depth = saved_loops
+  shst.func_depth = shst.func_depth - 1
+  if shst.flow == shexec.FLOW_RETURN then
+    shst.flow = shexec.FLOW_NONE
+    st = shst.status
+  elseif shst.flow == shexec.FLOW_BREAK or shst.flow == shexec.FLOW_CONTINUE then
+    shst.flow = shexec.FLOW_NONE
+  end
+  shst.params = saved_params
+  return st
+end
+
+-- Run a simple command.
+local function exec_simple(n: *N.Node): integer
+  shst.lineno = n.line
+  local assigns: sequence(string)
+  local args: sequence(string)
+  local assign_words: sequence(integer)
+  shst.cmdsub_status = 0
+  -- command words first (POSIX 2.9.1 step 1), then redirections, then assignments
+  for i = 0, < n.b do
+    local wi = N.L(n.a + i)
+    if N.W(wi).assign and #args == 0 and #assign_words == i then
+      assign_words:push(wi)
+    else
+      local f = shexp.expand_word(wi)
+      for j = 1, #f do args:push(f[j]) end
+    end
+  end
+  if #args == 0 then
+    -- assignments and/or redirections only
+    local save: sequence(shexec.Saved)
+    local ok = true
+    if n.r1 > 0 then ok = shexec.apply_redirs(n.r0, n.r1, &save) end
+    for i = 1, #assign_words do
+      local name, value = shexp.expand_assign(assign_words[i])
+      assigns:push(name .. '=' .. value)
+      shexec.setvar(name, value)
+    end
+    local status = shst.cmdsub_status
+    xtrace(assigns, args)
+    if n.r1 > 0 then shexec.restore_redirs(&save) end
+    if not ok then return 2 end
+    return status
+  end
+  for i = 1, #assign_words do
+    local name, value = shexp.expand_assign(assign_words[i])
+    assigns:push(name .. '=' .. value)
+  end
+  xtrace(assigns, args)
+  local name = args[1]
+  local bidx, special = shexec.builtin_lookup(name)
+  local fn = shst.funcs:peek(name)
+  if bidx > 0 and special then
+    for i = 1, #assigns do do_assign(assigns[i], false) end
+    local save: sequence(shexec.Saved)
+    if n.r1 > 0 and not shexec.apply_redirs(n.r0, n.r1, &save) then
+      shexec.restore_redirs(&save)
+      shexec.exit_shell(2)
+    end
+    local st = shexec.builtin_call(bidx, args)
+    if n.r1 > 0 and name ~= 'exec' then shexec.restore_redirs(&save) end
+    util.flush()
+    return st
+  end
+  if fn ~= nilptr or bidx > 0 then
+    local saved = temp_assign(assigns)
+    local save: sequence(shexec.Saved)
+    if n.r1 > 0 and not shexec.apply_redirs(n.r0, n.r1, &save) then
+      shexec.restore_redirs(&save)
+      temp_restore(saved)
+      return 2
+    end
+    local st: integer
+    if fn ~= nilptr then
+      st = shexec.call_function($fn, args)
+    else
+      st = shexec.builtin_call(bidx, args)
+    end
+    util.flush()
+    if n.r1 > 0 then shexec.restore_redirs(&save) end
+    temp_restore(saved)
+    return st
+  end
+  -- external command
+  local pid = shexec.fork_child()
+  if pid < 0 then shexec.errmsg('cannot fork: ' .. sys.errstr()); return 2 end
+  if pid == 0 then
+    if n.r1 > 0 and not shexec.apply_redirs(n.r0, n.r1, nilptr) then sys._exit(2) end
+    shexec.exec_external(args, assigns, default_path())
+  end
+  return shexec.wait_pid(pid, false)
+end
+
+local function exec_pipeline(n: *N.Node): integer
+  local count = n.b
+  local pids: sequence(cint)
+  local prev_read: cint = -1
+  for i = 0, < count do
+    local node = N.L(n.a + i)
+    local last = i == count - 1
+    local fds: [2]cint = {-1, -1}
+    if not last and sys.pipe(&fds) ~= 0 then shexec.fatal('cannot create pipe: ' .. sys.errstr()) end
+    local pid = shexec.fork_child()
+    if pid < 0 then shexec.fatal('cannot fork: ' .. sys.errstr()) end
+    if pid == 0 then
+      if prev_read >= 0 then sys.dup2(prev_read, 0); sys.close(prev_read) end
+      if not last then
+        sys.close(fds[0])
+        sys.dup2(fds[1], 1)
+        sys.close(fds[1])
+      end
+      local st = exec_node(node)
+      child_exit(st)
+    end
+    pids:push(pid)
+    if prev_read >= 0 then sys.close(prev_read) end
+    if not last then
+      sys.close(fds[1])
+      prev_read = fds[0]
+    end
+  end
+  local status: integer = 0
+  for i = 1, #pids do
+    local st = shexec.wait_pid(pids[i], false)
+    if i == #pids then status = st end
+  end
+  if n.c == 1 then status = status == 0 and 1 or 0 end
+  return status
+end
+
+local function exec_async(n: *N.Node): integer
+  local pid = shexec.fork_child()
+  if pid < 0 then shexec.errmsg('cannot fork: ' .. sys.errstr()); return 2 end
+  if pid == 0 then
+    local fd = sys.open('/dev/null', sys.O_RDONLY, 0)
+    if fd >= 0 then sys.dup2(fd, 0); sys.close(fd) end
+    shexec.set_handler(sys.SIGINT, 1)
+    shexec.set_handler(sys.SIGQUIT, 1)
+    local st = exec_node(n.a)
+    child_exit(st)
+  end
+  shst.jobs:push((@shexec.Job){pid = pid, status = 0, done = false})
+  shst.last_bg = pid
+  shst.has_bg = true
+  return 0
+end
+
+local function exec_loop_body(body: integer): (integer, boolean)
+  -- returns (status, stop)
+  local st = exec_node(body)
+  if shst.flow == shexec.FLOW_BREAK then
+    shst.flow_n = shst.flow_n - 1
+    if shst.flow_n <= 0 then shst.flow = shexec.FLOW_NONE end
+    return st, true
+  elseif shst.flow == shexec.FLOW_CONTINUE then
+    shst.flow_n = shst.flow_n - 1
+    if shst.flow_n <= 0 then shst.flow = shexec.FLOW_NONE; return st, false end
+    return st, true
+  elseif shst.flow ~= shexec.FLOW_NONE then
+    return st, true
+  end
+  return st, false
+end
+
+local function exec_while(n: *N.Node, until_: boolean): integer
+  local status: integer = 0
+  shst.loop_depth = shst.loop_depth + 1
+  while true do
+    shst.errexit_ignore = shst.errexit_ignore + 1
+    local c = exec_node(n.a)
+    shst.errexit_ignore = shst.errexit_ignore - 1
+    if shst.flow ~= shexec.FLOW_NONE then
+      -- break/continue in the condition
+      local _, stop = exec_loop_body(-1)
+      if stop then break end
+      continue
+    end
+    if (c == 0) == until_ then break end
+    local st, stop = exec_loop_body(n.b)
+    status = st
+    if stop then break end
+  end
+  shst.loop_depth = shst.loop_depth - 1
+  return status
+end
+
+local function exec_for(n: *N.Node): integer
+  local items: sequence(string)
+  if n.d == 1 then
+    for i = 1, #shst.params do items:push(shst.params[i]) end
+  else
+    items = shexp.expand_words(n.a, n.b)
+  end
+  local status: integer = 0
+  shst.loop_depth = shst.loop_depth + 1
+  for i = 1, #items do
+    shexec.setvar(n.s, items[i])
+    local st, stop = exec_loop_body(n.c)
+    status = st
+    if stop then break end
+  end
+  shst.loop_depth = shst.loop_depth - 1
+  return status
+end
+
+local function exec_case(n: *N.Node): integer
+  local word = shexp.expand_one(n.a)
+  for i = 0, < n.c do
+    local item: N.Node = shprog.nodes[N.L(n.b + i)]
+    for j = 0, < item.b do
+      local pat = shexp.expand_pattern(N.L(item.a + j))
+      if shexp.match(&pat, word) then
+        if item.c >= 0 then return exec_node(item.c) end
+        return 0
+      end
+    end
+  end
+  return 0
+end
+
+local function exec_subshell(n: *N.Node): integer
+  local pid = shexec.fork_child()
+  if pid < 0 then shexec.errmsg('cannot fork: ' .. sys.errstr()); return 2 end
+  if pid == 0 then
+    if n.r1 > 0 and not shexec.apply_redirs(n.r0, n.r1, nilptr) then child_exit(2) end
+    local st = exec_node(n.a)
+    child_exit(st)
+  end
+  return shexec.wait_pid(pid, false)
+end
+
+function exec_node(node: integer): integer
+  if node < 0 then return shst.status end
+  -- copy: eval and traps may grow the node arena while this node runs
+  local ncopy: N.Node = shprog.nodes[node]
+  local n = &ncopy
+  local kind = n.kind
+  if kind == N.N_EMPTY then return shst.status end
+  if kind == N.N_SIMPLE then
+    local st = exec_simple(n)
+    shst.status = st
+    if shst.got_signal then shexec.run_traps() end
+    check_errexit(st)
+    return st
+  elseif kind == N.N_PIPE then
+    shst.lineno = n.line
+    local st = exec_pipeline(n)
+    shst.status = st
+    if shst.got_signal then shexec.run_traps() end
+    if n.c == 0 then check_errexit(st) end
+    return st
+  elseif kind == N.N_AND or kind == N.N_OR then
+    shst.errexit_ignore = shst.errexit_ignore + 1
+    local l = exec_node(n.a)
+    shst.errexit_ignore = shst.errexit_ignore - 1
+    if shst.flow ~= shexec.FLOW_NONE then return l end
+    if (kind == N.N_AND) == (l == 0) then
+      return exec_node(n.b)
+    end
+    shst.status = l
+    return l
+  elseif kind == N.N_SEQ then
+    local st = shst.status
+    for i = 0, < n.b do
+      st = exec_node(N.L(n.a + i))
+      if shst.flow ~= shexec.FLOW_NONE then break end
+    end
+    return st
+  elseif kind == N.N_ASYNC then
+    shst.lineno = n.line
+    local st = exec_async(n)
+    shst.status = st
+    return st
+  elseif kind == N.N_SUBSHELL then
+    shst.lineno = n.line
+    local st = exec_subshell(n)
+    shst.status = st
+    if shst.got_signal then shexec.run_traps() end
+    check_errexit(st)
+    return st
+  elseif kind == N.N_FUNC then
+    local k = string.copy(n.s)
+    shst.funcs[k] = n.a
+    shst.func_defs = shst.func_defs + 1
+    shst.status = 0
+    return 0
+  end
+  -- compound commands with redirections
+  local save: sequence(shexec.Saved)
+  if n.r1 > 0 then
+    if not shexec.apply_redirs(n.r0, n.r1, &save) then
+      shexec.restore_redirs(&save)
+      shst.status = 2
+      return 2
+    end
+  end
+  local st: integer = 0
+  if kind == N.N_BRACE then
+    st = exec_node(n.a)
+  elseif kind == N.N_IF then
+    shst.errexit_ignore = shst.errexit_ignore + 1
+    local c = exec_node(n.a)
+    shst.errexit_ignore = shst.errexit_ignore - 1
+    if shst.flow ~= shexec.FLOW_NONE then
+      st = c
+    elseif c == 0 then
+      st = exec_node(n.b)
+    elseif n.c >= 0 then
+      st = exec_node(n.c)
+    else
+      st = 0
+    end
+  elseif kind == N.N_WHILE then st = exec_while(n, false)
+  elseif kind == N.N_UNTIL then st = exec_while(n, true)
+  elseif kind == N.N_FOR then st = exec_for(n)
+  elseif kind == N.N_CASE then st = exec_case(n)
+  end
+  if n.r1 > 0 then shexec.restore_redirs(&save) end
+  shst.status = st
+  return st
+end
+
+function shexec.exec(node: integer): integer
+  return exec_node(node)
+end
+
+-- Run every command a lexer yields. Returns the last status.
+function shexec.run_lexer(lx: *shlex.Lexer): integer
+  local status = shst.status
+  while true do
+    local node = shparse.next_command(lx)
+    if node < 0 then break end
+    lx:sync()
+    if shst.o_noexec then continue end
+    status = exec_node(node)
+    if shst.flow == shexec.FLOW_RETURN then break end
+    if shst.flow == shexec.FLOW_BREAK or shst.flow == shexec.FLOW_CONTINUE then
+      shst.flow = shexec.FLOW_NONE
+    end
+  end
+  return status
+end
+
+function run_string(text: string, line: integer): integer
+  local lx: shlex.Lexer
+  lx:init_text(text)
+  lx.srcs[1].line = line
+  local mark = N.mark()
+  local defs = shst.func_defs
+  local st = shexec.run_lexer(&lx)
+  if shst.func_defs == defs then N.release(mark) end
+  return st
+end
+
+function shexec.run_string(text: string, line: integer): integer
+  return run_string(text, line)
+end
+
+----------------------------------------------------------------------
+-- Startup
+----------------------------------------------------------------------
+
+local function arith_getvar(name: string): string
+  local v, set = shexec.getvar(name)
+  return v
+end
+
+function shexec.init(arg0: string)
+  shparse.init()
+  shlex.on_error = on_syntax_error
+  shexp.getvar = shexec.getvar
+  shexp.setvar = shexec.setvar
+  shexp.params = params_hook
+  shexp.special = special_param
+  shexp.cmdsub = cmdsub
+  shexp.fatal = on_expand_error
+  shexp.homedir = homedir
+  sharith.getvar = arith_getvar
+  sharith.setvar = shexec.setvar
+  shst.arg0 = arg0
+  shst.shell_pid = sys.getpid()
+  shst.lineno = 1
+  for sig: integer = 0, 64 do shst.traps[sig] = '' end
+  -- environment
+  local i: integer = 0
+  while environ[i] ~= nilptr do
+    local e: string = environ[i]
+    local eq = e:find('=', 1, true)
+    if eq > 1 then
+      local name = e:sub(1, eq - 1)
+      if N.is_name(name) then
+        local v = shexec.var(name)
+        v.value = e:sub(eq + 1)
+        v.set = true
+        v.exported = true
+      end
+    end
+    i = i + 1
+  end
+  local _, has_ifs = shexec.getvar('IFS')
+  shexec.setvar('IFS', ' \t\n')
+  local _, has_ps4 = shexec.getvar('PS4')
+  if not has_ps4 then shexec.setvar('PS4', '+ ') end
+  local _, has_ps1 = shexec.getvar('PS1')
+  if not has_ps1 then shexec.setvar('PS1', '$ ') end
+  local _, has_ps2 = shexec.getvar('PS2')
+  if not has_ps2 then shexec.setvar('PS2', '> ') end
+  shexec.setvar('OPTIND', '1')
+  shst.optind_seen = 1
+  shst.optpos = 0
+  shexec.setvar('PPID', string.format('%d', sys.getppid()))
+  -- PWD: keep the inherited value when it names the current directory
+  local buf: [4096]cchar
+  local cwd: string = ''
+  if sys.getcwd(&buf[0], 4096) ~= nilptr then cwd = string.copy(sys.cstr(&buf)) end
+  local pwd, has_pwd = shexec.getvar('PWD')
+  local keep = false
+  if has_pwd and pwd.size > 0 and pwd:byte(1) == #[B'/']# and cwd.size > 0 then
+    local a: sys.Stat
+    local b: sys.Stat
+    if sys.stat(pwd, &a) == 0 and sys.stat(cwd, &b) == 0 and a.st_ino == b.st_ino and a.st_dev == b.st_dev then
+      keep = true
+    end
+  end
+  if not keep then shexec.setvar('PWD', cwd) end
+  note_ignored_signals()
+end
+
+-- Finish: run the EXIT trap and exit with the last status.
+function shexec.finish() <noreturn>
+  shexec.exit_shell(shst.status)
+end

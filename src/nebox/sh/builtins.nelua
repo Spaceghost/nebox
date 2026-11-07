@@ -1,0 +1,1200 @@
+-- sh builtins: the special built-ins of POSIX.1-2017 XCU 2.14 and the
+-- regular built-in utilities a shell must provide itself (cd, command,
+-- getopts, hash, kill, pwd, read, type, umask, unalias, wait, alias,
+-- true, false, echo), plus printf and test through the nebox applets.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sh.ast'
+require 'nebox.sh.lex'
+require 'nebox.sh.parse'
+require 'nebox.sh.expand'
+require 'nebox.sh.exec'
+require 'nebox.applets.text'
+require 'nebox.applets.fs'
+
+## local function B(c) return string.byte(c) end
+
+global shbi = @record{}
+
+local N = shast
+local DEFPATH: string = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+-- Set while a special builtin runs under `command`: its errors then return
+-- instead of exiting the shell.
+local command_wrapped: boolean = false
+
+-- Error of a special builtin: exits the (non-interactive) shell with 2
+-- unless invoked through `command`.
+local function sberr(msg: string): integer
+  shexec.errmsg(msg)
+  if command_wrapped then return 2 end
+  shexec.exit_shell(2)
+  return 2
+end
+
+-- Error of a regular builtin: report, keep going.
+local function rberr(msg: string): integer
+  shexec.errmsg(msg)
+  return 2
+end
+
+local function quote(s: string): string
+  local sb: stringbuilder
+  sb:writebyte(#[B"'"]#)
+  for i: usize = 1, s.size do
+    local c = s:byte(i)
+    if c == #[B"'"]# then sb:write("'\"'\"'") else sb:writebyte(c) end
+  end
+  sb:writebyte(#[B"'"]#)
+  return sb:promote()
+end
+
+local function name_less(a: string, b: string): boolean return a < b end
+
+local function sorted_var_names(): sequence(string)
+  local names: sequence(string)
+  for k, v in pairs(shst.vars) do names:push(k) end
+  util.sort(names, name_less)
+  return names
+end
+
+----------------------------------------------------------------------
+-- Special built-ins
+----------------------------------------------------------------------
+
+local function bi_colon(args: sequence(string)): integer return 0 end
+local function bi_true(args: sequence(string)): integer return 0 end
+local function bi_false(args: sequence(string)): integer return 1 end
+
+local function bi_break(args: sequence(string)): integer
+  local n: integer = 1
+  if #args >= 2 then
+    local v, ok = util.toint(args[2])
+    if not ok or v < 1 then return sberr(args[1] .. ': Illegal number: ' .. args[2]) end
+    n = v
+  end
+  if shst.loop_depth == 0 then return 0 end
+  if n > shst.loop_depth then n = shst.loop_depth end
+  shst.flow = args[1] == 'break' and shexec.FLOW_BREAK or shexec.FLOW_CONTINUE
+  shst.flow_n = n
+  return 0
+end
+
+local function bi_exit(args: sequence(string)): integer
+  local code = shst.status
+  if #args >= 2 then
+    local v, ok = util.toint(args[2])
+    if not ok or v < 0 then return sberr('exit: Illegal number: ' .. args[2]) end
+    code = v
+  end
+  shexec.exit_shell(code)
+  return 0
+end
+
+local function bi_return(args: sequence(string)): integer
+  local code = shst.status
+  if #args >= 2 then
+    local v, ok = util.toint(args[2])
+    if not ok or v < 0 then return sberr('return: Illegal number: ' .. args[2]) end
+    code = v
+  end
+  if shst.func_depth == 0 and shst.dot_depth == 0 then shexec.exit_shell(code) end
+  shst.status = code
+  shst.flow = shexec.FLOW_RETURN
+  return code
+end
+
+local function bi_eval(args: sequence(string)): integer
+  local sb: stringbuilder
+  for i = 2, #args do
+    if i > 2 then sb:writebyte(32) end
+    sb:write(args[i])
+  end
+  if #sb == 0 then return 0 end
+  return shexec.run_string(sb:promote(), shst.lineno)
+end
+
+local function bi_exec(args: sequence(string)): integer
+  if #args < 2 then return 0 end
+  local rest: sequence(string)
+  for i = 2, #args do rest:push(args[i]) end
+  local none: sequence(string)
+  shexec.exec_external(rest, none, shexec.search_path())
+  return 127
+end
+
+local function find_dot_file(name: string): string
+  if name:find('/', 1, true) > 0 then return name end
+  local pathstr = shexec.search_path()
+  local start: usize = 1
+  for i: usize = 1, pathstr.size + 1 do
+    if i > pathstr.size or pathstr:byte(i) == #[B':']# then
+      local dir = i > start and pathstr:sub(start, i - 1) or '.'
+      local full = util.join(dir, name)
+      local st: sys.Stat
+      if sys.stat(full, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFREG then return full end
+      start = i + 1
+    end
+  end
+  return ''
+end
+
+local function bi_dot(args: sequence(string)): integer
+  if #args < 2 then return sberr('.: filename argument required') end
+  local path = find_dot_file(args[2])
+  if path.size == 0 then return sberr('.: ' .. args[2] .. ': not found') end
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return sberr('.: cannot open ' .. args[2] .. ': ' .. sys.errstr()) end
+  local lx: shlex.Lexer
+  lx:init_fd(fd, false)
+  local mark = N.mark()
+  local defs = shst.func_defs
+  shst.dot_depth = shst.dot_depth + 1
+  local saved_line = shst.lineno
+  local st = shexec.run_lexer(&lx)
+  shst.dot_depth = shst.dot_depth - 1
+  shst.lineno = saved_line
+  sys.close(fd)
+  if shst.flow == shexec.FLOW_RETURN then
+    shst.flow = shexec.FLOW_NONE
+    st = shst.status
+  end
+  if shst.func_defs == defs then N.release(mark) end
+  return st
+end
+
+local function print_var_decl(prefix: string, name: string, v: *shexec.Var)
+  if v.set then
+    util.line(prefix .. ' ' .. name .. '=' .. quote(v.value))
+  else
+    util.line(prefix .. ' ' .. name)
+  end
+end
+
+local function bi_export(args: sequence(string)): integer
+  local readonly = args[1] == 'readonly'
+  local i: integer = 2
+  if i <= #args and args[i] == '-p' then i = i + 1 end
+  if i > #args then
+    for _, name in ipairs(sorted_var_names()) do
+      local v = shst.vars:peek(name)
+      if readonly then
+        if v.readonly then print_var_decl('readonly', name, v) end
+      else
+        if v.exported and (v.set or v.readonly) then print_var_decl('export', name, v) end
+      end
+    end
+    return 0
+  end
+  while i <= #args do
+    local a = args[i]
+    local eq = a:find('=', 1, true)
+    local name = a
+    if eq > 0 then name = a:sub(1, eq - 1) end
+    if not N.is_name(name) then return sberr(args[1] .. ': ' .. name .. ': bad variable name') end
+    if eq > 0 then shexec.setvar(name, a:sub(eq + 1)) end
+    local v = shexec.var(name)
+    if readonly then v.readonly = true else v.exported = true end
+    i = i + 1
+  end
+  return 0
+end
+
+local function bi_set(args: sequence(string)): integer <forwarddecl> end
+
+local function bi_shift(args: sequence(string)): integer
+  local n: integer = 1
+  if #args >= 2 then
+    local v, ok = util.toint(args[2])
+    if not ok or v < 0 then return sberr('shift: Illegal number: ' .. args[2]) end
+    n = v
+  end
+  if n > #shst.params then return sberr("shift: can't shift that many") end
+  local np: sequence(string)
+  for i = n + 1, #shst.params do np:push(shst.params[i]) end
+  shst.params = np
+  return 0
+end
+
+local function fmt_time(ticks: clong, hz: clong): string
+  local t = (@integer)(ticks)
+  local h = (@integer)(hz)
+  local secs = t // h
+  local micros = (t % h) * 1000000 // h
+  return string.format('%dm%d.%06ds', secs // 60, secs % 60, micros)
+end
+
+local function bi_times(args: sequence(string)): integer
+  local t: sys.Tms
+  sys.times(&t)
+  local hz = sys.sysconf(sys._SC_CLK_TCK)
+  if hz <= 0 then hz = 100 end
+  util.line(fmt_time(t.tms_utime, hz) .. ' ' .. fmt_time(t.tms_stime, hz))
+  util.line(fmt_time(t.tms_cutime, hz) .. ' ' .. fmt_time(t.tms_cstime, hz))
+  return 0
+end
+
+local function trap_name(sig: integer): string
+  if sig == 0 then return 'EXIT' end
+  local n = shexec.signame(sig)
+  if n.size > 0 then return n end
+  return string.format('%d', sig)
+end
+
+local function bi_trap(args: sequence(string)): integer
+  local i: integer = 2
+  if i <= #args and args[i] == '--' then i = i + 1 end
+  if i > #args then
+    for sig: integer = 0, 64 do
+      if shst.trap_set[sig] then
+        util.line('trap -- ' .. quote(shst.traps[sig]) .. ' ' .. trap_name(sig))
+      end
+    end
+    return 0
+  end
+  local action = args[i]
+  local reset = false
+  local _, isnum = util.toint(action)
+  if isnum then
+    reset = true
+  else
+    i = i + 1
+    if action == '-' then reset = true end
+  end
+  if i > #args then return rberr('trap: usage: trap [action condition...]') end
+  local rc: integer = 0
+  while i <= #args do
+    local sig = shexec.signum(args[i])
+    if sig < 0 or sig == 9 or sig == 19 then
+      shexec.errplain('trap: ' .. args[i] .. ': bad trap')
+      rc = 1
+    elseif shst.ignored_on_entry[sig] then
+      -- cannot be trapped or reset: silently ignored
+    elseif reset then
+      shst.traps[sig] = ''
+      shst.trap_set[sig] = false
+      if sig > 0 then shexec.set_handler(sig, 0) end
+    elseif action.size == 0 then
+      shst.traps[sig] = ''
+      shst.trap_set[sig] = true
+      if sig > 0 then shexec.set_handler(sig, 1) end
+    else
+      shst.traps[sig] = string.copy(action)
+      shst.trap_set[sig] = true
+      if sig > 0 then shexec.set_handler(sig, 2) end
+    end
+    i = i + 1
+  end
+  return rc
+end
+
+local function bi_unset(args: sequence(string)): integer
+  local funcs = false
+  local i: integer = 2
+  while i <= #args and args[i].size >= 2 and args[i]:byte(1) == #[B'-']# do
+    local a = args[i]
+    if a == '-f' then funcs = true
+    elseif a == '-v' then funcs = false
+    elseif a == '--' then i = i + 1; break
+    else return sberr('unset: Illegal option ' .. a) end
+    i = i + 1
+  end
+  local rc: integer = 0
+  while i <= #args do
+    local name = args[i]
+    if funcs then
+      if shst.funcs:has(name) then shst.funcs:remove(name) end
+    else
+      if not N.is_name(name) then return sberr('unset: ' .. name .. ': bad variable name') end
+      if not shexec.unsetvar(name) then return sberr('unset: ' .. name .. ': is read only') end
+    end
+    i = i + 1
+  end
+  return rc
+end
+
+----------------------------------------------------------------------
+-- set
+----------------------------------------------------------------------
+
+local OptName = @record{ name: string, letter: byte }
+local OPTNAMES: []OptName = {
+  {'allexport', #[B'a']#}, {'notify', #[B'b']#}, {'noclobber', #[B'C']#}, {'errexit', #[B'e']#},
+  {'noglob', #[B'f']#}, {'hashall', #[B'h']#}, {'noexec', #[B'n']#}, {'nounset', #[B'u']#},
+  {'verbose', #[B'v']#}, {'xtrace', #[B'x']#}, {'ignoreeof', 0}, {'nolog', 0},
+}
+
+local function opt_get(letter: byte): boolean
+  if letter == #[B'a']# then return shst.o_allexport
+  elseif letter == #[B'b']# then return shst.o_notify
+  elseif letter == #[B'C']# then return shst.o_noclobber
+  elseif letter == #[B'e']# then return shst.o_errexit
+  elseif letter == #[B'f']# then return shst.o_noglob
+  elseif letter == #[B'h']# then return shst.o_hashall
+  elseif letter == #[B'n']# then return shst.o_noexec
+  elseif letter == #[B'u']# then return shst.o_nounset
+  elseif letter == #[B'v']# then return shst.o_verbose
+  elseif letter == #[B'x']# then return shst.o_xtrace end
+  return false
+end
+
+-- Apply one option letter; returns false when the letter is unknown.
+function shbi.set_option(letter: byte, on: boolean): boolean
+  if letter == #[B'a']# then shst.o_allexport = on
+  elseif letter == #[B'b']# then shst.o_notify = on
+  elseif letter == #[B'C']# then shst.o_noclobber = on
+  elseif letter == #[B'e']# then shst.o_errexit = on
+  elseif letter == #[B'f']# then shst.o_noglob = on; shexp.noglob = on
+  elseif letter == #[B'h']# then shst.o_hashall = on
+  elseif letter == #[B'n']# then shst.o_noexec = on
+  elseif letter == #[B'u']# then shst.o_nounset = on; shexp.nounset = on
+  elseif letter == #[B'v']# then shst.o_verbose = on; shlex.verbose = on
+  elseif letter == #[B'x']# then shst.o_xtrace = on
+  else return false end
+  return true
+end
+
+-- -o name / +o name; returns an error message or "".
+function shbi.set_option_name(name: string, on: boolean): string
+  if name == 'monitor' or name == 'vi' or name == 'emacs' then
+    return name .. ': option not supported (no job control or line editing)'
+  end
+  for i: integer = 0, < #OPTNAMES do
+    if OPTNAMES[i].name == name then
+      if OPTNAMES[i].letter ~= 0 then shbi.set_option(OPTNAMES[i].letter, on) end
+      return ''
+    end
+  end
+  return 'Illegal option -o ' .. name
+end
+
+local function print_options(as_commands: boolean)
+  if not as_commands then util.line('Current option settings') end
+  for i: integer = 0, < #OPTNAMES do
+    local o = OPTNAMES[i]
+    local on = o.letter ~= 0 and opt_get(o.letter) or false
+    if as_commands then
+      util.line('set ' .. (on and '-o ' or '+o ') .. o.name)
+    else
+      local pad: string = ''
+      for _ = (@integer)(o.name.size), 15 do pad = pad .. ' ' end
+      util.line(o.name .. pad .. (on and 'on' or 'off'))
+    end
+  end
+end
+
+-- Parse set/sh option arguments starting at args[i]; returns (next index,
+-- error message, saw_dashdash). `allow_c` admits -c/-s/-i for the applet.
+function shbi.parse_options(args: sequence(string), i: integer, printing_ok: boolean): (integer, string)
+  while i <= #args do
+    local a = args[i]
+    if a == '--' then
+      return i + 1, ''
+    end
+    if a.size < 2 or (a:byte(1) ~= #[B'-']# and a:byte(1) ~= #[B'+']#) then break end
+    if a == '-' then return i + 1, '' end
+    local on = a:byte(1) == #[B'-']#
+    local j: usize = 2
+    while j <= a.size do
+      local c = a:byte(j)
+      if c == #[B'o']# then
+        if j < a.size then return i, 'set: Illegal option ' .. a end
+        if i + 1 > #args then
+          if printing_ok then print_options(not on); return i + 1, '' end
+          return i, 'set: Illegal option -o'
+        end
+        local err = shbi.set_option_name(args[i + 1], on)
+        if err.size > 0 then return i, 'set: ' .. err end
+        i = i + 1
+        break
+      elseif c == #[B'm']# then
+        return i, 'set: -m: job control is not supported'
+      elseif c == #[B'i']# then
+        return i, 'set: -i: interactive mode is not supported'
+      else
+        if not shbi.set_option(c, on) then
+          return i, 'set: Illegal option ' .. (on and '-' or '+') .. string.char(c)
+        end
+      end
+      j = j + 1
+    end
+    i = i + 1
+  end
+  return i, ''
+end
+
+function bi_set(args: sequence(string)): integer
+  if #args == 1 then
+    for _, name in ipairs(sorted_var_names()) do
+      local v = shst.vars:peek(name)
+      if v.set then util.line(name .. '=' .. quote(v.value)) end
+    end
+    return 0
+  end
+  local i, err = shbi.parse_options(args, 2, true)
+  if err.size > 0 then return sberr(err) end
+  if i <= #args or (i > 2 and args[i - 1] == '--') then
+    local np: sequence(string)
+    for k = i, #args do np:push(args[k]) end
+    shst.params = np
+  end
+  return 0
+end
+
+----------------------------------------------------------------------
+-- Regular built-ins
+----------------------------------------------------------------------
+
+-- Logical path canonicalization for cd -L.
+local function canon(path: string): string
+  local comps: sequence(string)
+  local start: usize = 1
+  for i: usize = 1, path.size + 1 do
+    if i > path.size or path:byte(i) == #[B'/']# then
+      if i > start then
+        local c = path:sub(start, i - 1)
+        if c == '..' then
+          if #comps > 0 then comps:pop() end
+        elseif c ~= '.' then
+          comps:push(c)
+        end
+      end
+      start = i + 1
+    end
+  end
+  local sb: stringbuilder
+  for i = 1, #comps do sb:writebyte(#[B'/']#); sb:write(comps[i]) end
+  if #comps == 0 then sb:writebyte(#[B'/']#) end
+  return sb:promote()
+end
+
+local function getcwd_str(): string
+  local buf: [4096]cchar
+  if sys.getcwd(&buf[0], 4096) == nilptr then return '' end
+  return string.copy(sys.cstr(&buf))
+end
+
+local function bi_cd(args: sequence(string)): integer
+  local physical = false
+  local i: integer = 2
+  while i <= #args and args[i].size >= 2 and args[i]:byte(1) == #[B'-']# do
+    local a = args[i]
+    if a == '-L' then physical = false
+    elseif a == '-P' then physical = true
+    elseif a == '--' then i = i + 1; break
+    else return rberr('cd: Illegal option ' .. a) end
+    i = i + 1
+  end
+  local dir: string
+  local print_it = false
+  if i > #args then
+    local h, set = shexec.getvar('HOME')
+    if not set or h.size == 0 then return rberr('cd: HOME not set') end
+    dir = h
+  else
+    dir = args[i]
+    if dir == '-' then
+      local o, set = shexec.getvar('OLDPWD')
+      if not set then return rberr('cd: OLDPWD not set') end
+      dir = o
+      print_it = true
+    end
+  end
+  local pwd, _ = shexec.getvar('PWD')
+  local curpath = dir
+  -- CDPATH search
+  if dir.size > 0 and dir:byte(1) ~= #[B'/']# and dir ~= '.' and dir ~= '..'
+    and not (dir.size >= 2 and dir:sub(1, 2) == './') and not (dir.size >= 3 and dir:sub(1, 3) == '../') then
+    local cdpath, set = shexec.getvar('CDPATH')
+    if set then
+      local start: usize = 1
+      local found = false
+      for k: usize = 1, cdpath.size + 1 do
+        if k > cdpath.size or cdpath:byte(k) == #[B':']# then
+          local entry = k > start and cdpath:sub(start, k - 1) or '.'
+          local cand = util.join(entry, dir)
+          if util.isdir(cand) then
+            curpath = cand
+            if entry ~= '.' then print_it = true end
+            found = true
+            break
+          end
+          start = k + 1
+        end
+      end
+      if not found then curpath = dir end
+    end
+  end
+  local newpwd: string
+  if physical then
+    if sys.chdir(curpath) ~= 0 then return rberr("cd: can't cd to " .. dir) end
+    newpwd = getcwd_str()
+  else
+    if curpath:byte(1) ~= #[B'/']# then curpath = util.join(pwd, curpath) end
+    newpwd = canon(curpath)
+    if sys.chdir(newpwd) ~= 0 then return rberr("cd: can't cd to " .. dir) end
+  end
+  shexec.setvar('OLDPWD', pwd)
+  shexec.setvar('PWD', newpwd)
+  if print_it then util.line(newpwd) end
+  return 0
+end
+
+local function bi_pwd(args: sequence(string)): integer
+  local physical = false
+  for i = 2, #args do
+    if args[i] == '-P' then physical = true
+    elseif args[i] == '-L' then physical = false
+    elseif args[i] == '--' then
+    else return rberr('pwd: Illegal option ' .. args[i]) end
+  end
+  if not physical then
+    local pwd, set = shexec.getvar('PWD')
+    if set and pwd.size > 0 and pwd:byte(1) == #[B'/']# then util.line(pwd); return 0 end
+  end
+  util.line(getcwd_str())
+  return 0
+end
+
+local function read_ws(sep: string, c: byte): boolean
+  return (c == 32 or c == 9 or c == 10) and shexp.has_byte(sep, c)
+end
+local function read_sep(sep: string, c: byte): boolean
+  return shexp.has_byte(sep, c)
+end
+local function index_of(s: string, c: byte): isize
+  for i: usize = 0, < s.size do
+    if s.data[i] == c then return (@isize)(i) + 1 end
+  end
+  return 0
+end
+
+-- read [-r] [name...]
+local function bi_read(args: sequence(string)): integer
+  local raw = false
+  local i: integer = 2
+  while i <= #args and args[i].size >= 2 and args[i]:byte(1) == #[B'-']# do
+    if args[i] == '-r' then raw = true
+    elseif args[i] == '--' then i = i + 1; break
+    else return rberr('read: Illegal option ' .. args[i]) end
+    i = i + 1
+  end
+  local names: sequence(string)
+  while i <= #args do
+    if not N.is_name(args[i]) then return rberr('read: ' .. args[i] .. ': bad variable name') end
+    names:push(args[i]); i = i + 1
+  end
+  if #names == 0 then names:push('REPLY') end
+  util.flush()
+  -- read one line, byte by byte so the input position is left after it
+  local line: stringbuilder
+  local escaped: sequence(boolean)
+  local eof = false
+  local backslash = false
+  while true do
+    local c: byte
+    local r = sys.read(0, &c, 1)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then
+        if shst.got_signal then shexec.run_traps() end
+        continue
+      end
+      eof = true
+      break
+    end
+    if r == 0 then eof = true; break end
+    if backslash then
+      backslash = false
+      if c == 10 then continue end
+      line:writebyte(c); escaped:push(true)
+      continue
+    end
+    if c == 10 then break end
+    if c == 92 and not raw then backslash = true; continue end
+    line:writebyte(c); escaped:push(false)
+  end
+  local text = line:view()
+  local sep, set = shexec.getvar('IFS')
+  if not set then sep = ' \t\n' end
+  local n = (@integer)(text.size)
+  local pos: integer = 0
+  -- skip leading IFS whitespace
+  while pos < n and not escaped[pos + 1] and read_ws(sep, text.data[pos]) do pos = pos + 1 end
+  for vi = 1, #names do
+    local last = vi == #names
+    local sb: stringbuilder
+    if last then
+      -- the rest of the line, trailing IFS whitespace removed
+      local stop = n
+      while stop > pos and not escaped[stop] and read_ws(sep, text.data[stop - 1]) do stop = stop - 1 end
+      for k = pos, < stop do sb:writebyte(text.data[k]) end
+      pos = n
+    else
+      while pos < n and (escaped[pos + 1] or not read_sep(sep, text.data[pos])) do
+        sb:writebyte(text.data[pos]); pos = pos + 1
+      end
+      -- delimiter: IFS whitespace run, optionally one non-whitespace separator, more whitespace
+      while pos < n and not escaped[pos + 1] and read_ws(sep, text.data[pos]) do pos = pos + 1 end
+      if pos < n and not escaped[pos + 1] and read_sep(sep, text.data[pos]) and not read_ws(sep, text.data[pos]) then
+        pos = pos + 1
+        while pos < n and not escaped[pos + 1] and read_ws(sep, text.data[pos]) do pos = pos + 1 end
+      end
+    end
+    shexec.setvar(names[vi], sb:promote())
+  end
+  if eof then return 1 end
+  return 0
+end
+
+local function finish(ind: integer, pos: integer)
+  shexec.setvar('OPTIND', string.format('%d', ind))
+  shst.optind_seen = ind
+  shst.optpos = pos
+end
+
+local function bi_getopts(args: sequence(string)): integer
+  if #args < 3 then return rberr('getopts: Usage: getopts optstring var [arg...]') end
+  local optstring = args[2]
+  local name = args[3]
+  if not N.is_name(name) then return rberr('getopts: ' .. name .. ': bad variable name') end
+  local opargs: sequence(string)
+  if #args > 3 then
+    for i = 4, #args do opargs:push(args[i]) end
+  else
+    opargs = shst.params
+  end
+  local oi, _ = shexec.getvar('OPTIND')
+  local optind, ok = util.toint(oi)
+  if not ok or optind < 1 then optind = 1 end
+  if optind ~= shst.optind_seen then shst.optpos = 0 end
+  local silent = optstring.size > 0 and optstring:byte(1) == #[B':']#
+  if optind > #opargs then
+    shexec.setvar(name, '?')
+    finish(optind, 0)
+    return 1
+  end
+  local cur = opargs[optind]
+  if shst.optpos == 0 then
+    if cur == '--' then
+      shexec.setvar(name, '?')
+      finish(optind + 1, 0)
+      return 1
+    end
+    if cur.size < 2 or cur:byte(1) ~= #[B'-']# then
+      shexec.setvar(name, '?')
+      finish(optind, 0)
+      return 1
+    end
+    shst.optpos = 1
+  end
+  local pos = shst.optpos + 1
+  local c = cur:byte(pos)
+  pos = pos + 1
+  local found = index_of(optstring, c)
+  local takes = found > 0 and found < (@isize)(optstring.size) and optstring:byte(found + 1) == #[B':']#
+  if found <= 0 or c == #[B':']# then
+    shexec.setvar(name, '?')
+    if silent then
+      shexec.setvar('OPTARG', string.char(c))
+    else
+      shexec.unsetvar('OPTARG')
+      shexec.errplain('Illegal option -' .. string.char(c))
+    end
+    if pos > (@integer)(cur.size) then finish(optind + 1, 0) else finish(optind, pos - 1) end
+    return 0
+  end
+  if takes then
+    if pos <= (@integer)(cur.size) then
+      shexec.setvar('OPTARG', cur:sub(pos))
+      shexec.setvar(name, string.char(c))
+      finish(optind + 1, 0)
+      return 0
+    end
+    if optind + 1 > #opargs then
+      if silent then
+        shexec.setvar(name, ':')
+        shexec.setvar('OPTARG', string.char(c))
+      else
+        shexec.setvar(name, '?')
+        shexec.unsetvar('OPTARG')
+        shexec.errplain('No arg for -' .. string.char(c) .. ' option')
+      end
+      finish(optind + 1, 0)
+      return 0
+    end
+    shexec.setvar('OPTARG', opargs[optind + 1])
+    shexec.setvar(name, string.char(c))
+    finish(optind + 2, 0)
+    return 0
+  end
+  shexec.setvar(name, string.char(c))
+  shexec.unsetvar('OPTARG')
+  if pos > (@integer)(cur.size) then finish(optind + 1, 0) else finish(optind, pos - 1) end
+  return 0
+end
+
+local function bi_hash(args: sequence(string)): integer
+  local i: integer = 2
+  if i <= #args and args[i] == '-r' then
+    shst.cmd_hash:clear()
+    i = i + 1
+  end
+  if i > #args then
+    if #args == 1 then
+      local names: sequence(string)
+      for k, v in pairs(shst.cmd_hash) do names:push(k) end
+      util.sort(names, name_less)
+      for _, k in ipairs(names) do util.line(shst.cmd_hash[k]) end
+    end
+    return 0
+  end
+  local rc: integer = 0
+  while i <= #args do
+    local name = args[i]
+    local bidx, _ = shexec.builtin_lookup(name)
+    if bidx == 0 and not shst.funcs:has(name) then
+      local path, _ = shexec.find_command(name, shexec.search_path(), true)
+      if path.size == 0 then
+        shexec.errmsg('hash: ' .. name .. ': not found')
+        rc = 1
+      end
+    end
+    i = i + 1
+  end
+  return rc
+end
+
+local function bi_kill(args: sequence(string)): integer
+  local sig: integer = 15
+  local i: integer = 2
+  if #args < 2 then return rberr('kill: Usage: kill [-s sigspec | -signum | -sigspec] pid... or kill -l [exitstatus]') end
+  if args[2] == '-l' then
+    if #args == 2 then
+      for s: integer = 1, 31 do util.line(shexec.signame(s)) end
+      return 0
+    end
+    local rc: integer = 0
+    for k = 3, #args do
+      local v, ok = util.toint(args[k])
+      if ok and v > 128 then v = v - 128 end
+      local n = ok and shexec.signame(v) or ''
+      if n.size == 0 then shexec.errmsg('kill: ' .. args[k] .. ': invalid signal number'); rc = 1
+      else util.line(n) end
+    end
+    return rc
+  end
+  if args[2] == '-s' then
+    if #args < 3 then return rberr('kill: -s requires an argument') end
+    sig = shexec.signum(args[3])
+    if sig < 0 then return rberr('kill: invalid signal number or name: ' .. args[3]) end
+    i = 4
+  elseif args[2].size > 1 and args[2]:byte(1) == #[B'-']# and args[2] ~= '--' then
+    sig = shexec.signum(args[2]:sub(2))
+    if sig < 0 then return rberr('kill: invalid signal number or name: ' .. args[2]:sub(2)) end
+    i = 3
+  end
+  if i <= #args and args[i] == '--' then i = i + 1 end
+  if i > #args then return rberr('kill: Usage: kill [-s sigspec | -signum | -sigspec] pid...') end
+  local rc: integer = 0
+  while i <= #args do
+    if args[i].size > 0 and args[i]:byte(1) == #[B'%']# then
+      shexec.errmsg('kill: ' .. args[i] .. ': job control is not supported')
+      rc = 2
+    else
+      local pid, ok = util.toint(args[i])
+      if not ok then
+        shexec.errmsg('kill: Illegal number: ' .. args[i])
+        rc = 2
+      elseif sys.kill((@cint)(pid), (@cint)(sig)) ~= 0 then
+        shexec.errmsg('kill: ' .. sys.errstr())
+        rc = 1
+      end
+    end
+    i = i + 1
+  end
+  if shst.got_signal then shexec.run_traps() end
+  return rc
+end
+
+local function mode_symbolic(perm: integer): string
+  local sb: stringbuilder
+  local who: string = 'ugo'
+  for i: integer = 0, 2 do
+    if i > 0 then sb:writebyte(#[B',']#) end
+    sb:writebyte(who:byte(i + 1))
+    sb:writebyte(#[B'=']#)
+    local bits = (perm >> (@integer)(6 - 3 * i)) & 7
+    if bits & 4 ~= 0 then sb:writebyte(#[B'r']#) end
+    if bits & 2 ~= 0 then sb:writebyte(#[B'w']#) end
+    if bits & 1 ~= 0 then sb:writebyte(#[B'x']#) end
+  end
+  return sb:promote()
+end
+
+local function bi_umask(args: sequence(string)): integer
+  local symbolic = false
+  local i: integer = 2
+  while i <= #args and args[i].size >= 2 and args[i]:byte(1) == #[B'-']# do
+    if args[i] == '-S' then symbolic = true
+    elseif args[i] == '--' then i = i + 1; break
+    else return rberr('umask: Illegal option ' .. args[i]) end
+    i = i + 1
+  end
+  local cur = (@integer)(sys.umask(0))
+  sys.umask((@cuint)(cur))
+  if i > #args then
+    if symbolic then util.line(mode_symbolic(0x1FF & ~cur))
+    else util.line(string.format('%04o', cur)) end
+    return 0
+  end
+  local m = args[i]
+  local octal = true
+  for k: usize = 1, m.size do
+    if m:byte(k) < 48 or m:byte(k) > 55 then octal = false end
+  end
+  if octal and m.size > 0 then
+    local v: integer = 0
+    for k: usize = 1, m.size do v = v * 8 + (m:byte(k) - 48) end
+    sys.umask((@cuint)(v & 0x1FF))
+    return 0
+  end
+  -- symbolic: [who][op][perm](,...)
+  local perm = 0x1FF & ~cur
+  local pos: usize = 1
+  while pos <= m.size do
+    local whomask: integer = 0
+    while pos <= m.size do
+      local c = m:byte(pos)
+      if c == #[B'u']# then whomask = whomask | 0x1C0
+      elseif c == #[B'g']# then whomask = whomask | 0x38
+      elseif c == #[B'o']# then whomask = whomask | 7
+      elseif c == #[B'a']# then whomask = whomask | 0x1FF
+      else break end
+      pos = pos + 1
+    end
+    if whomask == 0 then whomask = 0x1FF end
+    if pos > m.size then return rberr('umask: Illegal mode: ' .. m) end
+    local op = m:byte(pos)
+    if op ~= #[B'+']# and op ~= #[B'-']# and op ~= #[B'=']# then return rberr('umask: Illegal mode: ' .. m) end
+    pos = pos + 1
+    local bits: integer = 0
+    while pos <= m.size and m:byte(pos) ~= #[B',']# do
+      local c = m:byte(pos)
+      if c == #[B'r']# then bits = bits | 0x124
+      elseif c == #[B'w']# then bits = bits | 0x92
+      elseif c == #[B'x']# then bits = bits | 0x49
+      elseif c == #[B'X']# or c == #[B's']# or c == #[B't']# then
+      else return rberr('umask: Illegal mode: ' .. m) end
+      pos = pos + 1
+    end
+    bits = bits & whomask
+    if op == #[B'+']# then perm = perm | bits
+    elseif op == #[B'-']# then perm = perm & ~bits
+    else perm = (perm & ~whomask) | bits end
+    if pos <= m.size then pos = pos + 1 end
+  end
+  sys.umask((@cuint)(0x1FF & ~perm))
+  return 0
+end
+
+local function bi_alias(args: sequence(string)): integer
+  if #args == 1 then
+    local names: sequence(string)
+    for k, v in pairs(shlex.aliases) do names:push(k) end
+    util.sort(names, name_less)
+    for _, k in ipairs(names) do util.line(k .. '=' .. quote(shlex.aliases[k])) end
+    return 0
+  end
+  local rc: integer = 0
+  for i = 2, #args do
+    local a = args[i]
+    local eq = a:find('=', 1, true)
+    if eq > 0 then
+      shlex.aliases[string.copy(a:sub(1, eq - 1))] = string.copy(a:sub(eq + 1))
+    else
+      local p = shlex.aliases:peek(a)
+      if p == nilptr then
+        shexec.errplain('alias: ' .. a .. ' not found')
+        rc = 1
+      else
+        util.line(a .. '=' .. quote($p))
+      end
+    end
+  end
+  return rc
+end
+
+local function bi_unalias(args: sequence(string)): integer
+  if #args >= 2 and args[2] == '-a' then
+    shlex.aliases:clear()
+    return 0
+  end
+  local rc: integer = 0
+  for i = 2, #args do
+    if shlex.aliases:has(args[i]) then shlex.aliases:remove(args[i])
+    else
+      shexec.errplain('unalias: ' .. args[i] .. ' not found')
+      rc = 1
+    end
+  end
+  return rc
+end
+
+local function pending_signal(): integer
+  for sig: integer = 1, 64 do
+    if shst.pending[sig] then return sig end
+  end
+  return 0
+end
+
+local function bi_wait(args: sequence(string)): integer
+  if #args == 1 then
+    for i = 1, #shst.jobs do
+      local j = &shst.jobs[i]
+      if not j.done then
+        local st = shexec.wait_pid(j.pid, true)
+        if st < 0 then
+          local sig = pending_signal()
+          shexec.run_traps()
+          return 128 + sig
+        end
+        j.status = st
+        j.done = true
+      end
+    end
+    return 0
+  end
+  local rc: integer = 0
+  for i = 2, #args do
+    local pid, ok = util.toint(args[i])
+    if not ok then return rberr('wait: Illegal number: ' .. args[i]) end
+    rc = 127
+    for k = 1, #shst.jobs do
+      local j = &shst.jobs[k]
+      if j.pid == pid then
+        if not j.done then
+          local st = shexec.wait_pid(j.pid, true)
+          if st < 0 then
+            local sig = pending_signal()
+            shexec.run_traps()
+            return 128 + sig
+          end
+          j.status = st
+          j.done = true
+        end
+        rc = j.status
+        break
+      end
+    end
+  end
+  return rc
+end
+
+-- echo as XSI echo: -n only as the first operand, escapes always interpreted.
+local function bi_echo(args: sequence(string)): integer
+  local i: integer = 2
+  local newline = true
+  if i <= #args and args[i] == '-n' then newline = false; i = i + 1 end
+  local stop = false
+  while i <= #args and not stop do
+    if i > 2 and not (i == 3 and not newline) then util.writebyte(32) end
+    local s = args[i]
+    local k: usize = 1
+    while k <= s.size do
+      local c = s:byte(k)
+      if c == 92 and k < s.size then
+        k = k + 1
+        local e = s:byte(k)
+        if e == #[B'a']# then util.writebyte(7)
+        elseif e == #[B'b']# then util.writebyte(8)
+        elseif e == #[B'c']# then stop = true; break
+        elseif e == #[B'f']# then util.writebyte(12)
+        elseif e == #[B'n']# then util.writebyte(10)
+        elseif e == #[B'r']# then util.writebyte(13)
+        elseif e == #[B't']# then util.writebyte(9)
+        elseif e == #[B'v']# then util.writebyte(11)
+        elseif e == 92 then util.writebyte(92)
+        elseif e == #[B'0']# then
+          local v: integer = 0
+          local digits: integer = 0
+          while digits < 3 and k < s.size and s:byte(k + 1) >= 48 and s:byte(k + 1) <= 55 do
+            k = k + 1
+            v = v * 8 + (s:byte(k) - 48)
+            digits = digits + 1
+          end
+          util.writebyte((@byte)(v & 0xFF))
+        else
+          util.writebyte(92); util.writebyte(e)
+        end
+      else
+        util.writebyte(c)
+      end
+      k = k + 1
+    end
+    i = i + 1
+  end
+  if newline and not stop then util.writebyte(10) end
+  return 0
+end
+
+local function rest_args(args: sequence(string)): sequence(string)
+  local out: sequence(string)
+  for i = 2, #args do out:push(args[i]) end
+  return out
+end
+
+local function bi_printf(args: sequence(string)): integer
+  local saved = util.applet
+  util.applet = 'printf'
+  local rc = applet_printf(rest_args(args))
+  util.applet = saved
+  return rc
+end
+
+local function bi_test(args: sequence(string)): integer
+  local saved = util.applet
+  util.applet = args[1]
+  local rc = applet_test(rest_args(args))
+  util.applet = saved
+  return rc
+end
+
+local function bi_unsupported(args: sequence(string)): integer
+  local what = 'job control'
+  if args[1] == 'local' then what = 'the local builtin (not POSIX)'
+  elseif args[1] == 'ulimit' then what = 'ulimit (not POSIX)' end
+  shexec.errmsg(args[1] .. ': ' .. what .. ' is not supported')
+  return 2
+end
+
+-- type / command -v / command -V
+local function describe(name: string, verbose: boolean, path_only: boolean, pathstr: string): boolean
+  local alias = shlex.aliases:peek(name)
+  if alias ~= nilptr then
+    if verbose then util.line(name .. ' is an alias for ' .. $alias)
+    else util.line('alias ' .. name .. '=' .. quote($alias)) end
+    return true
+  end
+  if shlex.is_reserved(name) then
+    if verbose then util.line(name .. ' is a shell keyword') else util.line(name) end
+    return true
+  end
+  if shst.funcs:has(name) then
+    if verbose then util.line(name .. ' is a shell function') else util.line(name) end
+    return true
+  end
+  local bidx, special = shexec.builtin_lookup(name)
+  if bidx > 0 then
+    if verbose then
+      util.line(name .. ' is a ' .. (special and 'special shell builtin' or 'shell builtin'))
+    else
+      util.line(name)
+    end
+    return true
+  end
+  local path, _ = shexec.find_command(name, pathstr, false)
+  if path.size == 0 or (name:find('/', 1, true) > 0 and sys.access(path, sys.X_OK) ~= 0) then
+    return false
+  end
+  if verbose then util.line(name .. ' is ' .. path) else util.line(path) end
+  return true
+end
+
+local function bi_type(args: sequence(string)): integer
+  local rc: integer = 0
+  for i = 2, #args do
+    if not describe(args[i], true, false, shexec.search_path()) then
+      util.line(args[i] .. ': not found')
+      rc = 127
+    end
+  end
+  return rc
+end
+
+local function bi_command(args: sequence(string)): integer
+  local i: integer = 2
+  local mode: byte = 0   -- 'v' or 'V'
+  local pathstr = shexec.search_path()
+  while i <= #args and args[i].size >= 2 and args[i]:byte(1) == #[B'-']# do
+    local a = args[i]
+    if a == '-p' then pathstr = DEFPATH
+    elseif a == '-v' then mode = #[B'v']#
+    elseif a == '-V' then mode = #[B'V']#
+    elseif a == '-pv' or a == '-vp' then pathstr = DEFPATH; mode = #[B'v']#
+    elseif a == '-pV' or a == '-Vp' then pathstr = DEFPATH; mode = #[B'V']#
+    elseif a == '--' then i = i + 1; break
+    else return rberr('command: Illegal option ' .. a) end
+    i = i + 1
+  end
+  if i > #args then return 0 end
+  if mode ~= 0 then
+    local rc: integer = 0
+    while i <= #args do
+      if not describe(args[i], mode == #[B'V']#, true, pathstr) then
+        if mode == #[B'V']# then util.line(args[i] .. ': not found') end
+        rc = 127
+      end
+      i = i + 1
+    end
+    return rc
+  end
+  local rest: sequence(string)
+  for k = i, #args do rest:push(args[k]) end
+  local bidx, special = shexec.builtin_lookup(rest[1])
+  if bidx > 0 then
+    local saved = command_wrapped
+    command_wrapped = true
+    local rc = shexec.builtin_call(bidx, rest)
+    command_wrapped = saved
+    return rc
+  end
+  local pid = shexec.fork_child()
+  if pid < 0 then return rberr('command: cannot fork: ' .. sys.errstr()) end
+  if pid == 0 then
+    local none: sequence(string)
+    shexec.exec_external(rest, none, pathstr)
+  end
+  return shexec.wait_pid(pid, false)
+end
+
+----------------------------------------------------------------------
+-- Table
+----------------------------------------------------------------------
+
+local Builtin = @record{ name: string, fn: function(sequence(string)): integer, special: boolean }
+
+local BUILTINS: []Builtin = {
+  {':', bi_colon, true}, {'.', bi_dot, true}, {'break', bi_break, true}, {'continue', bi_break, true},
+  {'eval', bi_eval, true}, {'exec', bi_exec, true}, {'exit', bi_exit, true}, {'export', bi_export, true},
+  {'readonly', bi_export, true}, {'return', bi_return, true}, {'set', bi_set, true}, {'shift', bi_shift, true},
+  {'times', bi_times, true}, {'trap', bi_trap, true}, {'unset', bi_unset, true},
+  {'alias', bi_alias, false}, {'cd', bi_cd, false}, {'command', bi_command, false}, {'echo', bi_echo, false},
+  {'false', bi_false, false}, {'getopts', bi_getopts, false}, {'hash', bi_hash, false}, {'kill', bi_kill, false},
+  {'printf', bi_printf, false}, {'pwd', bi_pwd, false}, {'read', bi_read, false}, {'test', bi_test, false},
+  {'[', bi_test, false}, {'true', bi_true, false}, {'type', bi_type, false}, {'umask', bi_umask, false},
+  {'unalias', bi_unalias, false}, {'wait', bi_wait, false},
+  {'bg', bi_unsupported, false}, {'fg', bi_unsupported, false}, {'jobs', bi_unsupported, false},
+  {'local', bi_unsupported, false}, {'ulimit', bi_unsupported, false},
+}
+
+local function lookup(name: string): (integer, boolean)
+  for i: integer = 0, < #BUILTINS do
+    if BUILTINS[i].name == name then return i + 1, BUILTINS[i].special end
+  end
+  return 0, false
+end
+
+local function call(idx: integer, args: sequence(string)): integer
+  return BUILTINS[idx - 1].fn(args)
+end
+
+function shbi.init()
+  shexec.builtin_lookup = lookup
+  shexec.builtin_call = call
+end
