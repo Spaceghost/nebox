@@ -38,9 +38,14 @@ run_in() { # dir path-prefix command
   (cd "$1" && LC_ALL=C PATH="$2$PATH" timeout 20 sh -c "$3" 2>"$1.err"; echo "exit=$?") > "$1.out"
 }
 
+# Reference implementations that are not the host's default go in $W/refbin
+# (tests/awk.sh puts a `gawk --posix` wrapper there); REFPATH prefixes the
+# reference run's PATH.
+REFPATH=""
+
 same() { # name command
   name=$1; cmd=$2
-  run_in "$W/ref" "" "$cmd"
+  run_in "$W/ref" "$REFPATH" "$cmd"
   run_in "$W/got" "$W/bin:" "$cmd"
   if cmp -s "$W/ref.out" "$W/got.out" && [ "$(snapshot "$W/ref")" = "$(snapshot "$W/got")" ]; then
     pass=$((pass+1))
@@ -749,8 +754,10 @@ same diff-N 'diff -N nosuch words.txt | head -1; echo $?'
 same diff-dir 'cp words.txt sub/; diff words.txt sub; echo $?'
 same diff-long 'seq 1000 > a; seq 1000 | sed "500s/.*/X/;700d;900a Y" > b; diff a b'
 same diff-all-diff 'seq 3 > a; seq 4 6 > b; diff a b'
+# awk
+. "$(dirname -- "$0")/awk.sh"
 # dispatch
-expect list-count '85
+expect list-count '86
 exit=0' "$BIN --list | wc -l"
 
 echo "nebox tests: $pass passed, $fail failed"
