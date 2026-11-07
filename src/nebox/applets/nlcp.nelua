@@ -1,0 +1,596 @@
+-- nl, comm, paste: ports of GNU coreutils 9.1 nl.c, comm.c and paste.c in
+-- the C locale.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+require 'allocators.default'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail(prog: string, msg: string): integer
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try '" .. prog .. " --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  return 1
+end
+
+-- A buffered reader with getc and GNU readlinebuffer_delim.
+local Reader = @record{fd: cint, buf: [65536]byte, pos: integer, len: integer, eof: boolean, err: cint}
+
+local function rgetc(r: *Reader): integer
+  if r.pos >= r.len then
+    if r.eof then return -1 end
+    local n: clong
+    repeat n = sys.read(r.fd, &r.buf[0], #r.buf) until not (n < 0 and sys.errno() == sys.EINTR)
+    if n <= 0 then
+      if n < 0 then r.err = sys.errno() end
+      r.eof = true
+      return -1
+    end
+    r.pos = 0; r.len = n
+  end
+  local c = r.buf[r.pos]
+  r.pos = r.pos + 1
+  return c
+end
+
+-- The line with its delimiter (supplied at EOF); false at end of input.
+local function readline(r: *Reader, line: *sequence(byte), delim: byte): boolean
+  line:clear()
+  while true do
+    local c = rgetc(r)
+    if c == -1 then break end
+    line:push((@byte)(c))
+    if c == delim then return true end
+  end
+  if #$line == 0 then return false end
+  line:push(delim)
+  return true
+end
+
+-- xdectoimax(s, lo, hi, "", msg, 0)
+local function dectoimax(s: string, lo: int64, hi: int64, msg: string): int64
+  local p = 1
+  while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
+  local neg = false
+  if p <= #s and (s:byte(p) == 45 or s:byte(p) == 43) then neg = s:byte(p) == 45; p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while p <= #s and s:byte(p) >= 48 and s:byte(p) <= 57 do
+    local d: uint64 = s:byte(p) - 48
+    if v > (0xffffffffffffffff - d) // 10 then ovf = true elseif not ovf then v = v * 10 + d end
+    p = p + 1
+  end
+  if p == start or p <= #s then die(msg .. ': ' .. util.quote(s)) end
+  local limit: uint64 = neg and 0x8000000000000000 or 0x7fffffffffffffff
+  if ovf or v > limit then die(msg .. ': ' .. util.quote(s) .. ': Value too large for defined data type') end
+  local r: int64 = neg and -(@int64)(v) or (@int64)(v)
+  if v == 0x8000000000000000 and neg then r = (@int64)(0x8000000000000000) end
+  if r < lo or r > hi then die(msg .. ': ' .. util.quote(s) .. ': Numerical result out of range') end
+  return r
+end
+
+-- nl -------------------------------------------------------------------------
+local NlType = @record{kind: byte, prog: regex.Prog}
+
+local function nl_build_type(t: *NlType, arg: string): boolean
+  local c: byte = #arg > 0 and arg:byte(1) or 0
+  if c == 97 or c == 116 or c == 110 then t.kind = c; return true end
+  if c == 112 then
+    local pat = arg:sub(2)
+    local prog, err = regex.compile(pat, false, false)
+    if #err > 0 then
+      -- glibc's re_compile_pattern says REG_BADPAT when the pattern ends
+      -- right after the '[' (or "[^") that opens a bracket expression
+      if err:find('Unmatched [', 1, true) == 1
+         and (pat:sub(#pat) == '[' or (#pat >= 2 and pat:sub(#pat - 1) == '[^')) then
+        err = 'Invalid regular expression'
+      end
+      die(err)
+    end
+    t.kind = 112
+    t.prog = prog
+    return true
+  end
+  return false
+end
+
+local NlState = @record{line_no: int64, overflow: boolean, incr: int64, width: int64, fmt: integer, separator: string}
+
+local function nl_print_lineno(st: *NlState)
+  if st.overflow then die('line number overflow') end
+  local num = tostring(st.line_no)
+  if st.fmt == 1 then
+    util.write(num)
+    for _ = #num + 1, st.width do util.writebyte(32) end
+  elseif st.fmt == 2 then
+    local neg = st.line_no < 0
+    local digits = neg and num:sub(2) or num
+    if neg then util.writebyte(45) end
+    for _ = #digits + (neg and 1 or 0) + 1, st.width do util.writebyte(48) end
+    util.write(digits)
+  else
+    for _ = #num + 1, st.width do util.writebyte(32) end
+    util.write(num)
+  end
+  util.write(st.separator)
+  local nv = st.line_no + st.incr
+  if (st.incr > 0 and nv < st.line_no) or (st.incr < 0 and nv > st.line_no) then st.overflow = true end
+  st.line_no = nv
+end
+
+global function applet_nl(args: sequence(string)): integer
+  local body: NlType = {kind = 116}
+  local header: NlType = {kind = 110}
+  local footer: NlType = {kind = 110}
+  local starting: int64 = 1
+  local incr: int64 = 1
+  local reset_numbers = true
+  local blank_join: int64 = 1
+  local separator = '\t'
+  local width: int64 = 6
+  local fmt = 0   -- 0 rn, 1 ln, 2 rz
+  local section_del = '\\:'
+  local ok = true
+  local longs: []util.LongOpt = {
+    {'header-numbering', 1, 104}, {'body-numbering', 1, 98}, {'footer-numbering', 1, 102},
+    {'starting-line-number', 1, 118}, {'line-increment', 1, 105}, {'no-renumber', 0, 112},
+    {'join-blank-lines', 1, 108}, {'number-separator', 1, 115}, {'number-width', 1, 119},
+    {'number-format', 1, 110}, {'section-delimiter', 1, 100},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'h:b:f:v:i:pl:s:w:n:d:', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then util.err(g.errmsg); ok = false
+    elseif c == util.UNSUPPORTED then util.err("option '--" .. g.longname .. "' is not supported"); ok = false
+    elseif c == 104 then
+      if not nl_build_type(&header, g.optarg) then util.err('invalid header numbering style: ' .. util.quote(g.optarg)); ok = false end
+    elseif c == 98 then
+      if not nl_build_type(&body, g.optarg) then util.err('invalid body numbering style: ' .. util.quote(g.optarg)); ok = false end
+    elseif c == 102 then
+      if not nl_build_type(&footer, g.optarg) then util.err('invalid footer numbering style: ' .. util.quote(g.optarg)); ok = false end
+    elseif c == 118 then starting = dectoimax(g.optarg, (@int64)(0x8000000000000000), 0x7fffffffffffffff, 'invalid starting line number')
+    elseif c == 105 then incr = dectoimax(g.optarg, (@int64)(0x8000000000000000), 0x7fffffffffffffff, 'invalid line number increment')
+    elseif c == 112 then reset_numbers = false
+    elseif c == 108 then blank_join = dectoimax(g.optarg, 1, 0x7fffffffffffffff, 'invalid line number of blank lines')
+    elseif c == 115 then separator = g.optarg
+    elseif c == 119 then width = dectoimax(g.optarg, 1, 0x7fffffff, 'invalid line number field width')
+    elseif c == 110 then
+      local a = g.optarg
+      if a == 'ln' then fmt = 1 elseif a == 'rn' then fmt = 0 elseif a == 'rz' then fmt = 2
+      else util.err('invalid line numbering format: ' .. util.quote(a)); ok = false end
+    elseif c == 100 then
+      local a = g.optarg
+      if #a == 1 or #a == 2 then
+        -- POSIX: GNU copies the characters over the current delimiter
+        -- string in place (the default, or an earlier -d argument); after
+        -- -d '' that write lands past the empty string, leaving no sections
+        if #section_del >= #a then section_del = a .. section_del:sub(#a + 1) end
+      else
+        section_del = a
+      end
+    end
+  end
+  if not ok then return usage_fail('nl', '') end
+  local header_del = section_del .. section_del .. section_del
+  local body_del = section_del .. section_del
+  local footer_del = section_del
+  local no_line: string
+  do
+    local sb: stringbuilder
+    for _ = 1, width + #separator do sb:writebyte(32) end
+    no_line = sb:promote()
+  end
+  local st: NlState = {line_no = starting, incr = incr, width = width, fmt = fmt, separator = separator}
+  local current = &body
+  local blank_lines: int64 = 0
+  local operands = g:operands()
+  if #operands == 0 then operands:push('-') end
+  local line: sequence(byte)
+  for _, file in ipairs(operands) do
+    local r: Reader
+    if file == '-' then r.fd = 0
+    else
+      r.fd = sys.open(file, sys.O_RDONLY, 0)
+      if r.fd < 0 then util.err(util.quotef(file) .. ': ' .. sys.errstr()); ok = false; continue end
+    end
+    while readline(&r, &line, 10) do
+      local len = #line - 1
+      local section = 3  -- text
+      if len >= 2 and #footer_del >= 2 and line[1] == section_del:byte(1) and line[2] == section_del:byte(2) then
+        local function eq(del: string): boolean
+          if len ~= #del then return false end
+          for k = 1, len do if line[k] ~= del:byte(k) then return false end end
+          return true
+        end
+        if eq(header_del) then section = 0 elseif eq(body_del) then section = 1 elseif eq(footer_del) then section = 2 end
+      end
+      if section ~= 3 then
+        if section == 0 then current = &header elseif section == 1 then current = &body else current = &footer end
+        if reset_numbers then st.line_no = starting; st.overflow = false end
+        util.writebyte(10)
+        continue
+      end
+      local k = current.kind
+      if k == 97 then
+        if blank_join > 1 then
+          if #line > 1 then nl_print_lineno(&st); blank_lines = 0
+          else
+            blank_lines = blank_lines + 1
+            if blank_lines == blank_join then nl_print_lineno(&st); blank_lines = 0
+            else util.write(no_line) end
+          end
+        else
+          nl_print_lineno(&st)
+        end
+      elseif k == 116 then
+        if #line > 1 then nl_print_lineno(&st) else util.write(no_line) end
+      elseif k == 110 then
+        util.write(no_line)
+      else
+        local text = (@string){data = &line[1], size = (@usize)(len)}
+        local caps: regex.Caps
+        if current.prog:search(text, 0, &caps) then nl_print_lineno(&st) else util.write(no_line) end
+      end
+      util.writebytes(&line[1], #line)
+    end
+    if r.fd ~= 0 then sys.close(r.fd) end
+    if r.err ~= 0 then util.err(util.quotef(file) .. ': ' .. sys.strerror(r.err)); ok = false end
+  end
+  line:destroy()
+  util.flush()
+  return ok and 0 or 1
+end
+
+-- comm ---------------------------------------------------------------------
+local function memcmp2(a: *sequence(byte), alen: integer, b: *sequence(byte), blen: integer): integer
+  local x, y = $a, $b
+  local n = alen < blen and alen or blen
+  for k = 1, n do
+    if x[k] ~= y[k] then return (@integer)(x[k]) - (@integer)(y[k]) end
+  end
+  if alen < blen then return -1 end
+  return alen ~= blen and 1 or 0
+end
+
+local CommState = @record{check: integer, seen_unpairable: boolean, warned: [2]boolean}
+
+local function comm_check_order(cs: *CommState, prev: *sequence(byte), cur: *sequence(byte), whatfile: integer)
+  if cs.check ~= 2 and (cs.check == 1 or cs.seen_unpairable) then
+    if not cs.warned[whatfile - 1] then
+      if memcmp2(prev, #$prev - 1, cur, #$cur - 1) > 0 then
+        util.err('file ' .. tostring(whatfile) .. ' is not in sorted order')
+        if cs.check == 1 then util.flush(); c_exit(1) end
+        cs.warned[whatfile - 1] = true
+      end
+    end
+  end
+end
+
+global function applet_comm(args: sequence(string)): integer
+  local only1, only2, both = true, true, true
+  local delim: byte = 10
+  local CHECK_DEFAULT, CHECK_ENABLED, CHECK_DISABLED = 0, 1, 2
+  local check = CHECK_DEFAULT
+  local col_sep = ''
+  local col_sep_given = false
+  local total_option = false
+  local longs: []util.LongOpt = {
+    {'check-order', 0, 200}, {'nocheck-order', 0, 201}, {'output-delimiter', 1, 202}, {'total', 0, 203},
+    {'zero-terminated', 0, 122}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, '123z', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail('comm', g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail('comm', "option '--" .. g.longname .. "' is not supported") end
+    if c == 49 then only1 = false elseif c == 50 then only2 = false elseif c == 51 then both = false
+    elseif c == 122 then delim = 0
+    elseif c == 201 then check = CHECK_DISABLED
+    elseif c == 200 then check = CHECK_ENABLED
+    elseif c == 202 then
+      if col_sep_given and col_sep ~= g.optarg then die('multiple output delimiters specified') end
+      col_sep = g.optarg
+      col_sep_given = true
+    elseif c == 203 then total_option = true end
+  end
+  -- an empty --output-delimiter writes one NUL byte
+  -- the --total line prints the delimiter with %s, so an empty one stays
+  -- empty there
+  local total_sep = col_sep_given and col_sep or '\t'
+  if not col_sep_given then col_sep = '\t' elseif #col_sep == 0 then col_sep = string.char(0) end
+  local files = g:operands()
+  if #files < 2 then
+    if #files == 0 then return usage_fail('comm', 'missing operand') end
+    return usage_fail('comm', 'missing operand after ' .. util.quote(args[#args]))
+  end
+  if #files > 2 then return usage_fail('comm', 'extra operand ' .. util.quote(files[3])) end
+  local readers: [2]Reader
+  local stdin_idx = -1
+  for i = 0, 1 do
+    if files[i + 1] == '-' then
+      readers[i].fd = 0
+    else
+      readers[i].fd = sys.open(files[i + 1], sys.O_RDONLY, 0)
+      if readers[i].fd < 0 then die(util.quotef(files[i + 1]) .. ': ' .. sys.errstr()) end
+    end
+  end
+  -- both operands "-" read the same stream
+  local rp: [2]*Reader = {&readers[0], &readers[1]}
+  if files[1] == '-' and files[2] == '-' then rp[1] = &readers[0] end
+  local lines: [2][4]sequence(byte)
+  local alt: [2][3]integer
+  local has: [2]boolean
+  local filled: [2][4]boolean
+  local cs: CommState = {check = check}
+  local total: [3]uint64
+  for i = 0, 1 do
+    has[i] = readline(rp[i], &lines[i][0], delim)
+    filled[i][0] = has[i]
+    if rp[i].err ~= 0 then die(util.quotef(files[i + 1]) .. ': ' .. sys.strerror(rp[i].err)) end
+  end
+  local function writeline(line: *sequence(byte), class: integer)
+    if class == 1 then
+      if not only1 then return end
+    elseif class == 2 then
+      if not only2 then return end
+      if only1 then util.write(col_sep) end
+    else
+      if not both then return end
+      if only1 then util.write(col_sep) end
+      if only2 then util.write(col_sep) end
+    end
+    local t = $line
+    util.writebytes(&t[1], #t)
+  end
+  while has[0] or has[1] do
+    local order: integer
+    local l0 = &lines[0][alt[0][0]]
+    local l1 = &lines[1][alt[1][0]]
+    if not has[0] then order = 1
+    elseif not has[1] then order = -1
+    else
+      local a, b = $l0, $l1
+      local len = (#a < #b and #a or #b) - 1
+      order = 0
+      for k = 1, len do
+        if a[k] ~= b[k] then order = (@integer)(a[k]) - (@integer)(b[k]); break end
+      end
+      if order == 0 then order = #a < #b and -1 or (#a ~= #b and 1 or 0) end
+    end
+    if order == 0 then
+      total[2] = total[2] + 1
+      writeline(l1, 3)
+    else
+      cs.seen_unpairable = true
+      if order <= 0 then total[0] = total[0] + 1; writeline(l0, 1)
+      else total[1] = total[1] + 1; writeline(l1, 2) end
+    end
+    local fill: [2]boolean = {order <= 0, 0 <= order}
+    for i = 0, 1 do
+      if fill[i] then
+        alt[i][2] = alt[i][1]
+        alt[i][1] = alt[i][0]
+        alt[i][0] = (alt[i][0] + 1) & 3
+        has[i] = readline(rp[i], &lines[i][alt[i][0]], delim)
+        filled[i][alt[i][0]] = has[i] or filled[i][alt[i][0]]
+        if has[i] then
+          comm_check_order(&cs, &lines[i][alt[i][1]], &lines[i][alt[i][0]], i + 1)
+        elseif filled[i][alt[i][2]] then
+          comm_check_order(&cs, &lines[i][alt[i][2]], &lines[i][alt[i][1]], i + 1)
+        end
+        if rp[i].err ~= 0 then die(util.quotef(files[i + 1]) .. ': ' .. sys.strerror(rp[i].err)) end
+      end
+    end
+  end
+  for i = 0, 1 do if readers[i].fd ~= 0 then sys.close(readers[i].fd) end end
+  local both_stdin = files[1] == '-' and files[2] == '-'
+  if total_option then
+    util.write(tostring(total[0])); util.write(total_sep)
+    util.write(tostring(total[1])); util.write(total_sep)
+    util.write(tostring(total[2])); util.write(total_sep)
+    util.write('total'); util.writebyte(delim)
+  end
+  util.flush()
+  -- GNU closes stdin once per operand; the second fclose fails
+  if both_stdin then die('-: Bad file descriptor') end
+  if cs.warned[0] or cs.warned[1] then die('input is not in sorted order') end
+  return 0
+end
+
+-- paste --------------------------------------------------------------------
+-- quotearg's c_maybe_quoting_style with the colon: plain unless a control
+-- character or ':' needs C quoting (backslashes are not doubled, which is
+-- why GNU paste uses this style for the delimiter list).
+local function c_maybe_quote_colon(s: string): string
+  local need = false
+  for k = 1, #s do
+    local c = s:byte(k)
+    if c == 34 or c == 58 or c < 32 or c > 126 then need = true end
+  end
+  if not need then return s end
+  local sb: stringbuilder
+  sb:writebyte(34)
+  for k = 1, #s do
+    local c = s:byte(k)
+    if c == 34 then sb:write('\\"')
+    elseif c == 10 then sb:write('\\n') elseif c == 9 then sb:write('\\t')
+    elseif c < 32 or c > 126 then sb:writef('\\%03o', c)
+    else sb:writebyte(c) end
+  end
+  sb:writebyte(34)
+  return sb:promote()
+end
+
+global function applet_paste(args: sequence(string)): integer
+  local delim_arg = '\t'
+  local serial = false
+  local line_delim: byte = 10
+  local longs: []util.LongOpt = {
+    {'serial', 0, 115}, {'delimiters', 1, 100}, {'zero-terminated', 0, 122},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'd:sz', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail('paste', g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail('paste', "option '--" .. g.longname .. "' is not supported") end
+    if c == 100 then delim_arg = #g.optarg == 0 and '\\0' or g.optarg
+    elseif c == 115 then serial = true
+    elseif c == 122 then line_delim = 0 end
+  end
+  -- collapse_escapes; 0 stands for "no delimiter"
+  local delims: sequence(byte)
+  do
+    local k = 1
+    while k <= #delim_arg do
+      local c = delim_arg:byte(k)
+      if c ~= 92 then delims:push(c); k = k + 1
+      else
+        if k == #delim_arg then
+          die('delimiter list ends with an unescaped backslash: ' .. c_maybe_quote_colon(delim_arg))
+        end
+        local e = delim_arg:byte(k + 1)
+        if e == 48 then delims:push(0) elseif e == 98 then delims:push(8) elseif e == 102 then delims:push(12)
+        elseif e == 110 then delims:push(10) elseif e == 114 then delims:push(13) elseif e == 116 then delims:push(9)
+        elseif e == 118 then delims:push(11) elseif e == 92 then delims:push(92) else delims:push(e) end
+        k = k + 2
+      end
+    end
+  end
+  local files = g:operands()
+  if #files == 0 then files:push('-') end
+  local ok = true
+  local stdin_reader: Reader
+  stdin_reader.fd = 0
+  if serial then
+    for _, f in ipairs(files) do
+      local own: Reader
+      local r: *Reader
+      if f == '-' then r = &stdin_reader
+      else
+        own.fd = sys.open(f, sys.O_RDONLY, 0)
+        if own.fd < 0 then util.err(util.quotef(f) .. ': ' .. sys.errstr()); ok = false; continue end
+        r = &own
+      end
+      local di = 1
+      local charold = rgetc(r)
+      if charold ~= -1 then
+        while true do
+          local charnew = rgetc(r)
+          if charnew == -1 then break end
+          if charold == line_delim then
+            if #delims > 0 and delims[di] ~= 0 then util.writebyte(delims[di]) end
+            di = di + 1
+            if di > #delims then di = 1 end
+          else
+            util.writebyte((@byte)(charold))
+          end
+          charold = charnew
+        end
+        util.writebyte((@byte)(charold))
+      end
+      if charold ~= line_delim then util.writebyte(line_delim) end
+      if r.err ~= 0 then util.err(util.quotef(f) .. ': ' .. sys.strerror(r.err)); ok = false end
+      if r ~= &stdin_reader then
+        sys.close(r.fd)
+      else
+        stdin_reader.eof = false
+      end
+    end
+  else
+    local n = #files
+    local readers: sequence(*Reader)
+    local own: sequence(*Reader)
+    for k = 1, n do
+      if files[k] == '-' then readers:push(&stdin_reader)
+      else
+        local r: *Reader = default_allocator:new(@Reader)
+        r.fd = sys.open(files[k], sys.O_RDONLY, 0)
+        if r.fd < 0 then die(util.quotef(files[k]) .. ': ' .. sys.errstr()) end
+        readers:push(r)
+        own:push(r)
+      end
+    end
+    local open: sequence(boolean)
+    for k = 1, n do open:push(true) end
+    local files_open = n
+    local delbuf: sequence(byte)
+    while files_open > 0 do
+      local somedone = false
+      local di = 1
+      delbuf:clear()
+      for i = 1, n do
+        if files_open == 0 then break end
+        local sometodo = false
+        local chr: integer = -1
+        if open[i] then
+          local r = readers[i]
+          chr = rgetc(r)
+          if chr ~= -1 and #delbuf > 0 then
+            util.writebytes(&delbuf[1], #delbuf)
+            delbuf:clear()
+          end
+          while chr ~= -1 do
+            sometodo = true
+            if chr == line_delim then break end
+            util.writebyte((@byte)(chr))
+            chr = rgetc(r)
+          end
+        end
+        if not sometodo then
+          if open[i] then
+            local r = readers[i]
+            if r.err ~= 0 then util.err(util.quotef(files[i]) .. ': ' .. sys.strerror(r.err)); ok = false end
+            if r == &stdin_reader then stdin_reader.eof = false end
+            open[i] = false
+            files_open = files_open - 1
+          end
+          if i == n then
+            if somedone then
+              if #delbuf > 0 then util.writebytes(&delbuf[1], #delbuf); delbuf:clear() end
+              util.writebyte(line_delim)
+            end
+          else
+            if delims[di] ~= 0 then delbuf:push(delims[di]) end
+            di = di + 1
+            if di > #delims then di = 1 end
+          end
+        else
+          somedone = true
+          if i ~= n then
+            if chr ~= line_delim and chr ~= -1 then util.writebyte((@byte)(chr)) end
+            if delims[di] ~= 0 then util.writebyte(delims[di]) end
+            di = di + 1
+            if di > #delims then di = 1 end
+          else
+            util.writebyte(chr == -1 and line_delim or (@byte)(chr))
+          end
+        end
+      end
+    end
+    for _, r in ipairs(own) do sys.close(r.fd); default_allocator:delete(r) end
+  end
+  util.flush()
+  return ok and 0 or 1
+end

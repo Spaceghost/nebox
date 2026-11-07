@@ -1865,30 +1865,3 @@ global function applet_printf(args: sequence(string)): integer
   return rc
 end
 
-global function applet_nl(args: sequence(string)): integer
-  local o = util.parsel(args, 'b:s:w:', &longopts.nl, #longopts.nl)
-  if not o:ok() then return util.optfail(o) end
-  local style = o:has('b') and o:get('b') or 't'
-  local sep = o:has('s') and o:get('s') or '\t'
-  local width: integer = 6
-  if o:has('w') then local v, ok = util.toint(o:get('w')); if not ok or v < 1 then util.err('invalid line number field width'); return 1 end; width = v end
-  if #o.operands == 0 then o.operands:push('-') end
-  local n: integer = 0
-  local rc: integer = 0
-  for _, path in ipairs(o.operands) do
-    local data, ok = util.readfile(path)
-    if not ok then rc = 1; continue end
-    for _, line in ipairs(util.lines(data)) do
-      local number = style == 'a' or (style == 't' and line.size > 0)
-      if number then
-        n = n + 1
-        util.write(string.format('%' .. string.format('%d', width) .. 'd', n))
-        util.write(sep)
-      else
-        for _ = 1, width + (@integer)(sep.size) do util.writebyte(32) end
-      end
-      util.line(line)
-    end
-  end
-  return rc
-end

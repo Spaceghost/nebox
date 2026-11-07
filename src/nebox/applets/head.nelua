@@ -129,15 +129,6 @@ local function elide_tail_pipe(name: string, fd: cint, n_elide: uint64, count_li
   local written: int64 = 0
   local buf: [8192]byte
   local ok = true
-  local function compact()
-    if start > 65536 then
-      local n = #pending - start + 1
-      for k = 1, n do pending[k] = pending[start + k - 1] end
-      pending:resize((@usize)(n))
-      for k = 1, #nls do nls[k] = nls[k] - (start - 1) end
-      start = 1
-    end
-  end
   while true do
     local r = read_some(fd, &buf, 8192)
     if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); ok = false; break end
@@ -164,7 +155,13 @@ local function elide_tail_pipe(name: string, fd: cint, n_elide: uint64, count_li
         start = start + out
       end
     end
-    compact()
+    if start > 65536 then
+      local m = #pending - start + 1
+      for k = 1, m do pending[k] = pending[start + k - 1] end
+      pending:resize((@usize)(m))
+      for k = 1, #nls do nls[k] = nls[k] - (start - 1) end
+      start = 1
+    end
   end
   if ok and count_lines and n_elide > 0 and #pending >= start and pending[#pending] ~= line_end then
     -- the partial last line is one of the elided lines

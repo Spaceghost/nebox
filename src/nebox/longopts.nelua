@@ -119,19 +119,6 @@ global longopts.realpath: []util.LongOpt = {
   {'strip', 0, 115}, {'no-symlinks', 0, 115}, {'zero', 0, 122}, {'logical', 0, 76},
   {'physical', 0, 80}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.nl: []util.LongOpt = {
-  {'header-numbering', 1, util.UNSUPPORTED}, {'body-numbering', 1, 98},
-  {'footer-numbering', 1, util.UNSUPPORTED}, {'starting-line-number', 1, util.UNSUPPORTED},
-  {'line-increment', 1, util.UNSUPPORTED}, {'no-renumber', 0, util.UNSUPPORTED},
-  {'join-blank-lines', 1, util.UNSUPPORTED}, {'number-separator', 1, 115},
-  {'number-width', 1, 119}, {'number-format', 1, util.UNSUPPORTED},
-  {'section-delimiter', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
-}
-global longopts.paste: []util.LongOpt = {
-  {'serial', 0, 115}, {'delimiters', 1, 100}, {'zero-terminated', 0, util.UNSUPPORTED},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.fold: []util.LongOpt = {
   {'bytes', 0, 98}, {'spaces', 0, 115}, {'width', 1, 119}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
@@ -154,12 +141,6 @@ global longopts.shuf: []util.LongOpt = {
 global longopts.truncate: []util.LongOpt = {
   {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
-global longopts.comm: []util.LongOpt = {
-  {'check-order', 0, util.UNSUPPORTED}, {'nocheck-order', 0, util.UNSUPPORTED},
-  {'output-delimiter', 1, util.UNSUPPORTED}, {'total', 0, util.UNSUPPORTED},
-  {'zero-terminated', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
 }
 global longopts.id: []util.LongOpt = {
   {'context', 0, util.UNSUPPORTED}, {'group', 0, 103}, {'groups', 0, 71}, {'name', 0, 110},

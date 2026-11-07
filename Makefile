@@ -54,6 +54,7 @@ test: $(OUT)/nebox
 	python3 tests/cutuniq_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/head_compare.py $(abspath $(OUT)/nebox) 400
 	python3 tests/tail_compare.py $(abspath $(OUT)/nebox) 300
+	python3 tests/nlcp_compare.py $(abspath $(OUT)/nebox) 500
 
 clean:
 	rm -rf $(OUT)

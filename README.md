@@ -99,6 +99,12 @@ Stated here rather than worked around:
   It always polls, as GNU does with `---disable-inotify` (GNU uses inotify
   when it can). `tests/tail_compare.py`: 662 cases including scripted
   follow scenarios against GNU, 0 mismatches.
+- `nl`, `comm` and `paste` port nl.c, comm.c and paste.c: nl's styles
+  (`a t n pBRE`), -v -i -p -l -s -w -n -d with GNU's in-place delimiter
+  quirk and section handling; comm's -123 -z --check-order --nocheck-order
+  --output-delimiter (empty means NUL) --total and order warnings; paste's
+  -d escapes (\0 for none), -s, -z and repeated "-" operands sharing stdin.
+  `tests/nlcp_compare.py`: 6022 random cases against GNU, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
