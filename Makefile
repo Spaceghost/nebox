@@ -50,6 +50,7 @@ test: $(OUT)/nebox
 	python3 tests/basenc_compare.py $(abspath $(OUT)/nebox) 300
 	python3 tests/opts_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/mode_compare.py $(abspath $(OUT)/nebox) 400
+	python3 tests/tr_compare.py $(abspath $(OUT)/nebox) 500
 
 clean:
 	rm -rf $(OUT)

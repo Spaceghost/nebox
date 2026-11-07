@@ -1,0 +1,692 @@
+-- tr: a port of GNU coreutils 9.1 src/tr.c in the C locale. Escapes (\ooo
+-- with the ambiguous-octal warning, \a..\v, a trailing backslash), ranges,
+-- [:class:], [=c=], [c*n] and [c*] (octal or decimal counts), -c/-C, -d,
+-- -s, -t, string2 padding, [:upper:]/[:lower:] alignment, and every
+-- validation message.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+local BEGIN_STATE: uint64 <comptime> = 0xfffffffffffffffe
+local NEW_ELEMENT: uint64 <comptime> = 0xffffffffffffffff
+local REPEAT_COUNT_MAXIMUM: uint64 <comptime> = 0xfffffffffffffffe
+
+local RE_NORMAL_CHAR: integer <comptime> = 0
+local RE_RANGE: integer <comptime> = 1
+local RE_CHAR_CLASS: integer <comptime> = 2
+local RE_EQUIV_CLASS: integer <comptime> = 3
+local RE_REPEATED_CHAR: integer <comptime> = 4
+
+local CC_LOWER: integer <comptime> = 6
+local CC_UPPER: integer <comptime> = 10
+
+local UL_LOWER: integer <comptime> = 0
+local UL_UPPER: integer <comptime> = 1
+local UL_NONE: integer <comptime> = 2
+
+local char_class_name: []string = {
+  'alnum', 'alpha', 'blank', 'cntrl', 'digit', 'graph', 'lower', 'print', 'punct', 'space', 'upper', 'xdigit',
+}
+
+local Elem = @record{kind: integer, c1: byte, c2: byte, class: integer, count: uint64}
+
+local Spec = @record{
+  elems: sequence(Elem),  -- the constructs; "tail" is an index (0 = end)
+  tail: integer,
+  state: uint64,
+  length: uint64,
+  n_indefinite_repeats: integer,
+  indefinite_repeat_element: integer,
+  has_equiv_class: boolean,
+  has_char_class: boolean,
+  has_restricted_char_class: boolean,
+}
+
+local squeeze_repeats: boolean
+local delete: boolean
+local complement: boolean
+local truncate_set1: boolean
+local translating: boolean
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function isupper(c: integer): boolean return c >= 65 and c <= 90 end
+local function islower(c: integer): boolean return c >= 97 and c <= 122 end
+local function isdigit(c: integer): boolean return c >= 48 and c <= 57 end
+local function isprint(c: integer): boolean return c >= 32 and c <= 126 end
+
+local function is_char_class_member(cls: integer, c: integer): boolean
+  if cls == 0 then return isupper(c) or islower(c) or isdigit(c)
+  elseif cls == 1 then return isupper(c) or islower(c)
+  elseif cls == 2 then return c == 32 or c == 9
+  elseif cls == 3 then return c < 32 or c == 127
+  elseif cls == 4 then return isdigit(c)
+  elseif cls == 5 then return c >= 33 and c <= 126
+  elseif cls == 6 then return islower(c)
+  elseif cls == 7 then return isprint(c)
+  elseif cls == 8 then return c >= 33 and c <= 126 and not (isupper(c) or islower(c) or isdigit(c))
+  elseif cls == 9 then return c == 32 or (c >= 9 and c <= 13)
+  elseif cls == 10 then return isupper(c)
+  else return isdigit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102) end
+end
+
+-- quote() in the C locale (locale_quoting_style).
+local function quote(s: string): string
+  local sb: stringbuilder
+  sb:writebyte(39)
+  for i = 1, #s do
+    local c = s:byte(i)
+    if c == 92 then sb:write('\\\\')
+    elseif c == 39 then sb:write("\\'")
+    elseif c == 7 then sb:write('\\a') elseif c == 8 then sb:write('\\b')
+    elseif c == 12 then sb:write('\\f') elseif c == 10 then sb:write('\\n')
+    elseif c == 13 then sb:write('\\r') elseif c == 9 then sb:write('\\t')
+    elseif c == 11 then sb:write('\\v')
+    elseif not isprint(c) then sb:writef('\\%03o', c)
+    else sb:writebyte(c) end
+  end
+  sb:writebyte(39)
+  return sb:promote()
+end
+
+local function make_printable_char(c: byte): string
+  if isprint(c) then return string.char(c) end
+  return string.format('\\%03o', c)
+end
+
+local function make_printable_str(s: *sequence(byte), from: integer, len: integer): string
+  local sb: stringbuilder
+  local t = $s
+  for k = 0, < len do
+    local c = t[from + k + 1]
+    if c == 92 then sb:write('\\')
+    elseif c == 7 then sb:write('\\a') elseif c == 8 then sb:write('\\b')
+    elseif c == 12 then sb:write('\\f') elseif c == 10 then sb:write('\\n')
+    elseif c == 13 then sb:write('\\r') elseif c == 9 then sb:write('\\t')
+    elseif c == 11 then sb:write('\\v')
+    elseif isprint(c) then sb:writebyte(c)
+    else sb:writef('\\%03o', c) end
+  end
+  return sb:promote()
+end
+
+-- E_string: unescaped bytes plus an "escaped" flag per byte (0-based API).
+local EStr = @record{s: sequence(byte), escaped: sequence(boolean)}
+
+local function es_at(es: *EStr, i: integer): byte
+  local t = es.s
+  return t[i + 1]
+end
+local function es_esc(es: *EStr, i: integer): boolean
+  local t = es.escaped
+  return t[i + 1]
+end
+local function es_match(es: *EStr, i: integer, c: byte): boolean
+  return es_at(es, i) == c and not es_esc(es, i)
+end
+
+local function unquote(s: string, es: *EStr)
+  local function at(i: integer): byte
+    if i >= 1 and i <= #s then return s:byte(i) end
+    return 0
+  end
+  local i = 1
+  while i <= #s do
+    local ch = s:byte(i)
+    if ch == 92 then
+      local esc = true
+      local c: byte
+      local n = at(i + 1)
+      if n == 92 then c = 92
+      elseif n == 97 then c = 7 elseif n == 98 then c = 8 elseif n == 102 then c = 12
+      elseif n == 110 then c = 10 elseif n == 114 then c = 13 elseif n == 116 then c = 9
+      elseif n == 118 then c = 11
+      elseif n >= 48 and n <= 55 then
+        local v: integer = n - 48
+        local d = at(i + 2)
+        if d >= 48 and d <= 55 then
+          v = 8 * v + (d - 48)
+          i = i + 1
+          d = at(i + 2)
+          if d >= 48 and d <= 55 then
+            if 8 * v + (d - 48) < 256 then
+              v = 8 * v + (d - 48)
+              i = i + 1
+            else
+              util.err(string.format('warning: the ambiguous octal escape \\%c%c%c is being\n\tinterpreted as the 2-byte sequence \\0%c%c, %c',
+                at(i), at(i + 1), at(i + 2), at(i), at(i + 1), at(i + 2)))
+            end
+          end
+        end
+        c = (@byte)(v)
+      elseif n == 0 then
+        util.err('warning: an unescaped backslash at end of string is not portable')
+        esc = false
+        i = i - 1
+        c = 92
+      else
+        c = n
+      end
+      i = i + 1
+      es.s:push(c)
+      es.escaped:push(esc)
+    else
+      es.s:push(ch)
+      es.escaped:push(false)
+    end
+    i = i + 1
+  end
+end
+
+local function look_up_char_class(es: *EStr, from: integer, len: integer): integer
+  for k = 0, < #char_class_name do
+    local name = char_class_name[k]
+    if #name == len then
+      local same = true
+      for m = 0, < len do
+        if es_at(es, from + m) ~= name:byte(m + 1) then same = false; break end
+      end
+      if same then return k end
+    end
+  end
+  return -1
+end
+
+local function find_closing_delim(es: *EStr, start_idx: integer, pre: byte): (boolean, integer)
+  local len = #es.s
+  local i = start_idx
+  while i < len - 1 do
+    if es_at(es, i) == pre and es_at(es, i + 1) == 93 and not es_esc(es, i) and not es_esc(es, i + 1) then
+      return true, i
+    end
+    i = i + 1
+  end
+  return false, 0
+end
+
+-- (status 0 found / -1 not / -2 bad count, char, count, closing index)
+local function find_bracketed_repeat(es: *EStr, start_idx: integer): (integer, byte, uint64, integer)
+  if not es_match(es, start_idx + 1, 42) then return -1, 0, 0, 0 end
+  local len = #es.s
+  local i = start_idx + 2
+  while i < len and not es_esc(es, i) do
+    if es_at(es, i) == 93 then
+      local digit_len = i - start_idx - 2
+      local ch = es_at(es, start_idx)
+      local count: uint64 = 0
+      if digit_len > 0 then
+        local base: uint64 = es_at(es, start_idx + 2) == 48 and 8 or 10
+        local ok = true
+        local p = start_idx + 2
+        local any = false
+        local ovf = false
+        while p < i do
+          local d = es_at(es, p)
+          if d < 48 or d > 57 or (@uint64)(d - 48) >= base then break end
+          local dv: uint64 = d - 48
+          if count > (UMAX - dv) // base then ovf = true end
+          count = count * base + dv
+          any = true
+          p = p + 1
+        end
+        if not any or ovf or p ~= i or count > REPEAT_COUNT_MAXIMUM then ok = false end
+        if not ok then
+          util.err('invalid repeat count ' .. quote(make_printable_str(&es.s, start_idx + 2, digit_len)) .. ' in [c*n] construct')
+          return -2, 0, 0, 0
+        end
+      end
+      return 0, ch, count, i
+    end
+    i = i + 1
+  end
+  return -1, 0, 0, 0
+end
+
+local function star_digits_closebracket(es: *EStr, idx: integer): boolean
+  if not es_match(es, idx, 42) then return false end
+  local len = #es.s
+  for i = idx + 1, len - 1 do
+    if not isdigit(es_at(es, i)) or es_esc(es, i) then return es_match(es, i, 93) end
+  end
+  return false
+end
+
+local function build_spec_list(es: *EStr, spec: *Spec): boolean
+  local len = #es.s
+  local i = 0
+  while i + 2 < len do
+    if es_match(es, i, 91) then
+      local matched = true
+      local try_repeat = true
+      if es_match(es, i + 1, 58) or es_match(es, i + 1, 61) then
+        local found, cdi = find_closing_delim(es, i + 2, es_at(es, i + 1))
+        if found then
+          local opnd_len = cdi - 1 - (i + 2) + 1
+          local is_class = es_at(es, i + 1) == 58
+          if opnd_len == 0 then
+            if is_class then util.err("missing character class name '[::]'")
+            else util.err("missing equivalence class character '[==]'") end
+            return false
+          end
+          local handled = false
+          if is_class then
+            local cls = look_up_char_class(es, i + 2, opnd_len)
+            if cls >= 0 then
+              spec.elems:push({kind = RE_CHAR_CLASS, class = cls})
+              handled = true
+            elseif not star_digits_closebracket(es, i + 2) then
+              util.err('invalid character class ' .. quote(make_printable_str(&es.s, i + 2, opnd_len)))
+              return false
+            end
+          else
+            if opnd_len == 1 then
+              spec.elems:push({kind = RE_EQUIV_CLASS, c1 = es_at(es, i + 2)})
+              handled = true
+            elseif not star_digits_closebracket(es, i + 2) then
+              util.err(make_printable_str(&es.s, i + 2, opnd_len) .. ': equivalence class operand must be a single character')
+              return false
+            end
+          end
+          if handled then
+            i = cdi + 2
+            continue
+          end
+        end
+      end
+      local err, ch, count, cbi = find_bracketed_repeat(es, i + 1)
+      if err == 0 then
+        spec.elems:push({kind = RE_REPEATED_CHAR, c1 = ch, count = count})
+        i = cbi + 1
+        continue
+      elseif err == -2 then
+        return false
+      end
+    end
+    if es_match(es, i + 1, 45) then
+      local first, last = es_at(es, i), es_at(es, i + 2)
+      if last < first then
+        util.err("range-endpoints of '" .. make_printable_char(first) .. '-' .. make_printable_char(last)
+          .. "' are in reverse collating sequence order")
+        return false
+      end
+      spec.elems:push({kind = RE_RANGE, c1 = first, c2 = last})
+      i = i + 3
+    else
+      spec.elems:push({kind = RE_NORMAL_CHAR, c1 = es_at(es, i)})
+      i = i + 1
+    end
+  end
+  while i < len do
+    spec.elems:push({kind = RE_NORMAL_CHAR, c1 = es_at(es, i)})
+    i = i + 1
+  end
+  return true
+end
+
+local function skip_construct(s: *Spec)
+  s.tail = s.tail + 1
+  if s.tail > #s.elems then s.tail = 0 end
+  s.state = NEW_ELEMENT
+end
+
+local function advance(s: *Spec)
+  s.tail = s.tail + 1
+  if s.tail > #s.elems then s.tail = 0 end
+end
+
+local function get_next(s: *Spec, class: *integer): integer
+  if class ~= nilptr then $class = UL_NONE end
+  if s.state == BEGIN_STATE then
+    s.tail = #s.elems > 0 and 1 or 0
+    s.state = NEW_ELEMENT
+  end
+  if s.tail == 0 then return -1 end
+  local p = s.elems[s.tail]
+  local ret: integer
+  if p.kind == RE_NORMAL_CHAR then
+    ret = p.c1
+    s.state = NEW_ELEMENT
+    advance(s)
+  elseif p.kind == RE_RANGE then
+    if s.state == NEW_ELEMENT then s.state = p.c1 else s.state = s.state + 1 end
+    ret = (@integer)(s.state)
+    if s.state == p.c2 then advance(s); s.state = NEW_ELEMENT end
+  elseif p.kind == RE_CHAR_CLASS then
+    if class ~= nilptr then
+      if p.class == CC_LOWER then $class = UL_LOWER elseif p.class == CC_UPPER then $class = UL_UPPER end
+    end
+    if s.state == NEW_ELEMENT then
+      local k = 0
+      while k < 256 and not is_char_class_member(p.class, k) do k = k + 1 end
+      s.state = (@uint64)(k)
+    end
+    ret = (@integer)(s.state)
+    local k = ret + 1
+    while k < 256 and not is_char_class_member(p.class, k) do k = k + 1 end
+    if k < 256 then s.state = (@uint64)(k)
+    else advance(s); s.state = NEW_ELEMENT end
+  elseif p.kind == RE_EQUIV_CLASS then
+    ret = p.c1
+    s.state = NEW_ELEMENT
+    advance(s)
+  else
+    if p.count == 0 then
+      advance(s)
+      s.state = NEW_ELEMENT
+      ret = get_next(s, class)
+    else
+      if s.state == NEW_ELEMENT then s.state = 0 end
+      s.state = s.state + 1
+      ret = p.c1
+      if s.state == p.count then advance(s); s.state = NEW_ELEMENT end
+    end
+  end
+  return ret
+end
+
+local function card_of_complement(s: *Spec): uint64
+  local card: uint64 = 256
+  local in_set: [256]boolean
+  s.state = BEGIN_STATE
+  while true do
+    local c = get_next(s, nilptr)
+    if c == -1 then break end
+    if not in_set[c] then card = card - 1 end
+    in_set[c] = true
+  end
+  return card
+end
+
+local function validate_case_classes(s1: *Spec, s2: *Spec)
+  if complement or not s2.has_char_class then return end
+  local n_upper: uint64, n_lower: uint64 = 26, 26
+  local s1_tail, s2_tail = s1.tail, s2.tail
+  local s1_new, s2_new = true, true
+  local c1, c2: integer = 0, 0
+  s1.state = BEGIN_STATE
+  s2.state = BEGIN_STATE
+  while c1 ~= -1 and c2 ~= -1 do
+    local cl1, cl2: integer = UL_NONE, UL_NONE
+    c1 = get_next(s1, &cl1)
+    c2 = get_next(s2, &cl2)
+    if s2_new and cl2 ~= UL_NONE and not (s1_new and cl1 ~= UL_NONE) then
+      die('misaligned [:upper:] and/or [:lower:] construct')
+    end
+    if cl2 ~= UL_NONE then
+      skip_construct(s1)
+      skip_construct(s2)
+      s1.length = s1.length - ((cl1 == UL_UPPER and n_upper or n_lower) - 1)
+      s2.length = s2.length - ((cl2 == UL_UPPER and n_upper or n_lower) - 1)
+    end
+    s1_new = s1.state == NEW_ELEMENT
+    s2_new = s2.state == NEW_ELEMENT
+  end
+  s1.tail = s1_tail
+  s2.tail = s2_tail
+end
+
+local function get_spec_stats(s: *Spec)
+  local length: uint64 = 0
+  s.n_indefinite_repeats = 0
+  s.has_equiv_class = false
+  s.has_restricted_char_class = false
+  s.has_char_class = false
+  for idx = 1, #s.elems do
+    local p = s.elems[idx]
+    local len: uint64 = 0
+    if p.kind == RE_NORMAL_CHAR then len = 1
+    elseif p.kind == RE_RANGE then len = p.c2 - p.c1 + 1
+    elseif p.kind == RE_CHAR_CLASS then
+      s.has_char_class = true
+      for k = 0, 255 do if is_char_class_member(p.class, k) then len = len + 1 end end
+      if p.class ~= CC_UPPER and p.class ~= CC_LOWER then s.has_restricted_char_class = true end
+    elseif p.kind == RE_EQUIV_CLASS then
+      len = 1
+      s.has_equiv_class = true
+    else
+      if p.count > 0 then len = p.count
+      else
+        s.indefinite_repeat_element = idx
+        s.n_indefinite_repeats = s.n_indefinite_repeats + 1
+      end
+    end
+    local new_length = length + len
+    if not (length <= new_length and new_length <= REPEAT_COUNT_MAXIMUM) then die('too many characters in set') end
+    length = new_length
+  end
+  s.length = length
+end
+
+local function string2_extend(s1: *Spec, s2: *Spec)
+  local p = s2.elems[#s2.elems]
+  local ch: byte
+  if p.kind == RE_NORMAL_CHAR then ch = p.c1
+  elseif p.kind == RE_RANGE then ch = p.c2
+  elseif p.kind == RE_CHAR_CLASS then
+    die('when translating with string1 longer than string2,\nthe latter string must not end with a character class')
+  else ch = p.c1 end
+  s2.elems:push({kind = RE_REPEATED_CHAR, c1 = ch, count = s1.length - s2.length})
+  s2.length = s1.length
+end
+
+local function homogeneous_spec_list(s: *Spec): boolean
+  s.state = BEGIN_STATE
+  local b = get_next(s, nilptr)
+  if b == -1 then return false end
+  while true do
+    local c = get_next(s, nilptr)
+    if c == -1 then break end
+    if c ~= b then return false end
+  end
+  return true
+end
+
+local function validate(s1: *Spec, s2: *Spec)
+  get_spec_stats(s1)
+  if complement then s1.length = card_of_complement(s1) end
+  if s1.n_indefinite_repeats > 0 then die('the [c*] repeat construct may not appear in string1') end
+  if s2 ~= nilptr then
+    get_spec_stats(s2)
+    if s1.length >= s2.length and s2.n_indefinite_repeats == 1 then
+      local e = s2.elems[s2.indefinite_repeat_element]
+      e.count = s1.length - s2.length
+      s2.elems[s2.indefinite_repeat_element] = e
+      s2.length = s1.length
+    end
+    if s2.n_indefinite_repeats > 1 then die('only one [c*] repeat construct may appear in string2') end
+    if translating then
+      if s2.has_equiv_class then die('[=c=] expressions may not appear in string2 when translating') end
+      if s2.has_restricted_char_class then
+        die("when translating, the only character classes that may appear in\nstring2 are 'upper' and 'lower'")
+      end
+      validate_case_classes(s1, s2)
+      if s1.length > s2.length and not truncate_set1 then
+        if s2.length == 0 then die('when not truncating set1, string2 must be non-empty') end
+        string2_extend(s1, s2)
+      end
+      if complement and s1.has_char_class and not (s2.length == s1.length and homogeneous_spec_list(s2)) then
+        die('when translating with complemented character classes,\nstring2 must map all characters in the domain to one')
+      end
+    else
+      if s2.n_indefinite_repeats > 0 then die('the [c*] construct may appear in string2 only when translating') end
+    end
+  end
+end
+
+local function set_initialize(s: *Spec, comp: boolean, in_set: *[256]boolean)
+  s.state = BEGIN_STATE
+  while true do
+    local c = get_next(s, nilptr)
+    if c == -1 then break end
+    in_set[c] = true
+  end
+  if comp then for k = 0, 255 do in_set[k] = not in_set[k] end end
+end
+
+local in_squeeze_set: [256]boolean
+local in_delete_set: [256]boolean
+local xlate: [256]byte
+
+-- 0 plain, 1 delete, 2 translate: one block of stdin through that reader.
+local function read_block(buf: *[8192]byte, mode: integer): integer
+  while true do
+    local nr: integer
+    repeat nr = sys.read(0, buf, 8192) until not (nr < 0 and sys.errno() == sys.EINTR)
+    if nr < 0 then die('read error: ' .. sys.errstr()) end
+    if nr == 0 then return 0 end
+    if mode == 2 then
+      for k = 0, < nr do buf[k] = xlate[buf[k]] end
+      return nr
+    elseif mode == 1 then
+      local n_saved = 0
+      for k = 0, < nr do
+        if not in_delete_set[buf[k]] then buf[n_saved] = buf[k]; n_saved = n_saved + 1 end
+      end
+      if n_saved > 0 then return n_saved end
+    else
+      return nr
+    end
+  end
+end
+
+local function squeeze_filter(mode: integer)
+  local buf: [8192]byte
+  local last: integer = -1
+  while true do
+    local n = read_block(&buf, mode)
+    if n == 0 then break end
+    for k = 0, < n do
+      local c = buf[k]
+      if c == last and in_squeeze_set[c] then continue end
+      util.writebyte(c)
+      last = c
+    end
+  end
+end
+
+local tr_longs: []util.LongOpt = {
+  {'complement', 0, 99}, {'delete', 0, 100}, {'squeeze-repeats', 0, 115}, {'truncate-set1', 0, 116},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
+global function applet_tr(args: sequence(string)): integer
+  squeeze_repeats = false; delete = false; complement = false; truncate_set1 = false
+  for k = 0, 255 do in_squeeze_set[k] = false; in_delete_set[k] = false end
+  local o = util.parsel(args, '+AcCdst', &tr_longs, #tr_longs)
+  if not o:ok() then return util.optfail(o) end
+  if o:has('c') or o:has('C') then complement = true end
+  delete = o:has('d'); squeeze_repeats = o:has('s'); truncate_set1 = o:has('t')
+  local n = #o.operands
+  translating = n == 2 and not delete
+  local min_ops = (delete == squeeze_repeats) and 2 or 1
+  local max_ops = (not delete or squeeze_repeats) and 2 or 1
+  if n < min_ops then
+    if n == 0 then util.err('missing operand')
+    else
+      util.err('missing operand after ' .. quote(o.operands[n]))
+      util.flush()
+      local m = squeeze_repeats and 'Two strings must be given when both deleting and squeezing repeats.\n'
+                                 or 'Two strings must be given when translating.\n'
+      sys.write(2, m.data, m.size)
+    end
+    return 1
+  end
+  if max_ops < n then
+    util.err('extra operand ' .. quote(o.operands[max_ops + 1]))
+    if n == 2 then
+      util.flush()
+      local m = 'Only one string may be given when deleting without squeezing repeats.\n'
+      sys.write(2, m.data, m.size)
+    end
+    return 1
+  end
+  local s1: Spec
+  local s2: Spec
+  do
+    local es: EStr
+    unquote(o.operands[1], &es)
+    if not build_spec_list(&es, &s1) then return 1 end
+  end
+  if n == 2 then
+    local es: EStr
+    unquote(o.operands[2], &es)
+    if not build_spec_list(&es, &s2) then return 1 end
+    validate(&s1, &s2)
+  else
+    validate(&s1, nilptr)
+  end
+  if squeeze_repeats and n == 1 then
+    set_initialize(&s1, complement, &in_squeeze_set)
+    squeeze_filter(0)
+  elseif delete and n == 1 then
+    set_initialize(&s1, complement, &in_delete_set)
+    local buf: [8192]byte
+    while true do
+      local nr = read_block(&buf, 1)
+      if nr == 0 then break end
+      util.writebytes(&buf, (@usize)(nr))
+    end
+  elseif squeeze_repeats and delete and n == 2 then
+    set_initialize(&s1, complement, &in_delete_set)
+    set_initialize(&s2, false, &in_squeeze_set)
+    squeeze_filter(1)
+  elseif translating then
+    for k = 0, 255 do xlate[k] = (@byte)(k) end
+    if complement then
+      local in_s1: [256]boolean
+      set_initialize(&s1, false, &in_s1)
+      s2.state = BEGIN_STATE
+      for k = 0, 255 do
+        if not in_s1[k] then
+          local ch = get_next(&s2, nilptr)
+          if ch == -1 then break end
+          xlate[k] = (@byte)(ch)
+        end
+      end
+    else
+      s1.state = BEGIN_STATE
+      s2.state = BEGIN_STATE
+      while true do
+        local cl1, cl2: integer = UL_NONE, UL_NONE
+        local c1 = get_next(&s1, &cl1)
+        local c2 = get_next(&s2, &cl2)
+        if cl1 == UL_LOWER and cl2 == UL_UPPER then
+          for k = 97, 122 do xlate[k] = (@byte)(k - 32) end
+        elseif cl1 == UL_UPPER and cl2 == UL_LOWER then
+          for k = 65, 90 do xlate[k] = (@byte)(k + 32) end
+        else
+          if c1 == -1 or c2 == -1 then break end
+          xlate[c1] = (@byte)(c2)
+        end
+        if cl2 ~= UL_NONE then
+          skip_construct(&s1)
+          skip_construct(&s2)
+        end
+      end
+    end
+    if squeeze_repeats then
+      set_initialize(&s2, false, &in_squeeze_set)
+      squeeze_filter(2)
+    else
+      local buf: [8192]byte
+      while true do
+        local nr = read_block(&buf, 2)
+        if nr == 0 then break end
+        util.writebytes(&buf, (@usize)(nr))
+      end
+    end
+  end
+  util.flush()
+  return 0
+end

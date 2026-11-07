@@ -75,6 +75,12 @@ Stated here rather than worked around:
   (umask handling, special bits, `-p` ancestors with u+wx); `install -m` and
   `find -perm` take symbolic modes too. `tests/mode_compare.py`: 4118 random
   cases against GNU, 0 mismatches.
+- `tr` is a port of GNU coreutils 9.1 `src/tr.c` in the C locale: escapes
+  (with the ambiguous-octal and trailing-backslash warnings), ranges,
+  `[:class:]`, `[=c=]`, `[c*n]`/`[c*]` with octal or decimal counts, `-c -C
+  -d -s -t`, string2 padding, `[:upper:]`/`[:lower:]` alignment and every
+  validation message. `tests/tr_compare.py`: 6116 random specs against GNU,
+  0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
@@ -409,7 +415,6 @@ Stated here rather than worked around:
   has no `getpwuid`); unknown ids print as numbers.
 - `id` lists supplementary groups from `getgroups`; `-G` is supported.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
-- `tr` has ranges, `[:class:]`, `[c*n]`, `-c`, `-d`, `-s`, and escapes; no equivalence classes.
 - `printf` (the applet and the `sh` builtin) has `%s %b %c %d %i %u %o
   %x %X %f %F %e %E %g %G %%` with flags, width and precision; no `*`
   width or precision, no `%a`, and arguments are reused until consumed.
