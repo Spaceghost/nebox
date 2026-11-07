@@ -1,0 +1,781 @@
+-- tail: a port of GNU coreutils 9.1 src/tail.c. -n/-c with GNU's suffixes
+-- and +N, the obsolete [+-]N[bcl][f] form, the file and pipe strategies,
+-- -q -v -z, and following: -f (descriptor), -F/--follow=name, --retry,
+-- --pid, -s, --max-unchanged-stats, with GNU's polling loop (its
+-- ---disable-inotify mode) and messages for truncated, replaced, removed
+-- and reappearing files.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_strtod(s: cstring, e: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
+local PollFd = @record{fd: cint, events: int16, revents: int16}
+local function c_poll(fds: *PollFd, n: culong, timeout: cint): cint <cimport 'poll', cinclude '<poll.h>'> end
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+local COPY_TO_EOF: uint64 <comptime> = 0xffffffffffffffff
+local COPY_A_BUFFER: uint64 <comptime> = 0xfffffffffffffffe
+local OFF_T_MAX: uint64 <comptime> = 0x7fffffffffffffff
+local BUFSIZ: integer <comptime> = 8192
+local EAGAIN: cint <comptime> = 11
+local O_NONBLOCK: cint <comptime> = 0x800
+local F_SETFL: cint <comptime> = 4
+
+local FOLLOW_NAME: integer <comptime> = 1
+local FOLLOW_DESCRIPTOR: integer <comptime> = 2
+
+local Spec = @record{
+  name: string, size: int64, mtime_s: int64, mtime_ns: int64, dev: culong, ino: culong, mode: cuint,
+  ignore: boolean, tailable: boolean, fd: cint, errnum: cint, blocking: integer, n_unchanged_stats: uint64,
+}
+
+local reopen_inaccessible_files: boolean
+local count_lines: boolean
+local follow_mode: integer
+local forever: boolean
+local from_start: boolean
+local print_headers: boolean
+local line_end: byte
+local max_n_unchanged: uint64
+local pid: cint
+local have_read_stdin: boolean
+local presume_input_pipe: boolean
+local first_header: boolean
+local monitor_output: boolean
+
+-- If stdout is a pipe whose reader has gone, exit as a write would.
+local function check_output_alive()
+  if not monitor_output then return end
+  local pfd: PollFd = {fd = 1, events = 0, revents = 0}
+  if c_poll(&pfd, 1, 0) >= 0 and (pfd.revents & (8 | 16)) ~= 0 then
+    sys.kill(sys.getpid(), sys.SIGPIPE)
+    c_exit(1)
+  end
+end
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'tail --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function pretty_name(f: *Spec): string
+  return f.name == '-' and 'standard input' or f.name
+end
+
+local function write_header(name: string)
+  util.write(first_header and '==> ' or '\n==> ')
+  util.write(name)
+  util.write(' <==\n')
+  first_header = false
+end
+
+local function read_some(fd: cint, buf: *[0]byte, n: integer): integer
+  local r: clong
+  repeat r = sys.read(fd, buf, (@csize)(n)) until not (r < 0 and sys.errno() == sys.EINTR)
+  return r
+end
+
+local function dump_remainder(want_header: boolean, name: string, fd: cint, n_bytes: uint64): uint64
+  local n_written: uint64 = 0
+  local remaining = n_bytes
+  local buffer: [8192]byte
+  while true do
+    local n: integer = remaining < 8192 and (@integer)(remaining) or 8192
+    local r = read_some(fd, &buffer, n)
+    if r < 0 then
+      if sys.errno() ~= EAGAIN then die('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()) end
+      break
+    end
+    if r == 0 then break end
+    if want_header then write_header(name); want_header = false end
+    util.writebytes(&buffer, (@usize)(r))
+    n_written = n_written + (@uint64)(r)
+    if n_bytes ~= COPY_TO_EOF then
+      remaining = remaining - (@uint64)(r)
+      if remaining == 0 or n_bytes == COPY_A_BUFFER then break end
+    end
+  end
+  return n_written
+end
+
+local function xlseek(fd: cint, off: int64, whence: cint, name: string): int64
+  local r = sys.lseek(fd, off, whence)
+  if r >= 0 then return r end
+  local what = whence == sys.SEEK_SET and 'offset ' or (whence == sys.SEEK_CUR and 'relative offset ' or 'end-relative offset ')
+  die(util.quotef(name) .. ': cannot seek to ' .. what .. tostring(off) .. ': ' .. sys.errstr())
+  return -1
+end
+
+local function file_lines(name: string, fd: cint, n_lines: uint64, start_pos: int64, end_pos: int64, read_pos: *uint64): boolean
+  local buffer: [8192]byte
+  local pos = end_pos
+  if n_lines == 0 then return true end
+  local bytes_read: integer = (@integer)((pos - start_pos) % BUFSIZ)
+  if bytes_read == 0 then bytes_read = BUFSIZ end
+  pos = pos - bytes_read
+  xlseek(fd, pos, sys.SEEK_SET, name)
+  bytes_read = read_some(fd, &buffer, bytes_read)
+  if bytes_read < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+  $read_pos = (@uint64)(pos + bytes_read)
+  if bytes_read > 0 and buffer[bytes_read - 1] ~= line_end then n_lines = n_lines - 1 end
+  repeat
+    local n = bytes_read
+    while n > 0 do
+      local k = n - 1
+      while k >= 0 and buffer[k] ~= line_end do k = k - 1 end
+      if k < 0 then break end
+      n = k
+      local was = n_lines
+      n_lines = n_lines - 1
+      if was == 0 then
+        util.writebytes(&buffer[n + 1], (@usize)(bytes_read - (n + 1)))
+        $read_pos = $read_pos + dump_remainder(false, name, fd, (@uint64)(end_pos - (pos + bytes_read)))
+        return true
+      end
+    end
+    if pos == start_pos then
+      xlseek(fd, start_pos, sys.SEEK_SET, name)
+      $read_pos = (@uint64)(start_pos) + dump_remainder(false, name, fd, (@uint64)(end_pos))
+      return true
+    end
+    pos = pos - BUFSIZ
+    xlseek(fd, pos, sys.SEEK_SET, name)
+    bytes_read = read_some(fd, &buffer, BUFSIZ)
+    if bytes_read < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+    $read_pos = (@uint64)(pos + bytes_read)
+  until bytes_read <= 0
+  return true
+end
+
+-- The last n lines (or bytes) of a pipe, holding only what may be printed.
+local function pipe_tail(name: string, fd: cint, n: uint64, lines: boolean, read_pos: *uint64): boolean
+  local pending: sequence(byte)
+  local nls: sequence(integer)
+  local start = 1
+  local buf: [8192]byte
+  local ok = true
+  while true do
+    local r = read_some(fd, &buf, 8192)
+    if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); ok = false; break end
+    if r == 0 then break end
+    $read_pos = $read_pos + (@uint64)(r)
+    for k = 0, < r do
+      pending:push(buf[k])
+      if lines and buf[k] == line_end then nls:push(#pending) end
+    end
+    if lines then
+      while (@uint64)(#nls) > n do start = nls[1] + 1; nls:remove(1) end
+    else
+      local held = (@uint64)(#pending - start + 1)
+      if held > n then start = start + (@integer)(held - n) end
+    end
+    if start > 65536 then
+      local m = #pending - start + 1
+      for k = 1, m do pending[k] = pending[start + k - 1] end
+      pending:resize((@usize)(m))
+      for k = 1, #nls do nls[k] = nls[k] - (start - 1) end
+      start = 1
+    end
+  end
+  if ok and #pending >= start and not (lines and n == 0) then
+    if lines and pending[#pending] ~= line_end and (@uint64)(#nls) >= n and #nls > 0 then
+      -- the partial last line is one of the n
+      start = nls[1] + 1
+    end
+    if #pending >= start then util.writebytes(&pending[start], (@usize)(#pending - start + 1)) end
+  end
+  pending:destroy(); nls:destroy()
+  return ok
+end
+
+-- 1 error, 0 ok, -1 EOF
+local function start_bytes(name: string, fd: cint, n: uint64, read_pos: *uint64): integer
+  local buffer: [8192]byte
+  while n > 0 do
+    local r = read_some(fd, &buffer, BUFSIZ)
+    if r == 0 then return -1 end
+    if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return 1 end
+    $read_pos = $read_pos + (@uint64)(r)
+    if (@uint64)(r) <= n then n = n - (@uint64)(r)
+    else
+      util.writebytes(&buffer[(@integer)(n)], (@usize)(r - (@integer)(n)))
+      break
+    end
+  end
+  return 0
+end
+
+local function start_lines(name: string, fd: cint, n: uint64, read_pos: *uint64): integer
+  if n == 0 then return 0 end
+  local buffer: [8192]byte
+  while true do
+    local r = read_some(fd, &buffer, BUFSIZ)
+    if r == 0 then return -1 end
+    if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return 1 end
+    $read_pos = $read_pos + (@uint64)(r)
+    for k = 0, < r do
+      if buffer[k] == line_end then
+        n = n - 1
+        if n == 0 then
+          if k + 1 < r then util.writebytes(&buffer[k + 1], (@usize)(r - k - 1)) end
+          return 0
+        end
+      end
+    end
+  end
+end
+
+local function usable_st_size(st: *sys.Stat): boolean
+  local t = st.st_mode & sys.S_IFMT
+  return t == sys.S_IFREG or t == 0xA000
+end
+
+local function tail_bytes(name: string, fd: cint, n: uint64, read_pos: *uint64): boolean
+  local st: sys.Stat
+  if sys.fstat(fd, &st) ~= 0 then util.err('cannot fstat ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+  if from_start then
+    local done = false
+    if not presume_input_pipe and n <= OFF_T_MAX then
+      if (st.st_mode & sys.S_IFMT) == sys.S_IFREG then
+        xlseek(fd, (@int64)(n), sys.SEEK_CUR, name)
+        done = true
+      elseif sys.lseek(fd, (@int64)(n), sys.SEEK_CUR) ~= -1 then
+        done = true
+      end
+    end
+    if done then $read_pos = $read_pos + n
+    else
+      local t = start_bytes(name, fd, n, read_pos)
+      if t ~= 0 then return t < 0 end
+    end
+    n = COPY_TO_EOF
+  else
+    local end_pos: int64 = -1
+    local current_pos: int64 = -1
+    if not presume_input_pipe and n <= OFF_T_MAX then
+      if usable_st_size(&st) then end_pos = st.st_size
+      else
+        current_pos = sys.lseek(fd, -(@int64)(n), 2)
+        if current_pos ~= -1 then end_pos = current_pos + (@int64)(n) end
+      end
+    end
+    if end_pos <= st.st_blksize then return pipe_tail(name, fd, n, false, read_pos) end
+    if current_pos == -1 then current_pos = xlseek(fd, 0, sys.SEEK_CUR, name) end
+    if current_pos < end_pos then
+      local remaining = end_pos - current_pos
+      if (@int64)(n) < remaining then
+        current_pos = end_pos - (@int64)(n)
+        xlseek(fd, current_pos, sys.SEEK_SET, name)
+      end
+    end
+    $read_pos = (@uint64)(current_pos)
+  end
+  $read_pos = $read_pos + dump_remainder(false, name, fd, n)
+  return true
+end
+
+local function tail_lines(name: string, fd: cint, n: uint64, read_pos: *uint64): boolean
+  local st: sys.Stat
+  if sys.fstat(fd, &st) ~= 0 then util.err('cannot fstat ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+  if from_start then
+    local t = start_lines(name, fd, n, read_pos)
+    if t ~= 0 then return t < 0 end
+    $read_pos = $read_pos + dump_remainder(false, name, fd, COPY_TO_EOF)
+  else
+    local start_pos: int64 = -1
+    local end_pos: int64 = 0
+    local use_file = false
+    if not presume_input_pipe and (st.st_mode & sys.S_IFMT) == sys.S_IFREG then
+      start_pos = sys.lseek(fd, 0, sys.SEEK_CUR)
+      if start_pos ~= -1 then
+        end_pos = sys.lseek(fd, 0, 2)
+        use_file = start_pos < end_pos
+      end
+    end
+    if use_file then
+      $read_pos = (@uint64)(end_pos)
+      if end_pos ~= 0 and not file_lines(name, fd, n, start_pos, end_pos, read_pos) then return false end
+    else
+      if start_pos ~= -1 then xlseek(fd, start_pos, sys.SEEK_SET, name) end
+      return pipe_tail(name, fd, n, true, read_pos)
+    end
+  end
+  return true
+end
+
+local function is_tailable_type(mode: cuint): boolean
+  local t = mode & sys.S_IFMT
+  return t == sys.S_IFREG or t == 0x1000 or t == 0xC000 or t == 0x2000
+end
+
+local function record_open_fd(f: *Spec, fd: cint, size: int64, st: *sys.Stat, blocking: integer)
+  f.fd = fd
+  f.size = size
+  f.mtime_s = st.st_mtim.tv_sec
+  f.mtime_ns = st.st_mtim.tv_nsec
+  f.dev = st.st_dev
+  f.ino = st.st_ino
+  f.mode = st.st_mode
+  f.blocking = blocking
+  f.n_unchanged_stats = 0
+  f.ignore = false
+end
+
+local function close_fd(fd: cint, name: string)
+  if fd ~= -1 and fd ~= 0 and sys.close(fd) ~= 0 then
+    util.err('closing ' .. util.quoteaf(name) .. ' (fd=' .. tostring(fd) .. '): ' .. sys.errstr())
+  end
+end
+
+local function tail_file(f: *Spec, n_units: uint64): boolean
+  local is_stdin = f.name == '-'
+  local fd: cint
+  if is_stdin then have_read_stdin = true; fd = 0
+  else fd = sys.open(f.name, sys.O_RDONLY, 0) end
+  f.tailable = not (reopen_inaccessible_files and fd == -1)
+  local ok: boolean
+  if fd == -1 then
+    local e = sys.errno()
+    if forever then
+      f.fd = -1; f.errnum = e; f.ignore = not reopen_inaccessible_files; f.ino = 0; f.dev = 0
+    end
+    util.err('cannot open ' .. util.quoteaf(pretty_name(f)) .. ' for reading: ' .. sys.strerror(e))
+    ok = false
+  else
+    local read_pos: uint64 = 0
+    if print_headers then write_header(pretty_name(f)) end
+    if count_lines then ok = tail_lines(pretty_name(f), fd, n_units, &read_pos)
+    else ok = tail_bytes(pretty_name(f), fd, n_units, &read_pos) end
+    if forever then
+      local st: sys.Stat
+      f.errnum = ok and 0 or -1
+      if sys.fstat(fd, &st) < 0 then
+        ok = false
+        f.errnum = sys.errno()
+        util.err('error reading ' .. util.quoteaf(pretty_name(f)) .. ': ' .. sys.errstr())
+      elseif not is_tailable_type(st.st_mode) then
+        ok = false
+        f.errnum = -1
+        f.tailable = false
+        f.ignore = not reopen_inaccessible_files
+        util.err(util.quotef(pretty_name(f)) .. ': cannot follow end of this type of file'
+          .. (f.ignore and '; giving up on this name' or ''))
+      end
+      if not ok then
+        f.ignore = not reopen_inaccessible_files
+        close_fd(fd, pretty_name(f))
+        f.fd = -1
+      else
+        record_open_fd(f, fd, (@int64)(read_pos), &st, is_stdin and -1 or 1)
+      end
+    else
+      if not is_stdin and sys.close(fd) ~= 0 then
+        util.err('error reading ' .. util.quoteaf(pretty_name(f)) .. ': ' .. sys.errstr())
+        ok = false
+      end
+    end
+  end
+  return ok
+end
+
+local function recheck(f: *Spec, blocking: boolean)
+  local st: sys.Stat
+  local ok = true
+  local is_stdin = f.name == '-'
+  local was_tailable = f.tailable
+  local prev_errnum = f.errnum
+  local fd: cint
+  if is_stdin then fd = 0
+  else fd = sys.open(f.name, sys.O_RDONLY | (blocking and 0 or O_NONBLOCK), 0) end
+  local open_errno = sys.errno()
+  f.tailable = not (reopen_inaccessible_files and fd == -1)
+  if fd == -1 or sys.fstat(fd, &st) < 0 then
+    ok = false
+    local e = fd == -1 and open_errno or sys.errno()
+    f.errnum = e
+    if not f.tailable then
+      if was_tailable then util.err(util.quoteaf(pretty_name(f)) .. ' has become inaccessible: ' .. sys.strerror(e)) end
+    elseif prev_errnum ~= e then
+      util.err(util.quotef(pretty_name(f)) .. ': ' .. sys.strerror(e))
+    end
+  elseif not is_tailable_type(st.st_mode) then
+    ok = false
+    f.errnum = -1
+    f.tailable = false
+    f.ignore = not (reopen_inaccessible_files and follow_mode == FOLLOW_NAME)
+    if was_tailable or prev_errnum ~= f.errnum then
+      util.err(util.quoteaf(pretty_name(f)) .. ' has been replaced with an untailable file'
+        .. (f.ignore and '; giving up on this name' or ''))
+    end
+  else
+    f.errnum = 0
+  end
+  local new_file = false
+  if not ok then
+    close_fd(fd, pretty_name(f))
+    close_fd(f.fd, pretty_name(f))
+    f.fd = -1
+  elseif prev_errnum ~= 0 and prev_errnum ~= sys.ENOENT then
+    new_file = true
+    util.err(util.quoteaf(pretty_name(f)) .. ' has become accessible')
+  elseif f.fd == -1 then
+    new_file = true
+    util.err(util.quoteaf(pretty_name(f)) .. ' has appeared;  following new file')
+  elseif f.ino ~= st.st_ino or f.dev ~= st.st_dev then
+    new_file = true
+    util.err(util.quoteaf(pretty_name(f)) .. ' has been replaced;  following new file')
+    close_fd(f.fd, pretty_name(f))
+  else
+    close_fd(fd, pretty_name(f))
+  end
+  if new_file then
+    record_open_fd(f, fd, 0, &st, is_stdin and -1 or (blocking and 1 or 0))
+    xlseek(fd, 0, sys.SEEK_SET, pretty_name(f))
+  end
+end
+
+local function any_live_files(fs: *sequence(Spec)): boolean
+  if reopen_inaccessible_files and follow_mode == FOLLOW_NAME then return true end
+  local t = $fs
+  for k = 1, #t do
+    if t[k].fd >= 0 then return true end
+    if not t[k].ignore and reopen_inaccessible_files then return true end
+  end
+  return false
+end
+
+local function tail_forever(fs: *sequence(Spec), sleep_interval: float64)
+  local t = $fs
+  local n_files = #t
+  local blocking = pid == 0 and follow_mode == FOLLOW_DESCRIPTOR and n_files == 1 and t[1].fd ~= -1
+                   and (t[1].mode & sys.S_IFMT) ~= sys.S_IFREG
+  local last = n_files
+  local writer_is_dead = false
+  while true do
+    local any_input = false
+    for i = 1, n_files do
+      local f = &t[i]
+      if f.ignore then continue end
+      if f.fd < 0 then recheck(f, blocking); continue end
+      local fd = f.fd
+      local name = pretty_name(f)
+      local mode = f.mode
+      local want_blocking: integer = blocking and 1 or 0
+      if f.blocking ~= want_blocking then
+        local old = sys.fcntl(fd, sys.F_GETFL, 0)
+        local new = old | (blocking and 0 or O_NONBLOCK)
+        if old < 0 or (new ~= old and sys.fcntl(fd, F_SETFL, new) == -1) then
+          if not ((f.mode & sys.S_IFMT) == sys.S_IFREG and sys.errno() == 1) then
+            die(util.quotef(name) .. ': cannot change nonblocking mode: ' .. sys.errstr())
+          end
+        else
+          f.blocking = want_blocking
+        end
+      end
+      local st: sys.Stat
+      if f.blocking == 0 then
+        if sys.fstat(fd, &st) ~= 0 then
+          f.fd = -1
+          f.errnum = sys.errno()
+          util.err(util.quotef(name) .. ': ' .. sys.errstr())
+          sys.close(fd)
+          continue
+        end
+        if f.mode == st.st_mode and ((st.st_mode & sys.S_IFMT) ~= sys.S_IFREG or f.size == st.st_size)
+           and f.mtime_s == st.st_mtim.tv_sec and f.mtime_ns == st.st_mtim.tv_nsec then
+          local was = f.n_unchanged_stats
+          f.n_unchanged_stats = f.n_unchanged_stats + 1
+          if max_n_unchanged <= was and follow_mode == FOLLOW_NAME then
+            recheck(f, f.blocking == 1)
+            f.n_unchanged_stats = 0
+          end
+          continue
+        end
+        f.mtime_s = st.st_mtim.tv_sec; f.mtime_ns = st.st_mtim.tv_nsec
+        f.mode = st.st_mode
+        f.n_unchanged_stats = 0
+        if (mode & sys.S_IFMT) == sys.S_IFREG and st.st_size < f.size then
+          util.err(util.quotef(name) .. ': file truncated')
+          xlseek(fd, 0, sys.SEEK_SET, name)
+          f.size = 0
+        end
+        if i ~= last then
+          if print_headers then write_header(name) end
+          last = i
+        end
+      end
+      local bytes_to_read = f.blocking == 1 and COPY_A_BUFFER or COPY_TO_EOF
+      local got = dump_remainder(false, name, fd, bytes_to_read)
+      if got ~= 0 then any_input = true end
+      f.size = f.size + (@int64)(got)
+    end
+    if not any_live_files(fs) then
+      util.err('no files remaining')
+      break
+    end
+    util.flush()
+    check_output_alive()
+    if not any_input then
+      if writer_is_dead then break end
+      writer_is_dead = pid ~= 0 and sys.kill(pid, 0) ~= 0 and sys.errno() ~= 1
+      if not writer_is_dead then
+        local ts: sys.Timespec
+        ts.tv_sec = (@clong)(sleep_interval)
+        ts.tv_nsec = (@clong)((sleep_interval - (@float64)(ts.tv_sec)) * 1e9)
+        sys.nanosleep(&ts, nilptr)
+      end
+    end
+  end
+end
+
+-- xdectoumax(s, 0, UINTMAX_MAX, suffixes, msg, 0); suffixes "" or GNU's.
+local function dectoumax(s: string, with_suffixes: boolean, msg: string, maxv: uint64): uint64
+  local p = 1
+  while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
+  local function fail(t: string) die(msg .. ': ' .. util.quote(s) .. t) end
+  if p <= #s and s:byte(p) == 45 then fail('') end
+  if p <= #s and s:byte(p) == 43 then p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while p <= #s and s:byte(p) >= 48 and s:byte(p) <= 57 do
+    local d: uint64 = s:byte(p) - 48
+    if v > (UMAX - d) // 10 then ovf = true; v = UMAX elseif not ovf then v = v * 10 + d end
+    p = p + 1
+  end
+  if p == start then
+    local c: byte = p <= #s and s:byte(p) or 0
+    if with_suffixes and c ~= 0 and ('bkKmMGTPEZY'):find(string.char(c), 1, true) > 0 then v = 1 else fail('') end
+  end
+  if p <= #s then
+    if not with_suffixes then fail('') end
+    local c = s:byte(p)
+    local base: uint64 = 1024
+    local nsuf = 1
+    local power = 0
+    if c == 98 then
+      if v > UMAX // 512 then ovf = true; v = UMAX else v = v * 512 end
+    elseif ('kKmMGTPEZY'):find(string.char(c), 1, true) > 0 then
+      local c1: byte = p + 1 <= #s and s:byte(p + 1) or 0
+      if c1 == 105 and p + 2 <= #s and s:byte(p + 2) == 66 then nsuf = 3
+      elseif c1 == 66 or c1 == 68 then base = 1000; nsuf = 2 end
+      if c == 107 or c == 75 then power = 1 elseif c == 109 or c == 77 then power = 2
+      elseif c == 71 then power = 3 elseif c == 84 then power = 4 elseif c == 80 then power = 5
+      elseif c == 69 then power = 6 elseif c == 90 then power = 7 else power = 8 end
+      for _ = 1, power do
+        if v ~= 0 and v > UMAX // base then ovf = true; v = UMAX else v = v * base end
+      end
+    else fail('') end
+    p = p + nsuf
+    if p <= #s then fail('') end
+  end
+  if ovf then fail(': Value too large for defined data type') end
+  if v > maxv then fail(': Numerical result out of range') end
+  return v
+end
+
+local RETRY_OPTION: integer <comptime> = 200
+local MAX_UNCHANGED_STATS_OPTION: integer <comptime> = 201
+local PID_OPTION: integer <comptime> = 202
+local PRESUME_INPUT_PIPE_OPTION: integer <comptime> = 203
+local LONG_FOLLOW_OPTION: integer <comptime> = 204
+local DISABLE_INOTIFY_OPTION: integer <comptime> = 205
+local tail_longs: []util.LongOpt = {
+  {'bytes', 1, 99}, {'follow', 2, LONG_FOLLOW_OPTION}, {'lines', 1, 110},
+  {'max-unchanged-stats', 1, MAX_UNCHANGED_STATS_OPTION}, {'-disable-inotify', 0, DISABLE_INOTIFY_OPTION},
+  {'pid', 1, PID_OPTION}, {'-presume-input-pipe', 0, PRESUME_INPUT_PIPE_OPTION}, {'quiet', 0, 113},
+  {'retry', 0, RETRY_OPTION}, {'silent', 0, 113}, {'sleep-interval', 1, 115}, {'verbose', 0, 118},
+  {'zero-terminated', 0, 122}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
+global function applet_tail(args: sequence(string)): integer
+  local NEVER, ALWAYS, MULTIPLE = 0, 1, 2
+  local header_mode = MULTIPLE
+  local n_units: uint64 = 10
+  local sleep_interval: float64 = 1.0
+  reopen_inaccessible_files = false; count_lines = true; follow_mode = FOLLOW_DESCRIPTOR
+  forever = false; from_start = false; print_headers = false; line_end = 10
+  max_n_unchanged = 5; pid = 0; have_read_stdin = false; presume_input_pipe = false
+  first_header = true
+  monitor_output = false
+  local argv: sequence(string)
+  for k = 1, #args do argv:push(args[k]) end
+  -- parse_obsolete_option (argc counts the program name)
+  do
+    local argc = #argv + 1
+    local applies = argc == 2 or (argc == 3 and not (#argv[2] >= 2 and argv[2]:byte(1) == 45))
+                    or (argc >= 3 and argc <= 4 and argv[2] == '--')
+    if applies then
+      local posix_ver: integer = 200809
+      local v = sys.getenv('_POSIX2_VERSION')
+      if v ~= nilptr then
+        local n, ok = util.toint((@string)(v))
+        if ok then posix_ver = n end
+      end
+      local obsolete_usage = posix_ver < 200112
+      local traditional_usage = obsolete_usage or posix_ver >= 200809
+      local a = argv[1]
+      local p = 2
+      local t_from_start = false
+      local t_count_lines = true
+      local t_forever = false
+      local default_count: uint64 = 10
+      local take = false
+      local c0: byte = #a >= 1 and a:byte(1) or 0
+      if c0 == 43 then
+        take = traditional_usage
+        t_from_start = true
+      elseif c0 == 45 then
+        local idx = (#a >= 2 and a:byte(2) == 99) and 3 or 2
+        local ch: byte = idx <= #a and a:byte(idx) or 0
+        take = obsolete_usage or ch ~= 0
+      end
+      if take then
+        local ns = p
+        while p <= #a and a:byte(p) >= 48 and a:byte(p) <= 57 do p = p + 1 end
+        local ne = p
+        local ch: byte = p <= #a and a:byte(p) or 0
+        if ch == 98 then default_count = default_count * 512; t_count_lines = false; p = p + 1
+        elseif ch == 99 then t_count_lines = false; p = p + 1
+        elseif ch == 108 then p = p + 1 end
+        if p <= #a and a:byte(p) == 102 then t_forever = true; p = p + 1 end
+        if p > #a then
+          if ns == ne then n_units = default_count
+          else
+            -- xstrtoumax(n_string, NULL, 10, &n, "b"), ignoring a bad suffix
+            local v: uint64 = 0
+            local ovf = false
+            local q = ns
+            while q < ne do
+              local d: uint64 = a:byte(q) - 48
+              if v > (UMAX - d) // 10 then ovf = true; v = UMAX elseif not ovf then v = v * 10 + d end
+              q = q + 1
+            end
+            if q <= #a and a:byte(q) == 98 and not ovf then
+              if v > UMAX // 512 then ovf = true else v = v * 512 end
+            end
+            if ovf then die('invalid number: ' .. util.quote(a) .. ': Numerical result out of range') end
+            n_units = v
+          end
+          from_start = t_from_start; count_lines = t_count_lines; forever = t_forever
+          argv:remove(1)
+        end
+      end
+    end
+  end
+  local g = util.getopt(argv, 'c:n:fFqs:vz0123456789', &tail_longs, #tail_longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 70 then forever = true; follow_mode = FOLLOW_NAME; reopen_inaccessible_files = true
+    elseif c == 99 or c == 110 then
+      count_lines = c == 110
+      local a = g.optarg
+      if #a > 0 and a:byte(1) == 43 then from_start = true
+      elseif #a > 0 and a:byte(1) == 45 then a = a:sub(2) end
+      n_units = dectoumax(a, true, count_lines and 'invalid number of lines' or 'invalid number of bytes', UMAX)
+    elseif c == 102 or c == LONG_FOLLOW_OPTION then
+      forever = true
+      if not g.has_optarg then follow_mode = FOLLOW_DESCRIPTOR
+      else
+        local a = g.optarg
+        local d = #a > 0 and ('descriptor'):sub(1, #a) == a
+        local n = #a > 0 and ('name'):sub(1, #a) == a
+        if a == 'descriptor' or (d and not n) then follow_mode = FOLLOW_DESCRIPTOR
+        elseif a == 'name' or (n and not d) then follow_mode = FOLLOW_NAME
+        else
+          util.err((#a == 0 and 'ambiguous' or 'invalid') .. ' argument ' .. util.quote(a) .. " for '--follow'")
+          util.flush()
+          local m = "Valid arguments are:\n  - 'descriptor'\n  - 'name'\n"
+          sys.write(2, m.data, m.size)
+          usage_fail('')
+        end
+      end
+    elseif c == RETRY_OPTION then reopen_inaccessible_files = true
+    elseif c == MAX_UNCHANGED_STATS_OPTION then
+      max_n_unchanged = dectoumax(g.optarg, false, 'invalid maximum number of unchanged stats between opens', UMAX)
+    elseif c == DISABLE_INOTIFY_OPTION then
+    elseif c == PID_OPTION then pid = (@cint)(dectoumax(g.optarg, false, 'invalid PID', 0x7fffffff))
+    elseif c == PRESUME_INPUT_PIPE_OPTION then presume_input_pipe = true
+    elseif c == 113 then header_mode = NEVER
+    elseif c == 115 then
+      local a = g.optarg
+      local e: cstring
+      local s = c_strtod(a, &e)
+      local consumed = (@usize)(e) - (@usize)((@cstring)(a))
+      if #a == 0 or consumed ~= (@usize)(#a) or not (s >= 0) then die('invalid number of seconds: ' .. util.quote(a)) end
+      sleep_interval = s
+    elseif c == 118 then header_mode = ALWAYS
+    elseif c == 122 then line_end = 0
+    elseif c >= 48 and c <= 57 then die('option used in invalid context -- ' .. string.char(c)) end
+  end
+  if reopen_inaccessible_files then
+    if not forever then
+      reopen_inaccessible_files = false
+      util.err('warning: --retry ignored; --retry is useful only when following')
+    elseif follow_mode == FOLLOW_DESCRIPTOR then
+      util.err('warning: --retry only effective for the initial open')
+    end
+  end
+  if pid ~= 0 and not forever then util.err('warning: PID ignored; --pid=PID is useful only when following') end
+  if from_start and n_units ~= 0 then n_units = n_units - 1 end
+  local files = g:operands()
+  if #files == 0 then files:push('-') end
+  local found_hyphen = false
+  for _, f in ipairs(files) do if f == '-' then found_hyphen = true end end
+  if found_hyphen and follow_mode == FOLLOW_NAME then die("cannot follow '-' by name") end
+  if forever and found_hyphen then
+    local st: sys.Stat
+    local blocking_stdin = pid == 0 and follow_mode == FOLLOW_DESCRIPTOR and #files == 1
+                           and sys.fstat(0, &st) == 0 and (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG
+    if not blocking_stdin and sys.isatty(0) ~= 0 then
+      util.err('warning: following standard input indefinitely is ineffective')
+    end
+  end
+  if n_units == 0 and not forever and not from_start then return 0 end
+  local fs: sequence(Spec)
+  for _, f in ipairs(files) do fs:push({name = f, fd = -1}) end
+  if header_mode == ALWAYS or (header_mode == MULTIPLE and #files > 1) then print_headers = true end
+  local ok = true
+  for k = 1, #fs do
+    if not tail_file(&fs[k], n_units) then ok = false end
+  end
+  if forever then
+    -- ignore_fifo_and_pipe: POSIX says -f is ignored for a pipe on stdin
+    local n_viable = 0
+    for k = 1, #fs do
+      local f = &fs[k]
+      if f.name == '-' and not f.ignore and f.fd >= 0 and (f.mode & sys.S_IFMT) == 0x1000 then
+        f.fd = -1
+        f.ignore = true
+      else
+        n_viable = n_viable + 1
+      end
+    end
+    if n_viable > 0 then
+      local ost: sys.Stat
+      if sys.fstat(1, &ost) < 0 then die('standard output: ' .. sys.errstr()) end
+      monitor_output = (ost.st_mode & sys.S_IFMT) == 0x1000
+      util.flush()
+      tail_forever(&fs, sleep_interval)
+    end
+  end
+  util.flush()
+  return ok and 0 or 1
+end

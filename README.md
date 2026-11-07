@@ -91,6 +91,14 @@ Stated here rather than worked around:
   after the output so `{ head -n 2; cat; } < f` works), -q -v -z, and the
   obsolete `-N[bkmclqvz]` first argument. `tests/head_compare.py`: 1550 cases
   against GNU, 0 mismatches.
+- `tail` ports tail.c: `-n`/`-c` with suffixes and `+N`, the obsolete
+  `[+-]N[bcl][f]` form (with GNU's _POSIX2_VERSION rules), GNU's file and
+  pipe strategies, -q -v -z, and following: `-f`, `-F`/`--follow=name`,
+  `--retry`, `--pid`, `-s`, `--max-unchanged-stats`, truncation, rotation,
+  removal and reappearance messages, and exit when a piped reader goes away.
+  It always polls, as GNU does with `---disable-inotify` (GNU uses inotify
+  when it can). `tests/tail_compare.py`: 662 cases including scripted
+  follow scenarios against GNU, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
@@ -356,7 +364,6 @@ Stated here rather than worked around:
   suffixes k K M G T P E Z Y, -V implements gnulib filevercmp. Long options
   follow GNU's table, including `--check[=quiet|silent|diagnose-first]`. No
   -M, -g, -R, --parallel, or locales.
-- `tail -f` polls once a second; `-F` is treated as `-f`.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
 - `tsort` reproduces GNU's output order (sorted zero-degree queue, successors
