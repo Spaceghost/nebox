@@ -43,6 +43,7 @@ global regex.Prog = @record{
   nsub: integer,
   icase: boolean,
   hasref: boolean,      -- program contains a back-reference
+  nlanchor: boolean,    -- ^ and $ also match after/before a newline (sed M)
   toocomplex: boolean,  -- last execution exceeded the thread bound
   -- Executor scratch, allocated on first use and kept for the program's life.
   clist: sequence(Thread),
@@ -112,6 +113,7 @@ local Parser = @record{
   sets: sequence(regex.Set),
   err: string,
   depth: integer,
+  newline: boolean, -- REG_NEWLINE: '.' and [^...] do not match a newline
 }
 
 function Parser:peek(): byte
@@ -237,8 +239,8 @@ function Parser:parse_bracket(): Frag
   end
   if negate then
     for i = 0, 31 do s.bits[i] = ~s.bits[i] end
-    -- a negated set never matches newline
-    s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7))
+    -- with REG_NEWLINE (sed's M flag) a negated set does not match newline
+    if self.newline then s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7)) end
   end
   self.sets:push(s)
   out:push(inst(OP_CLASS, 0, #self.sets, 0))
@@ -375,6 +377,12 @@ function Parser:parse_atom(start: boolean): (Frag, boolean)
     return self:single(36), true
   elseif c == 46 then
     self.pos = self.pos + 1
+    if self.newline then
+      local s: regex.Set
+      for i = 0, 31 do s.bits[i] = 0xff end
+      s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7))
+      return self:class_frag(s), true
+    end
     out:push(inst(OP_ANY, 0, 0, 0))
     return out, true
   elseif c == 91 then
@@ -425,6 +433,9 @@ function Parser:parse_atom(start: boolean): (Frag, boolean)
       for i = 0, 31 do s.bits[i] = ~s.bits[i] end
       return self:class_frag(s), true
     end
+    -- GNU \` and \' anchor at the ends of the whole buffer, even with M
+    if e == 96 then out:push(inst(OP_BOL, 1, 0, 0)); return out, true end
+    if e == 39 then out:push(inst(OP_EOL, 1, 0, 0)); return out, true end
     if e == 98 then out:push(inst(OP_WORDB, 0, 0, 0)); return out, true end
     if e == 66 then out:push(inst(OP_NWORDB, 0, 0, 0)); return out, true end
     if e == 60 then out:push(inst(OP_WSTART, 0, 0, 0)); return out, true end
@@ -443,10 +454,13 @@ function Parser:parse_atom(start: boolean): (Frag, boolean)
 end
 
 -- Compile a pattern. Returns the program and an error message ("" on success).
-function regex.compile(pat: string, ere: boolean, icase: boolean): (regex.Prog, string)
-  local p: Parser = {pat = pat, pos = 1, ere = ere, icase = icase}
+-- `newline` is REG_NEWLINE as GNU sed's M flag sets it ('.' and [^...] skip
+-- newline); `nlanchor` makes ^ and $ match at embedded newlines too.
+function regex.compile_nl(pat: string, ere: boolean, icase: boolean, newline: boolean, nlanchor: boolean): (regex.Prog, string)
+  local p: Parser = {pat = pat, pos = 1, ere = ere, icase = icase, newline = newline}
   local prog: regex.Prog
   prog.icase = icase
+  prog.nlanchor = nlanchor
   local body = p:parse_alt()
   if p.err.size == 0 and p:more() then
     if p:at_close() then p.err = ere and 'Unmatched ) or \\)' or 'Unmatched \\)' else p.err = 'Invalid regular expression' end
@@ -462,6 +476,10 @@ function regex.compile(pat: string, ere: boolean, icase: boolean): (regex.Prog, 
     if prog.code[i].op == OP_BACKREF then prog.hasref = true end
   end
   return prog, ''
+end
+
+function regex.compile(pat: string, ere: boolean, icase: boolean): (regex.Prog, string)
+  return regex.compile_nl(pat, ere, icase, false, false)
 end
 
 -- Executor ------------------------------------------------------------------
@@ -484,10 +502,11 @@ local function caps_clear(c: *regex.Caps)
   for i = 0, 19 do c.at[i] = -1 end
 end
 
-local function zw_ok(op: byte, text: string, pos: isize): boolean
+local function zw_ok(prog: *regex.Prog, ins: regex.Inst, text: string, pos: isize): boolean
+  local op = ins.op
   local n: isize = (@isize)(text.size)
-  if op == OP_BOL then return pos == 0 end
-  if op == OP_EOL then return pos == n end
+  if op == OP_BOL then return pos == 0 or (ins.c == 0 and prog.nlanchor and text.data[pos - 1] == 10) end
+  if op == OP_EOL then return pos == n or (ins.c == 0 and prog.nlanchor and text.data[pos] == 10) end
   local before = pos > 0 and isword(text.data[pos - 1])
   local after = pos < n and isword(text.data[pos])
   if op == OP_WORDB then return before ~= after end
@@ -582,7 +601,7 @@ local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer
   elseif op == OP_BACKREF then
     addthread(prog, list, n, pc + 1, pos, text, caps)
   else
-    if zw_ok(op, text, pos) then addthread(prog, list, n, pc + 1, pos, text, caps) end
+    if zw_ok(prog, ins, text, pos) then addthread(prog, list, n, pc + 1, pos, text, caps) end
   end
   if prog.hasref then prog.epsvis[pc + 1] = old end
 end
@@ -672,7 +691,7 @@ end
 -- Search from `start`; the leftmost match wins, then the longest.
 function regex.Prog:search(text: string, start: isize, caps: *regex.Caps): boolean
   caps_clear(caps)
-  if #self.code > 1 and self.code[2].op == OP_BOL then
+  if #self.code > 1 and self.code[2].op == OP_BOL and (self.code[2].c == 1 or not self.nlanchor) then
     if start > 0 then return false end
     return execute(self, text, 0, true, caps)
   end

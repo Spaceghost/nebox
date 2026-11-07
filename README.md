@@ -144,7 +144,9 @@ Stated here rather than worked around:
   Not implemented: multibyte locales (bytes only; `-i` folds ASCII; the test
   harness runs in the C locale, so this has no case), equivalence classes
   `[=a=]` and collating symbols `[.a.]` (`re-equiv-unsupported` pins the
-  current non-matching behavior).
+  current non-matching behavior). `\`` and `\'` match only at the ends of
+  the subject, as in GNU regex (`sed-buffer-anchors`); `.` and `[^...]`
+  match a newline unless REG_NEWLINE is in effect (sed's `M` flag).
 - `grep` takes -i -v -n -b -c -l -q -H -h -r -F -E -G -w -x -o -e -m and
   the context options -A, -B, -C and -NUM, following GNU grep 3.8's prtext:
   `--` before a group that is not adjacent to the previous output (also
@@ -160,10 +162,25 @@ Stated here rather than worked around:
   detection (a NUL byte does not make grep report "binary file matches"),
   `-o -w`, which prints the delimiting characters with the word, and -s,
   which is accepted but does not silence errors.
-- `sed` covers -n -e -f -E -s -i[SUFFIX], every address form, and the
-  commands `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F`.
-  `s` flags: g p N i/I w; replacement escapes `& \1..\9 \n \U \L \u \l \E`.
-  No `e`, `M`, `-z`, or `--posix`.
+- `sed` covers -n -e -f -E -s -i[SUFFIX] -z, every address form (`I` and
+  `M` after a regex address), and the commands
+  `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F e`.
+  `s` flags: g p N i/I m/M e w; replacement escapes
+  `& \1..\9 \n \U \L \u \l \E`. Compared with GNU sed 4.9: `M` is
+  REG_NEWLINE, so `.` and `[^...]` stop matching a newline and `^`/`$` also
+  match next to embedded newlines, except under -z where only the first
+  part applies (`sed-M-*`, `sed-z-M`). -z makes NUL the delimiter for input
+  lines, output, N G H D P W, `=`, `l`, `i`, `c`, `w` and `F`; text from `a`
+  still ends with a newline (`sed-z*`). `e COMMAND` writes the output of
+  `/bin/sh -c COMMAND` at once; `e` alone and the `s///e` flag replace the
+  pattern space with the output of running it, less one trailing
+  delimiter; `p` before `e` prints before evaluating, after it prints the
+  result; exit statuses are ignored (`sed-e-*`). A last line printed
+  without its delimiter gets it when more output follows, separately for
+  each `w` file and `/dev/stdout` (`sed-missing-newline`). Not supported:
+  `--posix`, `--sandbox`, `--debug`, `-u`, `-l N`, `--follow-symlinks`,
+  the `v` command, `R` (parsed but does nothing), and the `\dNNN \oNNN
+  \xHH \cX` escapes.
 - `find` has the usual tests and actions (-name -iname -path -regex -type
   -size -empty -newer -mtime -mmin -perm -user -group -links -inum -maxdepth
   -mindepth -depth -prune -print -print0 -delete -exec ; and + -quit), but

@@ -1,7 +1,7 @@
 -- sed: a stream editor over nebox's regex engine.
--- Supports -n -e -f -E/-r -s -i[SUFFIX]; addresses N, $, /re/[I], \cREc,
+-- Supports -n -e -f -E/-r -s -i[SUFFIX] -z; addresses N, $, /re/[IM], \cREc,
 -- first~step, addr,+N, addr,~N, 0,/re/, and !; commands { } s y p P d D n N
--- g G h H x a i c = l q Q r w b t T : z and # comments.
+-- g G h H x a i c = l q Q r w W b t T : z F e and # comments.
 ## pragmas.nogc = true
 
 require 'string'
@@ -27,7 +27,9 @@ local Cmd = @record{
   text: string,          -- a/i/c text, label, file name, y target
   re: regex.Prog, has_re: boolean,   -- s regex
   repl: string,          -- s replacement (raw, with \N and &)
-  allm: boolean, print: boolean, nth: integer, wfile: string,
+  allm: boolean, print: integer, nth: integer, wfile: string,
+  eval: boolean,         -- s///e
+
   ymap: [256]byte,
   target: integer,       -- matching } for {, or jump target for b/t/T
   exitcode: integer,
@@ -38,6 +40,8 @@ local Cmd = @record{
 local Sed = @record{
   cmds: sequence(Cmd),
   quiet: boolean, ere: boolean, separate: boolean, inplace: boolean, suffix: string,
+  delim: byte,            -- line delimiter: newline, or NUL with -z
+  missing: boolean,       -- the last output line lacked its delimiter
   err: string,
   -- runtime
   lines: sequence(string), lineno: integer, idx: integer, total: integer,
@@ -47,7 +51,7 @@ local Sed = @record{
   tflag: boolean,
   quit: boolean, exitcode: integer,
   lastre: regex.Prog, has_lastre: boolean,
-  wfiles: sequence(string), wfds: sequence(cint),
+  wfiles: sequence(string), wfds: sequence(cint), wmiss: sequence(boolean),
   rc: integer,
 }
 
@@ -115,12 +119,14 @@ function Script:number(): (integer, boolean)
   return v, any
 end
 
-local function compile_re(pat: string, icase: boolean): (regex.Prog, boolean)
+-- The M flag is REG_NEWLINE; as in GNU sed, ^ and $ match at embedded
+-- newlines only when the line delimiter is newline (not with -z).
+local function compile_re(pat: string, icase: boolean, mline: boolean): (regex.Prog, boolean)
   if pat.size == 0 then
     if not sed.has_lastre then sed.err = 'no previous regular expression'; return sed.lastre, false end
     return sed.lastre, true
   end
-  local prog, err = regex.compile(pat, sed.ere, icase)
+  local prog, err = regex.compile_nl(pat, sed.ere, icase, mline, mline and sed.delim == 10)
   if err.size > 0 then sed.err = '-e expression #1, char 0: ' .. err; return prog, false end
   sed.lastre = prog; sed.has_lastre = true
   return prog, true
@@ -150,12 +156,12 @@ function Script:address(a: *Addr): boolean
     self.pos = self.pos + 1
     local pat, ok = self:delimited(delim, true)
     if not ok then sed.err = 'unterminated address regex'; return false end
-    local icase = false
+    local icase, mline = false, false
     while self:peek() == 73 or self:peek() == 77 do
-      if self:peek() == 73 then icase = true end
+      if self:peek() == 73 then icase = true else mline = true end
       self.pos = self.pos + 1
     end
-    local prog, rok = compile_re(pat, icase)
+    local prog, rok = compile_re(pat, icase, mline)
     if not rok then return false end
     a.kind = ADDR_RE; a.re = prog; a.has_re = true
     return true
@@ -251,25 +257,31 @@ local function parse_script(text: string): boolean
       local rep, ok2 = sc:delimited(delim, false)
       if not ok2 then sed.err = 'unterminated `s\' command'; return false end
       cmd.repl = rep
-      local icase = false
+      local icase, mline = false, false
       cmd.nth = 0
       while sc:more() do
         local f = sc:peek()
         if f == 103 then cmd.allm = true
-        elseif f == 112 then cmd.print = true
+        elseif f == 112 then
+          -- GNU: p before e prints before evaluating, after e it prints the result
+          if cmd.print ~= 0 then sed.err = "multiple `p' options to `s' command"; return false end
+          cmd.print = cmd.eval and 2 or 1
         elseif f == 105 or f == 73 then icase = true
-        elseif f == 109 or f == 77 then
-        elseif f == 101 then sed.err = 'the `e\' flag is not supported'; return false
+        elseif f == 109 or f == 77 then mline = true
+        elseif f == 101 then cmd.eval = true
         elseif f >= 48 and f <= 57 then
           local n, _ = sc:number(); cmd.nth = n; continue
         elseif f == 119 then
           sc.pos = sc.pos + 1
           cmd.wfile = sc:rest_of_line()
+          local found = false
+          for _, f in ipairs(sed.wfiles) do if f == cmd.wfile then found = true end end
+          if not found then sed.wfiles:push(cmd.wfile) end
           break
         else break end
         sc.pos = sc.pos + 1
       end
-      local prog, rok = compile_re(pat, icase)
+      local prog, rok = compile_re(pat, icase, mline)
       if not rok then return false end
       cmd.re = prog; cmd.has_re = true
     elseif name == 121 then
@@ -285,6 +297,8 @@ local function parse_script(text: string): boolean
       for i: usize = 1, us.size do cmd.ymap[us:byte(i)] = ud:byte(i) end
     elseif name == 97 or name == 105 or name == 99 then
       cmd.text = sc:text_arg()
+    elseif name == 101 then
+      cmd.text = sc:rest_of_line()
     elseif name == 114 or name == 119 or name == 87 or name == 82 then
       cmd.text = sc:rest_of_line()
       if name == 119 or name == 87 then
@@ -311,8 +325,8 @@ local function parse_script(text: string): boolean
     sc:skip_ws()
     local t = sc:peek()
     if t == 59 or t == 10 then sc.pos = sc.pos + 1
-    elseif t == 125 or t == 0 or t == 35 or name == 123 then
-    elseif name == 97 or name == 105 or name == 99 or name == 114 or name == 119 or name == 98 or name == 116 or name == 84 or name == 58 then
+    elseif t == 125 or t == 0 or t == 35 or name == 123 or (name == 115 and cmd.wfile.size > 0) then
+    elseif name == 97 or name == 105 or name == 99 or name == 114 or name == 119 or name == 98 or name == 116 or name == 84 or name == 58 or name == 101 then
     else
       sed.err = "extra characters after command"
       return false
@@ -411,35 +425,87 @@ local function selected(c: *Cmd): boolean
   return m
 end
 
+-- GNU output_missing_newline: a line printed without its delimiter (the
+-- input's last line had none) gets it once anything else is printed.
+local function out_pending()
+  if sed.missing then util.writebyte(sed.delim); sed.missing = false end
+end
+
 local function emit(s: string, newline: boolean)
+  out_pending()
   util.write(s)
-  if newline then util.writebyte(10) end
+  if newline then util.writebyte(sed.delim) end
 end
 
 -- Print the pattern space with the input's trailing-newline convention.
 local function print_ps(s: string)
+  out_pending()
   util.write(s)
-  if not (is_last() and not sed.lastnl) then util.writebyte(10) end
+  if is_last() and not sed.lastnl then sed.missing = true else util.writebyte(sed.delim) end
+end
+
+local function find_delim(s: string): isize
+  for i: usize = 0, < s.size do
+    if s.data[i] == sed.delim then return (@isize)(i) + 1 end
+  end
+  return 0
+end
+
+-- Output of `sh -c cmd` (popen as GNU sed uses it for e and s///e). The
+-- command line ends at its first NUL byte, as a C string does.
+local function sh_output(cmd: string): string
+  util.flush()
+  local ccmd = string.copy(cmd)
+  local fds: [2]cint = {-1, -1}
+  if sys.pipe(&fds) ~= 0 then util.err('error in subprocess'); sed.quit = true; sed.exitcode = 4; return '' end
+  local pid = sys.fork()
+  if pid < 0 then
+    sys.close(fds[0]); sys.close(fds[1])
+    util.err('error in subprocess'); sed.quit = true; sed.exitcode = 4; return ''
+  end
+  if pid == 0 then
+    sys.dup2(fds[1], 1); sys.close(fds[0]); sys.close(fds[1])
+    local argv: [4]cstring = {'sh', '-c', (@cstring)(ccmd.data), nilptr}
+    sys.execve('/bin/sh', &argv, environ)
+    sys._exit(127)
+  end
+  sys.close(fds[1])
+  local out, _ = util.readfd(fds[0])
+  sys.close(fds[0])
+  local status: cint = 0
+  while sys.waitpid(pid, &status, 0) < 0 and sys.errno() == sys.EINTR do end
+  return out
+end
+
+-- e and s///e put the output in the pattern space less one final delimiter.
+local function sh_into_ps(cmd: string)
+  local out = sh_output(cmd)
+  if out.size > 0 and out.data[out.size - 1] == sed.delim then out = out:sub(1, -2) end
+  sed.ps = out
 end
 
 local function flush_append()
+  if #sed.appendq > 0 then out_pending() end
   for _, t in ipairs(sed.appendq) do util.write(t) end
   sed.appendq:clear()
 end
 
-local function wfd(name: string): cint
-  for i, f in ipairs(sed.wfiles) do
-    if f == name then return sed.wfds[i] end
-  end
-  return -1
-end
-
-local function write_to(name: string, s: string)
-  if name == '/dev/stdout' then util.write(s); util.writebyte(10); return end
-  local fd = wfd(name)
-  if fd < 0 then return end
-  local out = s .. '\n'
-  sys.write(fd, out.data, out.size)
+-- w, s///w and W. Each w file (and /dev/stdout, apart from the main
+-- output) has its own missing-delimiter state, as in GNU sed. `chomp`:
+-- the text is the whole pattern space, so the input's last line keeps its
+-- missing delimiter.
+local function write_to(name: string, s: string, chomp: boolean)
+  local k: integer = 0
+  for i, f in ipairs(sed.wfiles) do if f == name then k = i end end
+  if k == 0 then return end
+  local sb: stringbuilder
+  if sed.wmiss[k] then sb:writebyte(sed.delim); sed.wmiss[k] = false end
+  sb:write(s)
+  if chomp and is_last() and not sed.lastnl then sed.wmiss[k] = true else sb:writebyte(sed.delim) end
+  local out = sb:promote()
+  if name == '/dev/stdout' then util.write(out); return end
+  local fd = sed.wfds[k]
+  if fd >= 0 then sys.write(fd, out.data, out.size) end
 end
 
 -- Expand a replacement for one match.
@@ -556,11 +622,12 @@ local function list_ps(width: integer)
     elseif b < 32 or b >= 127 then piece = string.format('\\%03o', b)
     else piece = string.char(b) end
     if col + (@integer)(piece.size) > maxw - 1 then
-      sb:write('\\\n'); col = 0
+      sb:writebyte(92); sb:writebyte(sed.delim); col = 0
     end
     sb:write(piece); col = col + (@integer)(piece.size)
   end
-  sb:write('$\n')
+  sb:writebyte(36); sb:writebyte(sed.delim)
+  out_pending()
   util.write(sb:promote())
 end
 
@@ -570,7 +637,7 @@ local function next_line(append: boolean): boolean
   if sed.idx >= sed.total then return false end
   sed.idx = sed.idx + 1
   sed.lineno = sed.lineno + 1
-  if append then sed.ps = sed.ps .. '\n' .. sed.lines[sed.idx] else sed.ps = sed.lines[sed.idx] end
+  if append then sed.ps = sed.ps .. string.char(sed.delim) .. sed.lines[sed.idx] else sed.ps = sed.lines[sed.idx] end
   return true
 end
 
@@ -592,8 +659,10 @@ local function run_cycle()
     elseif name == 115 then
       if do_subst(c) then
         sed.tflag = true
-        if c.print then print_ps(sed.ps) end
-        if c.wfile.size > 0 then write_to(c.wfile, sed.ps) end
+        if c.print == 1 then print_ps(sed.ps) end
+        if c.eval then sh_into_ps(sed.ps) end
+        if c.print == 2 then print_ps(sed.ps) end
+        if c.wfile.size > 0 then write_to(c.wfile, sed.ps, true) end
       elseif sed.quit then
         autoprint = false; break
       end
@@ -605,12 +674,12 @@ local function run_cycle()
       pc = pc + 1
     elseif name == 112 then print_ps(sed.ps); pc = pc + 1
     elseif name == 80 then
-      local nl = sed.ps:find('\n', 1, true)
+      local nl = find_delim(sed.ps)
       if nl > 0 then emit(sed.ps:sub(1, nl - 1), true) else print_ps(sed.ps) end
       pc = pc + 1
     elseif name == 100 then autoprint = false; break
     elseif name == 68 then
-      local nl = sed.ps:find('\n', 1, true)
+      local nl = find_delim(sed.ps)
       if nl <= 0 then autoprint = false; break end
       sed.ps = sed.ps:sub(nl + 1)
       flush_append()
@@ -630,9 +699,9 @@ local function run_cycle()
       end
       pc = pc + 1
     elseif name == 103 then sed.ps = sed.hs; pc = pc + 1
-    elseif name == 71 then sed.ps = sed.ps .. '\n' .. sed.hs; pc = pc + 1
+    elseif name == 71 then sed.ps = sed.ps .. string.char(sed.delim) .. sed.hs; pc = pc + 1
     elseif name == 104 then sed.hs = sed.ps; pc = pc + 1
-    elseif name == 72 then sed.hs = sed.hs .. '\n' .. sed.ps; pc = pc + 1
+    elseif name == 72 then sed.hs = sed.hs .. string.char(sed.delim) .. sed.ps; pc = pc + 1
     elseif name == 120 then local t = sed.ps; sed.ps = sed.hs; sed.hs = t; pc = pc + 1
     elseif name == 97 then sed.appendq:push(c.text .. '\n'); pc = pc + 1
     elseif name == 105 then emit(c.text, true); pc = pc + 1
@@ -641,7 +710,16 @@ local function run_cycle()
       if c.a2.kind == ADDR_NONE or not c.active or c.negate then emit(c.text, true) end
       autoprint = false
       break
-    elseif name == 61 then util.writef('%d\n', sed.lineno); pc = pc + 1
+    elseif name == 61 then out_pending(); util.writef('%d', sed.lineno); util.writebyte(sed.delim); pc = pc + 1
+    elseif name == 101 then
+      if c.text.size > 0 then
+        local out = sh_output(c.text)
+        out_pending(); util.write(out)
+      else
+        sh_into_ps(sed.ps)
+      end
+      if sed.quit then autoprint = false; break end
+      pc = pc + 1
     elseif name == 108 then list_ps(c.exitcode > 0 and c.exitcode or 70); pc = pc + 1
     elseif name == 113 then sed.quit = true; sed.exitcode = c.exitcode; break
     elseif name == 81 then sed.quit = true; sed.exitcode = c.exitcode; autoprint = false; break
@@ -652,17 +730,17 @@ local function run_cycle()
         sed.appendq:push(data)
       end
       pc = pc + 1
-    elseif name == 119 then write_to(c.text, sed.ps); pc = pc + 1
+    elseif name == 119 then write_to(c.text, sed.ps, true); pc = pc + 1
     elseif name == 87 then
-      local nl = sed.ps:find('\n', 1, true)
-      write_to(c.text, nl > 0 and sed.ps:sub(1, nl - 1) or sed.ps); pc = pc + 1
+      local nl = find_delim(sed.ps)
+      write_to(c.text, nl > 0 and sed.ps:sub(1, nl - 1) or sed.ps, nl <= 0); pc = pc + 1
     elseif name == 98 then pc = c.target
     elseif name == 116 then
       if sed.tflag then sed.tflag = false; pc = c.target else pc = pc + 1 end
     elseif name == 84 then
       if not sed.tflag then pc = c.target else sed.tflag = false; pc = pc + 1 end
     elseif name == 122 then sed.ps = ''; pc = pc + 1
-    elseif name == 70 then util.line('-'); pc = pc + 1
+    elseif name == 70 then out_pending(); util.writebyte(45); util.writebyte(sed.delim); pc = pc + 1
     else pc = pc + 1 end
   end
   if autoprint and not sed.quiet then print_ps(sed.ps) end
@@ -671,10 +749,18 @@ end
 
 -- Run the script over one input (all lines of one file, or of all files).
 local function run_input(data: string)
-  sed.lines = util.lines(data)
+  sed.lines:clear()
+  local start: usize = 0
+  for i: usize = 0, < data.size do
+    if data.data[i] == sed.delim then
+      sed.lines:push((@string){data=&data.data[start], size=i - start})
+      start = i + 1
+    end
+  end
+  if start < data.size then sed.lines:push((@string){data=&data.data[start], size=data.size - start}) end
   sed.total = #sed.lines
   sed.idx = 0
-  sed.lastnl = data.size == 0 or data.data[data.size - 1] == 10
+  sed.lastnl = data.size == 0 or data.data[data.size - 1] == sed.delim
   for i = 1, #sed.cmds do sed.cmds[i].active = false; sed.cmds[i].finished = false end
   while not sed.quit and next_line(false) do
     sed.tflag = false
@@ -683,7 +769,7 @@ local function run_input(data: string)
 end
 
 global function applet_sed(args: sequence(string)): integer
-  sed = (@Sed){}
+  sed = (@Sed){delim = 10}
   local scripts: sequence(string)
   local files: sequence(string)
   local i: integer = 1
@@ -692,8 +778,9 @@ global function applet_sed(args: sequence(string)): integer
     local a = args[i]
     if a == '--' then i = i + 1; break end
     if a.size < 2 or a:byte(1) ~= 45 then break end
-    if a == '--expression' or a == '--file' or a == '--quiet' or a == '--silent' or a == '--regexp-extended' or a == '--separate' or a == '--in-place' then
+    if a == '--expression' or a == '--file' or a == '--quiet' or a == '--silent' or a == '--regexp-extended' or a == '--separate' or a == '--in-place' or a == '--null-data' or a == '--zero-terminated' then
       if a == '--quiet' or a == '--silent' then sed.quiet = true
+      elseif a == '--null-data' or a == '--zero-terminated' then sed.delim = 0
       elseif a == '--regexp-extended' then sed.ere = true
       elseif a == '--separate' then sed.separate = true
       elseif a == '--in-place' then sed.inplace = true; sed.separate = true
@@ -713,7 +800,7 @@ global function applet_sed(args: sequence(string)): integer
       if c == 110 then sed.quiet = true
       elseif c == 69 or c == 114 then sed.ere = true
       elseif c == 115 then sed.separate = true
-      elseif c == 122 then return util.die('-z is not supported')
+      elseif c == 122 then sed.delim = 0
       elseif c == 105 then
         sed.inplace = true; sed.separate = true
         sed.suffix = a:sub(j + 1); break
@@ -752,7 +839,7 @@ global function applet_sed(args: sequence(string)): integer
       fd = sys.open(f, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
       if fd < 0 then return util.die("couldn't open file " .. f .. ': ' .. sys.errstr()) end
     end
-    sed.wfds:push(fd)
+    sed.wfds:push(fd); sed.wmiss:push(false)
   end
   if #files == 0 then files:push('-') end
   if sed.inplace then
@@ -767,6 +854,7 @@ global function applet_sed(args: sequence(string)): integer
       if fd < 0 then util.perror(tmp); sed.rc = 4; continue end
       util.setout(fd)
       sed.quit = false
+      sed.missing = false
       run_input(data)
       util.flush()
       util.setout(1)
@@ -799,7 +887,7 @@ global function applet_sed(args: sequence(string)): integer
       local data, ok = util.readfile(f)
       if not ok then sed.rc = 2; continue end
       all:write(data)
-      if data.size > 0 and data.data[data.size - 1] ~= 10 and f ~= files[#files] then all:write('\n') end
+      if data.size > 0 and data.data[data.size - 1] ~= sed.delim and f ~= files[#files] then all:writebyte(sed.delim) end
     end
     run_input(all:promote())
   end

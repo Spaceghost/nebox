@@ -609,6 +609,31 @@ same sed-unknown 'sed "k" words.txt 2>/dev/null; echo $?'
 same sed-stdin 'cat words.txt | sed 1d'
 same sed-empty-pattern-space 'printf "\n\n" | sed "s/^$/E/"'
 same sed-anchors-g 'echo aaa | sed "s/^a/b/g"; echo aaa | sed "s/a\$/b/g"'
+# sed M flag (REG_NEWLINE, GNU sed 4.9), \` \' buffer anchors, -z, e
+same sed-M-anchors 'printf "a\nb\nc\n" | sed "N;N;s/^/>/Mg"; printf "a\nb\nc\n" | sed "N;N;s/\$/</Mg"; printf "a\nb\nc\n" | sed "N;N;s/^/>/g"; printf "x\n\ny\n" | sed "N;N;s/^\$/E/Mg"; echo aaa | sed "s/^a/b/Mg"; printf "ab\ncd\n" | sed "N;s/^c/X/M;s/b\$/Y/M"; printf "ab\ncd\n" | sed -E "N;s/^c|b\$/X/Mg"'
+same sed-M-newline 'printf "ab\ncd\n" | sed "N;s/b.c/X/M"; printf "ab\ncd\n" | sed "N;s/b.c/X/"; printf "ab\ncd\n" | sed "N;s/b[^x]c/X/M"; printf "ab\ncd\n" | sed "N;s/b[^x]c/X/"; printf "ab\ncd\n" | sed "N;s/b\\nc/X/M"; printf "ab\ncd\n" | sed -E "N;s/b[^[:alpha:]]c/X/m"'
+same sed-M-address 'printf "ab\ncd\nef\n" | sed -n "N;N;/^cd\$/Mp"; printf "ab\ncd\n" | sed -n "N;/^cd\$/p"; printf "ab\ncd\n" | sed -n "N;/B\$/IMp;/B\$/MIp;/B\$/Ip"; printf "ab\ncd\n" | sed -n "N;/^cd\$/mp" 2>/dev/null; echo $?'
+same sed-buffer-anchors 'printf "ab\ncd\n" | sed "N;s/\`/</Mg"; printf "ab\ncd\n" | sed "N;s/\`a\|^c/X/Mg"; printf "ab\ncd\n" | sed "N;s/b\x27\|d\x27/X/Mg"; printf "ab\ncd\n" | sed "N;s/\`a/X/;s/d\x27/Y/"; echo ab | grep "b\x27"; echo ab | grep -c "\`a"; echo ab | sed -E "s/\`a|b\x27/_/g"'
+same sed-z 'printf "one\0two\0three" | sed -z "s/^t/T/" | od -c; printf "a\0b\0" | sed -z "N;P;D" | od -c; printf "a\0b\0" | sed -z "N;s/\n/+/;l" | od -c; printf "a\0b\0" | sed -z "G;H;\$!d;x" | od -c; printf "a\nb\n" | sed -z "s/\n/,/g"'
+same sed-z-text 'printf "a\0b\0" | sed -z "1i\\
+hello
+\$a end
+=" | od -c; printf "a\0b\0" | sed -z "1c\\
+hi" | od -c; printf "a\0b\0" | sed -z "1,2c hi" | od -c; printf "x\0" | sed -z -n "p;w /dev/stdout" | od -c; printf "a\0b\0" | sed -z -s "F;\$!d" | od -c; printf "a\0b\0" | sed --null-data -n "\$p" | od -c'
+same sed-z-l 'printf "abcdefghij\0" | sed -z -n "l 5" | od -c; printf "a\nb\0" | sed -z -n l | od -c; printf "a\0b" | sed -z "N;l;P;D" | od -c; printf "a\0b" | sed -z p | od -c'
+same sed-missing-newline 'printf a | sed p; printf "a\nb" | sed "p;="; printf a | sed "a x"; printf a > m1; printf b > m2; sed -s p m1 m2; sed p m1 m2; printf a | sed "l;F"; printf a | sed -n "p;p"; printf a | sed "w /dev/stdout"; printf "a\nb" | sed -n "w out
+s/b/B/w out2
+W out3"; od -c out; od -c out2; od -c out3; printf "x\ny" | sed "s/x/X/w /dev/stdout"'
+same sed-z-M 'printf "a\nb\0c\nd\0" | sed -z "s/^/>/Mg;s/\$/</Mg" | od -c; printf "a\nb\0" | sed -z "s/a.b/X/M" | od -c; printf "a\nb\0" | sed -z "s/a[^x]b/X/M" | od -c; printf "a\nb\0" | sed -z "s/a.b/X/" | od -c'
+same sed-z-files 'printf "a\0b" > z1; printf "c\0" > z2; sed -z p z1 z2 | od -c; sed -z -s "\$p" z1 z2 | od -c; sed -zi "s/a/A/" z1; od -c z1'
+same sed-e-cmd 'printf "echo hi\nb\n" | sed 1e; printf "a\nb\n" | sed "1e echo X"; printf "a\n" | sed -n "e printf \"x\\\\ny\"
+p"; printf "a\nb\n" | sed "2e echo X;echo Y"; printf "x\n" | sed "1e echo -n Q"; printf "a\n" | sed "e exit 3"; echo $?; printf "a\nb\n" | sed -n "\$!{e echo X
+};p"; printf "a\n" | sed "1e echo 1
+1e echo 2
+1i\\
+ins
+1a app"'
+same sed-e-ps 'printf "printf \"1\\\\n\\\\n\"\n" | sed e | od -c; printf "true\n" | sed e; printf "echo a\0" | sed -z e | od -c; printf "a\nb\n" | sed "s/.*/echo [&]/e"; printf "a\n" | sed "s/a/false/e;p"; printf "x\n" | sed "s/x/echo a; echo b/e"; printf "x\n" | sed "s/x/echo hi/ep;s/hi/HI/w /dev/stdout"; printf "a\n" | sed -n "s/a/echo z/gpe"; printf "a\n" | sed -n "s/a/echo z/gep"; printf "a\n" | sed "s/a/echo z/pp" 2>/dev/null; echo $?; printf "a\nb\n" | sed "s/b/echo B/e;s/a/echo A/e"'
 # find
 same find-all 'find . | sort'
 same find-name 'find . -name "*.txt" | sort'
