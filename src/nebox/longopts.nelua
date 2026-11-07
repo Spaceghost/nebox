@@ -174,11 +174,6 @@ global longopts.rmdir: []util.LongOpt = {
   {'ignore-fail-on-non-empty', 0, 201}, {'path', 0, 112}, {'parents', 0, 112}, {'verbose', 0, 118},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.timeout: []util.LongOpt = {
-  {'kill-after', 1, 107}, {'signal', 1, 115}, {'verbose', 0, 118},
-  {'foreground', 0, util.UNSUPPORTED}, {'preserve-status', 0, 112},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.expand: []util.LongOpt = {
   {'tabs', 1, 116}, {'initial', 0, 105}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},

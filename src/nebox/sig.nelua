@@ -1,0 +1,112 @@
+-- Signal names as gnulib sig2str/str2sig and coreutils operand2sig handle
+-- them on Linux: the standard names with their aliases (IOT, CLD, IO),
+-- RTMIN/RTMAX with +N/-N offsets, numbers, and exit-status-style numbers.
+## pragmas.nogc = true
+
+require 'string'
+
+global sig = @record{}
+
+local SigName = @record{name: string, num: cint}
+-- gnulib's numname_table order: sig2str returns the first name for a number
+local names: []SigName = {
+  {'HUP', 1}, {'INT', 2}, {'QUIT', 3}, {'ILL', 4}, {'TRAP', 5}, {'ABRT', 6}, {'FPE', 8}, {'KILL', 9},
+  {'SEGV', 11}, {'BUS', 7}, {'PIPE', 13}, {'ALRM', 14}, {'TERM', 15}, {'USR1', 10}, {'USR2', 12},
+  {'CHLD', 17}, {'URG', 23}, {'STOP', 19}, {'TSTP', 20}, {'CONT', 18}, {'TTIN', 21}, {'TTOU', 22},
+  {'SYS', 31}, {'POLL', 29}, {'VTALRM', 26}, {'PROF', 27}, {'XCPU', 24}, {'XFSZ', 25},
+  {'IOT', 6}, {'CLD', 17}, {'PWR', 30}, {'WINCH', 28}, {'IO', 29}, {'STKFLT', 16},
+}
+
+global sig.RTMIN: cint <comptime> = 34
+global sig.RTMAX: cint <comptime> = 64
+global sig.NUMBOUND: cint <comptime> = 64
+
+-- str2sig: true and the number, or false.
+function sig.str2sig(s: string): (boolean, cint)
+  if #s > 0 and s:byte(1) >= 48 and s:byte(1) <= 57 then
+    local v: integer = 0
+    for k = 1, #s do
+      local c = s:byte(k)
+      if c < 48 or c > 57 then return false, -1 end
+      v = v * 10 + (c - 48)
+      if v > sig.NUMBOUND then return false, -1 end
+    end
+    return true, (@cint)(v)
+  end
+  for k = 0, < #names do
+    if names[k].name == s then return true, names[k].num end
+  end
+  local function offset(rest: string): (boolean, integer)
+    if #rest == 0 then return true, 0 end
+    local v: integer = 0
+    for k = 1, #rest do
+      local c = rest:byte(k)
+      if c < 48 or c > 57 then return false, 0 end
+      v = v * 10 + (c - 48)
+    end
+    return true, v
+  end
+  if s:sub(1, 5) == 'RTMIN' then
+    local rest = s:sub(6)
+    if #rest == 0 then return true, sig.RTMIN end
+    if rest:byte(1) ~= 43 then return false, -1 end
+    local ok, n = offset(rest:sub(2))
+    if ok and #rest > 1 and n <= sig.RTMAX - sig.RTMIN then return true, (@cint)(sig.RTMIN + n) end
+    return false, -1
+  elseif s:sub(1, 5) == 'RTMAX' then
+    local rest = s:sub(6)
+    if #rest == 0 then return true, sig.RTMAX end
+    if rest:byte(1) ~= 45 then return false, -1 end
+    local ok, n = offset(rest:sub(2))
+    if ok and #rest > 1 and n <= sig.RTMAX - sig.RTMIN then return true, (@cint)(sig.RTMAX - n) end
+    return false, -1
+  end
+  return false, -1
+end
+
+-- sig2str: the name without "SIG", or "" when there is none.
+function sig.sig2str(n: cint): string
+  for k = 0, < #names do
+    if names[k].num == n then return names[k].name end
+  end
+  if n >= sig.RTMIN and n <= sig.RTMAX then
+    local base = sig.RTMIN
+    local delta = n - sig.RTMIN
+    if (sig.RTMAX - sig.RTMIN) // 2 < delta then
+      if n == sig.RTMAX then return 'RTMAX' end
+      return 'RTMAX-' .. tostring(sig.RTMAX - n)
+    end
+    if delta == 0 then return 'RTMIN' end
+    return 'RTMIN+' .. tostring(delta)
+  end
+  return ''
+end
+
+-- coreutils operand2sig: a number (an exit status like 137 means its
+-- signal) or a name, upper-cased, with an optional SIG prefix; -1 if bad.
+function sig.operand2sig(operand: string): cint
+  local signum: cint = -1
+  if #operand > 0 and operand:byte(1) >= 48 and operand:byte(1) <= 57 then
+    local v: integer = 0
+    local ok = true
+    for k = 1, #operand do
+      local c = operand:byte(k)
+      if c < 48 or c > 57 then ok = false; break end
+      v = v * 10 + (c - 48)
+      if v > 0x7fffffff then ok = false; break end
+    end
+    if ok then
+      -- WIFSIGNALED(i) ? WTERMSIG(i) : i
+      local low = v & 0x7f
+      if low ~= 0 and low ~= 0x7f then signum = (@cint)(low) else signum = (@cint)(v) end
+    end
+  else
+    local up = operand:upper()
+    local name = up
+    if #up > 3 and up:sub(1, 3) == 'SIG' then name = up:sub(4) end
+    local ok, n = sig.str2sig(name)
+    if ok then signum = n end
+  end
+  if signum < 0 or sig.NUMBOUND < signum then return -1 end
+  return signum
+end

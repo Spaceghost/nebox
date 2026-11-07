@@ -105,6 +105,14 @@ Stated here rather than worked around:
   --output-delimiter (empty means NUL) --total and order warnings; paste's
   -d escapes (\0 for none), -s, -z and repeated "-" operands sharing stdin.
   `tests/nlcp_compare.py`: 6022 random cases against GNU, 0 mismatches.
+- `timeout` ports timeout.c: its own process group (or `--foreground`), an
+  interval timer and `sigsuspend`, signals forwarded to the command and its
+  group followed by CONT, `-k`, `-s` with coreutils' operand2sig (names,
+  numbers, exit statuses like 137), `-v`, `--preserve-status`, GNU's exit
+  statuses, and re-raising the signal that killed the command with core
+  dumps disabled (RLIMIT_CORE). Signal names come from `src/nebox/sig.nelua`
+  (gnulib sig2str/str2sig). `tests/timeout_compare.py`: 44 cases, 0
+  mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
@@ -378,8 +386,6 @@ Stated here rather than worked around:
   `%d`/`%D`/`%t`/`%T`; `%x %y %z` and the default output show local time
   with nanoseconds and `%z` offset, as GNU does (`stat-tz`).
 - `xargs` runs commands with `fork`+`execvp`; no `-P`, `-L`, or `-s` limits.
-- `timeout` polls the child every 2 ms rather than using signals; `-k` is
-  accepted but ignored.
 - `mktemp` draws names from `getrandom`; `groups`/`whoami` know only the
   current process.
 - Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)

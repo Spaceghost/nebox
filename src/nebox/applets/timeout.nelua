@@ -1,0 +1,268 @@
+-- timeout: a port of GNU coreutils 9.1 src/timeout.c. The command runs in
+-- timeout's own process group (unless --foreground); an interval timer and
+-- sigsuspend wait for it; on expiry or on INT/QUIT/HUP/TERM the signal goes
+-- to the command and its group (followed by CONT), -k arms a later KILL,
+-- and the exit status follows GNU (124 timed out, 125 timeout failed, 126,
+-- 127, 128+N, --preserve-status). Core dumps are disabled before timeout
+-- re-raises a signal that killed the command.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sig'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_strtod(s: cstring, e: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
+local SigSet = @record{bits: [16]culong}
+local function c_sigprocmask(how: cint, set: *SigSet, old: *SigSet): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
+local function c_sigsuspend(set: *SigSet): cint <cimport 'sigsuspend', cinclude '<signal.h>'> end
+local Timeval = @record{tv_sec: clong, tv_usec: clong}
+local Itimerval = @record{it_interval: Timeval, it_value: Timeval}
+local function c_setitimer(which: cint, new: *Itimerval, old: *Itimerval): cint <cimport 'setitimer', cinclude '<sys/time.h>'> end
+local Rlimit = @record{cur: culong, max: culong}
+local function c_setrlimit(res: cint, rl: *Rlimit): cint <cimport 'setrlimit', cinclude '<sys/resource.h>'> end
+local function c_setpgid(pid: cint, pgid: cint): cint <cimport 'setpgid', cinclude '<unistd.h>'> end
+local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', cinclude '<sys/wait.h>'> end
+
+local SIG_BLOCK: cint <comptime> = 0
+local SIG_UNBLOCK: cint <comptime> = 1
+local SIG_SETMASK: cint <comptime> = 2
+local SIGKILL: cint <comptime> = 9
+local SIGALRM: cint <comptime> = 14
+local SIGTERM: cint <comptime> = 15
+local SIGCONT: cint <comptime> = 18
+local SA_RESTART: cint <comptime> = 0x10000000
+local EXIT_TIMEDOUT: integer <comptime> = 124
+local EXIT_CANCELED: integer <comptime> = 125
+local EXIT_CANNOT_INVOKE: integer <comptime> = 126
+local EXIT_ENOENT: integer <comptime> = 127
+
+local timed_out: boolean
+local term_signal: cint
+local monitored_pid: cint
+local kill_after: float64
+local foreground: boolean
+local verbose: boolean
+local command: string
+
+local function sigaddset(set: *SigSet, n: cint)
+  local b = n - 1
+  set.bits[b // 64] = set.bits[b // 64] | ((@culong)(1) << (b % 64))
+end
+
+local function set_handler(n: cint, handler: function(cint), flags: cint)
+  local sa: sys.Sigaction
+  sa.sa_handler = handler
+  sa.sa_flags = flags
+  sys.sigaction(n, &sa, nilptr)
+end
+
+local function set_disposition(n: cint, ign: boolean)
+  local sa: sys.Sigaction
+  sa.sa_handler = (@function(cint): void)((@pointer)(ign and sys.SIG_IGN or sys.SIG_DFL))
+  sys.sigaction(n, &sa, nilptr)
+end
+
+local function unblock_signal(n: cint)
+  local set: SigSet
+  sigaddset(&set, n)
+  if c_sigprocmask(SIG_UNBLOCK, &set, nilptr) ~= 0 then util.err('warning: sigprocmask: ' .. sys.errstr()) end
+end
+
+local function settimeout(duration: float64, warn: boolean)
+  -- setitimer with the microseconds rounded up, as GNU's fallback does
+  local it: Itimerval
+  local secs = duration
+  if secs > 9.2e18 then secs = 9.2e18 end
+  local s = (@clong)(secs)
+  local ns = (@clong)((secs - (@float64)(s)) * 1e9)
+  if ns < 0 then ns = 0 end
+  local us = (ns + 999) // 1000
+  if us >= 1000000 then s = s + 1; us = 0 end
+  it.it_value.tv_sec = s
+  it.it_value.tv_usec = us
+  if c_setitimer(0, &it, nilptr) ~= 0 and warn then util.err('warning: setitimer: ' .. sys.errstr()) end
+end
+
+local function send_sig(where: cint, n: cint): cint
+  -- signalling our own group: ignore it here so we do not loop
+  if where == 0 then set_disposition(n, true) end
+  return sys.kill(where, n)
+end
+
+local function chld(n: cint) end
+
+local function cleanup(n: cint)
+  if n == SIGALRM then
+    timed_out = true
+    n = term_signal
+  end
+  if monitored_pid ~= 0 then
+    if kill_after ~= 0 then
+      local saved = sys.errno()
+      term_signal = SIGKILL
+      settimeout(kill_after, false)
+      kill_after = 0
+      sys.seterrno(saved)
+    end
+    if verbose then
+      local name = sig.sig2str(n)
+      if #name == 0 then name = tostring(n) end
+      util.err('sending signal ' .. name .. ' to command ' .. util.quote(command))
+    end
+    send_sig(monitored_pid, n)
+    if not foreground then
+      send_sig(0, n)
+      if n ~= SIGKILL and n ~= SIGCONT then
+        send_sig(monitored_pid, SIGCONT)
+        send_sig(0, SIGCONT)
+      end
+    end
+  else
+    sys._exit(128 + n)
+  end
+end
+
+local function usage_fail(msg: string): integer
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'timeout --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  return EXIT_CANCELED
+end
+
+-- parse_duration: strtod in the C locale, >= 0, an optional s/m/h/d.
+local function parse_duration(str: string): (boolean, float64)
+  local e: cstring
+  sys.seterrno(0)
+  local d = c_strtod(str, &e)
+  local used = (@integer)((@usize)(e) - (@usize)((@cstring)(str)))
+  local erange = sys.errno() == 34
+  if used == 0 or not (d >= 0) then return false, 0 end
+  local rest = str:sub(used + 1)
+  if #rest > 1 then return false, 0 end
+  local mult: float64 = 1
+  if #rest == 1 then
+    local c = rest:byte(1)
+    if c == 115 then mult = 1 elseif c == 109 then mult = 60 elseif c == 104 then mult = 3600
+    elseif c == 100 then mult = 86400 else return false, 0 end
+  end
+  if erange and d ~= d then return false, 0 end
+  return true, d * mult
+end
+
+local FOREGROUND_OPTION: integer <comptime> = 200
+local PRESERVE_STATUS_OPTION: integer <comptime> = 201
+local timeout_longs: []util.LongOpt = {
+  {'kill-after', 1, 107}, {'signal', 1, 115}, {'verbose', 0, 118},
+  {'foreground', 0, FOREGROUND_OPTION}, {'preserve-status', 0, PRESERVE_STATUS_OPTION},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
+global function applet_timeout(args: sequence(string)): integer
+  timed_out = false; term_signal = SIGTERM; monitored_pid = 0; kill_after = 0
+  foreground = false; verbose = false
+  local preserve_status = false
+  local g = util.getopt(args, '+k:s:v', &timeout_longs, #timeout_longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 107 then
+      local ok, d = parse_duration(g.optarg)
+      if not ok then return usage_fail('invalid time interval ' .. util.quote(g.optarg)) end
+      kill_after = d
+    elseif c == 115 then
+      term_signal = sig.operand2sig(g.optarg)
+      if term_signal == -1 then
+        util.err(util.quote(g.optarg) .. ': invalid signal')
+        return usage_fail('')
+      end
+    elseif c == 118 then verbose = true
+    elseif c == FOREGROUND_OPTION then foreground = true
+    elseif c == PRESERVE_STATUS_OPTION then preserve_status = true end
+  end
+  local operands = g:operands()
+  if #operands < 2 then return usage_fail('') end
+  local ok, timeout = parse_duration(operands[1])
+  if not ok then return usage_fail('invalid time interval ' .. util.quote(operands[1])) end
+  command = operands[2]
+  if not foreground then c_setpgid(0, 0) end
+  set_handler(SIGALRM, cleanup, SA_RESTART)
+  set_handler(sys.SIGINT, cleanup, SA_RESTART)
+  set_handler(sys.SIGQUIT, cleanup, SA_RESTART)
+  set_handler(sys.SIGHUP, cleanup, SA_RESTART)
+  set_handler(SIGTERM, cleanup, SA_RESTART)
+  if term_signal > 0 then set_handler(term_signal, cleanup, SA_RESTART) end
+  set_disposition(sys.SIGTTIN, true)
+  set_disposition(sys.SIGTTOU, true)
+  set_handler(sys.SIGCHLD, chld, SA_RESTART)
+  unblock_signal(sys.SIGCHLD)
+  local cargv: sequence(cstring)
+  for k = 2, #operands do cargv:push(operands[k]) end
+  cargv:push(nilptr)
+  util.flush()
+  local pid = sys.fork()
+  if pid == -1 then
+    util.err('fork system call failed: ' .. sys.errstr())
+    return EXIT_CANCELED
+  elseif pid == 0 then
+    set_disposition(sys.SIGTTIN, false)
+    set_disposition(sys.SIGTTOU, false)
+    sys.execvp(cargv[1], &cargv[1])
+    local e = sys.errno()
+    util.err('failed to run command ' .. util.quote(command) .. ': ' .. sys.strerror(e))
+    util.flush()
+    sys._exit(e == sys.ENOENT and EXIT_ENOENT or EXIT_CANNOT_INVOKE)
+  end
+  monitored_pid = pid
+  unblock_signal(SIGALRM)
+  settimeout(timeout, true)
+  local block: SigSet
+  local blocked: [7]cint = {SIGALRM, sys.SIGINT, sys.SIGQUIT, sys.SIGHUP, SIGTERM, term_signal, sys.SIGCHLD}
+  for k = 0, 6 do
+    if blocked[k] > 0 then sigaddset(&block, blocked[k]) end
+  end
+  local old: SigSet
+  if c_sigprocmask(SIG_BLOCK, &block, &old) ~= 0 then util.err('warning: sigprocmask: ' .. sys.errstr()) end
+  local status: cint = 0
+  local wait_result: cint
+  while true do
+    wait_result = c_waitpid(monitored_pid, &status, sys.WNOHANG)
+    if wait_result ~= 0 then break end
+    c_sigsuspend(&old)
+  end
+  local code: integer
+  if wait_result < 0 then
+    util.err('error waiting for command: ' .. sys.errstr())
+    code = EXIT_CANCELED
+  elseif (status & 0x7f) == 0 then
+    code = (status >> 8) & 0xff
+  elseif ((status & 0x7f) + 1) & 0x7f >= 2 then
+    local n: cint = status & 0x7f
+    if (status & 0x80) ~= 0 then util.err('the monitored command dumped core') end
+    if not timed_out then
+      local rl: Rlimit = {0, 0}
+      if c_setrlimit(4, &rl) == 0 then
+        util.flush()
+        set_disposition(n, false)
+        unblock_signal(n)
+        sys.kill(sys.getpid(), n)
+      else
+        util.err('warning: disabling core dumps failed: ' .. sys.errstr())
+      end
+    end
+    if timed_out and n == SIGKILL then preserve_status = true end
+    code = n + 128
+  else
+    util.err('unknown status from command (' .. tostring(status) .. ')')
+    code = 1
+  end
+  if timed_out and not preserve_status then code = EXIT_TIMEDOUT end
+  util.flush()
+  return code
+end
