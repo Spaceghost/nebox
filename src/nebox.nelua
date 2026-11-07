@@ -22,6 +22,7 @@ require 'nebox.applets.misc'
 require 'nebox.applets.awk'
 require 'nebox.applets.sh'
 require 'nebox.applets.diff'
+require 'nebox.applets.patch'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
@@ -39,7 +40,7 @@ local applets: []Applet = {
   {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
   {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
   {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
-  {'paste', applet_paste}, {'printenv', applet_printenv}, {'printf', applet_printf},
+  {'paste', applet_paste}, {'patch', applet_patch}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
   {'seq', applet_seq}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha256sum', applet_sha256sum},

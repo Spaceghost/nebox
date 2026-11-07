@@ -374,6 +374,17 @@ same grep-ctx-quiet "$GR grep -l -C1 x f n; grep -q -C1 x f; echo \$?; grep -c -
 same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -C 1x x f; echo \$?; grep -B \"\" x f; echo \$?; grep -A \" +1\" x f; echo \$?; grep -A 99999999999999999999 x f | wc -l"
 same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
 same touch-d-fraction "touch -d '2026-01-02 03:04:05.123456789' f; TZ=UTC stat -c '%y' f; touch -d '2026-01-02 03:04:05,5' g; TZ=UTC stat -c '%y' g"
+# patch (GNU patch 2.7.6); tests/patch_fuzz.py compares hunk placement, fuzz, rejects and backups on random inputs
+PF='seq 1 10 > a; seq 1 10 | sed "s/^5$/five/" > b; seq 1 6 > c; seq 1 6 | sed "s/^2$/two/" > d; mkdir -p src/x; seq 1 10 > src/x/a; touch -d "2026-01-02 03:04:05" a b c d src/x/a;'
+same patch-multi "$PF diff -u a b > m.diff; diff -u c d | sed 's/^+++ d/+++ c/; s/^--- c/--- c/' >> m.diff; sed -i 's/^+++ b/+++ a/' m.diff; patch < m.diff; echo \$?; cat a c"
+same patch-strip "$PF diff -u src/x/a b | sed 's#^--- src/x/a#--- old/src/x/a#; s#^+++ b#+++ new/src/x/a#' > p.diff; patch -p1 < p.diff; echo \$?; cat src/x/a; patch -p1 -R < p.diff; echo \$?; patch -p9 < p.diff; echo \$?"
+same patch-index "$PF diff -u a b | sed '1,2d' > body; { echo 'Index: a'; echo '--- a'; echo '+++ a'; cat body; } > i.diff; patch < i.diff; echo \$?; cat a"
+same patch-create-delete "$PF diff -u /dev/null b | sed 's#^+++ b#+++ newdir/newfile#; s#\t.*##' > cr.diff; patch < cr.diff; echo \$?; cat newdir/newfile; diff -u c /dev/null | sed 's#\t.*##' > del.diff; patch < del.diff; echo \$?; ls c 2>&1; patch < del.diff; echo \$?; patch < cr.diff; echo \$?"
+same patch-output-reject "$PF diff -u a b | sed 's/^+++ b/+++ a/; s#\t.*##' > o.diff; patch -o out < o.diff; echo \$?; cat out; cat a | head -5; sed 's/^5$/FIVE/' a > a2; mv a2 a; patch -r my.rej < o.diff; echo \$?; cat my.rej; ls"
+same patch-dir-empty "$PF diff -u a b | sed 's/^+++ b/+++ a/; s#\t.*##' > o.diff; mkdir w; cp a w/; patch -d w < o.diff; echo \$?; cat w/a; printf '1\n' > one; printf -- '--- one\n+++ one\n@@ -1 +0,0 @@\n-1\n' > e.diff; patch -E < e.diff; echo \$?; ls one 2>&1"
+same patch-nonl "printf 'a\nb' > f; printf 'a\nc' > g; diff -u f g | sed 's/^+++ g/+++ f/; s#\t.*##' > n.diff; patch < n.diff; echo \$?; od -c f; printf 'x\ny\n' > h; printf -- '--- h\n+++ h\n@@ -1,2 +1,2 @@\n x\n-y\n+z\n\\\\ No newline at end of file\n' > n2.diff; patch < n2.diff; echo \$?; od -c h"
+same patch-normal-context "$PF diff a b > n.diff; patch a n.diff; echo \$?; cat a; diff -c c d | sed 's/^--- d/--- c/; s#\t.*##' > c.diff; patch < c.diff; echo \$?; cat c"
+same patch-garbage "echo hello | patch; echo \$?; printf '' | patch; echo \$?"
 # diff (GNU diffutils 3.8); tests/diff_fuzz.py compares the edit scripts on random inputs
 DF='printf "a\nb\nc\n" > x; printf "a\nB\nc\nd" > y; touch -d "2026-01-02 03:04:05.123456789" x y; mkdir -p d1/sub d2/sub d1/only1 d1/o2; echo 1 > d1/f; echo 2 > d2/f; echo s > d1/sub/s; echo t > d2/sub/s; echo o > d1/o; mkdir d2/o; : > d2/o2; echo same > d1/eq; echo same > d2/eq;'
 same diff-formats "$DF TZ=UTC diff x y; echo \$?; TZ=UTC diff -c x y; TZ=America/Los_Angeles diff -u x y; diff -U0 x y; diff -C1 x y | tail -n +3; diff -e x y; echo \$?"
@@ -910,7 +921,7 @@ exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
 # sh
 . "$(dirname -- "$0")/sh.sh"
 # dispatch
-expect list-count '88
+expect list-count '89
 exit=0' "$BIN --list | wc -l"
 
 echo "nebox tests: $pass passed, $fail failed"

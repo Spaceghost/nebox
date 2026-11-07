@@ -1,0 +1,912 @@
+-- patch: apply a diff to files, as GNU patch 2.7.6 does.
+--   patch [-bEfNRst] [-p N] [-F N] [-i PATCHFILE] [-o OUTFILE] [-r REJECTFILE]
+--         [-d DIR] [--dry-run] [FILE [PATCHFILE]]
+-- Unified, context and normal diffs; several files per patch. Each hunk is
+-- placed with GNU's locate_hunk: at its line plus the offset of the previous
+-- hunks, then searching outward line by line, then again ignoring up to F
+-- (default 2) lines of context at each end ("fuzz"). A first hunk that only
+-- fits the other way round is a reversed (or applied) patch: -N skips it, -t
+-- assumes -R, -f applies forward; otherwise the questions GNU asks are asked
+-- on /dev/tty (answered with their defaults without one). Hunks that do not
+-- apply are saved to FILE.rej in the patch's format. File names come from the
+-- headers with -p N leading components removed (the base name without -p),
+-- choosing as GNU does among the old, new and Index: names. Not supported: ed
+-- scripts (-e), -D/--ifdef, -l, --posix, version control lookups.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+local PLine = @record{ text: string, nonl: boolean }
+
+local Hunk = @record{
+  -- 1-based first line and count; an empty range names the line after the
+  -- one given in the header ("do append rather than insert", GNU's pch.c)
+  old_first: integer, old_count: integer,
+  new_first: integer, new_count: integer,
+  old: sequence(PLine),                      -- context and removed lines
+  new: sequence(PLine),                      -- context and added lines
+  old_marks: sequence(byte),                 -- ' ' '-' '!' per old line
+  new_marks: sequence(byte),                 -- ' ' '+' '!' per new line
+  prefix: integer, suffix: integer,          -- context lines at the start and end
+  cfunc: string,                             -- text after @@ ... @@ or ***************
+  raw: sequence(string),
+}
+
+local FilePatch = @record{
+  format: byte,                  -- 'u' unified, 'c' context, 'n' normal
+  old_name: string, new_name: string, index_name: string,
+  old_rest: string, new_rest: string,  -- "name<TAB>date" as written, for the reject file
+  header: sequence(string),      -- the ---/+++ (or ***/---) lines, for messages
+  leading: sequence(string),     -- text before the hunks, for messages
+  first_hunk_line: integer,      -- input line of the first hunk
+  hunks: sequence(Hunk),
+}
+
+local Opt = @record{
+  strip: integer, fuzz: integer,
+  reverse: boolean, forward: boolean, batch: boolean, force: boolean, silent: boolean,
+  backup: boolean, remove_empty: boolean, dry_run: boolean,
+  outfile: string, rejfile: string,
+}
+
+local function starts(s: string, p: string): boolean
+  return s.size >= p.size and s:sub(1, (@isize)(p.size)) == p
+end
+
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+
+-- "N" or "N,M" at s[i..]; returns the numbers and the next index.
+local function range_at(s: string, i: usize): (integer, integer, usize, boolean)
+  local a, b = 0, -1
+  local j = i
+  if j >= s.size or not isdigit(s.data[j]) then return 0, 0, i, false end
+  while j < s.size and isdigit(s.data[j]) do a = a * 10 + (s.data[j] - 48); j = j + 1 end
+  if j < s.size and s.data[j] == 44 then
+    j = j + 1
+    if j >= s.size or not isdigit(s.data[j]) then return 0, 0, i, false end
+    b = 0
+    while j < s.size and isdigit(s.data[j]) do b = b * 10 + (s.data[j] - 48); j = j + 1 end
+  end
+  return a, b, j, true
+end
+
+-- The name in a "--- name<TAB>date" header line (after the 4-byte tag).
+local function header_name(line: string): string
+  local s = line:sub(5)
+  local tab = s:find('\t', 1, true)
+  if tab > 0 then s = s:sub(1, tab - 1) end
+  -- without a tab, a trailing date "  2026-01-02 ..." is not split off; names
+  -- with spaces need the tab GNU diff writes
+  while s.size > 0 and (s.data[s.size - 1] == 32 or s.data[s.size - 1] == 13) do s = s:sub(1, -2) end
+  if s.size >= 2 and s.data[0] == 34 and s.data[s.size - 1] == 34 then s = s:sub(2, -2) end
+  return s
+end
+
+local function is_normal_command(s: string): boolean
+  local a, b, j, ok = range_at(s, 0)
+  if not ok or j >= s.size then return false end
+  local c = s.data[j]
+  if c ~= 97 and c ~= 99 and c ~= 100 then return false end
+  local x, y, k, ok2 = range_at(s, j + 1)
+  return ok2 and k == s.size
+end
+
+local function compute_context(h: *Hunk, marks_old: *sequence(byte), marks_new: *sequence(byte))
+  -- prefix: leading context lines (in both sides); suffix: trailing ones
+  local p = 0
+  while p < #marks_old and p < #marks_new and marks_old[p + 1] == 32 and marks_new[p + 1] == 32 do p = p + 1 end
+  local q = 0
+  while q < #marks_old - p and q < #marks_new - p and marks_old[#marks_old - q] == 32 and marks_new[#marks_new - q] == 32 do q = q + 1 end
+  h.prefix, h.suffix = p, q
+end
+
+----------------------------------------------------------------------
+-- Parsing
+----------------------------------------------------------------------
+
+local Parser = @record{ lines: sequence(string), nonl_at_end: boolean, pos: integer }
+
+function Parser:at(i: integer): string
+  if i >= 1 and i <= #self.lines then return self.lines[i] end
+  return ''
+end
+
+-- A "\ No newline at end of file" line after line `i`?
+function Parser:nonl_after(i: integer): boolean
+  return starts(self:at(i + 1), '\\ ')
+end
+
+local function parse_unified_hunk(p: *Parser, h: *Hunk): boolean
+  local line = p:at(p.pos)
+  -- "@@ -a[,b] +c[,d] @@"
+  if not starts(line, '@@ -') then return false end
+  local a, b, j, ok = range_at(line, 4)
+  if not ok or j + 1 >= line.size or line.data[j] ~= 32 or line.data[j + 1] ~= 43 then return false end
+  local c, d, k, ok2 = range_at(line, j + 2)
+  if not ok2 then return false end
+  h.old_first = a; h.old_count = b < 0 and 1 or b
+  h.new_first = c; h.new_count = d < 0 and 1 or d
+  if h.old_count == 0 then h.old_first = h.old_first + 1 end
+  if h.new_count == 0 then h.new_first = h.new_first + 1 end
+  -- "@@ -a,b +c,d @@ text": the text (with its leading space) is kept
+  local at = line:find('@@', (@isize)(k) + 1, true)
+  if at > 0 and (@usize)(at) + 1 < line.size and line.data[at + 1] == 32 then h.cfunc = line:sub(at + 2) end
+  h.raw:push(line)
+  p.pos = p.pos + 1
+  local mo: sequence(byte)
+  local mn: sequence(byte)
+  local need_old, need_new = h.old_count, h.new_count
+  while (need_old > 0 or need_new > 0) and p.pos <= #p.lines do
+    local l = p:at(p.pos)
+    local kind: byte = l.size > 0 and l.data[0] or 32
+    local text = l.size > 0 and l:sub(2) or ''
+    local nonl = p:nonl_after(p.pos)
+    if kind == 32 then
+      h.old:push({text, nonl}); h.new:push({text, nonl}); mo:push(32); mn:push(32)
+      need_old = need_old - 1; need_new = need_new - 1
+    elseif kind == 45 then
+      h.old:push({text, nonl}); mo:push(45); need_old = need_old - 1
+    elseif kind == 43 then
+      h.new:push({text, nonl}); mn:push(43); need_new = need_new - 1
+    else
+      return false
+    end
+    h.raw:push(l)
+    p.pos = p.pos + 1
+    if nonl then h.raw:push(p:at(p.pos)); p.pos = p.pos + 1 end
+  end
+  if need_old > 0 or need_new > 0 then return false end
+  -- a marker after the last line counts too
+  if starts(p:at(p.pos), '\\ ') then h.raw:push(p:at(p.pos)); p.pos = p.pos + 1 end
+  compute_context(h, &mo, &mn)
+  h.old_marks = mo
+  h.new_marks = mn
+  return true
+end
+
+local function parse_context_hunk(p: *Parser, h: *Hunk): boolean
+  if not starts(p:at(p.pos), '***************') then return false end
+  local stars = p:at(p.pos)
+  if stars.size > 15 and stars.data[15] == 32 then h.cfunc = stars:sub(16) end
+  h.raw:push(p:at(p.pos))
+  p.pos = p.pos + 1
+  local l = p:at(p.pos)
+  if not starts(l, '*** ') then return false end
+  local a, b, j, ok = range_at(l, 4)
+  if not ok then return false end
+  h.raw:push(l)
+  p.pos = p.pos + 1
+  -- "*** a,b ****": the old range is a..b (b alone when a single line; b is
+  -- a-1 when empty)
+  if b < 0 then b = a end
+  h.old_first = a
+  h.old_count = (a == 0 and b == 0) and 0 or b - a + 1
+  local old_lines: sequence(PLine)
+  local old_marks: sequence(byte)
+  while p.pos <= #p.lines and not starts(p:at(p.pos), '--- ') do
+    local x = p:at(p.pos)
+    if x.size < 2 then return false end
+    local nonl = p:nonl_after(p.pos)
+    old_lines:push({x:sub(3), nonl}); old_marks:push(x.data[0])
+    h.raw:push(x)
+    p.pos = p.pos + 1
+    if nonl then h.raw:push(p:at(p.pos)); p.pos = p.pos + 1 end
+  end
+  l = p:at(p.pos)
+  if not starts(l, '--- ') then return false end
+  local c, d, k, ok2 = range_at(l, 4)
+  if not ok2 then return false end
+  if d < 0 then d = c end
+  h.new_first = c
+  h.new_count = (c == 0 and d == 0) and 0 or d - c + 1
+  h.raw:push(l)
+  p.pos = p.pos + 1
+  local new_lines: sequence(PLine)
+  local new_marks: sequence(byte)
+  while p.pos <= #p.lines and #new_lines < h.new_count do
+    local x = p:at(p.pos)
+    if x.size < 2 or not (x.data[0] == 32 or x.data[0] == 43 or x.data[0] == 33) or x.data[1] ~= 32 then break end
+    local nonl = p:nonl_after(p.pos)
+    new_lines:push({x:sub(3), nonl}); new_marks:push(x.data[0])
+    h.raw:push(x)
+    p.pos = p.pos + 1
+    if nonl then h.raw:push(p:at(p.pos)); p.pos = p.pos + 1 end
+  end
+  -- a side left out is the other side's context lines
+  if #old_lines == 0 and h.old_count > 0 then
+    for i = 1, #new_lines do if new_marks[i] == 32 then old_lines:push(new_lines[i]); old_marks:push(32) end end
+  end
+  if #new_lines == 0 and h.new_count > 0 then
+    for i = 1, #old_lines do if old_marks[i] == 32 then new_lines:push(old_lines[i]); new_marks:push(32) end end
+  end
+  if #old_lines ~= h.old_count or #new_lines ~= h.new_count then return false end
+  h.old = old_lines
+  h.new = new_lines
+  if h.old_count == 0 then h.old_first = h.old_first + 1 end
+  if h.new_count == 0 then h.new_first = h.new_first + 1 end
+  compute_context(h, &old_marks, &new_marks)
+  h.old_marks = old_marks
+  h.new_marks = new_marks
+  return true
+end
+
+local function parse_normal_hunk(p: *Parser, h: *Hunk): boolean
+  local l = p:at(p.pos)
+  local a, b, j, ok = range_at(l, 0)
+  local cmd = l.data[j]
+  local c, d, k, ok2 = range_at(l, j + 1)
+  h.raw:push(l)
+  p.pos = p.pos + 1
+  if b < 0 then b = a end
+  if d < 0 then d = c end
+  -- "a" inserts after line a; "d" deletes a..b, after line c of the new
+  -- file: an empty range names the line before, as in unified hunks
+  if cmd == 97 then h.old_first = a + 1; h.old_count = 0 else h.old_first = a; h.old_count = b - a + 1 end
+  if cmd == 100 then h.new_first = c + 1; h.new_count = 0 else h.new_first = c; h.new_count = d - c + 1 end
+  for _ = 1, h.old_count do
+    local x = p:at(p.pos)
+    if not starts(x, '< ') and x ~= '<' then return false end
+    local nonl = p:nonl_after(p.pos)
+    h.old:push({x:sub(3), nonl}); h.old_marks:push(45); h.raw:push(x); p.pos = p.pos + 1
+    if nonl then h.raw:push(p:at(p.pos)); p.pos = p.pos + 1 end
+  end
+  if cmd == 99 then
+    if p:at(p.pos) ~= '---' then return false end
+    h.raw:push('---'); p.pos = p.pos + 1
+  end
+  for _ = 1, h.new_count do
+    local x = p:at(p.pos)
+    if not starts(x, '> ') and x ~= '>' then return false end
+    local nonl = p:nonl_after(p.pos)
+    h.new:push({x:sub(3), nonl}); h.new_marks:push(43); h.raw:push(x); p.pos = p.pos + 1
+    if nonl then h.raw:push(p:at(p.pos)); p.pos = p.pos + 1 end
+  end
+  h.prefix, h.suffix = 0, 0
+  return true
+end
+
+-- Split the input into per-file patches.
+local function parse_patch(data: string): sequence(FilePatch)
+  local p: Parser
+  p.lines = util.lines(data)
+  p.pos = 1
+  local out: sequence(FilePatch)
+  local leading: sequence(string)
+  local index_name: string = ''
+  while p.pos <= #p.lines do
+    local l = p:at(p.pos)
+    local fp: FilePatch
+    local found = false
+    if starts(l, '--- ') and starts(p:at(p.pos + 1), '+++ ') and starts(p:at(p.pos + 2), '@@ -') then
+      fp.format = 117
+      fp.old_name = header_name(l); fp.new_name = header_name(p:at(p.pos + 1))
+      fp.old_rest = l:sub(5); fp.new_rest = p:at(p.pos + 1):sub(5)
+      fp.header:push(l); fp.header:push(p:at(p.pos + 1))
+      p.pos = p.pos + 2
+      fp.first_hunk_line = p.pos
+      while starts(p:at(p.pos), '@@ -') do
+        local h: Hunk
+        if not parse_unified_hunk(&p, &h) then break end
+        fp.hunks:push(h)
+      end
+      found = true
+    elseif starts(l, '*** ') and starts(p:at(p.pos + 1), '--- ') and starts(p:at(p.pos + 2), '***************') then
+      fp.format = 99
+      fp.old_name = header_name(l); fp.new_name = header_name(p:at(p.pos + 1))
+      fp.old_rest = l:sub(5); fp.new_rest = p:at(p.pos + 1):sub(5)
+      fp.header:push(l); fp.header:push(p:at(p.pos + 1))
+      p.pos = p.pos + 2
+      fp.first_hunk_line = p.pos
+      while starts(p:at(p.pos), '***************') do
+        local h: Hunk
+        if not parse_context_hunk(&p, &h) then break end
+        fp.hunks:push(h)
+      end
+      found = true
+    elseif is_normal_command(l) then
+      fp.format = 110
+      fp.first_hunk_line = p.pos
+      while p.pos <= #p.lines and is_normal_command(p:at(p.pos)) do
+        local h: Hunk
+        if not parse_normal_hunk(&p, &h) then break end
+        fp.hunks:push(h)
+      end
+      found = true
+    end
+    if found then
+      fp.index_name = index_name
+      fp.leading = leading
+      out:push(fp)
+      leading = (@sequence(string)){}
+      index_name = ''
+    else
+      if starts(l, 'Index: ') then index_name = l:sub(8) end
+      leading:push(l)
+      p.pos = p.pos + 1
+    end
+  end
+  return out
+end
+
+----------------------------------------------------------------------
+-- File names
+----------------------------------------------------------------------
+
+-- Remove `n` leading components (-p N); the base name when n < 0. "" when
+-- the name has fewer components.
+local function strip_name(name: string, n: integer): string
+  if name.size == 0 or name == '/dev/null' then return '' end
+  if n < 0 then return util.basename(name) end
+  local s = name
+  local k = 0
+  while k < n do
+    local slash = s:find('/', 1, true)
+    if slash <= 0 then return '' end
+    s = s:sub(slash + 1)
+    while s.size > 0 and s.data[0] == 47 do s = s:sub(2) end
+    k = k + 1
+  end
+  return s
+end
+
+local function components(s: string): integer
+  local n = 1
+  for i: usize = 0, < s.size do if s.data[i] == 47 then n = n + 1 end end
+  return n
+end
+
+-- GNU's "best name": fewest components, then shortest base name, then shortest name.
+local function better(a: string, b: string): boolean
+  local ca, cb = components(a), components(b)
+  if ca ~= cb then return ca < cb end
+  local ba, bb = util.basename(a), util.basename(b)
+  if ba.size ~= bb.size then return ba.size < bb.size end
+  return a.size < b.size
+end
+
+local function choose_name(fp: *FilePatch, o: *Opt): string
+  local cands: [3]string = {strip_name(fp.old_name, o.strip), strip_name(fp.new_name, o.strip), ''}
+  if (fp.old_name.size == 0 and fp.new_name.size == 0) and fp.index_name.size > 0 then
+    cands[2] = strip_name(fp.index_name, o.strip)
+  end
+  local best: string = ''
+  for i = 0, 2 do
+    local c = cands[i]
+    if c.size > 0 and util.exists(c) then
+      if best.size == 0 or better(c, best) then best = c end
+    end
+  end
+  if best.size > 0 then return best end
+  -- creating: the best of the names given
+  for i = 0, 2 do
+    local c = cands[i]
+    if c.size > 0 and (best.size == 0 or better(c, best)) then best = c end
+  end
+  return best
+end
+
+----------------------------------------------------------------------
+-- Applying
+----------------------------------------------------------------------
+
+local Target = @record{ lines: sequence(PLine) }
+
+local function load_target(path: string, t: *Target): boolean
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return false end
+  local data, ok = util.readfd(fd)
+  sys.close(fd)
+  if not ok then return false end
+  local ls = util.lines(data)
+  local incomplete = data.size > 0 and data.data[data.size - 1] ~= 10
+  for i = 1, #ls do t.lines:push({ls[i], incomplete and i == #ls}) end
+  return true
+end
+
+local function line_eq(a: PLine, b: PLine): boolean
+  return a.nonl == b.nonl and a.text == b.text
+end
+
+-- GNU patch_match: the hunk's old lines (less the fuzzed ones) at `base`.
+local function patch_match(t: *Target, h: *Hunk, base: integer, prefix_fuzz: integer, suffix_fuzz: integer): boolean
+  local n = #h.old - suffix_fuzz
+  local iline = base + prefix_fuzz
+  for pline = 1 + prefix_fuzz, n do
+    if iline < 1 or iline > #t.lines then return false end
+    if not line_eq(t.lines[iline], h.old[pline]) then return false end
+    iline = iline + 1
+  end
+  return true
+end
+
+-- GNU locate_hunk: where (1-based) the hunk's old lines begin, or 0.
+local function locate_hunk(t: *Target, h: *Hunk, fuzz: integer, in_offset: *integer, last_frozen: integer): integer
+  local first_guess = h.old_first + $in_offset
+  local pat_lines = #h.old
+  local prefix_context, suffix_context = h.prefix, h.suffix
+  local context = prefix_context < suffix_context and suffix_context or prefix_context
+  local prefix_fuzz = fuzz + prefix_context - context
+  local suffix_fuzz = fuzz + suffix_context - context
+  local max_where = #t.lines - (pat_lines - suffix_fuzz) + 1
+  local min_where = last_frozen + 1 - (prefix_context - prefix_fuzz)
+  local max_pos_offset = max_where - first_guess
+  local max_neg_offset = first_guess - min_where
+  local max_offset = max_pos_offset < max_neg_offset and max_neg_offset or max_pos_offset
+  if pat_lines == 0 then return first_guess end
+  if first_guess <= max_neg_offset then max_neg_offset = first_guess - 1 end
+  if prefix_fuzz < 0 and h.old_first <= 1 then
+    -- can only match the start of the file
+    if suffix_fuzz < 0 then
+      if pat_lines ~= #t.lines or prefix_context < last_frozen then return 0 end
+    end
+    local offset = 1 - first_guess
+    if last_frozen <= prefix_context and offset <= max_pos_offset and
+       patch_match(t, h, first_guess + offset, 0, suffix_fuzz < 0 and 0 or suffix_fuzz) then
+      $in_offset = $in_offset + offset
+      return first_guess + offset
+    end
+    return 0
+  elseif prefix_fuzz < 0 then
+    prefix_fuzz = 0
+  end
+  if suffix_fuzz < 0 then
+    -- can only match the end of the file
+    local offset = first_guess - (#t.lines - pat_lines + 1)
+    if offset <= max_neg_offset and patch_match(t, h, first_guess - offset, prefix_fuzz, 0) then
+      $in_offset = $in_offset - offset
+      return first_guess - offset
+    end
+    return 0
+  end
+  for offset = 0, max_offset do
+    if offset <= max_pos_offset and patch_match(t, h, first_guess + offset, prefix_fuzz, suffix_fuzz) then
+      $in_offset = $in_offset + offset
+      return first_guess + offset
+    end
+    if offset > 0 and offset <= max_neg_offset and patch_match(t, h, first_guess - offset, prefix_fuzz, suffix_fuzz) then
+      $in_offset = $in_offset - offset
+      return first_guess - offset
+    end
+  end
+  return 0
+end
+
+local function swap_hunk(h: *Hunk)
+  h.old, h.new = h.new, h.old
+  -- the marks swap sides and meaning: '-' becomes '+' and the reverse
+  local om, nm = h.new_marks, h.old_marks
+  for i = 1, #om do if om[i] == 43 then om[i] = 45 end end
+  for i = 1, #nm do if nm[i] == 45 then nm[i] = 43 end end
+  h.old_marks, h.new_marks = om, nm
+  h.old_first, h.new_first = h.new_first, h.old_first
+  h.old_count, h.new_count = h.new_count, h.old_count
+end
+
+local function say(s: string)
+  util.write(s)
+end
+
+-- A question for the user, on /dev/tty; without a terminal the default
+-- answer, after a newline (as GNU patch prints).
+local function ask(prompt: string): string
+  util.write(prompt)
+  util.flush()
+  local fd = sys.open('/dev/tty', sys.O_RDWR | sys.O_CLOEXEC, 0)
+  if fd < 0 then
+    util.write('\n')
+    return ''
+  end
+  local sb: stringbuilder
+  local b: byte
+  while sys.read(fd, &b, 1) == 1 do
+    if b == 10 then break end
+    sb:writebyte(b)
+  end
+  sys.close(fd)
+  return sb:promote()
+end
+
+local function plural(n: integer, word: string): string
+  if n == 1 then return word end
+  return word .. 's'
+end
+
+local function write_file(path: string, lines: *sequence(PLine), fresh_mode: cuint): boolean
+  local sb: stringbuilder
+  for i = 1, #lines do
+    sb:write(lines[i].text)
+    if not lines[i].nonl then sb:writebyte(10) end
+  end
+  local data = sb:promote()
+  -- write next to the file and rename over it, keeping the mode
+  local st: sys.Stat
+  local mode: cuint = fresh_mode
+  if sys.stat(path, &st) == 0 then mode = st.st_mode & 0xFFF end
+  local tmp = path .. '.nebox-patch-tmp'
+  local fd = sys.open(tmp, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC | sys.O_CLOEXEC, mode)
+  if fd < 0 then util.perror(tmp); return false end
+  local off: usize = 0
+  while off < data.size do
+    local r = sys.write(fd, &data.data[off], data.size - off)
+    if r <= 0 then util.perror(tmp); sys.close(fd); sys.unlink(tmp); return false end
+    off = off + (@usize)(r)
+  end
+  sys.close(fd)
+  sys.chmod(tmp, mode)
+  if sys.rename(tmp, path) ~= 0 then util.perror(path); sys.unlink(tmp); return false end
+  return true
+end
+
+-- GNU print_unidiff_range: "start-1,0" for an empty range, "n" for one line.
+local function unidiff_range(sb: *stringbuilder, start: integer, count: integer)
+  if count == 0 then sb:write(start - 1, ',0')
+  elseif count == 1 then sb:write(start)
+  else sb:write(start, ',', count) end
+end
+
+-- A patch line as GNU's pch_write_line writes it: a line that had no newline
+-- in the patch is written without one.
+local function rej_line(sb: *stringbuilder, l: PLine)
+  sb:write(l.text)
+  if not l.nonl then sb:writebyte(10) end
+end
+
+-- One rejected hunk, regenerated as GNU's abort_hunk does: unified patches
+-- give unified rejects, context and normal ones context rejects; the line
+-- numbers carry the offset of the hunks applied before it.
+local function reject_hunk(sb: *stringbuilder, fp: *FilePatch, h: *Hunk, header: boolean, reverse: boolean, out_offset: integer)
+  local old_rest: string = fp.old_rest.size > 0 and fp.old_rest or '/dev/null'
+  local new_rest: string = fp.new_rest.size > 0 and fp.new_rest or '/dev/null'
+  if reverse then old_rest, new_rest = new_rest, old_rest end
+  if fp.format == 117 then
+    if header then
+      if fp.index_name.size > 0 then sb:write('Index: ', fp.index_name, '\n') end
+      sb:write('--- ', old_rest, '\n+++ ', new_rest, '\n')
+    end
+    sb:write('@@ -')
+    unidiff_range(sb, h.old_first + out_offset, #h.old)
+    sb:write(' +')
+    unidiff_range(sb, h.new_first + out_offset, #h.new)
+    sb:write(' @@', h.cfunc, '\n')
+    local o, n = 1, 1
+    while true do
+      while o <= #h.old and h.old_marks[o] ~= 32 do sb:writebyte(45); rej_line(sb, h.old[o]); o = o + 1 end
+      while n <= #h.new and h.new_marks[n] ~= 32 do sb:writebyte(43); rej_line(sb, h.new[n]); n = n + 1 end
+      if o > #h.old then break end
+      sb:writebyte(32); rej_line(sb, h.old[o])
+      o = o + 1; n = n + 1
+    end
+    return
+  end
+  local normal = fp.format == 110
+  local stars: string = normal and '' or ' ****'
+  local minuses: string = normal and ' -----' or ' ----'
+  if header then
+    if fp.index_name.size > 0 then sb:write('Index: ', fp.index_name, '\n') end
+    sb:write('*** ', old_rest, '\n--- ', new_rest, '\n')
+  end
+  sb:write('***************', h.cfunc, '\n')
+  local oldfirst = h.old_first + out_offset
+  local oldlast = oldfirst + #h.old - 1
+  if oldlast < oldfirst then sb:write('*** 0', stars, '\n')
+  elseif oldlast == oldfirst then sb:write('*** ', oldfirst, stars, '\n')
+  else sb:write('*** ', oldfirst, ',', oldlast, stars, '\n') end
+  for i = 1, #h.old do sb:writebyte(h.old_marks[i]); sb:writebyte(32); rej_line(sb, h.old[i]) end
+  local newfirst = h.new_first + out_offset
+  local newlast = newfirst + #h.new - 1
+  if newlast < newfirst then sb:write('--- 0', minuses, '\n')
+  elseif newlast == newfirst then sb:write('--- ', newfirst, minuses, '\n')
+  else sb:write('--- ', newfirst, ',', newlast, minuses, '\n') end
+  for i = 1, #h.new do sb:writebyte(h.new_marks[i]); sb:writebyte(32); rej_line(sb, h.new[i]) end
+end
+
+local function save_file(path: string, data: string): boolean
+  local fd = sys.open(path, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC | sys.O_CLOEXEC, 0x1A4)
+  if fd < 0 then util.perror(path); return false end
+  local off: usize = 0
+  while off < data.size do
+    local r = sys.write(fd, &data.data[off], data.size - off)
+    if r <= 0 then util.perror(path); sys.close(fd); return false end
+    off = off + (@usize)(r)
+  end
+  sys.close(fd)
+  return true
+end
+
+-- GNU ok_to_reverse: say what was found, then -N skips, -t reverses, and
+-- otherwise the user is asked. Returns (reverse, skip).
+local function ok_to_reverse(o: *Opt, message: string, reverse: boolean): (boolean, boolean)
+  if o.forward or not (o.force and o.silent) then say(message) end
+  if o.forward then
+    say('  Skipping patch.\n')
+    return false, true
+  elseif o.force then
+    if not o.silent then say('  Applying it anyway.\n') end
+    return false, false
+  elseif o.batch then
+    say(reverse and '  Ignoring -R.\n' or '  Assuming -R.\n')
+    return true, false
+  end
+  local answer = ask(reverse and '  Ignore -R? [n] ' or '  Assume -R? [n] ')
+  if answer.size > 0 and answer.data[0] == 121 then return true, false end
+  local anyway = ask('Apply anyway? [n] ')
+  if anyway.size > 0 and anyway.data[0] == 121 then return false, false end
+  if not o.silent then say('Skipping patch.\n') end
+  return false, true
+end
+
+-- Apply one file's hunks. Returns 0, 1 (some hunks failed or were skipped) or 2.
+local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): integer
+  local name = file_operand.size > 0 and file_operand or choose_name(fp, o)
+  local nhunks = #fp.hunks
+  local reverse = o.reverse
+  -- which side the patch says does not exist
+  local old_absent = fp.old_name == '/dev/null'
+  local new_absent = fp.new_name == '/dev/null'
+  local function_ignored = false
+  if name.size == 0 or (not util.exists(name) and not (reverse and new_absent or old_absent)) then
+    if not (not util.exists(name) and (reverse and old_absent or new_absent)) then
+      -- GNU asks for a file name; without one the patch is skipped
+      if o.batch or o.force then
+        say('No file to patch.  Skipping patch.\n')
+      else
+        local sb: stringbuilder
+        sb:write("can't find file to patch at input line ", fp.first_hunk_line, '\n')
+        if o.strip >= 0 then sb:write('Perhaps you used the wrong -p or --strip option?\n') end
+        sb:write('The text leading up to this was:\n--------------------------\n')
+        for i = 1, #fp.leading do sb:write('|', fp.leading[i], '\n') end
+        for i = 1, #fp.header do sb:write('|', fp.header[i], '\n') end
+        sb:write('--------------------------\n')
+        say(sb:promote())
+        local given = ask('File to patch: ')
+        if given.size > 0 and util.exists(given) then return apply_file(fp, o, given) end
+        local skip = ask('Skip this patch? [y] ')
+        if skip.size > 0 and skip.data[0] == 110 then return 1 end
+        say('Skipping patch.\n')
+      end
+      function_ignored = true
+    end
+  end
+  if not function_ignored then
+    -- GNU maybe_reverse: creating a file that exists, or deleting one that does not
+    local exists = util.exists(name)
+    local st: sys.Stat
+    local empty = exists and sys.stat(name, &st) == 0 and st.st_size == 0
+    local creates = reverse and new_absent or old_absent
+    local deletes = reverse and old_absent or new_absent
+    local message: string = ''
+    if creates and exists and not empty then
+      message = 'The next patch' .. (reverse and ', when reversed,' or '') .. ' would create the file ' .. name .. ',\nwhich already exists!'
+    elseif deletes and not exists then
+      message = 'The next patch' .. (reverse and ', when reversed,' or '') .. ' would delete the file ' .. name .. ',\nwhich does not exist!'
+    end
+    if message.size > 0 then
+      local r, skip = ok_to_reverse(o, message, reverse)
+      if skip then function_ignored = true end
+      if r then reverse = not reverse end
+    end
+  end
+  if function_ignored then
+    util.writef('%d out of %d %s ignored\n', nhunks, nhunks, plural(nhunks, 'hunk'))
+    return 1
+  end
+  local t: Target
+  if util.exists(name) and not load_target(name, &t) then util.perror(name); return 2 end
+  if not o.silent then
+    if o.outfile.size > 0 and o.outfile ~= name then
+      say((o.dry_run and 'checking file ' or 'patching file ') .. o.outfile .. ' (read from ' .. name .. ')\n')
+    else
+      say((o.dry_run and 'checking file ' or 'patching file ') .. name .. '\n')
+    end
+  end
+  if reverse then
+    for i = 1, nhunks do swap_hunk(&fp.hunks[i]) end
+  end
+  local reverse_given = reverse
+  local out: sequence(PLine)
+  local copied = 0          -- input lines copied to `out` so far (last_frozen_line)
+  local in_offset = 0
+  local out_offset = 0
+  local rej: stringbuilder
+  local failed = 0
+  local skip_rest = false
+  local apply_anyway = false
+  local mismatch = false
+  for hi = 1, nhunks do
+    local h = &fp.hunks[hi]
+    local where = 0
+    local fuzz = 0
+    local context = h.prefix < h.suffix and h.suffix or h.prefix
+    local maxfuzz = o.fuzz < context and o.fuzz or context
+    if not skip_rest then
+      while true do
+        where = locate_hunk(&t, h, fuzz, &in_offset, copied)
+        if where == 0 or fuzz > 0 or in_offset ~= 0 then mismatch = true end
+        if hi == 1 and where == 0 and not (o.force or apply_anyway) and reverse == reverse_given then
+          -- dwim for a reversed patch: try the hunk the other way round
+          swap_hunk(h)
+          where = locate_hunk(&t, h, fuzz, &in_offset, copied)
+          local accepted = false
+          if where ~= 0 then
+            local r, skip = ok_to_reverse(o, (reverse and 'Unreversed' or 'Reversed (or previously applied)') .. ' patch detected!', reverse)
+            if skip then skip_rest = true end
+            accepted = r
+          end
+          if accepted then
+            reverse = not reverse
+            for k = 2, nhunks do swap_hunk(&fp.hunks[k]) end
+          else
+            swap_hunk(h)
+            if where ~= 0 then
+              apply_anyway = true
+              fuzz = fuzz - 1
+              where = 0
+            end
+          end
+        end
+        if skip_rest or where ~= 0 then break end
+        fuzz = fuzz + 1
+        if fuzz > maxfuzz then break end
+      end
+    end
+    local newwhere = (where ~= 0 and where or h.old_first) + out_offset
+    if skip_rest or where == 0 then
+      reject_hunk(&rej, fp, h, failed == 0, reverse, out_offset)
+      failed = failed + 1
+      if not skip_rest and not o.silent then
+        util.writef('Hunk #%d FAILED at %d.\n', hi, newwhere)
+      end
+      continue
+    end
+    -- copy up to the hunk, then its new lines in place of its old ones; with
+    -- fuzz, the fuzzed context lines at the edges stay as the file has them
+    for i = copied + 1, where - 1 do out:push(t.lines[i]) end
+    local pf, sf = 0, 0
+    if fuzz > 0 then
+      pf = fuzz + h.prefix - context; if pf < 0 then pf = 0 end
+      sf = fuzz + h.suffix - context; if sf < 0 then sf = 0 end
+    end
+    for i = 1, pf do out:push(t.lines[where + i - 1]) end
+    for i = 1 + pf, #h.new - sf do out:push(h.new[i]) end
+    -- fuzzed suffix lines may lie past the end of the file: only those
+    -- that exist are copied (never index past the end: that would grow it)
+    for i = 1, sf do
+      local idx = where + #h.old - sf + i - 1
+      if idx <= #t.lines then out:push(t.lines[idx]) end
+    end
+    copied = where - 1 + #h.old
+    if copied > #t.lines then copied = #t.lines end
+    out_offset = out_offset + #h.new - #h.old
+    if not o.silent and (fuzz > 0 or in_offset ~= 0) then
+      local sb: stringbuilder
+      sb:write('Hunk #', hi, ' succeeded at ', newwhere)
+      if fuzz > 0 then sb:write(' with fuzz ', fuzz) end
+      if in_offset ~= 0 then
+        sb:write(' (offset ', in_offset, ' ', plural(in_offset == 1 and 1 or 2, 'line'), ')')
+      end
+      sb:write('.\n')
+      say(sb:promote())
+    end
+  end
+  for i = copied + 1, #t.lines do out:push(t.lines[i]) end
+  local rc = 0
+  if failed > 0 then
+    rc = 1
+    local rejname = o.rejfile.size > 0 and o.rejfile or name .. '.rej'
+    local sb: stringbuilder
+    sb:write(failed, ' out of ', nhunks, ' ', plural(nhunks, 'hunk'), ' ', skip_rest and 'ignored' or 'FAILED')
+    if not o.dry_run then sb:write(' -- saving rejects to file ', rejname) end
+    sb:write('\n')
+    say(sb:promote())
+    if not o.dry_run then save_file(rejname, rej:promote()) end
+  end
+  if skip_rest or o.dry_run then return rc end
+  -- write the result: a backup when asked or when the patch did not match
+  -- exactly (GNU's default --backup-if-mismatch); an empty result of a patch
+  -- that deletes the file removes it
+  local target = o.outfile.size > 0 and o.outfile or name
+  local deletes = reverse and old_absent or new_absent
+  if o.outfile.size == 0 and (o.backup or mismatch or failed > 0) and util.exists(name) then
+    local data, ok = util.readfile(name)
+    if ok then save_file(name .. '.orig', data) end
+  end
+  if o.outfile.size == 0 and #out == 0 and (o.remove_empty or deletes) then
+    if util.exists(name) and sys.unlink(name) ~= 0 then util.perror(name); return 2 end
+    return rc
+  end
+  if o.outfile.size == 0 and #out > 0 and deletes then
+    if not o.silent then say('Not deleting file ' .. name .. ' as content differs from patch\n') end
+    rc = 1
+  end
+  -- creating a file in directories that do not exist yet
+  if not util.exists(target) then
+    local dir = util.dirname(target)
+    if dir ~= '.' and not util.isdir(dir) then
+      local parts: sequence(string)
+      local d = dir
+      while d ~= '.' and d ~= '/' and not util.isdir(d) do parts:push(d); d = util.dirname(d) end
+      for i = #parts, 1, -1 do sys.mkdir(parts[i], 0x1ED) end
+    end
+  end
+  -- GNU leaves an -o file with its temporary file's mode, 0600
+  if not write_file(target, &out, o.outfile.size > 0 and 0x180 or 0x1A4) then return 2 end
+  return rc
+end
+
+global function applet_patch(args: sequence(string)): integer
+  -- long options GNU patch users write, mapped to the short ones
+  local rest: sequence(string)
+  local dry = false
+  for i = 1, #args do
+    local a = args[i]
+    if a == '--dry-run' then dry = true
+    elseif a == '--forward' then rest:push('-N')
+    elseif a == '--reverse' then rest:push('-R')
+    elseif a == '--batch' then rest:push('-t')
+    elseif a == '--force' then rest:push('-f')
+    elseif a == '--silent' or a == '--quiet' then rest:push('-s')
+    elseif a == '--backup' then rest:push('-b')
+    elseif a == '--remove-empty-files' then rest:push('-E')
+    elseif starts(a, '--strip=') then rest:push('-p'); rest:push(a:sub(9))
+    elseif starts(a, '--input=') then rest:push('-i'); rest:push(a:sub(9))
+    elseif starts(a, '--output=') then rest:push('-o'); rest:push(a:sub(10))
+    elseif starts(a, '--reject-file=') then rest:push('-r'); rest:push(a:sub(15))
+    elseif starts(a, '--directory=') then rest:push('-d'); rest:push(a:sub(13))
+    elseif starts(a, '--fuzz=') then rest:push('-F'); rest:push(a:sub(8))
+    elseif a == '--unified' then rest:push('-u')
+    elseif a == '--context' then rest:push('-c')
+    elseif a == '--normal' then rest:push('-n')
+    else rest:push(a) end
+  end
+  local o = util.parse(rest, 'bcd:EfF:i:no:p:Rr:stuN')
+  if not o:ok() then return util.optfail(o) + 1 end
+  local opt: Opt = {strip = -1, fuzz = 2, reverse = o:has('R'), forward = o:has('N'),
+    batch = o:has('t'), force = o:has('f'), silent = o:has('s'), backup = o:has('b'),
+    remove_empty = o:has('E'), dry_run = dry}
+  if o:has('p') then
+    local v, ok = util.toint(o:get('p'))
+    if not ok or v < 0 then util.err("strip count " .. o:get('p') .. " is not a number"); return 2 end
+    opt.strip = v
+  end
+  if o:has('F') then
+    local v, ok = util.toint(o:get('F'))
+    if not ok or v < 0 then util.err("fuzz factor " .. o:get('F') .. " is not a number"); return 2 end
+    opt.fuzz = v
+  end
+  if o:has('o') then opt.outfile = o:get('o') end
+  if o:has('r') then opt.rejfile = o:get('r') end
+  local file_operand: string = ''
+  local patchfile: string = o:has('i') and o:get('i') or '-'
+  if #o.operands >= 1 then file_operand = o.operands[1] end
+  if #o.operands >= 2 then patchfile = o.operands[2] end
+  if #o.operands > 2 then util.err('extra operand ' .. o.operands[3]); return 2 end
+  local data: string
+  if patchfile == '-' then
+    local d, ok = util.readfd(0)
+    if not ok then util.perror('-'); return 2 end
+    data = d
+  else
+    local d, ok = util.readfile(patchfile)
+    if not ok then return 2 end
+    data = d
+  end
+  if o:has('d') and sys.chdir(o:get('d')) ~= 0 then util.perror(o:get('d')); return 2 end
+  local fps = parse_patch(data)
+  if #fps == 0 and data.size == 0 then return 0 end   -- empty input: nothing to do
+  if #fps == 0 then
+    util.flush()
+    local msg: string = 'patch: **** Only garbage was found in the patch input.\n'
+    sys.write(2, msg.data, msg.size)
+    return 2
+  end
+  local rc = 0
+  for i = 1, #fps do
+    local r = apply_file(&fps[i], &opt, #fps == 1 and file_operand or (i == 1 and file_operand or ''))
+    if r > rc then rc = r end
+  end
+  return rc
+end

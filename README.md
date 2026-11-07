@@ -44,7 +44,7 @@ stdout, exit status, and the resulting directory tree.
 [ awk base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df
 dirname du echo env expand expr factor false find fold free grep groups head
 hexdump hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc nsh
-od paste printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
+od paste patch printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
 sha256sum shuf sleep sort split stat strings sync tac tail tee test timeout
 touch tr true truncate tsort tty unexpand uname uniq unlink wc which whoami
 xargs yes
@@ -177,6 +177,26 @@ Stated here rather than worked around:
   current non-matching behavior). `\`` and `\'` match only at the ends of
   the subject, as in GNU regex (`sed-buffer-anchors`); `.` and `[^...]`
   match a newline unless REG_NEWLINE is in effect (sed's `M` flag).
+- `patch` follows GNU patch 2.7.6 (read from its source): unified,
+  context and normal diffs, several files per patch; each hunk is placed by
+  GNU's locate_hunk (its line plus the previous offset, then outward, then
+  with up to `-F` (2) lines of context ignored at each end, never more than
+  the hunk has); a first hunk that only fits reversed is reported and `-N`
+  skips, `-t` assumes `-R`, `-f` applies, otherwise GNU's questions are asked
+  on `/dev/tty` (defaults without one); creating an existing file or deleting
+  a missing one asks the same way. Rejects are regenerated as GNU does
+  (unified for unified patches, context for context and normal ones, line
+  numbers shifted by the hunks applied before); a backup `FILE.orig` is made
+  with `-b` or whenever a hunk needed an offset or fuzz or failed (GNU's
+  default `--backup-if-mismatch`); an empty result of a deleting patch, or
+  with `-E`, removes the file. Names come from the headers with `-p N`
+  components stripped (the base name without `-p`), choosing among old, new
+  and `Index:` names as GNU does. Options `-b -E -f -F N -i -N -o -p -r -R -s
+  -t -d --dry-run` and their long forms. `tests/patch_fuzz.py` compares
+  output, status, result, reject and backup files with GNU patch on random
+  patches and perturbed targets (2,000 cases, no difference; `make test` runs
+  200). Not supported: ed scripts (`-e`), `-D`, `-l`, `--merge`, `--posix`,
+  git diffs (renames, modes, binary), version control lookups.
 - `diff` follows GNU diffutils 3.8's algorithm step by step (`find_identical_ends`
   on bytes with horizon lines, `discard_confusing_lines`, the middle-snake
   `compareseq` with its cost cut-off, `shift_boundaries`), so its edit
