@@ -41,12 +41,13 @@ stdout, exit status, and the resulting directory tree.
 ## Applets
 
 ```
-[ base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df dirname du
-echo env expand expr factor false find fold free grep groups head hexdump
-hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc od paste
-printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum sha256sum
-shuf sleep sort split stat strings sync tac tail tee test timeout touch tr true
-truncate tsort tty unexpand uname uniq unlink wc which whoami xargs yes
+[ awk base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df
+dirname du echo env expand expr factor false find fold free grep groups head
+hexdump hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc od
+paste printenv printf pwd readlink realpath rev rm rmdir sed seq sha1sum
+sha256sum shuf sleep sort split stat strings sync tac tail tee test timeout
+touch tr true truncate tsort tty unexpand uname uniq unlink wc which whoami
+xargs yes
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
@@ -56,6 +57,37 @@ per applet in `DIR`.
 
 Stated here rather than worked around:
 
+- `awk` is POSIX.1-2017 awk (`src/nebox/awk/`: lexer, parser to a tree,
+  tree-walking interpreter): all statement forms, range patterns, every
+  `getline` form, `print`/`printf` with `>` `>>` `|` and `close()`,
+  `system()`, user functions with array-by-reference and recursion,
+  CONVFMT/OFMT, numeric strings, `RS=""` paragraph mode, `-F -f -v`,
+  `var=value` operands, ENVIRON/ARGV, and the POSIX builtins. The reference
+  in `tests/awk.sh` is GNU Awk 5.2.1 `--posix` (mawk 1.3.4 as a second
+  opinion); the regex engine is the shared `src/nebox/regex.nelua`.
+  Extensions kept because gawk --posix accepts them: `nextfile`,
+  `delete array`, `length(array)`, printf `*` width/precision.
+  Not supported: every other GNU extension (`**`, `fflush`, `gensub`,
+  `strftime`, `systime`, `BEGINFILE`, `IGNORECASE`, `-e`, long options),
+  a regex `RS` (only the first character of RS is used),
+  locales and multibyte characters (strings are bytes, collation is byte
+  order), `[/]` inside a regex literal (the first unescaped `/` ends it),
+  and hexadecimal/`inf`/`nan` spellings in numeric strings (they are
+  strings; gawk treats "0x1A" as 26). Choices where references disagree:
+  every error exits 2 (gawk exits 1 for syntax errors and division by
+  zero); `cmd | getline` increments NR as the POSIX table says (gawk and
+  mawk do not); `substr` truncates its arguments and clamps a start below
+  1 to 1 without shortening the length (gawk --posix and the One True AWK;
+  mawk shortens); a field past NF compares as the empty string, as gawk and
+  mawk do, not as the uninitialized value; `system()` and `close()` of a
+  pipe return the exit status (gawk --posix returns the raw wait status);
+  an empty FS or split separator splits into characters (undefined in
+  POSIX; gawk --posix keeps the record whole for FS but splits for
+  `split()`); unknown string escapes drop the backslash (gawk; mawk keeps
+  it); `srand()` reports 1 before the first call (gawk) and `rand()` is an
+  xorshift64* generator, so its sequence matches no other awk. Memory for
+  string temporaries is not reclaimed until exit; records and fields are
+  views into a reused buffer.
 - `grep`, `sed`, `expr` and `find -regex` use nebox's own regex engine
   (`src/nebox/regex.nelua`): POSIX BRE and ERE with brackets, named classes,
   intervals, groups, alternation, back-references, and the GNU
