@@ -116,6 +116,22 @@ def _():
     sh.close()
 
 
+@case('here-document lines are read with PS2')
+def _():
+    sh = Shell()
+    sh.send('cat <<END\r')
+    sh.expect('> ')
+    sh.send('line one\r')
+    sh.expect('> ')
+    sh.send('END\r')
+    sh.expect('line one\r\n')
+    sh.prompt()
+    sh.run('alias hi="echo aliased"', '\x1b[?2004l')
+    sh.prompt()
+    sh.run('hi', 'aliased\r\n')
+    sh.close()
+
+
 @case('history recall with Up and Ctrl-P, saved to $HISTFILE')
 def _():
     sh = Shell()
