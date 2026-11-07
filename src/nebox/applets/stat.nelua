@@ -1,0 +1,868 @@
+-- stat: a port of GNU coreutils 9.1 src/stat.c (statx build, C locale).
+-- -L, -f, -c/--format, --printf with backslash escapes, -t, --cached;
+-- every file and file-system directive, printf flags/width/precision per
+-- directive (make_format's allowed-flag lists), %X-style seconds with
+-- out_epoch_sec's fraction rules, %N under QUOTING_STYLE, %m through
+-- find_mount_point and find_bind_mount over /proc/self/mountinfo, %C from
+-- the security.selinux attribute, %w/%W birth times from statx, and GNU's
+-- default and terse formats.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.quotearg'
+require 'nebox.fstype'
+require 'nebox.mountlist'
+require 'nebox.canonicalize'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
+local function c_fchdir(fd: cint): cint <cimport 'fchdir', cinclude '<unistd.h>'> end
+local function c_getxattr(path: cstring, name: cstring, value: pointer, size: csize): clong <cimport 'getxattr', cinclude '<sys/xattr.h>'> end
+local function c_lgetxattr(path: cstring, name: cstring, value: pointer, size: csize): clong <cimport 'lgetxattr', cinclude '<sys/xattr.h>'> end
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
+
+local StatxTs = @record{ tv_sec: int64, tv_nsec: uint32, reserved: int32 }
+local Statx: type <cimport 'nebox_statx', cinclude '<sys/stat.h>', nodecl, ctypedef 'statx'> = @record{
+  stx_mask: uint32, stx_blksize: uint32, stx_attributes: uint64,
+  stx_nlink: uint32, stx_uid: uint32, stx_gid: uint32, stx_mode: uint16, spare0: uint16,
+  stx_ino: uint64, stx_size: uint64, stx_blocks: uint64, stx_attributes_mask: uint64,
+  stx_atime: StatxTs, stx_btime: StatxTs, stx_ctime: StatxTs, stx_mtime: StatxTs,
+  stx_rdev_major: uint32, stx_rdev_minor: uint32, stx_dev_major: uint32, stx_dev_minor: uint32,
+  rest: [14]uint64,
+}
+local function c_statx(dirfd: cint, path: cstring, flags: cint, mask: cuint, buf: *Statx): cint <cimport 'statx', cinclude '<sys/stat.h>'> end
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local AT_NO_AUTOMOUNT: cint <comptime> = 0x800
+local AT_EMPTY_PATH: cint <comptime> = 0x1000
+local AT_STATX_FORCE_SYNC: cint <comptime> = 0x2000
+local AT_STATX_DONT_SYNC: cint <comptime> = 0x4000
+
+local STATX_TYPE: cuint <comptime> = 0x1
+local STATX_MODE: cuint <comptime> = 0x2
+local STATX_NLINK: cuint <comptime> = 0x4
+local STATX_UID: cuint <comptime> = 0x8
+local STATX_GID: cuint <comptime> = 0x10
+local STATX_ATIME: cuint <comptime> = 0x20
+local STATX_MTIME: cuint <comptime> = 0x40
+local STATX_CTIME: cuint <comptime> = 0x80
+local STATX_INO: cuint <comptime> = 0x100
+local STATX_SIZE: cuint <comptime> = 0x200
+local STATX_BLOCKS: cuint <comptime> = 0x400
+local STATX_BTIME: cuint <comptime> = 0x800
+
+local S_IFMT: cuint <comptime> = 0xF000
+local S_IFREG: cuint <comptime> = 0x8000
+local S_IFDIR: cuint <comptime> = 0x4000
+local S_IFLNK: cuint <comptime> = 0xA000
+local S_IFBLK: cuint <comptime> = 0x6000
+local S_IFCHR: cuint <comptime> = 0x2000
+local S_IFIFO: cuint <comptime> = 0x1000
+local S_IFSOCK: cuint <comptime> = 0xC000
+
+-- The stat fields print_stat reads (statx_to_stat's result).
+local FileStat = @record{
+  dev: uint64, ino: uint64, mode: cuint, nlink: uint64, uid: cuint, gid: cuint,
+  rdev: uint64, size: int64, blksize: int64, blocks: int64,
+  atime_s: int64, atime_ns: int64, mtime_s: int64, mtime_ns: int64,
+  ctime_s: int64, ctime_ns: int64, btime_s: int64, btime_ns: int64,
+}
+
+local follow_links = false
+local interpret_backslash_escapes = false
+local trailing_delim = ''
+local dont_sync = false
+local force_sync = false
+local quoting_style: integer = quotearg.LITERAL
+
+local function makedev(maj: uint64, min: uint64): uint64
+  return ((maj & 0xfffff000) << 32) | ((maj & 0xfff) << 8) | ((min & 0xffffff00) << 12) | (min & 0xff)
+end
+local function major(d: uint64): uint64 return ((d >> 8) & 0xfff) | ((d >> 32) & ~(@uint64)(0xfff)) end
+local function minor(d: uint64): uint64 return (d & 0xff) | ((d >> 12) & ~(@uint64)(0xff)) end
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'stat --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+local printf_flags = "'-+ #0I"
+local function has(set: string, c: byte): boolean return set:find(string.char(c), 1, true) > 0 end
+
+-- make_format: drop the leading printf flags not in ALLOWED, append SUFFIX.
+local function make_format(pf: string, allowed: string, suffix: string): string
+  local sb: stringbuilder
+  sb:writebyte(37)
+  local i = 2
+  while i <= #pf and has(printf_flags, pf:byte(i)) do
+    if has(allowed, pf:byte(i)) then sb:writebyte(pf:byte(i)) end
+    i = i + 1
+  end
+  sb:write(pf:sub(i))
+  sb:write(suffix)
+  return sb:promote()
+end
+
+local function cformat_i(fmt: string, v: int64): string
+  local n = c_snprintf(nilptr, 0, fmt, (@clonglong)(v))
+  local buf: sequence(byte)
+  buf:resize(n + 1)
+  c_snprintf((@cstring)(&buf[1]), (@csize)(n + 1), fmt, (@clonglong)(v))
+  return (@string){data = &buf[1], size = (@usize)(n)}
+end
+
+local function cformat_u(fmt: string, v: uint64): string
+  local n = c_snprintf(nilptr, 0, fmt, (@culonglong)(v))
+  local buf: sequence(byte)
+  buf:resize(n + 1)
+  c_snprintf((@cstring)(&buf[1]), (@csize)(n + 1), fmt, (@culonglong)(v))
+  return (@string){data = &buf[1], size = (@usize)(n)}
+end
+
+local function cformat_f(fmt: string, v: float64): string
+  local n = c_snprintf(nilptr, 0, fmt, v)
+  local buf: sequence(byte)
+  buf:resize(n + 1)
+  c_snprintf((@cstring)(&buf[1]), (@csize)(n + 1), fmt, v)
+  return (@string){data = &buf[1], size = (@usize)(n)}
+end
+
+-- printf of a C format holding one %s conversion ("%[-][W][.P]s", then
+-- literal text), over bytes.
+local function out_string_fmt(f: string, s: string)
+  local i = 2
+  local left = false
+  while i <= #f and f:byte(i) == 45 do left = true; i = i + 1 end
+  local width = 0
+  while i <= #f and isdigit(f:byte(i)) do width = width * 10 + f:byte(i) - 48; i = i + 1 end
+  if i <= #f and f:byte(i) == 46 then
+    i = i + 1
+    local prec = 0
+    while i <= #f and isdigit(f:byte(i)) do prec = prec * 10 + f:byte(i) - 48; i = i + 1 end
+    if prec < #s then s = s:sub(1, prec) end
+  end
+  if not left then for _ = 1, width - #s do util.writebyte(32) end end
+  util.write(s)
+  if left then for _ = 1, width - #s do util.writebyte(32) end end
+  util.write(f:sub(i + 1))
+end
+
+local function out_string(pf: string, s: string)
+  out_string_fmt(make_format(pf, '-', 's'), s)
+end
+
+-- make_format edits PFORMAT in place, so a second out_string on the same
+-- directive (%N's " -> TARGET") formats from the edited buffer through the
+-- original prefix length. This replays both edits on a byte buffer and
+-- returns the C string the second printf sees.
+local function mk_inplace(b: *sequence(byte), plen: integer, allowed: string, suffix: string)
+  local dst = 2
+  local src = 2
+  local srclim = plen + 1
+  while src < srclim and (b[src] == 0 or has(printf_flags, b[src])) do
+    if b[src] == 0 or has(allowed, b[src]) then b[dst] = b[src]; dst = dst + 1 end
+    src = src + 1
+  end
+  while src < srclim do b[dst] = b[src]; dst = dst + 1; src = src + 1 end
+  for k = 1, #suffix + 1 do
+    local ch: byte = k <= #suffix and suffix:byte(k) or 0
+    if dst > #b then b:push(ch) else b[dst] = ch end
+    dst = dst + 1
+  end
+end
+
+local function second_format(pf: string, allowed: string, suffix: string): string
+  local b: sequence(byte)
+  for k = 1, #pf do b:push(pf:byte(k)) end
+  b:push(0)
+  mk_inplace(&b, #pf, allowed, suffix)
+  mk_inplace(&b, #pf, allowed, suffix)
+  local sb: stringbuilder
+  for k = 1, #b do
+    if b[k] == 0 then break end
+    sb:writebyte(b[k])
+  end
+  return sb:promote()
+end
+
+local function out_int(pf: string, v: int64): integer
+  local s = cformat_i(make_format(pf, "'-+ 0", 'lld'), v)
+  util.write(s)
+  return #s
+end
+local function out_uint(pf: string, v: uint64): integer
+  local s = cformat_u(make_format(pf, "'-0", 'llu'), v)
+  util.write(s)
+  return #s
+end
+local function out_uint_o(pf: string, v: uint64) util.write(cformat_u(make_format(pf, '-#0', 'llo'), v)) end
+local function out_uint_x(pf: string, v: uint64) util.write(cformat_u(make_format(pf, '-#0', 'llx'), v)) end
+local function out_minus_zero(pf: string): integer
+  local s = cformat_f(make_format(pf, "'-+ 0", '.0f'), -0.25)
+  util.write(s)
+  return #s
+end
+
+local function strtol_digits(s: string, i: integer): integer
+  local v: int64 = 0
+  while i <= #s and isdigit(s:byte(i)) do
+    if v <= 0x7fffffff then v = v * 10 + s:byte(i) - 48 end
+    i = i + 1
+  end
+  if v > 0x7fffffff then v = 0x7fffffff end
+  return v
+end
+
+-- out_epoch_sec: seconds since the Epoch with printf %f-like rules.
+local function out_epoch_sec(pf: string, sec: int64, nsec: int64)
+  local dot = pf:find('.', 1, true)
+  local sec_prefix = pf
+  local width = 0
+  local precision = 0
+  local frac_left_adjust = false
+  if dot > 0 then
+    sec_prefix = pf:sub(1, dot - 1)
+    if dot + 1 <= #pf and isdigit(pf:byte(dot + 1)) then precision = strtol_digits(pf, dot + 1)
+    else precision = 9 end
+    if precision ~= 0 and isdigit(pf:byte(dot - 1)) then
+      local p = dot - 1
+      while isdigit(pf:byte(p - 1)) do p = p - 1 end
+      width = strtol_digits(pf, p)
+      if 1 < width then
+        if pf:byte(p) == 48 then p = p + 1 end
+        sec_prefix = pf:sub(1, p - 1)
+        local w_d = 1 < width and width - 1 or 0
+        if 1 < w_d then
+          local w = w_d - precision
+          if 1 < w then
+            local sb: stringbuilder
+            for k = 1, p - 1 do
+              if pf:byte(k) == 45 then frac_left_adjust = true else sb:writebyte(pf:byte(k)) end
+            end
+            if not frac_left_adjust then sb:write(tostring(w)) end
+            sec_prefix = sb:promote()
+          end
+        end
+      end
+    end
+  end
+  local divisor: int64 = 1
+  for _ = precision, 8 do divisor = divisor * 10 end
+  local frac_sec: int64 = nsec // divisor
+  local minus_zero = false
+  if sec < 0 and nsec ~= 0 then
+    local modulus: int64 = 1000000000 // divisor
+    frac_sec = modulus - frac_sec - ((nsec % divisor ~= 0) and 1 or 0)
+    if frac_sec ~= 0 then sec = sec + 1 end
+    minus_zero = sec == 0
+  end
+  local int_len = minus_zero and out_minus_zero(sec_prefix) or out_int(sec_prefix, sec)
+  if precision ~= 0 then
+    local prec = precision < 9 and precision or 9
+    local trailing_prec = precision - prec
+    local ilen = int_len < 0 and 0 or int_len
+    local trailing_width = (ilen < width and 1 < width - ilen) and width - ilen - 1 - prec or 0
+    util.writebyte(46)
+    util.write(cformat_i('%.' .. tostring(prec) .. 'lld', frac_sec))
+    if trailing_width < 0 then trailing_width = -trailing_width end
+    util.write(cformat_i('%-' .. tostring(trailing_width) .. '.' .. tostring(trailing_prec) .. 'lld', 0))
+  end
+end
+
+local function pad(v: int64, n: integer): string
+  local s = tostring(v)
+  while #s < n do s = '0' .. s end
+  return s
+end
+
+-- human_time: "%Y-%m-%d %H:%M:%S.%N %z" as gnulib nstrftime writes it.
+local function human_time(sec: int64, nsec: int64): string
+  local t: clong = sec
+  local tm: sys.Tm
+  if sys.localtime_r(&t, &tm) == nilptr then
+    return tostring(sec) .. '.' .. pad(nsec, 9)
+  end
+  local year: int64 = (@int64)(tm.tm_year) + 1900
+  local ys = year < 0 and '-' .. pad(-year, 3) or pad(year, 4)
+  local off: int64 = tm.tm_gmtoff
+  local sign = off < 0 and '-' or '+'
+  if off < 0 then off = -off end
+  local hhmm = (off // 3600) * 100 + (off // 60) % 60
+  return ys .. '-' .. pad(tm.tm_mon + 1, 2) .. '-' .. pad(tm.tm_mday, 2) .. ' '
+    .. pad(tm.tm_hour, 2) .. ':' .. pad(tm.tm_min, 2) .. ':' .. pad(tm.tm_sec, 2) .. '.'
+    .. pad(nsec, 9) .. ' ' .. sign .. pad(hhmm, 4)
+end
+
+local function file_type(st: *FileStat): string
+  local f = st.mode & S_IFMT
+  if f == S_IFREG then return st.size == 0 and 'regular empty file' or 'regular file' end
+  if f == S_IFDIR then return 'directory' end
+  if f == S_IFLNK then return 'symbolic link' end
+  if f == S_IFBLK then return 'block special file' end
+  if f == S_IFCHR then return 'character special file' end
+  if f == S_IFIFO then return 'fifo' end
+  if f == S_IFSOCK then return 'socket' end
+  return 'weird file'
+end
+
+local function quoteN(s: string): string return quotearg.style(s, quoting_style) end
+
+local function readlink_str(path: string): (boolean, string)
+  local size = 128
+  while true do
+    local buf: sequence(byte)
+    buf:resize(size)
+    local n = sys.readlink(path, &buf[1], (@csize)(size))
+    if n < 0 then return false, '' end
+    if n < size then return true, string.copy((@string){data = &buf[1], size = (@usize)(n)}) end
+    size = size * 2
+  end
+  return false, ''
+end
+
+-- Mount points -----------------------------------------------------------------
+local mounts: sequence(mountlist.Entry)
+local tried_mount_list = false
+
+local function find_bind_mount(name: string): (boolean, string)
+  if not tried_mount_list then
+    local ok: boolean
+    mounts, ok = mountlist.read()
+    if not ok then util.err(errno_msg('cannot read table of mounted file systems', sys.errno())) end
+    tried_mount_list = true
+  end
+  local ns: sys.Stat
+  if sys.stat(name, &ns) ~= 0 then return false, '' end
+  for i = 1, #mounts do
+    local me = &mounts[i]
+    if me.dummy and me.devname:sub(1, 1) == '/' and me.mountdir == name then
+      local ds: sys.Stat
+      if sys.stat(me.devname, &ds) == 0 and ds.st_ino == ns.st_ino and ds.st_dev == ns.st_dev then
+        return true, me.devname
+      end
+    end
+  end
+  return false, ''
+end
+
+local function getcwd_str(): (boolean, string)
+  local size = 256
+  while true do
+    local buf: sequence(byte)
+    buf:resize(size)
+    if sys.getcwd((@cstring)(&buf[1]), (@csize)(size)) ~= nilptr then
+      return true, string.copy((@cstring)(&buf[1]))
+    end
+    if sys.errno() ~= 34 then return false, '' end
+    size = size * 2
+  end
+  return false, ''
+end
+
+-- gnulib find_mount_point, chdir walk included.
+local function find_mount_point(file: string, fst: *FileStat): (boolean, string)
+  local cwd = sys.open('.', sys.O_RDONLY | 0x10000 | 0x200000, 0) -- O_DIRECTORY|O_PATH
+  if cwd < 0 then util.err(errno_msg('cannot get current directory', sys.errno())); return false, '' end
+  local last_dev: uint64
+  local last_ino: uint64
+  local result = false
+  local mp = ''
+  if (fst.mode & S_IFMT) == S_IFDIR then
+    last_dev = fst.dev; last_ino = fst.ino
+    if sys.chdir(file) < 0 then
+      util.err(errno_msg('cannot change to directory ' .. util.quoteaf(file), sys.errno()))
+      sys.close(cwd)
+      return false, ''
+    end
+  else
+    local dir = util.dirname(file)
+    if sys.chdir(dir) < 0 then
+      util.err(errno_msg('cannot change to directory ' .. util.quoteaf(dir), sys.errno()))
+      sys.close(cwd)
+      return false, ''
+    end
+    local ls: sys.Stat
+    if sys.stat('.', &ls) < 0 then
+      util.err(errno_msg('cannot stat current directory (now ' .. util.quoteaf(dir) .. ')', sys.errno()))
+      goto done
+    end
+    last_dev = ls.st_dev; last_ino = ls.st_ino
+  end
+  while true do
+    local st: sys.Stat
+    if sys.stat('..', &st) < 0 then
+      util.err(errno_msg('cannot stat ' .. util.quoteaf('..'), sys.errno()))
+      goto done
+    end
+    if st.st_dev ~= last_dev or st.st_ino == last_ino then break end
+    if sys.chdir('..') < 0 then
+      util.err(errno_msg('cannot change to directory ' .. util.quoteaf('..'), sys.errno()))
+      goto done
+    end
+    last_dev = st.st_dev; last_ino = st.st_ino
+  end
+  result, mp = getcwd_str()
+::done::
+  if c_fchdir(cwd) ~= 0 then die(errno_msg('failed to return to initial working directory', sys.errno())) end
+  sys.close(cwd)
+  return result, mp
+end
+
+local function out_mount_point(filename: string, pf: string, st: *FileStat): boolean
+  local np = '?'
+  local have_bp, bp = false, ''
+  local have_mp, mp = false, ''
+  local fail = true
+  if follow_links or (st.mode & S_IFMT) ~= S_IFLNK then
+    local resolved, e = canon.canonicalize(filename, canon.CAN_EXISTING)
+    if #resolved == 0 then
+      util.err(errno_msg('failed to canonicalize ' .. util.quoteaf(filename), e))
+      goto print_mount_point
+    end
+    have_bp, bp = find_bind_mount(resolved)
+    if have_bp then
+      fail = false
+      goto print_mount_point
+    end
+  end
+  have_mp, mp = find_mount_point(filename, st)
+  if have_mp then
+    have_bp, bp = find_bind_mount(mp)
+    fail = false
+  end
+::print_mount_point::
+  out_string(pf, have_bp and bp or (have_mp and mp or np))
+  return fail
+end
+
+local function out_file_context(pf: string, filename: string): boolean
+  local buf: [4096]byte
+  local n: clong
+  if follow_links then n = c_getxattr(filename, 'security.selinux', &buf, #buf)
+  else n = c_lgetxattr(filename, 'security.selinux', &buf, #buf) end
+  local fail = false
+  local ctx = '?'
+  if n < 0 then
+    util.err(errno_msg('failed to get security context of ' .. util.quoteaf(filename), sys.errno()))
+    fail = true
+  else
+    local len = n
+    while len > 0 and buf[len - 1] == 0 do len = len - 1 end
+    ctx = string.copy((@string){data = &buf[0], size = (@usize)(len)})
+  end
+  local f = pf .. 's'
+  local n2 = c_snprintf(nilptr, 0, f, (@cstring)(ctx))
+  local ob: sequence(byte)
+  ob:resize(n2 + 1)
+  c_snprintf((@cstring)(&ob[1]), (@csize)(n2 + 1), f, (@cstring)(ctx))
+  util.writebytes(&ob[1], (@usize)(n2))
+  return fail
+end
+
+-- Directives -------------------------------------------------------------------
+local K_STAT <comptime> = 0
+local K_STATFS <comptime> = 1
+
+local function print_stat(pf: string, mod: byte, m: byte, filename: string, st: *FileStat): boolean
+  local fail = false
+  if m == 110 then out_string(pf, filename)
+  elseif m == 78 then
+    out_string(pf, quoteN(filename))
+    if (st.mode & S_IFMT) == S_IFLNK then
+      local ok, link = readlink_str(filename)
+      if not ok then
+        util.err(errno_msg('cannot read symbolic link ' .. util.quoteaf(filename), sys.errno()))
+        return true
+      end
+      util.write(' -> ')
+      out_string_fmt(second_format(pf, '-', 's'), quoteN(link))
+    end
+  elseif m == 100 then
+    if mod == 72 then out_uint(pf, major(st.dev))
+    elseif mod == 76 then out_uint(pf, minor(st.dev))
+    else out_uint(pf, st.dev) end
+  elseif m == 68 then out_uint_x(pf, st.dev)
+  elseif m == 105 then out_uint(pf, st.ino)
+  elseif m == 97 then out_uint_o(pf, st.mode & 0xfff)
+  elseif m == 65 then out_string(pf, util.modestr(st.mode))
+  elseif m == 102 then out_uint_x(pf, st.mode)
+  elseif m == 70 then out_string(pf, file_type(st))
+  elseif m == 104 then out_uint(pf, st.nlink)
+  elseif m == 117 then out_uint(pf, st.uid)
+  elseif m == 85 then
+    local pw = c_getpwuid(st.uid)
+    out_string(pf, pw ~= nilptr and (@string)(pw.pw_name) or 'UNKNOWN')
+  elseif m == 103 then out_uint(pf, st.gid)
+  elseif m == 71 then
+    local gr = c_getgrgid(st.gid)
+    out_string(pf, gr ~= nilptr and (@string)(gr.gr_name) or 'UNKNOWN')
+  elseif m == 109 then fail = out_mount_point(filename, pf, st) or fail
+  elseif m == 115 then out_int(pf, st.size)
+  elseif m == 114 then
+    if mod == 72 then out_uint(pf, major(st.rdev))
+    elseif mod == 76 then out_uint(pf, minor(st.rdev))
+    else out_uint(pf, st.rdev) end
+  elseif m == 82 then out_uint_x(pf, st.rdev)
+  elseif m == 116 then out_uint_x(pf, major(st.rdev))
+  elseif m == 84 then out_uint_x(pf, minor(st.rdev))
+  elseif m == 66 then out_uint(pf, 512)
+  elseif m == 98 then out_uint(pf, (@uint64)(st.blocks))
+  elseif m == 111 then out_uint(pf, (st.blksize > 0 and st.blksize <= 0x2000000000000000) and (@uint64)(st.blksize) or 512)
+  elseif m == 119 then
+    if st.btime_ns < 0 then out_string(pf, '-') else out_string(pf, human_time(st.btime_s, st.btime_ns)) end
+  elseif m == 87 then
+    if st.btime_ns < 0 then out_epoch_sec(pf, 0, 0) else out_epoch_sec(pf, st.btime_s, st.btime_ns) end
+  elseif m == 120 then out_string(pf, human_time(st.atime_s, st.atime_ns))
+  elseif m == 88 then out_epoch_sec(pf, st.atime_s, st.atime_ns)
+  elseif m == 121 then out_string(pf, human_time(st.mtime_s, st.mtime_ns))
+  elseif m == 89 then out_epoch_sec(pf, st.mtime_s, st.mtime_ns)
+  elseif m == 122 then out_string(pf, human_time(st.ctime_s, st.ctime_ns))
+  elseif m == 90 then out_epoch_sec(pf, st.ctime_s, st.ctime_ns)
+  elseif m == 67 then fail = out_file_context(pf, filename) or fail
+  else util.writebyte(63) end
+  return fail
+end
+
+local function print_statfs(pf: string, m: byte, filename: string, fs: *sys.Statfs): boolean
+  if m == 110 then out_string(pf, filename)
+  elseif m == 105 then
+    local fsid: uint64 = ((@uint64)((@uint32)(fs.f_fsid[0])) << 32) | (@uint64)((@uint32)(fs.f_fsid[1]))
+    out_uint_x(pf, fsid)
+  elseif m == 108 then out_uint(pf, (@uint64)(fs.f_namelen))
+  elseif m == 116 then out_uint_x(pf, (@uint64)(fs.f_type))
+  elseif m == 84 then out_string(pf, fstype.name((@uint64)((@culong)(fs.f_type))))
+  elseif m == 98 then out_int(pf, (@int64)(fs.f_blocks))
+  elseif m == 102 then out_int(pf, (@int64)(fs.f_bfree))
+  elseif m == 97 then out_int(pf, (@int64)(fs.f_bavail))
+  elseif m == 115 then out_uint(pf, (@uint64)(fs.f_bsize))
+  elseif m == 83 then
+    local fr: uint64 = (@uint64)(fs.f_frsize)
+    if fr == 0 then fr = (@uint64)(fs.f_bsize) end
+    out_uint(pf, fr)
+  elseif m == 99 then out_uint(pf, (@uint64)(fs.f_files))
+  elseif m == 100 then out_int(pf, (@int64)(fs.f_ffree))
+  else util.writebyte(63) end
+  return false
+end
+
+local function format_code_offset(f: string, i: integer): integer
+  local j = i + 1
+  while j <= #f and has(printf_flags, f:byte(j)) do j = j + 1 end
+  while j <= #f and isdigit(f:byte(j)) do j = j + 1 end
+  if j <= #f and f:byte(j) == 46 then
+    j = j + 1
+    while j <= #f and isdigit(f:byte(j)) do j = j + 1 end
+  end
+  return j - i
+end
+
+local function isodigit(c: byte): boolean return c >= 48 and c <= 55 end
+local function isxdigit(c: byte): boolean
+  return isdigit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+end
+local function hextobin(c: byte): integer
+  if c >= 97 and c <= 102 then return c - 87 end
+  if c >= 65 and c <= 70 then return c - 55 end
+  return c - 48
+end
+
+local function print_esc_char(c: byte)
+  if c == 97 then c = 7 elseif c == 98 then c = 8 elseif c == 101 then c = 27
+  elseif c == 102 then c = 12 elseif c == 110 then c = 10 elseif c == 114 then c = 13
+  elseif c == 116 then c = 9 elseif c == 118 then c = 11
+  elseif c == 34 or c == 92 then
+  else
+    util.err("warning: unrecognized escape '\\" .. string.char(c) .. "'")
+  end
+  util.writebyte(c)
+end
+
+local function print_it(format: string, filename: string, kind: integer, st: *FileStat, fs: *sys.Statfs): boolean
+  local fail = false
+  local i = 1
+  local n = #format
+  while i <= n do
+    local c = format:byte(i)
+    if c == 37 then
+      local len = format_code_offset(format, i)
+      local fmt_char: byte = i + len <= n and format:byte(i + len) or 0
+      local mod_char: byte = 0
+      local dest = format:sub(i, i + len - 1)
+      i = i + len
+      if fmt_char == 0 or fmt_char == 37 then
+        if fmt_char == 0 then i = i - 1 end
+        if 1 < len then
+          die(util.quote(fmt_char == 0 and dest or dest .. '%') .. ': invalid directive')
+        end
+        util.writebyte(37)
+      else
+        if fmt_char == 72 or fmt_char == 76 then
+          mod_char = fmt_char
+          local nx: byte = i + 1 <= n and format:byte(i + 1) or 0
+          if kind == K_STAT and (nx == 100 or nx == 114) then
+            fmt_char = nx
+            i = i + 1
+          else
+            mod_char = 0
+          end
+        end
+        if kind == K_STAT then fail = print_stat(dest, mod_char, fmt_char, filename, st) or fail
+        else fail = print_statfs(dest, fmt_char, filename, fs) or fail end
+      end
+    elseif c == 92 then
+      if not interpret_backslash_escapes then
+        util.writebyte(92)
+      else
+        i = i + 1
+        local b: byte = i <= n and format:byte(i) or 0
+        if isodigit(b) then
+          local v = b - 48
+          local l = 1
+          i = i + 1
+          while l < 3 and i <= n and isodigit(format:byte(i)) do
+            v = v * 8 + format:byte(i) - 48
+            l = l + 1
+            i = i + 1
+          end
+          util.writebyte((@byte)(v & 0xff))
+          i = i - 1
+        elseif b == 120 and i + 1 <= n and isxdigit(format:byte(i + 1)) then
+          local v = hextobin(format:byte(i + 1))
+          i = i + 1
+          if i + 1 <= n and isxdigit(format:byte(i + 1)) then
+            i = i + 1
+            v = v * 16 + hextobin(format:byte(i))
+          end
+          util.writebyte((@byte)(v))
+        elseif b == 0 and i > n then
+          util.err('warning: backslash at end of format')
+          util.writebyte(92)
+          i = i - 1
+        else
+          print_esc_char(b)
+        end
+      end
+    else
+      util.writebyte(c)
+    end
+    i = i + 1
+  end
+  util.write(trailing_delim)
+  return fail
+end
+
+local function fmt_to_mask(c: byte): cuint
+  if c == 78 or c == 100 or c == 68 or c == 97 or c == 65 or c == 116 or c == 84 then return STATX_MODE end
+  if c == 105 then return STATX_INO end
+  if c == 102 then return STATX_MODE | STATX_TYPE end
+  if c == 70 then return STATX_TYPE end
+  if c == 104 then return STATX_NLINK end
+  if c == 117 or c == 85 then return STATX_UID end
+  if c == 103 or c == 71 then return STATX_GID end
+  if c == 109 then return STATX_MODE | STATX_INO end
+  if c == 115 then return STATX_SIZE end
+  if c == 98 then return STATX_BLOCKS end
+  if c == 119 or c == 87 then return STATX_BTIME end
+  if c == 120 or c == 88 then return STATX_ATIME end
+  if c == 121 or c == 89 then return STATX_MTIME end
+  if c == 122 or c == 90 then return STATX_CTIME end
+  return 0
+end
+
+local function format_to_mask(f: string): cuint
+  local mask: cuint = 0
+  local i = 1
+  while i <= #f do
+    if f:byte(i) == 37 then
+      i = i + format_code_offset(f, i)
+      if i > #f then break end
+      mask = mask | fmt_to_mask(f:byte(i))
+    end
+    i = i + 1
+  end
+  return mask
+end
+
+local function do_stat(filename: string, format: string, format2: string): boolean
+  local fd: cint = filename == '-' and 0 or AT_FDCWD
+  local flags: cint = 0
+  local pathname = filename
+  if fd ~= AT_FDCWD then
+    pathname = ''
+    flags = AT_EMPTY_PATH
+  elseif not follow_links then
+    flags = AT_SYMLINK_NOFOLLOW
+  end
+  if dont_sync then flags = flags | AT_STATX_DONT_SYNC
+  elseif force_sync then flags = flags | AT_STATX_FORCE_SYNC end
+  if not force_sync then flags = flags | AT_NO_AUTOMOUNT end
+  local stx: Statx
+  if c_statx(fd, pathname, flags, format_to_mask(format), &stx) < 0 then
+    if (flags & AT_EMPTY_PATH) ~= 0 then util.err(errno_msg('cannot stat standard input', sys.errno()))
+    else util.err(errno_msg('cannot statx ' .. util.quoteaf(filename), sys.errno())) end
+    return false
+  end
+  local ft = stx.stx_mode & S_IFMT
+  if ft == S_IFBLK or ft == S_IFCHR then format = format2 end
+  local st: FileStat = {
+    dev = makedev(stx.stx_dev_major, stx.stx_dev_minor), ino = stx.stx_ino, mode = stx.stx_mode,
+    nlink = stx.stx_nlink, uid = stx.stx_uid, gid = stx.stx_gid,
+    rdev = makedev(stx.stx_rdev_major, stx.stx_rdev_minor), size = (@int64)(stx.stx_size),
+    blksize = stx.stx_blksize, blocks = (@int64)(stx.stx_blocks),
+    atime_s = stx.stx_atime.tv_sec, atime_ns = stx.stx_atime.tv_nsec,
+    mtime_s = stx.stx_mtime.tv_sec, mtime_ns = stx.stx_mtime.tv_nsec,
+    ctime_s = stx.stx_ctime.tv_sec, ctime_ns = stx.stx_ctime.tv_nsec,
+    btime_s = -1, btime_ns = -1,
+  }
+  if (stx.stx_mask & STATX_BTIME) ~= 0 then
+    st.btime_s = stx.stx_btime.tv_sec
+    st.btime_ns = stx.stx_btime.tv_nsec
+  end
+  return not print_it(format, filename, K_STAT, &st, nilptr)
+end
+
+local function do_statfs(filename: string, format: string): boolean
+  if filename == '-' then
+    util.err('using ' .. util.quoteaf(filename) .. ' to denote standard input does not work in file system mode')
+    return false
+  end
+  local fs: sys.Statfs
+  local r = sys.statfs(filename, &fs)
+  if r ~= 0 then
+    util.err(errno_msg('cannot read file system information for ' .. util.quoteaf(filename), (@cint)(-r)))
+    return false
+  end
+  return not print_it(format, filename, K_STATFS, nilptr, &fs)
+end
+
+local function selinux_enabled(): boolean
+  return sys.access('/sys/fs/selinux/enforce', 0) == 0
+end
+
+local function default_format(fs: boolean, terse: boolean, device: boolean): string
+  if fs then
+    if terse then return '%n %i %l %t %s %S %b %f %a %c %d\n' end
+    return '  File: "%n"\n    ID: %-8i Namelen: %-7l Type: %T\nBlock size: %-10s Fundamental block size: %S\n'
+      .. 'Blocks: Total: %-10b Free: %-10f Available: %a\nInodes: Total: %-10c Free: %d\n'
+  end
+  if terse then
+    if selinux_enabled() then return '%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o %C\n' end
+    return '%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n'
+  end
+  local f = '  File: %N\n  Size: %-10s\tBlocks: %-10b IO Block: %-6o %F\n'
+  if device then f = f .. 'Device: %Hd,%Ld\tInode: %-10i  Links: %-5h Device type: %Hr,%Lr\n'
+  else f = f .. 'Device: %Hd,%Ld\tInode: %-10i  Links: %h\n' end
+  f = f .. 'Access: (%04a/%10.10A)  Uid: (%5u/%8U)   Gid: (%5g/%8G)\n'
+  if selinux_enabled() then f = f .. 'Context: %C\n' end
+  return f .. 'Access: %x\nModify: %y\nChange: %z\n Birth: %w\n'
+end
+
+-- ARGMATCH without the diagnostic: exact, else a unique prefix.
+local function argmatch_style(arg: string): integer
+  local found = -1
+  for i = 0, 9 do
+    local nm = quotearg.style_names[i]
+    if nm == arg then return i end
+    if #arg < #nm and nm:sub(1, #arg) == arg then
+      if found == -1 then found = i else found = -2 end
+    end
+  end
+  return found
+end
+
+local function getenv_quoting_style()
+  local q = sys.getenv('QUOTING_STYLE')
+  if q ~= nilptr then
+    local qs: string = (@string)(q)
+    local i = argmatch_style(qs)
+    if i >= 0 then quoting_style = i
+    else
+      quoting_style = quotearg.SHELL_ESCAPE_ALWAYS
+      util.err('ignoring invalid value of environment variable QUOTING_STYLE: ' .. util.quote(qs))
+    end
+  else
+    quoting_style = quotearg.SHELL_ESCAPE_ALWAYS
+  end
+end
+
+global function applet_stat(args: sequence(string)): integer
+  local fs = false
+  local terse = false
+  local format = ''
+  local have_format = false
+  local longs: []util.LongOpt = {
+    {'dereference', 0, 76}, {'file-system', 0, 102}, {'format', 1, 99}, {'printf', 1, 256},
+    {'terse', 0, 116}, {'cached', 1, 257}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'c:fLt', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 256 then
+      format = g.optarg; have_format = true
+      interpret_backslash_escapes = true
+      trailing_delim = ''
+    elseif c == 99 then
+      format = g.optarg; have_format = true
+      interpret_backslash_escapes = false
+      trailing_delim = '\n'
+    elseif c == 76 then follow_links = true
+    elseif c == 102 then fs = true
+    elseif c == 116 then terse = true
+    elseif c == 257 then
+      local names: []string = {'default', 'never', 'always'}
+      local values: []integer = {0, 1, 2}
+      local v = util.argmatch('--cached', g.optarg, &names, &values, 3)
+      if v < 0 then usage_fail('') end
+      if v == 1 then force_sync = true; dont_sync = false
+      elseif v == 2 then force_sync = false; dont_sync = true
+      else force_sync = false; dont_sync = false end
+    end
+  end
+  local ops = g:operands()
+  if #ops == 0 then usage_fail('missing operand') end
+  local format2: string
+  if have_format then
+    if format:find('%N', 1, true) > 0 then getenv_quoting_style() end
+    format2 = format
+  else
+    format = default_format(fs, terse, false)
+    format2 = default_format(fs, terse, true)
+  end
+  local ok = true
+  for _, f in ipairs(ops) do
+    if fs then ok = do_statfs(f, format) and ok
+    else ok = do_stat(f, format, format2) and ok end
+  end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end

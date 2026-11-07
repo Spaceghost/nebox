@@ -137,6 +137,22 @@ Stated here rather than worked around:
   a draw is possible, as in GNU. Without it, bytes come from getrandom
   (GNU seeds ISAAC from getrandom). `tests/shuf_compare.py`: 97 cases, 0
   mismatches.
+- `stat` ports stat.c as GNU builds it on Linux (statx): -L, -f, -c,
+  `--printf` with its escapes and warnings, -t, `--cached`; every file and
+  file-system directive with make_format's per-directive flag filtering
+  (including the in-place edit that leaves a stray `s` after `%+6N`'s link
+  target), out_epoch_sec's width/precision rules for `%X`-style times,
+  negative and pre-1000 timestamps as nstrftime writes them, `%N` under
+  `QUOTING_STYLE` (literal unless a `-c`/`--printf` format names `%N`, as in
+  GNU), `%m` via find_mount_point and find_bind_mount, `%C` from the
+  security.selinux attribute, `%w`/`%W` birth times. New shared modules:
+  `src/nebox/quotearg.nelua` (gnulib quotearg_buffer_restyled, all ten
+  styles), `src/nebox/mountlist.nelua` (/proc/self/mountinfo with ME_DUMMY
+  and ME_REMOTE) and `src/nebox/fstype.nelua` (stat.c's 132 file-system
+  magic numbers, generated). SELinux detection is `/sys/fs/selinux/enforce`
+  rather than libselinux. `tests/stat_compare.py`: 279 fixed cases plus 400
+  random format strings over a shared fixture, 0 mismatches (1500 random
+  also run clean).
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

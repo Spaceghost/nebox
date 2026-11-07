@@ -1,0 +1,143 @@
+-- Linux file system type names from GNU coreutils 9.1 stat.c human_fstype
+-- (generated from its "case S_MAGIC_...: /* 0x... */" table).
+## pragmas.nogc = true
+
+require 'string'
+
+global fstype = @record{}
+
+function fstype.name(t: uint64): string
+  if t == 0x5A3C69F0 then return 'aafs' end
+  if t == 0x61636673 then return 'acfs' end
+  if t == 0xADF5 then return 'adfs' end
+  if t == 0xADFF then return 'affs' end
+  if t == 0x5346414F then return 'afs' end
+  if t == 0x9041934 then return 'anon-inode FS' end
+  if t == 0x61756673 then return 'aufs' end
+  if t == 0x187 then return 'autofs' end
+  if t == 0x13661366 then return 'balloon-kvm-fs' end
+  if t == 0x42465331 then return 'befs' end
+  if t == 0x62646576 then return 'bdevfs' end
+  if t == 0x1BADFACE then return 'bfs' end
+  if t == 0x6C6F6F70 then return 'binderfs' end
+  if t == 0xCAFE4A11 then return 'bpf_fs' end
+  if t == 0x42494E4D then return 'binfmt_misc' end
+  if t == 0x9123683E then return 'btrfs' end
+  if t == 0x73727279 then return 'btrfs_test' end
+  if t == 0xC36400 then return 'ceph' end
+  if t == 0x27E0EB then return 'cgroupfs' end
+  if t == 0x63677270 then return 'cgroup2fs' end
+  if t == 0xFF534D42 then return 'cifs' end
+  if t == 0x73757245 then return 'coda' end
+  if t == 0x12FF7B7 then return 'coh' end
+  if t == 0x62656570 then return 'configfs' end
+  if t == 0x28CD3D45 then return 'cramfs' end
+  if t == 0x453DCD28 then return 'cramfs-wend' end
+  if t == 0x64646178 then return 'daxfs' end
+  if t == 0x64626720 then return 'debugfs' end
+  if t == 0x1373 then return 'devfs' end
+  if t == 0x454D444D then return 'devmem' end
+  if t == 0x1CD1 then return 'devpts' end
+  if t == 0x444D4142 then return 'dma-buf-fs' end
+  if t == 0xF15F then return 'ecryptfs' end
+  if t == 0xDE5E81E4 then return 'efivarfs' end
+  if t == 0x414A53 then return 'efs' end
+  if t == 0xE0F5E1E2 then return 'erofs' end
+  if t == 0x2011BAB0 then return 'exfat' end
+  if t == 0x45584653 then return 'exfs' end
+  if t == 0x5DF5 then return 'exofs' end
+  if t == 0x137D then return 'ext' end
+  if t == 0xEF53 then return 'ext2/ext3' end
+  if t == 0xEF51 then return 'ext2' end
+  if t == 0xF2F52010 then return 'f2fs' end
+  if t == 0x4006 then return 'fat' end
+  if t == 0x19830326 then return 'fhgfs' end
+  if t == 0x65735546 then return 'fuseblk' end
+  if t == 0x65735543 then return 'fusectl' end
+  if t == 0xBAD1DEA then return 'futexfs' end
+  if t == 0x1161970 then return 'gfs/gfs2' end
+  if t == 0x47504653 then return 'gpfs' end
+  if t == 0x4244 then return 'hfs' end
+  if t == 0x482B then return 'hfs+' end
+  if t == 0x4858 then return 'hfsx' end
+  if t == 0xC0FFEE then return 'hostfs' end
+  if t == 0xF995E849 then return 'hpfs' end
+  if t == 0x958458F6 then return 'hugetlbfs' end
+  if t == 0x11307854 then return 'inodefs' end
+  if t == 0x13111A8 then return 'ibrix' end
+  if t == 0x2BAD1DEA then return 'inotifyfs' end
+  if t == 0x9660 then return 'isofs' end
+  if t == 0x4004 then return 'isofs' end
+  if t == 0x4000 then return 'isofs' end
+  if t == 0x7C0 then return 'jffs' end
+  if t == 0x72B6 then return 'jffs2' end
+  if t == 0x3153464A then return 'jfs' end
+  if t == 0x6B414653 then return 'k-afs' end
+  if t == 0xC97E8168 then return 'logfs' end
+  if t == 0xBD00BD0 then return 'lustre' end
+  if t == 0x5346314D then return 'm1fs' end
+  if t == 0x137F then return 'minix' end
+  if t == 0x138F then return 'minix (30 char.)' end
+  if t == 0x2468 then return 'minix v2' end
+  if t == 0x2478 then return 'minix v2 (30 char.)' end
+  if t == 0x4D5A then return 'minix3' end
+  if t == 0x19800202 then return 'mqueue' end
+  if t == 0x4D44 then return 'msdos' end
+  if t == 0x564C then return 'novell' end
+  if t == 0x6969 then return 'nfs' end
+  if t == 0x6E667364 then return 'nfsd' end
+  if t == 0x3434 then return 'nilfs' end
+  if t == 0x6E736673 then return 'nsfs' end
+  if t == 0x5346544E then return 'ntfs' end
+  if t == 0x9FA1 then return 'openprom' end
+  if t == 0x7461636F then return 'ocfs2' end
+  if t == 0x794C7630 then return 'overlayfs' end
+  if t == 0xAAD7AAEA then return 'panfs' end
+  if t == 0x50495045 then return 'pipefs' end
+  if t == 0xC7571590 then return 'ppc-cmm-fs' end
+  if t == 0x7C7C6673 then return 'prl_fs' end
+  if t == 0x9FA0 then return 'proc' end
+  if t == 0x6165676C then return 'pstorefs' end
+  if t == 0x2F then return 'qnx4' end
+  if t == 0x68191122 then return 'qnx6' end
+  if t == 0x858458F6 then return 'ramfs' end
+  if t == 0x7655821 then return 'rdt' end
+  if t == 0x52654973 then return 'reiserfs' end
+  if t == 0x7275 then return 'romfs' end
+  if t == 0x67596969 then return 'rpc_pipefs' end
+  if t == 0x5DCA2DF5 then return 'sdcardfs' end
+  if t == 0x5345434D then return 'secretmem' end
+  if t == 0x73636673 then return 'securityfs' end
+  if t == 0xF97CFF8C then return 'selinux' end
+  if t == 0x43415D53 then return 'smackfs' end
+  if t == 0x517B then return 'smb' end
+  if t == 0xFE534D42 then return 'smb2' end
+  if t == 0xBEEFDEAD then return 'snfs' end
+  if t == 0x534F434B then return 'sockfs' end
+  if t == 0x73717368 then return 'squashfs' end
+  if t == 0x62656572 then return 'sysfs' end
+  if t == 0x12FF7B6 then return 'sysv2' end
+  if t == 0x12FF7B5 then return 'sysv4' end
+  if t == 0x1021994 then return 'tmpfs' end
+  if t == 0x74726163 then return 'tracefs' end
+  if t == 0x24051905 then return 'ubifs' end
+  if t == 0x15013346 then return 'udf' end
+  if t == 0x11954 then return 'ufs' end
+  if t == 0x54190100 then return 'ufs' end
+  if t == 0x9FA2 then return 'usbdevfs' end
+  if t == 0x1021997 then return 'v9fs' end
+  if t == 0x786F4256 then return 'vboxsf' end
+  if t == 0xBACBACBC then return 'vmhgfs' end
+  if t == 0xA501FCF5 then return 'vxfs' end
+  if t == 0x565A4653 then return 'vzfs' end
+  if t == 0x53464846 then return 'wslfs' end
+  if t == 0xABBA1974 then return 'xenfs' end
+  if t == 0x12FF7B4 then return 'xenix' end
+  if t == 0x58465342 then return 'xfs' end
+  if t == 0x12FD16D then return 'xia' end
+  if t == 0x33 then return 'z3fold' end
+  if t == 0x2FC12FC1 then return 'zfs' end
+  if t == 0x5A4F4653 then return 'zonefs' end
+  if t == 0x58295829 then return 'zsmallocfs' end
+  return string.format('UNKNOWN (0x%x)', t)
+end

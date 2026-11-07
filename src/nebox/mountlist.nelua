@@ -1,0 +1,133 @@
+-- gnulib read_file_system_list for Linux: /proc/self/mountinfo parsed as
+-- mountlist.c does (fields split at single blanks, \ooo unescaped), with
+-- its ME_DUMMY and ME_REMOTE classifications.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+global mountlist = @record{}
+global mountlist.Entry = @record{
+  devname: string,
+  mountdir: string,
+  mntroot: string,
+  fstype: string,
+  dev: uint64,
+  dummy: boolean,
+  remote: boolean,
+}
+
+local function unescape_tab(s: string): string
+  local sb: stringbuilder
+  local i = 1
+  local n = #s
+  while i <= n do
+    local c = s:byte(i)
+    -- gnulib's bound counts the terminating NUL: i + 4 < len + 1
+    if c == 92 and i + 3 <= n
+        and s:byte(i + 1) >= 48 and s:byte(i + 1) <= 51
+        and s:byte(i + 2) >= 48 and s:byte(i + 2) <= 55
+        and s:byte(i + 3) >= 48 and s:byte(i + 3) <= 55 then
+      sb:writebyte((s:byte(i + 1) - 48) * 64 + (s:byte(i + 2) - 48) * 8 + (s:byte(i + 3) - 48))
+      i = i + 4
+    else
+      sb:writebyte(c)
+      i = i + 1
+    end
+  end
+  return sb:promote()
+end
+
+local function is_dummy(fstype: string): boolean
+  local t: []string = {'autofs', 'proc', 'subfs', 'debugfs', 'devpts', 'fusectl', 'fuse.portal',
+    'mqueue', 'rpc_pipefs', 'sysfs', 'devfs', 'kernfs', 'ignore', 'none'}
+  for i = 0, #t - 1 do if t[i] == fstype then return true end end
+  return false
+end
+
+local function is_remote(name: string, fstype: string): boolean
+  if name:find(':', 1, true) > 0 then return true end
+  if name:sub(1, 2) == '//' and (fstype == 'smbfs' or fstype == 'smb3' or fstype == 'cifs') then return true end
+  local t: []string = {'acfs', 'afs', 'coda', 'auristorfs', 'fhgfs', 'gpfs', 'ibrix', 'ocfs2', 'vxfs'}
+  for i = 0, #t - 1 do if t[i] == fstype then return true end end
+  return name == '-hosts'
+end
+
+-- Split at the first blank from position p: the field and the index after it.
+local function field(line: string, p: integer): (string, integer, boolean)
+  local b = line:find(' ', p, true)
+  if b == 0 then return '', 0, false end
+  return line:sub(p, b - 1), b + 1, true
+end
+
+local function scan_num(line: string, p: integer): (integer, boolean, uint64)
+  local st = p
+  local v: uint64 = 0
+  while p <= #line and line:byte(p) >= 48 and line:byte(p) <= 57 do
+    v = v * 10 + line:byte(p) - 48
+    p = p + 1
+  end
+  return p, p > st, v
+end
+
+local function skip_ws(line: string, p: integer): integer
+  while p <= #line and (line:byte(p) == 32 or (line:byte(p) >= 9 and line:byte(p) <= 13)) do p = p + 1 end
+  return p
+end
+
+-- One mountinfo line (with its newline) into E; false when malformed.
+local function parse_line(line: string, e: *mountlist.Entry): boolean
+  -- sscanf "%*u %*u %u:%u %n"
+  local p, ok, maj, min = 1, false, (@uint64)(0), (@uint64)(0)
+  p, ok = scan_num(line, p)
+  if not ok then return false end
+  p = skip_ws(line, p)
+  p, ok = scan_num(line, p)
+  if not ok then return false end
+  p = skip_ws(line, p)
+  p, ok, maj = scan_num(line, p)
+  if not ok or p > #line or line:byte(p) ~= 58 then return false end
+  p, ok, min = scan_num(line, p + 1)
+  if not ok then return false end
+  p = skip_ws(line, p)
+  local mntroot, p2, f1 = field(line, p)
+  if not f1 then return false end
+  local target, p3, f2 = field(line, p2)
+  if not f2 then return false end
+  local dash = line:find(' - ', p3 - 1, true)
+  if dash == 0 then return false end
+  local fstype, p4, f3 = field(line, dash + 3)
+  if not f3 then return false end
+  local source, _, f4 = field(line, p4)
+  if not f4 then return false end
+  e.devname = unescape_tab(source)
+  e.mountdir = unescape_tab(target)
+  e.mntroot = unescape_tab(mntroot)
+  e.fstype = unescape_tab(fstype)
+  e.dev = ((maj & 0xfffff000) << 32) | ((maj & 0xfff) << 8) | ((min & 0xffffff00) << 12) | (min & 0xff)
+  e.dummy = is_dummy(e.fstype)
+  e.remote = is_remote(e.devname, e.fstype)
+  return true
+end
+
+-- The mounted file systems, or false (errno set) when the table can't be read.
+function mountlist.read(): (sequence(mountlist.Entry), boolean)
+  local list: sequence(mountlist.Entry)
+  local fd = sys.open('/proc/self/mountinfo', sys.O_RDONLY, 0)
+  if fd < 0 then return list, false end
+  local s, ok = util.readfd(fd)
+  sys.close(fd)
+  if not ok then return list, false end
+  local pos = 1
+  while pos <= #s do
+    local nl = s:find('\n', pos, true)
+    local line: string
+    if nl == 0 then line = s:sub(pos) .. '\n'; pos = #s + 1
+    else line = s:sub(pos, nl); pos = nl + 1 end
+    local e: mountlist.Entry
+    if parse_line(line, &e) then list:push(e) end
+  end
+  return list, true
+end

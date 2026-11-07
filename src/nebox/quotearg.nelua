@@ -1,0 +1,260 @@
+-- gnulib quotearg_buffer_restyled in the C locale (unibyte, untranslated
+-- quotes): every quoting style coreutils accepts, with quote_these_too,
+-- QA_ELIDE_NULL_BYTES, QA_ELIDE_OUTER_QUOTES and QA_SPLIT_TRIGRAPHS. The
+-- control flow follows the C function, including the restart after a
+-- shell-always scan that met a single quote (which keeps the first pass's
+-- flags, as gnulib does).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+
+global quotearg = @record{}
+global quotearg.LITERAL: integer <comptime> = 0
+global quotearg.SHELL: integer <comptime> = 1
+global quotearg.SHELL_ALWAYS: integer <comptime> = 2
+global quotearg.SHELL_ESCAPE: integer <comptime> = 3
+global quotearg.SHELL_ESCAPE_ALWAYS: integer <comptime> = 4
+global quotearg.C: integer <comptime> = 5
+global quotearg.C_MAYBE: integer <comptime> = 6
+global quotearg.ESCAPE: integer <comptime> = 7
+global quotearg.LOCALE: integer <comptime> = 8
+global quotearg.CLOCALE: integer <comptime> = 9
+
+global quotearg.ELIDE_NULL_BYTES: integer <comptime> = 1
+global quotearg.ELIDE_OUTER_QUOTES: integer <comptime> = 2
+global quotearg.SPLIT_TRIGRAPHS: integer <comptime> = 4
+
+-- quoting_style_args, in quoting_style_vals order.
+global quotearg.style_names: [10]string = {
+  'literal', 'shell', 'shell-always', 'shell-escape', 'shell-escape-always',
+  'c', 'c-maybe', 'escape', 'locale', 'clocale',
+}
+
+local QStyle = @record{
+  out: sequence(byte),
+  pending: boolean,
+  escaping: boolean,
+  style: integer,
+  elide: boolean,
+  force: boolean,
+}
+
+local function store(q: *QStyle, c: byte) q.out:push(c) end
+
+-- START_ESC: false when the caller must force outer quoting.
+local function start_esc(q: *QStyle): boolean
+  if q.elide then q.force = true; return false end
+  q.escaping = true
+  if q.style == quotearg.SHELL_ALWAYS and not q.pending then
+    store(q, 39); store(q, 36); store(q, 39)
+    q.pending = true
+  end
+  store(q, 92)
+  return true
+end
+
+local function end_esc(q: *QStyle)
+  if q.pending and not q.escaping then
+    store(q, 39); store(q, 39)
+    q.pending = false
+  end
+end
+
+local function isprint(c: byte): boolean return c >= 32 and c < 127 end
+
+local function safe_char(c: byte): boolean
+  if (c >= 48 and c <= 58) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) then return true end
+  return c == 37 or c == 43 or c == 44 or c == 45 or c == 46 or c == 47 or c == 93 or c == 95
+end
+
+local function shell_special(c: byte): boolean
+  return c == 33 or c == 34 or c == 36 or c == 38 or c == 40 or c == 41 or c == 42 or c == 59
+    or c == 60 or c == 61 or c == 62 or c == 91 or c == 94 or c == 96 or c == 124
+end
+
+local A_DEFAULT <comptime> = 0
+local A_STORE_ESCAPE <comptime> = 1
+local A_STORE_C <comptime> = 2
+local A_SKIP <comptime> = 3
+
+function quotearg.restyled(arg: string, style: integer, flags: integer, qtt: *[256]boolean): string
+  local q: QStyle
+  q.style = style
+  q.elide = (flags & quotearg.ELIDE_OUTER_QUOTES) ~= 0
+  local quote_string = ''
+  local backslash_escapes = false
+  local encountered_single_quote = false
+  local all_compat = true
+  local scanned = false   -- gnulib's orig_buffersize: a scan pass began
+  local scanning = false  -- gnulib's buffersize == 0 during that scan
+  local argsize = #arg
+  while true do
+    -- process_input:
+    if q.style == quotearg.C_MAYBE or q.style == quotearg.C then
+      if q.style == quotearg.C_MAYBE then q.style = quotearg.C; q.elide = true end
+      if not q.elide then store(&q, 34) end
+      backslash_escapes = true
+      quote_string = '"'
+    elseif q.style == quotearg.ESCAPE then
+      backslash_escapes = true
+      q.elide = false
+    elseif q.style == quotearg.LOCALE or q.style == quotearg.CLOCALE then
+      local qs = q.style == quotearg.CLOCALE and '"' or "'"
+      if not q.elide then store(&q, qs:byte(1)) end
+      backslash_escapes = true
+      quote_string = qs
+    elseif q.style == quotearg.SHELL_ESCAPE or q.style == quotearg.SHELL
+        or q.style == quotearg.SHELL_ESCAPE_ALWAYS or q.style == quotearg.SHELL_ALWAYS then
+      if q.style == quotearg.SHELL_ESCAPE then backslash_escapes = true end
+      if q.style == quotearg.SHELL_ESCAPE or q.style == quotearg.SHELL then q.elide = true end
+      if q.style ~= quotearg.SHELL_ALWAYS and not q.elide then backslash_escapes = true end
+      q.style = quotearg.SHELL_ALWAYS
+      if not q.elide then store(&q, 39) end
+      quote_string = "'"
+    else
+      q.elide = false
+    end
+    local qlen = #quote_string
+    local i = 0
+    while i < argsize do
+      local c: byte = arg:byte(i + 1)
+      local esc: byte = 0
+      local is_right_quote = false
+      q.escaping = false
+      local compat = false
+      local action = A_DEFAULT
+      if backslash_escapes and q.style ~= quotearg.SHELL_ALWAYS and qlen > 0
+          and i + qlen <= argsize and arg:sub(i + 1, i + qlen) == quote_string then
+        if q.elide then q.force = true; break end
+        is_right_quote = true
+      end
+      local escape_kind = 0 -- 1 c_escape, 2 c_and_shell_escape
+      if c == 0 then
+        if backslash_escapes then
+          if not start_esc(&q) then break end
+          if q.style ~= quotearg.SHELL_ALWAYS and i + 1 < argsize
+              and arg:byte(i + 2) >= 48 and arg:byte(i + 2) <= 57 then
+            store(&q, 48); store(&q, 48)
+          end
+          c = 48
+        elseif (flags & quotearg.ELIDE_NULL_BYTES) ~= 0 then
+          action = A_SKIP
+        end
+      elseif c == 63 then
+        if q.style == quotearg.SHELL_ALWAYS then
+          if q.elide then q.force = true; break end
+        elseif q.style == quotearg.C and (flags & quotearg.SPLIT_TRIGRAPHS) ~= 0
+            and i + 2 < argsize and arg:byte(i + 2) == 63 then
+          local c2 = arg:byte(i + 3)
+          if c2 == 33 or c2 == 39 or c2 == 40 or c2 == 41 or c2 == 45 or c2 == 47
+              or c2 == 60 or c2 == 61 or c2 == 62 then
+            if q.elide then q.force = true; break end
+            c = c2
+            i = i + 2
+            store(&q, 63); store(&q, 34); store(&q, 34); store(&q, 63)
+          end
+        end
+      elseif c == 7 then esc = 97; escape_kind = 1
+      elseif c == 8 then esc = 98; escape_kind = 1
+      elseif c == 12 then esc = 102; escape_kind = 1
+      elseif c == 10 then esc = 110; escape_kind = 2
+      elseif c == 13 then esc = 114; escape_kind = 2
+      elseif c == 9 then esc = 116; escape_kind = 2
+      elseif c == 11 then esc = 118; escape_kind = 1
+      elseif c == 92 then
+        esc = c
+        if q.style == quotearg.SHELL_ALWAYS then
+          if q.elide then q.force = true; break end
+          action = A_STORE_C
+        elseif backslash_escapes and q.elide and qlen > 0 then
+          action = A_STORE_C
+        else
+          escape_kind = 2
+        end
+      elseif c == 123 or c == 125 or c == 35 or c == 126 or c == 32 then
+        local go = true
+        if (c == 123 or c == 125) and argsize ~= 1 then go = false end
+        if go and c ~= 32 and i ~= 0 then go = false end
+        if go then
+          compat = true
+          if q.style == quotearg.SHELL_ALWAYS and q.elide then q.force = true; break end
+        end
+      elseif shell_special(c) then
+        if q.style == quotearg.SHELL_ALWAYS and q.elide then q.force = true; break end
+      elseif c == 39 then
+        encountered_single_quote = true
+        compat = true
+        if q.style == quotearg.SHELL_ALWAYS then
+          if q.elide then q.force = true; break end
+          if not scanned then scanned = true; scanning = true end
+          store(&q, 39); store(&q, 92); store(&q, 39)
+          q.pending = false
+        end
+      elseif safe_char(c) then
+        compat = true
+      else
+        local printable = isprint(c)
+        compat = printable
+        if backslash_escapes and not printable then
+          if not start_esc(&q) then break end
+          store(&q, 48 + (c >> 6))
+          store(&q, 48 + ((c >> 3) & 7))
+          c = 48 + (c & 7)
+          action = A_STORE_C
+        end
+      end
+      if escape_kind == 2 then
+        if q.style == quotearg.SHELL_ALWAYS and q.elide then q.force = true; break end
+        escape_kind = 1
+      end
+      if escape_kind == 1 and backslash_escapes then
+        c = esc
+        action = A_STORE_ESCAPE
+      end
+      if action == A_DEFAULT then
+        local listed = qtt ~= nilptr and qtt[c]
+        if not (((backslash_escapes and q.style ~= quotearg.SHELL_ALWAYS) or q.elide) and listed)
+            and not is_right_quote then
+          action = A_STORE_C
+        else
+          action = A_STORE_ESCAPE
+        end
+      end
+      if action == A_STORE_ESCAPE then
+        if not start_esc(&q) then break end
+        action = A_STORE_C
+      end
+      if action == A_STORE_C then
+        end_esc(&q)
+        store(&q, c)
+        if not compat then all_compat = false end
+      end
+      i = i + 1
+    end
+    if not q.force and #q.out == 0 and q.style == quotearg.SHELL_ALWAYS and q.elide then q.force = true end
+    if q.force then
+      local st = q.style
+      if st == quotearg.SHELL_ALWAYS and backslash_escapes then st = quotearg.SHELL_ESCAPE_ALWAYS end
+      return quotearg.restyled(arg, st, flags & ~quotearg.ELIDE_OUTER_QUOTES, nilptr)
+    end
+    if q.style == quotearg.SHELL_ALWAYS and not q.elide and encountered_single_quote then
+      if all_compat then
+        return quotearg.restyled(arg, quotearg.C, flags, qtt)
+      elseif scanning then
+        scanning = false
+        q.out:clear()
+        continue
+      end
+    end
+    break
+  end
+  local sb: stringbuilder
+  for i = 1, #q.out do sb:writebyte(q.out[i]) end
+  if #quote_string > 0 and not q.elide then sb:write(quote_string) end
+  return sb:promote()
+end
+
+function quotearg.style(s: string, style: integer): string
+  return quotearg.restyled(s, style, 0, nilptr)
+end

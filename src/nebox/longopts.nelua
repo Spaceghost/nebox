@@ -113,11 +113,6 @@ global longopts.uname: []util.LongOpt = {
   {'processor', 0, 112}, {'hardware-platform', 0, 105}, {'operating-system', 0, 111},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.stat: []util.LongOpt = {
-  {'dereference', 0, 76}, {'file-system', 0, util.UNSUPPORTED}, {'format', 1, 99},
-  {'printf', 1, util.UNSUPPORTED}, {'terse', 0, 116}, {'cached', 1, util.UNSUPPORTED},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.install: []util.LongOpt = {
   {'backup', 2, util.UNSUPPORTED}, {'compare', 0, util.UNSUPPORTED}, {'directory', 0, 100},
   {'group', 1, 103}, {'mode', 1, 109}, {'no-target-directory', 0, util.UNSUPPORTED},
