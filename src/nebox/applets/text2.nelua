@@ -7,6 +7,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 
 -- cmp: -s silent, -l list every differing byte
 global function applet_cmp(args: sequence(string)): integer
@@ -52,7 +53,7 @@ end
 
 -- comm: three-column compare of sorted files; -1 -2 -3 suppress columns
 global function applet_comm(args: sequence(string)): integer
-  local o = util.parse(args, '123')
+  local o = util.parsel(args, '123', &longopts.comm, #longopts.comm)
   if not o:ok() then return util.optfail(o) end
   if #o.operands < 2 then return util.die('missing operand') end
   local da, oka = util.readfile(o.operands[1])
@@ -105,54 +106,134 @@ global function applet_tac(args: sequence(string)): integer
 end
 
 -- fold: -w WIDTH (default 80), -s break at spaces, -b count bytes (always)
-global function applet_fold(args: sequence(string)): integer
-  local o = util.parse(args, 'bsw:')
-  if not o:ok() then return util.optfail(o) end
-  local width: integer = 80
-  if o:has('w') then
-    local v, ok = util.toint(o:get('w'))
-    if not ok or v <= 0 then return util.die("invalid number of columns: '" .. o:get('w') .. "'") end
-    width = v
+-- fold: GNU coreutils 9.1 fold.c. -b counts bytes, -s breaks after the last
+-- blank, -w or the obsolete -NUM sets the width (xdectoumax rules).
+local fold_line: sequence(byte)
+
+local function fold_adjust(column: integer, c: byte, count_bytes: boolean): integer
+  if count_bytes then return column + 1 end
+  if c == 8 then
+    if column > 0 then column = column - 1 end
+  elseif c == 13 then column = 0
+  elseif c == 9 then column = column + 8 - column % 8
+  else column = column + 1 end
+  return column
+end
+
+local function fold_width(a: string): (integer, boolean)
+  -- xdectoumax(optarg, 1, SIZE_MAX - TAB_WIDTH - 1, "", ..., 0)
+  local p = 1
+  while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+  local bad = p <= #a and a:byte(p) == 45
+  if not bad and p <= #a and a:byte(p) == 43 then p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while not bad and p <= #a and a:byte(p) >= 48 and a:byte(p) <= 57 do
+    local d: uint64 = a:byte(p) - 48
+    if v > (0xffffffffffffffff - d) // 10 then ovf = true else v = v * 10 + d end
+    p = p + 1
   end
-  if #o.operands == 0 then o.operands:push('-') end
+  if bad or p == start or p <= #a then
+    util.err("invalid number of columns: '" .. a .. "'"); return 0, false
+  end
+  local maxw: uint64 = 0xfffffffffffffff6
+  if ovf or v > maxw then
+    util.err("invalid number of columns: '" .. a .. "': Value too large for defined data type"); return 0, false
+  end
+  if v < 1 then
+    util.err("invalid number of columns: '" .. a .. "': Numerical result out of range"); return 0, false
+  end
+  return (@integer)(v), true
+end
+
+global function applet_fold(args: sequence(string)): integer
+  local g = util.getopt(args, 'bsw:0::1::2::3::4::5::6::7::8::9::', &longopts.fold, #longopts.fold)
+  local width: integer = 80
+  local count_bytes, break_spaces = false, false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 98 then count_bytes = true
+    elseif c == 115 then break_spaces = true
+    elseif (c >= 48 and c <= 57) or c == 119 then
+      local a = g.optarg
+      if c ~= 119 then a = string.char(c) .. (g.has_optarg and g.optarg or '') end
+      local v, ok = fold_width(a)
+      if not ok then return 1 end
+      width = v
+    elseif c == util.UNSUPPORTED then return util.die("option '--" .. g.longname .. "' is not supported")
+    else return 1 end
+  end
+  local operands = g:operands()
+  if #operands == 0 then operands:push('-') end
   local rc: integer = 0
-  for _, path in ipairs(o.operands) do
-    local data, ok = util.readfile(path)
-    if not ok then rc = 1; continue end
-    local col: integer = 0
-    local line: sequence(byte)
-    for i: usize = 0, < data.size do
-      local c = data.data[i]
-      if c == 10 then
-        line:push(10)
-        util.writebytes(&line[1], #line); line:clear(); col = 0
-        continue
-      end
-      local w: integer = 1
-      if c == 8 then w = -1 elseif c == 13 then w = -col elseif c == 9 then w = 8 - col % 8 end
-      if col + w > width and w > 0 then
-        local cut: integer = #line
-        if o:has('s') then
-          local k = #line
-          while k >= 1 and line[k] ~= 32 do k = k - 1 end
-          if k >= 1 then cut = k end
-        end
-        if cut > 0 then util.writebytes(&line[1], (@usize)(cut)) end
-        util.writebyte(10)
-        local n = #line
-        for k = 1, n - cut do line[k] = line[k + cut] end
-        line:resize((@usize)(n - cut))
-        col = 0
-        for k = 1, #line do
-          local b = line[k]
-          if b == 9 then col = col + (8 - col % 8) elseif b == 8 then col = col - 1 else col = col + 1 end
-        end
-      end
-      line:push(c)
-      col = col + w
-      if col < 0 then col = 0 end
+  local buf: [65536]byte
+  for _, path in ipairs(operands) do
+    local fd: cint = 0
+    if path ~= '-' then
+      fd = sys.open(path, sys.O_RDONLY, 0)
+      if fd < 0 then util.err(util.quotef(path) .. ': ' .. sys.errstr()); rc = 1; continue end
     end
-    if #line > 0 then util.writebytes(&line[1], #line) end
+    local column: integer = 0
+    fold_line:clear()
+    local err: cint = 0
+    while true do
+      local n = sys.read(fd, &buf, #buf)
+      if n < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        err = sys.errno(); break
+      end
+      if n == 0 then break end
+      for i = 0, < n do
+        local c = buf[i]
+        if c == 10 then
+          fold_line:push(10)
+          util.writebytes(&fold_line[1], #fold_line)
+          fold_line:clear(); column = 0
+          continue
+        end
+        while true do   -- rescan
+          column = fold_adjust(column, c, count_bytes)
+          if column > width then
+            if break_spaces then
+              local logical_end = #fold_line
+              local found = false
+              while logical_end > 0 do
+                logical_end = logical_end - 1
+                local b = fold_line[logical_end + 1]
+                if b == 32 or b == 9 then found = true; break end
+              end
+              if found then
+                logical_end = logical_end + 1
+                util.writebytes(&fold_line[1], (@usize)(logical_end))
+                util.writebyte(10)
+                local rest = #fold_line - logical_end
+                for k = 1, rest do fold_line[k] = fold_line[k + logical_end] end
+                fold_line:resize((@usize)(rest))
+                column = 0
+                for k = 1, rest do column = fold_adjust(column, fold_line[k], count_bytes) end
+                continue
+              end
+            end
+            if #fold_line == 0 then
+              fold_line:push(c)
+              break
+            end
+            fold_line:push(10)
+            util.writebytes(&fold_line[1], #fold_line)
+            fold_line:clear(); column = 0
+            continue
+          end
+          fold_line:push(c)
+          break
+        end
+      end
+    end
+    if #fold_line > 0 then util.writebytes(&fold_line[1], #fold_line) end
+    fold_line:clear()
+    if fd ~= 0 then sys.close(fd) end
+    if err ~= 0 then util.err(util.quotef(path) .. ': ' .. sys.strerror(err)); rc = 1 end
   end
   return rc
 end
@@ -167,7 +248,7 @@ local function delim(k: integer): string
 end
 
 global function applet_paste(args: sequence(string)): integer
-  local o = util.parse(args, 'd:s')
+  local o = util.parsel(args, 'd:s', &longopts.paste, #longopts.paste)
   if not o:ok() then return util.optfail(o) end
   paste_delims = '\t'
   if o:has('d') then
@@ -225,7 +306,7 @@ local function next_stop(stops: sequence(integer), col: integer): integer
 end
 
 global function applet_expand(args: sequence(string)): integer
-  local o = util.parse(args, 'it:')
+  local o = util.parsel(args, 'it:', &longopts.expand, #longopts.expand)
   if not o:ok() then return util.optfail(o) end
   local stops, ok = tabstops(o:has('t') and o:get('t') or '8')
   if not ok then return util.die("tab size contains invalid character(s): '" .. o:get('t') .. "'") end
@@ -267,7 +348,7 @@ end
 
 -- unexpand: leading blanks only unless -a; -t sets stops (implies -a)
 global function applet_unexpand(args: sequence(string)): integer
-  local o = util.parse(args, 'at:')
+  local o = util.parsel(args, 'at:', &longopts.unexpand, #longopts.unexpand)
   if not o:ok() then return util.optfail(o) end
   local stops, ok = tabstops(o:has('t') and o:get('t') or '8')
   if not ok then return util.die("tab size contains invalid character(s): '" .. o:get('t') .. "'") end
@@ -356,7 +437,7 @@ local function suffix(n: integer, len: integer, numeric: boolean): string
 end
 
 global function applet_split(args: sequence(string)): integer
-  local o = util.parse(args, 'l:b:a:d')
+  local o = util.parsel(args, 'l:b:a:d', &longopts.split, #longopts.split)
   if not o:ok() then return util.optfail(o) end
   local lines: integer = 1000
   local bytes: integer = 0

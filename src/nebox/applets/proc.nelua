@@ -7,6 +7,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.getdate'
 require 'nebox.clock'
 
@@ -121,7 +122,7 @@ global function applet_env(args: sequence(string)): integer
 end
 
 global function applet_uname(args: sequence(string)): integer
-  local o = util.parse(args, 'asnrvmpio')
+  local o = util.parsel(args, 'asnrvmpio', &longopts.uname, #longopts.uname)
   if not o:ok() then return util.optfail(o) end
   if #o.operands > 0 then return util.die("extra operand '" .. o.operands[1] .. "'") end
   local u: sys.Utsname
@@ -154,7 +155,7 @@ global function applet_hostname(args: sequence(string)): integer
 end
 
 global function applet_id(args: sequence(string)): integer
-  local o = util.parse(args, 'ugrnG')
+  local o = util.parsel(args, 'ugrnG', &longopts.id, #longopts.id)
   if not o:ok() then return util.optfail(o) end
   local uid, euid = sys.getuid(), sys.geteuid()
   local gid, egid = sys.getgid(), sys.getegid()
@@ -249,7 +250,7 @@ global function applet_kill(args: sequence(string)): integer
 end
 
 global function applet_which(args: sequence(string)): integer
-  local o = util.parse(args, 'a')
+  local o = util.parse(args, '+a')
   if not o:ok() then return util.optfail(o) end
   local path = sys.getenv('PATH')
   local pathstr: string = '/usr/local/bin:/usr/bin:/bin'

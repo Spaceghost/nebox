@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.applets.fs'
 require 'nebox.applets.proc2'
 require 'nebox.regex'
@@ -408,7 +409,7 @@ end
 
 -- install ---------------------------------------------------------------------
 global function applet_install(args: sequence(string)): integer
-  local o = util.parse(args, 'dDm:o:g:t:pcsv')
+  local o = util.parsel(args, 'dDm:o:g:t:pcsv', &longopts.install, #longopts.install)
   if not o:ok() then return util.optfail(o) end
   local mode: cuint = 0x1ED
   if o:has('m') then
@@ -551,7 +552,7 @@ local function df_print(rows: sequence(DfRow), heads: [5]string, human: boolean)
 end
 
 global function applet_df(args: sequence(string)): integer
-  local o = util.parse(args, 'hHkPiaT')
+  local o = util.parsel(args, 'hHkPiaT', &longopts.df, #longopts.df)
   if not o:ok() then return util.optfail(o) end
   local ms = mounts()
   local human = o:has('h') or o:has('H')

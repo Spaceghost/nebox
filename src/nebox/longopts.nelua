@@ -1,0 +1,241 @@
+-- GNU coreutils 9.1 long options for the applets that parse with util.parsel,
+-- generated from coreutils' long_options tables. Names nebox does not
+-- implement map to util.UNSUPPORTED, so abbreviations resolve as in GNU and
+-- the option is refused by name.
+## pragmas.nogc = true
+
+require 'nebox.util'
+
+global longopts = @record{}
+
+global longopts.cat: []util.LongOpt = {
+  {'number-nonblank', 0, 98}, {'number', 0, 110}, {'squeeze-blank', 0, 115},
+  {'show-nonprinting', 0, 118}, {'show-ends', 0, 69}, {'show-tabs', 0, 84}, {'show-all', 0, 65},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.cut: []util.LongOpt = {
+  {'bytes', 1, 98}, {'characters', 1, 99}, {'fields', 1, 102}, {'delimiter', 1, 100},
+  {'only-delimited', 0, 115}, {'output-delimiter', 1, util.UNSUPPORTED},
+  {'complement', 0, util.UNSUPPORTED}, {'zero-terminated', 0, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.wc: []util.LongOpt = {
+  {'bytes', 0, 99}, {'chars', 0, 109}, {'lines', 0, 108}, {'words', 0, 119},
+  {'debug', 0, util.UNSUPPORTED}, {'files0-from', 1, util.UNSUPPORTED}, {'max-line-length', 0, 76},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.uniq: []util.LongOpt = {
+  {'count', 0, 99}, {'repeated', 0, 100}, {'all-repeated', 2, util.UNSUPPORTED},
+  {'group', 2, util.UNSUPPORTED}, {'ignore-case', 0, 105}, {'unique', 0, 117},
+  {'skip-fields', 1, util.UNSUPPORTED}, {'skip-chars', 1, util.UNSUPPORTED},
+  {'check-chars', 1, util.UNSUPPORTED}, {'zero-terminated', 0, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.tee: []util.LongOpt = {
+  {'append', 0, 97}, {'ignore-interrupts', 0, 105}, {'output-error', 2, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.mkdir: []util.LongOpt = {
+  {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.rm: []util.LongOpt = {
+  {'force', 0, 102}, {'interactive', 2, util.UNSUPPORTED},
+  {'one-file-system', 0, util.UNSUPPORTED}, {'no-preserve-root', 0, util.UNSUPPORTED},
+  {'preserve-root', 2, util.UNSUPPORTED}, {'-presume-input-tty', 0, util.UNSUPPORTED},
+  {'recursive', 0, 114}, {'dir', 0, util.UNSUPPORTED}, {'verbose', 0, 118},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.cp: []util.LongOpt = {
+  {'archive', 0, 97}, {'attributes-only', 0, util.UNSUPPORTED}, {'backup', 2, util.UNSUPPORTED},
+  {'copy-contents', 0, util.UNSUPPORTED}, {'dereference', 0, util.UNSUPPORTED}, {'force', 0, 102},
+  {'interactive', 0, 105}, {'link', 0, util.UNSUPPORTED}, {'no-clobber', 0, 110},
+  {'no-dereference', 0, util.UNSUPPORTED}, {'no-preserve', 1, util.UNSUPPORTED},
+  {'no-target-directory', 0, util.UNSUPPORTED}, {'one-file-system', 0, util.UNSUPPORTED},
+  {'parents', 0, util.UNSUPPORTED}, {'path', 0, util.UNSUPPORTED},
+  {'preserve', 2, util.UNSUPPORTED}, {'recursive', 0, 82},
+  {'remove-destination', 0, util.UNSUPPORTED}, {'sparse', 1, util.UNSUPPORTED},
+  {'reflink', 2, util.UNSUPPORTED}, {'strip-trailing-slashes', 0, util.UNSUPPORTED},
+  {'suffix', 1, util.UNSUPPORTED}, {'symbolic-link', 0, util.UNSUPPORTED},
+  {'target-directory', 1, util.UNSUPPORTED}, {'update', 0, util.UNSUPPORTED}, {'verbose', 0, 118},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.mv: []util.LongOpt = {
+  {'backup', 2, util.UNSUPPORTED}, {'context', 0, util.UNSUPPORTED}, {'force', 0, 102},
+  {'interactive', 0, 105}, {'no-clobber', 0, 110}, {'no-target-directory', 0, util.UNSUPPORTED},
+  {'strip-trailing-slashes', 0, util.UNSUPPORTED}, {'suffix', 1, util.UNSUPPORTED},
+  {'target-directory', 1, util.UNSUPPORTED}, {'update', 0, util.UNSUPPORTED}, {'verbose', 0, 118},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.ln: []util.LongOpt = {
+  {'backup', 2, util.UNSUPPORTED}, {'directory', 0, util.UNSUPPORTED}, {'no-dereference', 0, 110},
+  {'no-target-directory', 0, 84}, {'force', 0, 102}, {'interactive', 0, util.UNSUPPORTED},
+  {'suffix', 1, util.UNSUPPORTED}, {'target-directory', 1, util.UNSUPPORTED},
+  {'logical', 0, util.UNSUPPORTED}, {'physical', 0, util.UNSUPPORTED},
+  {'relative', 0, util.UNSUPPORTED}, {'symbolic', 0, 115}, {'verbose', 0, 118},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.touch: []util.LongOpt = {
+  {'time', 1, util.UNSUPPORTED}, {'no-create', 0, 99}, {'date', 1, 100}, {'reference', 1, 114},
+  {'no-dereference', 0, 104}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.sort: []util.LongOpt = {
+  {'ignore-leading-blanks', 0, 98}, {'check', 2, 200},
+  {'compress-program', 1, util.UNSUPPORTED}, {'debug', 0, util.UNSUPPORTED},
+  {'dictionary-order', 0, 100}, {'ignore-case', 0, 102}, {'files0-from', 1, util.UNSUPPORTED},
+  {'general-numeric-sort', 0, util.UNSUPPORTED}, {'ignore-nonprinting', 0, 105}, {'key', 1, 107},
+  {'merge', 0, 109}, {'month-sort', 0, util.UNSUPPORTED}, {'numeric-sort', 0, 110},
+  {'human-numeric-sort', 0, 104}, {'version-sort', 0, 86}, {'random-sort', 0, util.UNSUPPORTED},
+  {'random-source', 1, util.UNSUPPORTED}, {'sort', 1, util.UNSUPPORTED}, {'output', 1, 111},
+  {'reverse', 0, 114}, {'stable', 0, 115}, {'batch-size', 1, util.UNSUPPORTED},
+  {'buffer-size', 1, util.UNSUPPORTED}, {'field-separator', 1, 116},
+  {'temporary-directory', 1, util.UNSUPPORTED}, {'unique', 0, 117}, {'zero-terminated', 0, 122},
+  {'parallel', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.du: []util.LongOpt = {
+  {'all', 0, 97}, {'apparent-size', 0, util.UNSUPPORTED}, {'block-size', 1, util.UNSUPPORTED},
+  {'bytes', 0, 98}, {'count-links', 0, util.UNSUPPORTED}, {'-debug', 0, util.UNSUPPORTED},
+  {'dereference', 0, 76}, {'dereference-args', 0, util.UNSUPPORTED},
+  {'exclude', 1, util.UNSUPPORTED}, {'exclude-from', 1, util.UNSUPPORTED},
+  {'files0-from', 1, util.UNSUPPORTED}, {'human-readable', 0, 104},
+  {'inodes', 0, util.UNSUPPORTED}, {'si', 0, util.UNSUPPORTED}, {'max-depth', 1, 100},
+  {'null', 0, util.UNSUPPORTED}, {'no-dereference', 0, util.UNSUPPORTED},
+  {'one-file-system', 0, 120}, {'separate-dirs', 0, util.UNSUPPORTED}, {'summarize', 0, 115},
+  {'total', 0, 99}, {'threshold', 1, util.UNSUPPORTED}, {'time', 2, util.UNSUPPORTED},
+  {'time-style', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.df: []util.LongOpt = {
+  {'all', 0, 97}, {'block-size', 1, util.UNSUPPORTED}, {'inodes', 0, 105},
+  {'human-readable', 0, 104}, {'si', 0, 72}, {'local', 0, util.UNSUPPORTED},
+  {'output', 2, util.UNSUPPORTED}, {'portability', 0, 80}, {'print-type', 0, 84},
+  {'sync', 0, util.UNSUPPORTED}, {'no-sync', 0, util.UNSUPPORTED}, {'total', 0, util.UNSUPPORTED},
+  {'type', 1, util.UNSUPPORTED}, {'exclude-type', 1, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.basename: []util.LongOpt = {
+  {'multiple', 0, 97}, {'suffix', 1, 115}, {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.dirname: []util.LongOpt = {
+  {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.readlink: []util.LongOpt = {
+  {'canonicalize', 0, 102}, {'canonicalize-existing', 0, 101}, {'canonicalize-missing', 0, 109},
+  {'no-newline', 0, 110}, {'quiet', 0, 113}, {'silent', 0, 115}, {'verbose', 0, 118},
+  {'zero', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.realpath: []util.LongOpt = {
+  {'canonicalize-existing', 0, 101}, {'canonicalize-missing', 0, 109},
+  {'relative-to', 1, util.UNSUPPORTED}, {'relative-base', 1, util.UNSUPPORTED}, {'quiet', 0, 113},
+  {'strip', 0, 115}, {'no-symlinks', 0, 115}, {'zero', 0, 122}, {'logical', 0, 76},
+  {'physical', 0, 80}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.nl: []util.LongOpt = {
+  {'header-numbering', 1, util.UNSUPPORTED}, {'body-numbering', 1, 98},
+  {'footer-numbering', 1, util.UNSUPPORTED}, {'starting-line-number', 1, util.UNSUPPORTED},
+  {'line-increment', 1, util.UNSUPPORTED}, {'no-renumber', 0, util.UNSUPPORTED},
+  {'join-blank-lines', 1, util.UNSUPPORTED}, {'number-separator', 1, 115},
+  {'number-width', 1, 119}, {'number-format', 1, util.UNSUPPORTED},
+  {'section-delimiter', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.paste: []util.LongOpt = {
+  {'serial', 0, 115}, {'delimiters', 1, 100}, {'zero-terminated', 0, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.fold: []util.LongOpt = {
+  {'bytes', 0, 98}, {'spaces', 0, 115}, {'width', 1, 119}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.split: []util.LongOpt = {
+  {'bytes', 1, 98}, {'lines', 1, 108}, {'line-bytes', 1, util.UNSUPPORTED},
+  {'number', 1, util.UNSUPPORTED}, {'elide-empty-files', 0, util.UNSUPPORTED},
+  {'unbuffered', 0, util.UNSUPPORTED}, {'suffix-length', 1, 97},
+  {'additional-suffix', 1, util.UNSUPPORTED}, {'numeric-suffixes', 2, util.UNSUPPORTED},
+  {'hex-suffixes', 2, util.UNSUPPORTED}, {'filter', 1, util.UNSUPPORTED},
+  {'verbose', 0, util.UNSUPPORTED}, {'separator', 1, util.UNSUPPORTED},
+  {'-io-blksize', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.shuf: []util.LongOpt = {
+  {'echo', 0, 101}, {'input-range', 1, 105}, {'head-count', 1, 110}, {'output', 1, 111},
+  {'random-source', 1, util.UNSUPPORTED}, {'repeat', 0, 114}, {'zero-terminated', 0, 122},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.tr: []util.LongOpt = {
+  {'complement', 0, 99}, {'delete', 0, 100}, {'squeeze-repeats', 0, 115},
+  {'truncate-set1', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.truncate: []util.LongOpt = {
+  {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.comm: []util.LongOpt = {
+  {'check-order', 0, util.UNSUPPORTED}, {'nocheck-order', 0, util.UNSUPPORTED},
+  {'output-delimiter', 1, util.UNSUPPORTED}, {'total', 0, util.UNSUPPORTED},
+  {'zero-terminated', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.id: []util.LongOpt = {
+  {'context', 0, util.UNSUPPORTED}, {'group', 0, 103}, {'groups', 0, 71}, {'name', 0, 110},
+  {'real', 0, 114}, {'user', 0, 117}, {'zero', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.uname: []util.LongOpt = {
+  {'all', 0, 97}, {'kernel-name', 0, 115}, {'sysname', 0, 115}, {'nodename', 0, 110},
+  {'kernel-release', 0, 114}, {'release', 0, 114}, {'kernel-version', 0, 118}, {'machine', 0, 109},
+  {'processor', 0, 112}, {'hardware-platform', 0, 105}, {'operating-system', 0, 111},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.mktemp: []util.LongOpt = {
+  {'directory', 0, 100}, {'quiet', 0, 113}, {'dry-run', 0, 117}, {'suffix', 1, util.UNSUPPORTED},
+  {'tmpdir', 2, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.stat: []util.LongOpt = {
+  {'dereference', 0, 76}, {'file-system', 0, util.UNSUPPORTED}, {'format', 1, 99},
+  {'printf', 1, util.UNSUPPORTED}, {'terse', 0, 116}, {'cached', 1, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.install: []util.LongOpt = {
+  {'backup', 2, util.UNSUPPORTED}, {'compare', 0, util.UNSUPPORTED}, {'directory', 0, 100},
+  {'group', 1, 103}, {'mode', 1, 109}, {'no-target-directory', 0, util.UNSUPPORTED},
+  {'owner', 1, 111}, {'preserve-timestamps', 0, 112}, {'preserve-context', 0, util.UNSUPPORTED},
+  {'strip', 0, 115}, {'strip-program', 1, util.UNSUPPORTED}, {'suffix', 1, util.UNSUPPORTED},
+  {'target-directory', 1, 116}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.rmdir: []util.LongOpt = {
+  {'ignore-fail-on-non-empty', 0, 201}, {'path', 0, 112}, {'parents', 0, 112}, {'verbose', 0, 118},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.timeout: []util.LongOpt = {
+  {'kill-after', 1, 107}, {'signal', 1, 115}, {'verbose', 0, 118},
+  {'foreground', 0, util.UNSUPPORTED}, {'preserve-status', 0, 112},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.expand: []util.LongOpt = {
+  {'tabs', 1, 116}, {'initial', 0, 105}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.unexpand: []util.LongOpt = {
+  {'tabs', 1, 116}, {'all', 0, 97}, {'first-only', 0, util.UNSUPPORTED},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+global longopts.tty: []util.LongOpt = {
+  {'silent', 0, 115}, {'quiet', 0, 115}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.pwd: []util.LongOpt = {
+  {'logical', 0, 76}, {'physical', 0, 80}, {'help', 0, util.UNSUPPORTED},
+  {'version', 0, util.UNSUPPORTED},
+}
+global longopts.chown: []util.LongOpt = {
+  {'recursive', 0, 82}, {'changes', 0, 99}, {'dereference', 0, util.UNSUPPORTED},
+  {'from', 1, util.UNSUPPORTED}, {'no-dereference', 0, 104},
+  {'no-preserve-root', 0, util.UNSUPPORTED}, {'preserve-root', 0, util.UNSUPPORTED},
+  {'quiet', 0, 102}, {'silent', 0, 102}, {'reference', 1, util.UNSUPPORTED}, {'verbose', 0, 118},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}

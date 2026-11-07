@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.regex'
 require 'nebox.applets.proc'
 
@@ -35,7 +36,7 @@ global function applet_groups(args: sequence(string)): integer
 end
 
 global function applet_tty(args: sequence(string)): integer
-  local o = util.parse(args, 's')
+  local o = util.parsel(args, 's', &longopts.tty, #longopts.tty)
   if not o:ok() then return util.optfail(o) end
   if #o.operands > 0 then return util.die("extra operand '" .. o.operands[1] .. "'") end
   if sys.isatty(0) == 0 then
@@ -132,7 +133,7 @@ local function replace_all(s: string, needle: string, rep: string): string
 end
 
 global function applet_xargs(args: sequence(string)): integer
-  local o = util.parse(args, '0rtn:I:E:a:s:')
+  local o = util.parse(args, '+0rtn:I:E:a:s:')
   if not o:ok() then return util.optfail(o) end
   local cmd: sequence(string)
   if #o.operands == 0 then cmd:push('echo') else for _, a in ipairs(o.operands) do cmd:push(a) end end
@@ -199,8 +200,8 @@ local function now_mono(): float64
 end
 
 global function applet_timeout(args: sequence(string)): integer
-  local o = util.parse(args, 's:k:pv')
-  if not o:ok() then return util.optfail(o) end
+  local o = util.parsel(args, '+s:k:v', &longopts.timeout, #longopts.timeout)
+  if not o:ok() then util.optfail(o); return 125 end
   if #o.operands < 2 then
     if #o.operands == 0 then return util.die('missing operand') + 124 end
     return util.die("missing command") + 124

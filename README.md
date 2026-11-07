@@ -57,6 +57,20 @@ per applet in `DIR`.
 
 Stated here rather than worked around:
 
+- Option parsing follows glibc `getopt_long` (`util.getopt`) for the applets
+  listed in `src/nebox/longopts.nelua` and for grep, fold and the coreutils
+  ports: options may come after operands unless POSIXLY_CORRECT is set or
+  GNU stops at the first operand (basename, tr, timeout, xargs, awk, which),
+  long options accept unique abbreviations with glibc's ambiguity rules, and
+  a GNU long option nebox does not implement is refused by name ("option
+  '--x' is not supported") rather than misparsed. No applet has `--help` or
+  `--version` except the coreutils ports. `tests/opts_compare.py` checks 233
+  invocations against GNU (output, status, first diagnostic line).
+- `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
+  squeezing and a pending CR carry across files; "input file is output
+  file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
+  rmdir.c (-p, -v, --ignore-fail-on-non-empty); `mkdir -v` reports each
+  directory; `wc -L` measures tabs and control characters as GNU does.
 - `awk` is POSIX.1-2017 awk (`src/nebox/awk/`: lexer, parser to a tree,
   tree-walking interpreter): all statement forms, range patterns, every
   `getline` form, `print`/`printf` with `>` `>>` `|` and `close()`,
@@ -277,8 +291,10 @@ Stated here rather than worked around:
   -c counts still end in a newline); -Z writes a NUL after file names in
   -l/-L/-c output and line prefixes. -s silences unreadable-file messages
   but keeps exit status 2. `-o -w` prints the word without its delimiters
-  (`grep-o-w`). Not supported: -T, long options (`--group-separator` and the
-  rest), and binary-file detection (a NUL byte does not make grep report
+  (`grep-o-w`). GNU grep's long options work (`--color`/`--colour` accept
+  never/auto, `--line-buffered` is accepted); -T, -P, -a/-I, --include and
+  the other options nebox lacks are refused by name. Not supported:
+  binary-file detection (a NUL byte does not make grep report
   "binary file matches").
 - `sed` covers -n -e -f -E -s -i[SUFFIX] -z, every address form (`I` and
   `M` after a regex address), and the commands
@@ -312,8 +328,9 @@ Stated here rather than worked around:
   `F[.C][OPTS][,F[.C][OPTS]]` positions and the modifiers b d f h i n r V,
   following GNU's key inheritance, last-resort and -u/-c rules in the C locale
   (bytes, no collation). -n compares digit strings like GNU, -h knows the
-  suffixes k K M G T P E Z Y, -V implements gnulib filevercmp. No -M, -g, -R,
-  --parallel, long options, or locales.
+  suffixes k K M G T P E Z Y, -V implements gnulib filevercmp. Long options
+  follow GNU's table, including `--check[=quiet|silent|diagnose-first]`. No
+  -M, -g, -R, --parallel, or locales.
 - `tail -f` polls once a second; `-F` is treated as `-f`.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.

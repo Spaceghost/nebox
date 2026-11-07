@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.clock'
 
 -- Directory children, sorted, without . and ..
@@ -64,7 +65,7 @@ function Du:walk(path: string, top: boolean): integer
 end
 
 global function applet_du(args: sequence(string)): integer
-  local o = util.parse(args, 'sabhkcLxd:')
+  local o = util.parsel(args, 'sabhkcLxd:', &longopts.du, #longopts.du)
   if not o:ok() then return util.optfail(o) end
   local d: Du = {summarize = o:has('s'), all = o:has('a'), apparent = o:has('b'), human = o:has('h'),
     bytes = o:has('b'), deref = o:has('L')}
@@ -142,7 +143,7 @@ local function stat_format(fmt: string, path: string, st: *sys.Stat)
 end
 
 global function applet_stat(args: sequence(string)): integer
-  local o = util.parse(args, 'Lc:t')
+  local o = util.parsel(args, 'Lc:t', &longopts.stat, #longopts.stat)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
   local fmt: string
@@ -188,7 +189,7 @@ function Chown:apply(path: string)
 end
 
 local function chown_main(args: sequence(string), groupmode: boolean): integer
-  local o = util.parse(args, 'RhvfcH')
+  local o = util.parsel(args, 'RhvfcH', &longopts.chown, #longopts.chown)
   if not o:ok() then return util.optfail(o) end
   if #o.operands < 2 then
     if #o.operands == 0 then return util.die('missing operand') end
@@ -239,7 +240,7 @@ local function fill_template(t: string): (string, boolean)
 end
 
 global function applet_mktemp(args: sequence(string)): integer
-  local o = util.parse(args, 'dqutp:')
+  local o = util.parsel(args, 'dqutp:', &longopts.mktemp, #longopts.mktemp)
   if not o:ok() then return util.optfail(o) end
   local template: string = 'tmp.XXXXXXXXXX'
   local explicit = false
@@ -279,7 +280,7 @@ end
 
 -- truncate: -s [+-]SIZE, -c no-create, -r REF
 global function applet_truncate(args: sequence(string)): integer
-  local o = util.parse(args, 'cos:r:')
+  local o = util.parsel(args, 'cos:r:', &longopts.truncate, #longopts.truncate)
   if not o:ok() then return util.optfail(o) end
   if not o:has('s') and not o:has('r') then return util.die('you must specify either -s or -r') end
   if #o.operands == 0 then return util.die('missing file operand') end
@@ -355,7 +356,7 @@ local function normalize(p: string): string
 end
 
 global function applet_realpath(args: sequence(string)): integer
-  local o = util.parse(args, 'emsqzPL')
+  local o = util.parsel(args, 'emsqzPL', &longopts.realpath, #longopts.realpath)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
   local rc: integer = 0

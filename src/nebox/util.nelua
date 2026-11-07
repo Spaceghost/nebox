@@ -168,6 +168,9 @@ global util.Getopt = @record{
   mode: integer,       -- 0 permute, 1 require order, 2 return in order
   skipped: sequence(string),
   arg_index: integer,  -- index in args of the element the last option came from
+  quiet: boolean,      -- keep errors in errmsg instead of printing them
+  errmsg: string,
+  longname: string,    -- the long option last matched
 }
 
 function util.getopt(args: sequence(string), shortopts: string, longopts: *[0]util.LongOpt, nlong: integer): util.Getopt
@@ -193,8 +196,8 @@ function util.Getopt:operands(): sequence(string)
   return out
 end
 
-local function getopt_err(s: string): integer
-  util.err(s)
+local function getopt_err(g: *util.Getopt, s: string): integer
+  if g.quiet then g.errmsg = s else util.err(s) end
   return 63
 end
 
@@ -234,31 +237,44 @@ function util.Getopt:next(): integer
       local found = -1
       local exact = false
       local ambig = false
+      -- glibc: an exact match wins; otherwise a prefix is ambiguous when a
+      -- later match differs from the first in has_arg or val, and only the
+      -- first match and the differing ones are listed
+      local marked: [256]boolean
       for i = 0, < self.nlong do
         local ln = self.longopts[i].name
         if ln == name then found = i; exact = true; break end
-        if #name <= #ln and ln:sub(1, #name) == name then
-          if found < 0 then found = i
-          elseif self.longopts[found].has_arg ~= self.longopts[i].has_arg
-                 or self.longopts[found].val ~= self.longopts[i].val then ambig = true end
+      end
+      if not exact then
+        for i = 0, < self.nlong do
+          local ln = self.longopts[i].name
+          if #name <= #ln and ln:sub(1, #name) == name then
+            if found < 0 then found = i
+            elseif self.longopts[found].has_arg ~= self.longopts[i].has_arg
+                   or self.longopts[found].val ~= self.longopts[i].val then
+              ambig = true
+              if i < 256 then marked[i] = true end
+              if found < 256 then marked[found] = true end
+            end
+          end
         end
       end
       if ambig and not exact then
         local sb: stringbuilder
         sb:write("option '", a, "' is ambiguous; possibilities:")
         for i = 0, < self.nlong do
-          local ln = self.longopts[i].name
-          if #name <= #ln and ln:sub(1, #name) == name then sb:write(" '--", ln, "'") end
+          if i < 256 and marked[i] then sb:write(" '--", self.longopts[i].name, "'") end
         end
-        return getopt_err(sb:promote())
+        return getopt_err(self, sb:promote())
       end
-      if found < 0 then return getopt_err("unrecognized option '" .. a .. "'") end
+      if found < 0 then return getopt_err(self, "unrecognized option '" .. a .. "'") end
       local o = self.longopts[found]
+      self.longname = o.name
       if eq > 0 then
-        if o.has_arg == 0 then return getopt_err("option '--" .. o.name .. "' doesn't allow an argument") end
+        if o.has_arg == 0 then return getopt_err(self, "option '--" .. o.name .. "' doesn't allow an argument") end
         self.optarg = body:sub(eq + 1); self.has_optarg = true
       elseif o.has_arg == 1 then
-        if self.optind > #self.args then return getopt_err("option '--" .. o.name .. "' requires an argument") end
+        if self.optind > #self.args then return getopt_err(self, "option '--" .. o.name .. "' requires an argument") end
         self.optarg = self.args[self.optind]; self.has_optarg = true
         self.optind = self.optind + 1
       end
@@ -271,7 +287,7 @@ function util.Getopt:next(): integer
   self.nextchar = self.nextchar:sub(2)
   local pos = c ~= 58 and self.shortopts:find(string.char(c), 1, true) or 0
   if pos <= 0 then
-    return getopt_err("invalid option -- '" .. string.char(c) .. "'")
+    return getopt_err(self, "invalid option -- '" .. string.char(c) .. "'")
   end
   if pos < #self.shortopts and self.shortopts:byte(pos + 1) == 58 then
     local optional = pos + 1 < #self.shortopts and self.shortopts:byte(pos + 2) == 58
@@ -280,7 +296,7 @@ function util.Getopt:next(): integer
       self.nextchar = ''
     elseif not optional then
       if self.optind > #self.args then
-        return getopt_err("option requires an argument -- '" .. string.char(c) .. "'")
+        return getopt_err(self, "option requires an argument -- '" .. string.char(c) .. "'")
       end
       self.optarg = self.args[self.optind]; self.has_optarg = true
       self.optind = self.optind + 1
@@ -293,8 +309,8 @@ end
 -- letters; a letter followed by ':' takes a value. Parsing stops at the first
 -- operand, at "--", or at "-" (which is an operand).
 global util.Opts = @record{
-  set: [128]boolean,
-  value: [128]string,
+  set: [256]boolean,
+  value: [256]string,
   operands: sequence(string),
   bad: string,  -- unknown option letter, or "" if none
   missing: string, -- option that lacked its value, or ""
@@ -335,51 +351,43 @@ local function spec_find(spec: string, c: byte): (boolean, boolean)
   return false, false
 end
 
-function util.parse(args: sequence(string), spec: string): util.Opts
+-- A long option GNU has and nebox does not implement maps to this code, so
+-- abbreviations resolve exactly as in GNU and the option is refused by name.
+global util.UNSUPPORTED: integer <comptime> = 255
+
+-- GNU-style parsing through util.getopt: options may follow operands unless
+-- the spec starts with '+' or POSIXLY_CORRECT is set; long options map to a
+-- short letter or to a code of 128 and up.
+function util.parsel(args: sequence(string), spec: string, longs: *[0]util.LongOpt, nlong: integer): util.Opts
   local o: util.Opts
-  local i: integer = 1
-  while i <= #args do
-    local a = args[i]
-    if a.size < 2 or a:byte(1) ~= 45 then break end
-    if a == '--' then i = i + 1; break end
-    local j: usize = 2
-    while j <= a.size do
-      local c = a:byte(j)
-      local known, takes = spec_find(spec, c)
-      if c >= 128 then known = false end
-      if not known then
-        o.bad = string.char(c)
-        return o
-      end
-      o.set[c] = true
-      o.order:push(c)
-      if takes then
-        if j < a.size then
-          o.value[c] = a:sub(j + 1)
-        elseif i < #args then
-          i = i + 1
-          o.value[c] = args[i]
-        else
-          o.missing = string.char(c)
-          return o
-        end
-        o.keys:push(c); o.vals:push(o.value[c])
-        break
-      end
-      j = j + 1
+  local g = util.getopt(args, spec, longs, nlong)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 and #g.errmsg > 0 then o.bad = g.errmsg; return o end
+    if c == util.UNSUPPORTED then
+      o.bad = "option '--" .. g.longname .. "' is not supported"
+      return o
     end
-    i = i + 1
+    if c < 0 or c > 255 then continue end
+    o.set[c] = true
+    o.order:push((@byte)(c))
+    if g.has_optarg then
+      o.value[c] = g.optarg
+      o.keys:push((@byte)(c)); o.vals:push(g.optarg)
+    end
   end
-  while i <= #args do
-    o.operands:push(args[i])
-    i = i + 1
-  end
+  o.operands = g:operands()
   return o
 end
 
--- Report a parse failure in the usual coreutils phrasing; returns the exit code.
+function util.parse(args: sequence(string), spec: string): util.Opts
+  return util.parsel(args, spec, nilptr, 0)
+end
+
 function util.optfail(o: util.Opts): integer
-  if o.bad.size > 0 then return util.die("invalid option -- '" .. o.bad .. "'") end
+  if o.bad.size > 0 then return util.die(o.bad) end
   return util.die("option requires an argument -- '" .. o.missing .. "'")
 end
 

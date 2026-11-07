@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 
 -- od ------------------------------------------------------------------------
 local OdFmt = @record{ kind: byte, size: integer }   -- kind: a c d u o x
@@ -277,7 +278,7 @@ local function rand_below(n: integer): integer
 end
 
 global function applet_shuf(args: sequence(string)): integer
-  local o = util.parse(args, 'ern:i:o:z')
+  local o = util.parsel(args, 'ern:i:o:z', &longopts.shuf, #longopts.shuf)
   if not o:ok() then return util.optfail(o) end
   local items: sequence(string)
   if o:has('e') then

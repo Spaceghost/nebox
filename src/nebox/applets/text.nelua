@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.regex'
 
 global function applet_echo(args: sequence(string)): integer
@@ -35,39 +36,122 @@ global function applet_echo(args: sequence(string)): integer
   return 0
 end
 
-global function applet_cat(args: sequence(string)): integer
-  local o = util.parse(args, 'nbuEvTAs')
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then o.operands:push('-') end
-  local rc: integer = 0
-  local number = o:has('n') or o:has('b')
-  local lineno: integer = 0
-  for _, path in ipairs(o.operands) do
-    local fd = util.openin(path)
-    if fd < 0 then rc = 1; continue end
-    if number then
-      local data, ok = util.readfd(fd)
-      if not ok then util.perror(path); rc = 1 end
-      local start: usize = 0
-      for i: usize = 0, < data.size do
-        if data.data[i] == 10 then
-          local line = (@string){data=&data.data[start], size=i - start}
-          if o:has('b') and line.size == 0 then util.writebyte(10)
-          else lineno = lineno + 1; util.writef('%6d\t', lineno); util.line(line) end
-          start = i + 1
+-- cat: GNU coreutils 9.1 cat.c. -b -n -s -v -E -T -A -e -t (-u ignored);
+-- line numbers, squeezing and a pending CR carry across files; a regular
+-- input that is also the output (and not yet at its end) is refused.
+local cat_newlines: integer
+local cat_pending_cr: boolean
+local cat_lineno: integer
+
+local function cat_number()
+  cat_lineno = cat_lineno + 1
+  util.writef('%6d\t', cat_lineno)
+end
+
+local function cat_chunk(buf: *[0]byte, n: integer, show_nonprinting: boolean, show_tabs: boolean,
+                         number: boolean, number_nonblank: boolean, show_ends: boolean, squeeze_blank: boolean)
+  local i: integer = 0
+  while i < n do
+    local ch = buf[i]
+    i = i + 1
+    if ch == 10 then
+      cat_newlines = cat_newlines + 1
+      if cat_newlines > 0 then
+        if cat_newlines >= 2 then
+          cat_newlines = 2
+          if squeeze_blank then continue end
         end
+        if number and not number_nonblank then cat_number() end
       end
-      if start < data.size then
-        lineno = lineno + 1
-        util.writef('%6d\t', lineno)
-        util.write((@string){data=&data.data[start], size=data.size - start})
+      if show_ends then
+        if cat_pending_cr then util.write('^M'); cat_pending_cr = false end
+        util.writebyte(36)
       end
-    else
-      if not util.copyfd(fd) then util.perror(path); rc = 1 end
+      util.writebyte(10)
+      continue
     end
-    if fd ~= 0 then sys.close(fd) end
+    if cat_pending_cr then util.writebyte(13); cat_pending_cr = false end
+    if cat_newlines >= 0 and number then cat_number() end
+    cat_newlines = -1
+    if show_nonprinting then
+      if ch >= 32 then
+        if ch < 127 then util.writebyte(ch)
+        elseif ch == 127 then util.write('^?')
+        else
+          util.write('M-')
+          if ch >= 128 + 32 then
+            if ch < 128 + 127 then util.writebyte(ch - 128) else util.write('^?') end
+          else
+            util.writebyte(94); util.writebyte(ch - 128 + 64)
+          end
+        end
+      elseif ch == 9 and not show_tabs then util.writebyte(9)
+      else util.writebyte(94); util.writebyte(ch + 64) end
+    else
+      if ch == 9 and show_tabs then util.write('^I')
+      elseif ch == 13 and show_ends and (i >= n or buf[i] == 10) then
+        if i >= n then cat_pending_cr = true else util.write('^M') end
+      else util.writebyte(ch) end
+    end
   end
-  return rc
+end
+
+global function applet_cat(args: sequence(string)): integer
+  local o = util.parsel(args, 'benstuvAET', &longopts.cat, #longopts.cat)
+  if not o:ok() then return util.optfail(o) end
+  local number, number_nonblank, squeeze_blank = false, false, false
+  local show_ends, show_nonprinting, show_tabs = false, false, false
+  for _, c in ipairs(o.order) do
+    if c == 98 then number = true; number_nonblank = true
+    elseif c == 101 then show_ends = true; show_nonprinting = true
+    elseif c == 110 then number = true
+    elseif c == 115 then squeeze_blank = true
+    elseif c == 116 then show_tabs = true; show_nonprinting = true
+    elseif c == 118 then show_nonprinting = true
+    elseif c == 65 then show_nonprinting = true; show_ends = true; show_tabs = true
+    elseif c == 69 then show_ends = true
+    elseif c == 84 then show_tabs = true end
+  end
+  local simple = not (number or show_ends or show_nonprinting or show_tabs or squeeze_blank)
+  cat_newlines = 0; cat_pending_cr = false; cat_lineno = 0
+  local ost: sys.Stat
+  local out_isreg = false
+  if sys.fstat(1, &ost) == 0 then out_isreg = (ost.st_mode & sys.S_IFMT) == sys.S_IFREG end
+  if #o.operands == 0 then o.operands:push('-') end
+  local ok = true
+  local buf: [65536]byte
+  for _, infile in ipairs(o.operands) do
+    local reading_stdin = infile == '-'
+    local fd: cint = 0
+    if not reading_stdin then
+      fd = sys.open(infile, sys.O_RDONLY, 0)
+      if fd < 0 then util.err(util.quotef(infile) .. ': ' .. sys.errstr()); ok = false; continue end
+    end
+    local st: sys.Stat
+    if sys.fstat(fd, &st) ~= 0 then
+      util.err(util.quotef(infile) .. ': ' .. sys.errstr()); ok = false
+    elseif out_isreg and st.st_dev == ost.st_dev and st.st_ino == ost.st_ino
+           and sys.lseek(fd, 0, sys.SEEK_CUR) < st.st_size then
+      util.err(util.quotef(infile) .. ': input file is output file'); ok = false
+    else
+      while true do
+        util.flush()
+        local n = sys.read(fd, &buf, #buf)
+        if n < 0 then
+          if sys.errno() == sys.EINTR then continue end
+          util.err(util.quotef(infile) .. ': ' .. sys.errstr()); ok = false
+          break
+        end
+        if n == 0 then break end
+        if simple then util.writebytes(&buf, (@usize)(n))
+        else cat_chunk(&buf, n, show_nonprinting, show_tabs, number, number_nonblank, show_ends, squeeze_blank) end
+      end
+    end
+    if not reading_stdin then sys.close(fd) end
+  end
+  if cat_pending_cr then util.writebyte(13) end
+  util.flush()
+  return ok and 0 or 1
 end
 
 -- head/tail share operand handling: "-n N", "-c N", legacy "-N".
@@ -294,7 +378,7 @@ function WcShow:line(l: integer, w: integer, c: integer, L: integer, name: strin
 end
 
 global function applet_wc(args: sequence(string)): integer
-  local o = util.parse(args, 'lwcmL')
+  local o = util.parsel(args, 'lwcmL', &longopts.wc, #longopts.wc)
   if not o:ok() then return util.optfail(o) end
   local wl, ww, wc = o:has('l'), o:has('w'), o:has('c') or o:has('m')
   local wL = o:has('L')
@@ -334,7 +418,14 @@ global function applet_wc(args: sequence(string)): integer
     local inword = false
     for i: usize = 0, < data.size do
       local b = data.data[i]
-      if b == 10 then l = l + 1; if cur > L then L = cur end; cur = 0 else cur = cur + 1 end
+      -- -L as GNU wc measures it in the C locale: \n \r \f end a line, a
+      -- tab advances to the next multiple of 8, printable bytes count one
+      if b == 10 then l = l + 1 end
+      if b == 10 or b == 13 or b == 12 then
+        if cur > L then L = cur end
+        cur = 0
+      elseif b == 9 then cur = cur + 8 - cur % 8
+      elseif b >= 32 and b <= 126 then cur = cur + 1 end
       -- GNU wc: whitespace ends a word, a printable byte starts one, and
       -- other bytes (controls, high bytes in the C locale) do neither.
       local space = b == 32 or (b >= 9 and b <= 13)
@@ -851,8 +942,30 @@ local function sort_emit(l: string)
 end
 
 global function applet_sort(args: sequence(string)): integer
-  local o = util.parse(args, 'bcCdfhimnrsuVzo:k:t:')
+  local o = util.parsel(args, 'bcCdfhimnrsuVzo:k:t:', &longopts.sort, #longopts.sort)
   if not o:ok() then util.optfail(o); return 2 end
+  if o.set[200] then
+    -- --check[=quiet|silent|diagnose-first]: the last of -c, -C, --check wins
+    local a = o.value[200]
+    local has = false
+    for _, k in ipairs(o.keys) do if k == 200 then has = true end end
+    local letter: byte = 99
+    if has then
+      local function is_prefix(x: string, full: string): boolean
+        return #x > 0 and #x <= #full and full:sub(1, #x) == x
+      end
+      local q, si, d = is_prefix(a, 'quiet'), is_prefix(a, 'silent'), is_prefix(a, 'diagnose-first')
+      if q or si then letter = 67
+      elseif d then letter = 99
+      else
+        util.err("invalid argument '" .. a .. "' for '--check'")
+        local m = "Valid arguments are:\n  - 'quiet', 'silent'\n  - 'diagnose-first'\nTry 'sort --help' for more information.\n"
+        util.flush(); sys.write(2, m.data, m.size)
+        return 1
+      end
+    end
+    o.set[letter] = true
+  end
   local gkey: SortKey
   gkey.sword = -1; gkey.eword = -1
   local flags = 'bdfhinrV'
@@ -961,7 +1074,7 @@ global function applet_sort(args: sequence(string)): integer
 end
 
 global function applet_uniq(args: sequence(string)): integer
-  local o = util.parse(args, 'cdui')
+  local o = util.parsel(args, 'cdui', &longopts.uniq, #longopts.uniq)
   if not o:ok() then return util.optfail(o) end
   local inpath = #o.operands >= 1 and o.operands[1] or '-'
   local data, ok = util.readfile(inpath)
@@ -996,7 +1109,7 @@ global function applet_uniq(args: sequence(string)): integer
 end
 
 global function applet_tee(args: sequence(string)): integer
-  local o = util.parse(args, 'ai')
+  local o = util.parsel(args, 'ai', &longopts.tee, #longopts.tee)
   if not o:ok() then return util.optfail(o) end
   local fds: sequence(cint)
   local rc: integer = 0
@@ -1147,50 +1260,86 @@ local function grep_records(data: string, eol: byte): sequence(string)
   return out
 end
 
+local GREP_NOOP: integer <comptime> = 200
+local GREP_COLOR: integer <comptime> = 201
+local U: integer <comptime> = 255
+-- GNU grep 3.8's long options; the ones nebox lacks are refused by name.
+local grep_longs: []util.LongOpt = {
+  {'basic-regexp', 0, 71}, {'extended-regexp', 0, 69}, {'fixed-regexp', 0, 70}, {'fixed-strings', 0, 70},
+  {'perl-regexp', 0, U}, {'after-context', 1, 65}, {'before-context', 1, 66}, {'binary-files', 1, U},
+  {'byte-offset', 0, 98}, {'context', 1, 67}, {'color', 2, GREP_COLOR}, {'colour', 2, GREP_COLOR},
+  {'count', 0, 99}, {'devices', 1, U}, {'directories', 1, U}, {'dereference-recursive', 0, U},
+  {'exclude', 1, U}, {'exclude-from', 1, U}, {'exclude-dir', 1, U}, {'file', 1, 102},
+  {'files-with-matches', 0, 108}, {'files-without-match', 0, 76}, {'group-separator', 1, U},
+  {'help', 0, U}, {'include', 1, U}, {'ignore-case', 0, 105}, {'no-ignore-case', 0, U},
+  {'initial-tab', 0, U}, {'label', 1, U}, {'line-buffered', 0, GREP_NOOP}, {'line-number', 0, 110},
+  {'line-regexp', 0, 120}, {'max-count', 1, 109}, {'no-filename', 0, 104}, {'no-group-separator', 0, U},
+  {'no-messages', 0, 115}, {'null', 0, 90}, {'null-data', 0, 122}, {'only-matching', 0, 111},
+  {'quiet', 0, 113}, {'recursive', 0, 114}, {'regexp', 1, 101}, {'invert-match', 0, 118},
+  {'silent', 0, 113}, {'text', 0, U}, {'binary', 0, U}, {'version', 0, U},
+  {'with-filename', 0, 72}, {'word-regexp', 0, 119},
+}
+
 global function applet_grep(args: sequence(string)): integer
-  -- -NUM context options: digits inside an option cluster accumulate per
-  -- argument (GNU grep); everything else goes to the ordinary parser.
-  local rest: sequence(string)
+  -- -NUM context options: consecutive digits in one argument accumulate
+  -- into a context length (GNU grep's get_nondigit_option); the last -C or
+  -- -NUM sets the default that -A and -B override.
+  local o: util.Opts
   do
-    local i: integer = 1
-    local stop = false
-    while i <= #args do
-      local a = args[i]
-      if stop or a.size < 2 or a:byte(1) ~= 45 then
-        stop = true; rest:push(a); i = i + 1; continue
-      end
-      if a == '--' then stop = true; rest:push(a); i = i + 1; continue end
-      local sb: stringbuilder
-      sb:writebyte(45)
-      local digits: string = ''
-      local takes = false
-      local j: usize = 2
-      while j <= a.size do
-        local c = a:byte(j)
-        if c >= 48 and c <= 57 then
+    local gg = util.getopt(args, '0123456789ivnclLqHhFEGwxe:f:srom:A:B:C:bzZ', &grep_longs, #grep_longs)
+    gg.quiet = true
+    local digits: string = ''
+    local was_digit = false
+    local last_elem: integer = -1
+    while true do
+      local c = gg:next()
+      if c >= 48 and c <= 57 then
+        if was_digit and gg.arg_index == last_elem then
           if digits == '0' then digits = '' end
-          digits = digits .. string.char(c)
         else
-          sb:writebyte(c)
-          if c == 101 or c == 102 or c == 109 or c == 65 or c == 66 or c == 67 then
-            takes = true
-            for k: usize = j + 1, a.size do sb:writebyte(a:byte(k)) end
-            break
-          end
+          digits = ''
         end
-        j = j + 1
+        digits = digits .. string.char(c)
+        was_digit = true
+        last_elem = gg.arg_index
+        continue
       end
-      -- the digits become a -C option, before a value-taking option that
-      -- ends the cluster (its value follows them) and after anything else
-      local opt = sb:promote()
-      if digits.size > 0 and takes then rest:push('-C' .. digits) end
-      if opt.size > 1 then rest:push(opt) end
-      if takes and j == a.size and i < #args then i = i + 1; rest:push(args[i]) end
-      if digits.size > 0 and not takes then rest:push('-C' .. digits) end
-      i = i + 1
+      if #digits > 0 then
+        o.set[67] = true; o.order:push(67); o.keys:push(67); o.vals:push(digits)
+        digits = ''
+      end
+      was_digit = false
+      if c == -1 then break end
+      if c == 63 and #gg.errmsg > 0 then o.bad = gg.errmsg; break end
+      if c == U then o.bad = "option '--" .. gg.longname .. "' is not supported"; break end
+      if c == GREP_NOOP then continue end
+      if c == GREP_COLOR then
+        -- GNU grep compares the WHEN argument case-insensitively
+        local w = gg.optarg
+        local lw: stringbuilder
+        for k = 1, #w do
+          local ch = w:byte(k)
+          if ch >= 65 and ch <= 90 then ch = ch + 32 end
+          lw:writebyte(ch)
+        end
+        local l = lw:promote()
+        if gg.has_optarg and (l == 'always' or l == 'yes' or l == 'force') then
+          o.bad = "option '--" .. gg.longname .. "=" .. w .. "' is not supported"; break
+        end
+        if gg.has_optarg and not (l == 'never' or l == 'no' or l == 'none' or l == 'auto' or l == 'tty' or l == 'if-tty') then
+          util.flush()
+          local m = "Usage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.\n"
+          sys.write(2, m.data, m.size)
+          return 2
+        end
+        continue
+      end
+      o.set[c] = true
+      o.order:push((@byte)(c))
+      if gg.has_optarg then o.value[c] = gg.optarg; o.keys:push((@byte)(c)); o.vals:push(gg.optarg) end
     end
+    if o.bad.size == 0 then o.operands = gg:operands() end
   end
-  local o = util.parse(rest, 'ivnclLqHhFEGwxe:f:srom:A:B:C:bzZ')
   if not o:ok() then return util.optfail(o) + 1 end
   local g: Grep = {before = -1, after = -1, invert = o:has('v'), only = o:has('o'),
     lineno = o:has('n'), byteoff = o:has('b'), word = o:has('w') and not o:has('x'),
@@ -1231,7 +1380,9 @@ global function applet_grep(args: sequence(string)): integer
     if operands[1].size == 0 then patterns:push('') end
     operands:remove(1)
   end
-  if o:has('r') and #operands == 0 then operands:push('.') end
+  -- with no operand, -r searches "." but names files without "./" (GNU)
+  local implicit_dot = o:has('r') and #operands == 0
+  if implicit_dot then operands:push('.') end
   if #operands == 0 then operands:push('-') end
   local ere = o:has('E')
   if o:has('F') then
@@ -1265,7 +1416,7 @@ global function applet_grep(args: sequence(string)): integer
         local names, ok = util.readnames(p, true)
         if ok then
           for _, n in ipairs(names) do
-            if n ~= '.' and n ~= '..' then stack:push(p == '.' and n or util.join(p, n)) end
+            if n ~= '.' and n ~= '..' then stack:push((implicit_dot and i == 1) and n or util.join(p, n)) end
           end
         end
       else
@@ -1419,9 +1570,35 @@ local function expand_set(s: string, fill: integer): sequence(byte)
 end
 
 global function applet_tr(args: sequence(string)): integer
-  local o = util.parse(args, 'dsc')
+  local o = util.parsel(args, '+dsc', &longopts.tr, #longopts.tr)
   if not o:ok() then return util.optfail(o) end
-  if #o.operands < 1 then util.err('missing operand'); return 1 end
+  do
+    -- GNU tr's operand counts
+    local del, sq = o:has('d'), o:has('s')
+    local n = #o.operands
+    local min_ops = (del == sq) and 2 or 1
+    local max_ops = (not del or sq) and 2 or 1
+    if n < min_ops then
+      if n == 0 then util.err('missing operand')
+      else
+        util.err("missing operand after '" .. o.operands[n] .. "'")
+        util.flush()
+        local m = sq and 'Two strings must be given when both deleting and squeezing repeats.\n'
+                     or 'Two strings must be given when translating.\n'
+        sys.write(2, m.data, m.size)
+      end
+      return 1
+    end
+    if max_ops < n then
+      util.err("extra operand '" .. o.operands[max_ops + 1] .. "'")
+      if n == 2 then
+        util.flush()
+        local m = 'Only one string may be given when deleting without squeezing repeats.\n'
+        sys.write(2, m.data, m.size)
+      end
+      return 1
+    end
+  end
   local set1 = expand_set(o.operands[1], 0)
   local in1: [256]boolean
   for _, b in ipairs(set1) do in1[b] = true end
@@ -1493,7 +1670,7 @@ local function inlist(list: sequence(Range), n: integer): boolean
 end
 
 global function applet_cut(args: sequence(string)): integer
-  local o = util.parse(args, 'b:c:f:d:sn')
+  local o = util.parsel(args, 'b:c:f:d:sn', &longopts.cut, #longopts.cut)
   if not o:ok() then return util.optfail(o) end
   local mode: string = ''
   local spec: string
@@ -2083,7 +2260,7 @@ global function applet_printf(args: sequence(string)): integer
 end
 
 global function applet_nl(args: sequence(string)): integer
-  local o = util.parse(args, 'b:s:w:')
+  local o = util.parsel(args, 'b:s:w:', &longopts.nl, #longopts.nl)
   if not o:ok() then return util.optfail(o) end
   local style = o:has('b') and o:get('b') or 't'
   local sep = o:has('s') and o:get('s') or '\t'

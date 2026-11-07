@@ -8,6 +8,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.awk.lex'
 require 'nebox.awk.ast'
 require 'nebox.awk.parse'
@@ -42,7 +43,7 @@ local function program_text(o: *util.Opts): (string, boolean)
 end
 
 global function applet_awk(args: sequence(string)): integer
-  local o = util.parse(args, 'F:f:v:')
+  local o = util.parse(args, '+F:f:v:')
   if not o:ok() then
     util.optfail(o)
     return 2

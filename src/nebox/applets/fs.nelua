@@ -6,6 +6,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.longopts'
 require 'nebox.clock'
 
 local function digits(v: integer): integer
@@ -636,18 +637,23 @@ global function applet_ls(args: sequence(string)): integer
   return ls.rc
 end
 
-global function mkdir_p(path: string, mode: cuint): boolean
+local function mkdir_pv(path: string, mode: cuint, verbose: boolean): boolean
   if util.isdir(path) then return true end
   local parent = util.dirname(path)
   if parent ~= path and parent ~= '.' and parent ~= '/' then
-    if not mkdir_p(parent, mode) then return false end
+    if not mkdir_pv(parent, mode, verbose) then return false end
   end
   if sys.mkdir(path, mode) ~= 0 then
     if sys.errno() == sys.EEXIST and util.isdir(path) then return true end
-    util.err("cannot create directory '" .. path .. "': " .. sys.errstr())
+    util.err('cannot create directory ' .. util.quoteaf(path) .. ': ' .. sys.errstr())
     return false
   end
+  if verbose then util.line(util.applet .. ': created directory ' .. util.quoteaf(path)) end
   return true
+end
+
+global function mkdir_p(path: string, mode: cuint): boolean
+  return mkdir_pv(path, mode, false)
 end
 
 global function parse_mode(s: string): (cuint, boolean)
@@ -662,7 +668,7 @@ global function parse_mode(s: string): (cuint, boolean)
 end
 
 global function applet_mkdir(args: sequence(string)): integer
-  local o = util.parse(args, 'pm:v')
+  local o = util.parsel(args, 'pm:v', &longopts.mkdir, #longopts.mkdir)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
   local mode: cuint = 0x1FF
@@ -672,35 +678,107 @@ global function applet_mkdir(args: sequence(string)): integer
     mode = m
   end
   local rc: integer = 0
+  local verbose = o:has('v')
   for _, p in ipairs(o.operands) do
     if o:has('p') then
-      if not mkdir_p(p, 0x1FF) then rc = 1
+      if not mkdir_pv(p, 0x1FF, verbose) then rc = 1
       elseif o:has('m') then sys.chmod(p, mode) end
     elseif sys.mkdir(p, mode) ~= 0 then
-      util.err("cannot create directory '" .. p .. "': " .. sys.errstr())
+      util.err('cannot create directory ' .. util.quoteaf(p) .. ': ' .. sys.errstr())
       rc = 1
-    elseif o:has('m') then
-      sys.chmod(p, mode)
+    else
+      if verbose then util.line(util.applet .. ': created directory ' .. util.quoteaf(p)) end
+      if o:has('m') then sys.chmod(p, mode) end
     end
   end
   return rc
 end
 
-global function applet_rmdir(args: sequence(string)): integer
-  local o = util.parse(args, 'p')
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then return util.die('missing operand') end
-  local rc: integer = 0
-  for _, p in ipairs(o.operands) do
-    if sys.rmdir(p) ~= 0 then
-      util.err("failed to remove '" .. p .. "': " .. sys.errstr())
-      rc = 1
-    elseif o:has('p') then
-      local d = util.dirname(p)
-      while d ~= '.' and d ~= '/' and sys.rmdir(d) == 0 do d = util.dirname(d) end
+-- rmdir: GNU coreutils 9.1 rmdir.c (-p, -v, --ignore-fail-on-non-empty).
+local rmdir_ignore_nonempty: boolean
+local rmdir_verbose: boolean
+
+local function rmdir_is_empty(dir: string): boolean
+  local names, ok = util.readnames(dir, true)
+  if not ok then return false end
+  for _, n in ipairs(names) do
+    if n ~= '.' and n ~= '..' then return false end
+  end
+  return true
+end
+
+local function rmdir_ignorable(e: cint, dir: string): boolean
+  if not rmdir_ignore_nonempty then return false end
+  if e == 39 or e == sys.EEXIST then return true end           -- ENOTEMPTY, EEXIST
+  if e == sys.EACCES or e == 1 or e == 30 or e == 16 then      -- EACCES EPERM EROFS EBUSY
+    sys.seterrno(0)
+    local names, ok = util.readnames(dir, true)
+    if not ok then return false end
+    local empty = true
+    for _, n in ipairs(names) do if n ~= '.' and n ~= '..' then empty = false end end
+    return not empty
+  end
+  return false
+end
+
+local function rmdir_strip_slashes(d: string): string
+  while #d > 1 and d:byte(#d) == 47 do d = d:sub(1, #d - 1) end
+  return d
+end
+
+local function rmdir_parents(dir: string): boolean
+  dir = rmdir_strip_slashes(dir)
+  local ok = true
+  while true do
+    local slash = 0
+    for k = #dir, 1, -1 do if dir:byte(k) == 47 then slash = k; break end end
+    if slash == 0 then break end
+    while slash > 1 and dir:byte(slash) == 47 do slash = slash - 1 end
+    dir = dir:sub(1, slash)
+    if rmdir_verbose then util.line('rmdir: removing directory, ' .. util.quoteaf(dir)) end
+    ok = sys.rmdir(dir) == 0
+    local e = sys.errno()
+    if not ok then
+      if rmdir_ignorable(e, dir) then ok = true
+      elseif e ~= sys.ENOTDIR then util.err('failed to remove directory ' .. util.quoteaf(dir) .. ': ' .. sys.strerror(e))
+      else util.err('failed to remove ' .. util.quoteaf(dir) .. ': ' .. sys.strerror(e)) end
+      break
     end
   end
-  return rc
+  return ok
+end
+
+global function applet_rmdir(args: sequence(string)): integer
+  local o = util.parsel(args, 'pv', &longopts.rmdir, #longopts.rmdir)
+  if not o:ok() then return util.optfail(o) end
+  rmdir_ignore_nonempty = o.set[201]
+  rmdir_verbose = o:has('v')
+  if #o.operands == 0 then return util.die('missing operand') end
+  local ok = true
+  for _, dir in ipairs(o.operands) do
+    if rmdir_verbose then util.line('rmdir: removing directory, ' .. util.quoteaf(dir)) end
+    if sys.rmdir(dir) ~= 0 then
+      local e = sys.errno()
+      if rmdir_ignorable(e, dir) then continue end
+      local custom = false
+      if e == sys.ENOTDIR and #dir > 0 and dir:byte(#dir) == 47 then
+        local st: sys.Stat
+        local ret = sys.stat(dir, &st)
+        if (ret ~= 0 and sys.errno() ~= sys.ENOTDIR) or (ret == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR) then
+          local stripped = rmdir_strip_slashes(dir)
+          if sys.lstat(stripped, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
+            util.err('failed to remove ' .. util.quoteaf(dir) .. ': Symbolic link not followed')
+            custom = true
+          end
+        end
+      end
+      if not custom then util.err('failed to remove ' .. util.quoteaf(dir) .. ': ' .. sys.strerror(e)) end
+      ok = false
+    elseif o:has('p') then
+      if not rmdir_parents(dir) then ok = false end
+    end
+  end
+  return ok and 0 or 1
 end
 
 local function rm_tree(path: string, force: boolean, verbose: boolean): boolean
@@ -729,7 +807,7 @@ local function rm_tree(path: string, force: boolean, verbose: boolean): boolean
 end
 
 global function applet_rm(args: sequence(string)): integer
-  local o = util.parse(args, 'rRfvi')
+  local o = util.parsel(args, 'rRfvi', &longopts.rm, #longopts.rm)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then
     if o:has('f') then return 0 end
@@ -829,7 +907,7 @@ global function parse_touch_t(s: string): (clong, boolean)
 end
 
 global function applet_touch(args: sequence(string)): integer
-  local o = util.parse(args, 'camhd:r:t:')
+  local o = util.parsel(args, 'camhd:r:t:', &longopts.touch, #longopts.touch)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing file operand') end
   local times: [2]sys.Timespec
@@ -932,7 +1010,7 @@ local function copy_tree(src: string, dst: string, recursive: boolean, preserve:
 end
 
 global function applet_cp(args: sequence(string)): integer
-  local o = util.parse(args, 'rRfpvaint')
+  local o = util.parsel(args, 'rRfpvaint', &longopts.cp, #longopts.cp)
   if not o:ok() then return util.optfail(o) end
   if #o.operands < 2 then return util.die(#o.operands == 0 and 'missing file operand' or "missing destination file operand after '" .. o.operands[1] .. "'") end
   local recursive = o:has('r') or o:has('R') or o:has('a')
@@ -954,7 +1032,7 @@ global function applet_cp(args: sequence(string)): integer
 end
 
 global function applet_mv(args: sequence(string)): integer
-  local o = util.parse(args, 'fivn')
+  local o = util.parsel(args, 'fivn', &longopts.mv, #longopts.mv)
   if not o:ok() then return util.optfail(o) end
   if #o.operands < 2 then return util.die(#o.operands == 0 and 'missing file operand' or "missing destination file operand after '" .. o.operands[1] .. "'") end
   local dst = o.operands[#o.operands]
@@ -984,7 +1062,7 @@ global function applet_mv(args: sequence(string)): integer
 end
 
 global function applet_ln(args: sequence(string)): integer
-  local o = util.parse(args, 'sfnvT')
+  local o = util.parsel(args, 'sfnvT', &longopts.ln, #longopts.ln)
   if not o:ok() then return util.optfail(o) end
   if #o.operands < 1 then return util.die('missing file operand') end
   local targets: sequence(string)
@@ -1014,7 +1092,7 @@ global function applet_ln(args: sequence(string)): integer
 end
 
 global function applet_readlink(args: sequence(string)): integer
-  local o = util.parse(args, 'fenmqsv')
+  local o = util.parsel(args, 'fenmqsv', &longopts.readlink, #longopts.readlink)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
   local rc: integer = 0
@@ -1049,7 +1127,7 @@ global function applet_readlink(args: sequence(string)): integer
 end
 
 global function applet_pwd(args: sequence(string)): integer
-  local o = util.parse(args, 'LP')
+  local o = util.parsel(args, 'LP', &longopts.pwd, #longopts.pwd)
   if not o:ok() then return util.optfail(o) end
   if o:has('L') then
     local env = sys.getenv('PWD')
@@ -1069,7 +1147,7 @@ global function applet_pwd(args: sequence(string)): integer
 end
 
 global function applet_basename(args: sequence(string)): integer
-  local o = util.parse(args, 'as:z')
+  local o = util.parsel(args, '+as:z', &longopts.basename, #longopts.basename)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
   local multi = o:has('a') or o:has('s')
@@ -1093,7 +1171,7 @@ global function applet_basename(args: sequence(string)): integer
 end
 
 global function applet_dirname(args: sequence(string)): integer
-  local o = util.parse(args, 'z')
+  local o = util.parsel(args, 'z', &longopts.dirname, #longopts.dirname)
   if not o:ok() then return util.optfail(o) end
   if #o.operands == 0 then return util.die('missing operand') end
   for _, p in ipairs(o.operands) do
