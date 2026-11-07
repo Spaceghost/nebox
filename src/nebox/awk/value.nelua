@@ -1,0 +1,415 @@
+-- awk values: the Cell record (uninitialized / number / string / numeric
+-- string / array / reference), string<->number conversion with the POSIX
+-- numeric-string rules, comparison, and the sprintf engine shared by
+-- printf, sprintf, CONVFMT and OFMT.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'allocators.default'
+require 'nebox.sys'
+
+## local function B(c) return string.byte(c) end
+
+global awkval = @record{}
+
+global awkval.UNINIT: byte <comptime> = 0
+global awkval.NUM: byte <comptime> = 1
+global awkval.STR: byte <comptime> = 2
+global awkval.STRNUM: byte <comptime> = 3   -- numeric string: both num and str valid
+global awkval.ARRAY: byte <comptime> = 4
+global awkval.REF: byte <comptime> = 5      -- untyped parameter aliasing the caller's cell
+
+global awkval.Cell = @record{
+  kind: byte,
+  view: boolean,     -- str points into a transient buffer; copy before storing
+  num: float64,
+  str: string,
+  arr: pointer,      -- *awkval.Array
+  ref: *awkval.Cell,
+}
+
+global awkval.Array = @record{
+  map: hashmap(string, awkval.Cell),
+}
+
+function awkval.new_array(): *awkval.Array
+  return default_allocator:new(@awkval.Array)
+end
+
+-- Element lookup, creating an uninitialized element (awk semantics for a
+-- reference such as `x = a["k"]`).
+function awkval.Array:get(key: string): *awkval.Cell
+  local p = self.map:peek(key)
+  if p ~= nilptr then return p end
+  local k = string.copy(key)
+  self.map[k] = (@awkval.Cell){kind = awkval.UNINIT}
+  return self.map:peek(k)
+end
+
+function awkval.Array:has(key: string): boolean
+  return self.map:has(key)
+end
+
+function awkval.Array:remove(key: string)
+  if self.map:has(key) then self.map:remove(key) end
+end
+
+function awkval.Array:clear()
+  self.map:clear()
+end
+
+function awkval.Array:count(): integer
+  return (@integer)(#self.map)
+end
+
+-- Snapshot of the keys, so the body of `for (k in a)` may delete elements.
+function awkval.Array:keys(): sequence(string)
+  local out: sequence(string)
+  for k, v in pairs(self.map) do out:push(k) end
+  return out
+end
+
+function awkval.num(v: float64): awkval.Cell
+  return (@awkval.Cell){kind = awkval.NUM, num = v}
+end
+
+function awkval.str(s: string, view: boolean): awkval.Cell
+  return (@awkval.Cell){kind = awkval.STR, str = s, view = view}
+end
+
+function awkval.uninit(): awkval.Cell
+  return (@awkval.Cell){kind = awkval.UNINIT}
+end
+
+local function isblank(c: byte): boolean return c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12 end
+local function isdigit(c: byte): boolean return c >= #[B'0']# and c <= #[B'9']# end
+
+-- Scan the longest decimal floating constant prefix (after optional blanks
+-- and sign): returns (start, stop) byte indices of the numeric text (1-based,
+-- stop exclusive) and whether a digit was seen.
+local function scan_number(s: string): (usize, usize, boolean)
+  local i: usize = 1
+  while i <= s.size and isblank(s:byte(i)) do i = i + 1 end
+  local start = i
+  if i <= s.size and (s:byte(i) == #[B'+']# or s:byte(i) == #[B'-']#) then i = i + 1 end
+  local digits = false
+  while i <= s.size and isdigit(s:byte(i)) do i = i + 1; digits = true end
+  if i <= s.size and s:byte(i) == #[B'.']# then
+    i = i + 1
+    while i <= s.size and isdigit(s:byte(i)) do i = i + 1; digits = true end
+  end
+  if not digits then return start, start, false end
+  if i <= s.size and (s:byte(i) == #[B'e']# or s:byte(i) == #[B'E']#) then
+    local j = i + 1
+    if j <= s.size and (s:byte(j) == #[B'+']# or s:byte(j) == #[B'-']#) then j = j + 1 end
+    if j <= s.size and isdigit(s:byte(j)) then
+      while j <= s.size and isdigit(s:byte(j)) do j = j + 1 end
+      i = j
+    end
+  end
+  return start, i, true
+end
+
+local function strtod_range(s: string, start: usize, stop: usize): float64
+  local buf: [128]byte
+  local n = stop - start
+  if n >= 128 then
+    local copy = string.copy(s:subview(start, stop - 1))
+    local v = sys.strtod(copy, nilptr)
+    copy:destroy()
+    return v
+  end
+  for k: usize = 0, < n do buf[k] = s:byte(start + k) end
+  buf[n] = 0
+  return sys.strtod((@cstring)(&buf[0]), nilptr)
+end
+
+-- Value of the leading numeric prefix, as atof would give ("3abc" -> 3).
+-- Hexadecimal, inf and nan spellings are not numbers here.
+function awkval.str_to_num(s: string): float64
+  local start, stop, ok = scan_number(s)
+  if not ok then return 0 end
+  return strtod_range(s, start, stop)
+end
+
+-- Numeric string test (POSIX "Expressions in awk"): optional blanks, a
+-- floating constant, optional blanks, nothing else.
+function awkval.looks_numeric(s: string): (float64, boolean)
+  local start, stop, ok = scan_number(s)
+  if not ok then return 0, false end
+  local i = stop
+  while i <= s.size and isblank(s:byte(i)) do i = i + 1 end
+  if i <= s.size then return 0, false end
+  return strtod_range(s, start, stop), true
+end
+
+-- A string from input: numeric string when it looks like a number.
+function awkval.strnum(s: string, view: boolean): awkval.Cell
+  local v, ok = awkval.looks_numeric(s)
+  if ok then return (@awkval.Cell){kind = awkval.STRNUM, num = v, str = s, view = view} end
+  return (@awkval.Cell){kind = awkval.STR, str = s, view = view}
+end
+
+function awkval.to_num(c: awkval.Cell): float64
+  if c.kind == awkval.NUM or c.kind == awkval.STRNUM then return c.num end
+  if c.kind == awkval.STR then return awkval.str_to_num(c.str) end
+  return 0
+end
+
+-- Truth value: numbers by nonzero, strings by non-empty, numeric strings
+-- by their numeric value.
+function awkval.truth(c: awkval.Cell): boolean
+  if c.kind == awkval.NUM or c.kind == awkval.STRNUM then return c.num ~= 0 end
+  if c.kind == awkval.STR then return c.str.size > 0 end
+  return false
+end
+
+local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
+
+local TWO63: float64 <comptime> = 9223372036854775808.0
+local TWO64: float64 <comptime> = 18446744073709551616.0
+
+local function isnan(v: float64): boolean return v ~= v end
+local function isinf(v: float64): boolean return v == v and (v - v) ~= 0 end
+
+-- Format one C conversion into a string, growing the buffer as needed.
+local function cfmt_f(fmt: string, v: float64): string
+  local buf: [256]byte
+  local n = c_snprintf((@cstring)(&buf[0]), 256, fmt, v)
+  if n < 0 then return '' end
+  if n < 256 then return string.copy((@string){data = &buf[0], size = (@usize)(n)}) end
+  local s = string.create((@usize)(n))
+  c_snprintf((@cstring)(s.data), (@usize)(n) + 1, fmt, v)
+  return s
+end
+
+local function cfmt_i(fmt: string, v: int64): string
+  local buf: [256]byte
+  local n = c_snprintf((@cstring)(&buf[0]), 256, fmt, v)
+  if n < 0 then return '' end
+  if n < 256 then return string.copy((@string){data = &buf[0], size = (@usize)(n)}) end
+  local s = string.create((@usize)(n))
+  c_snprintf((@cstring)(s.data), (@usize)(n) + 1, fmt, v)
+  return s
+end
+
+local function cfmt_u(fmt: string, v: uint64): string
+  local buf: [256]byte
+  local n = c_snprintf((@cstring)(&buf[0]), 256, fmt, v)
+  if n < 0 then return '' end
+  if n < 256 then return string.copy((@string){data = &buf[0], size = (@usize)(n)}) end
+  local s = string.create((@usize)(n))
+  c_snprintf((@cstring)(s.data), (@usize)(n) + 1, fmt, v)
+  return s
+end
+
+-- Infinite and NaN values print with an explicit sign, as gawk does.
+local function special_str(v: float64): string
+  if isnan(v) then
+    local s = cfmt_f('%f', v)
+    if s.size > 0 and s:byte(1) == #[B'-']# then return '-nan' end
+    return '+nan'
+  end
+  if v > 0 then return '+inf' end
+  return '-inf'
+end
+
+function awkval.sprintf(fmt: string, args: *sequence(awkval.Cell), first: integer, convfmt: string): (string, string) <forwarddecl> end
+
+-- Number to string: integers print as integers, others through fmt
+-- (CONVFMT for conversions, OFMT for print).
+function awkval.num_to_str(v: float64, fmt: string): string
+  if isnan(v) or isinf(v) then return special_str(v) end
+  if v == sys.floor(v) then
+    if v > -TWO63 and v < TWO63 then return cfmt_i('%lld', (@int64)(v)) end
+    return cfmt_f('%.0f', v)
+  end
+  local args: sequence(awkval.Cell)
+  args:push(awkval.num(v))
+  local s, err = awkval.sprintf(fmt, &args, 1, '%.6g')
+  args:destroy()
+  return s
+end
+
+function awkval.to_str(c: awkval.Cell, convfmt: string): string
+  if c.kind == awkval.STR or c.kind == awkval.STRNUM then return c.str end
+  if c.kind == awkval.NUM then return awkval.num_to_str(c.num, convfmt) end
+  return ''
+end
+
+local function is_numeric_kind(c: awkval.Cell): boolean
+  return c.kind == awkval.NUM or c.kind == awkval.STRNUM or c.kind == awkval.UNINIT
+end
+
+local function strcmp(a: string, b: string): integer
+  local n = a.size < b.size and a.size or b.size
+  for i: usize = 0, < n do
+    if a.data[i] ~= b.data[i] then return a.data[i] < b.data[i] and -1 or 1 end
+  end
+  if a.size == b.size then return 0 end
+  return a.size < b.size and -1 or 1
+end
+
+-- Comparison rule: numeric when both operands are numeric (number, numeric
+-- string or uninitialized), otherwise as strings.
+function awkval.compare(a: awkval.Cell, b: awkval.Cell, convfmt: string): integer
+  if is_numeric_kind(a) and is_numeric_kind(b) then
+    local x, y = awkval.to_num(a), awkval.to_num(b)
+    if x < y then return -1 elseif x > y then return 1 else return 0 end
+  end
+  return strcmp(awkval.to_str(a, convfmt), awkval.to_str(b, convfmt))
+end
+
+-- Pad `s` to `width` with spaces; left-justified when `left`.
+local function pad(sb: *stringbuilder, s: string, width: integer, left: boolean)
+  local n = (@integer)(s.size)
+  if not left then for _ = n + 1, width do sb:writebyte(32) end end
+  sb:write(s)
+  if left then for _ = n + 1, width do sb:writebyte(32) end end
+end
+
+-- Truncate toward zero to an integer value (as a float).
+local function trunc(v: float64): float64
+  if v >= 0 then return sys.floor(v) end
+  return -sys.floor(-v)
+end
+
+-- The printf engine. Conversions: c d i o u x X e E f F g G s %. Flags
+-- - + space # 0, width and precision as digits or '*' (an extension gawk
+-- accepts). Returns (text, "") or ("", error).
+function awkval.sprintf(fmt: string, args: *sequence(awkval.Cell), first: integer, convfmt: string): (string, string)
+  local sb: stringbuilder
+  local ai = first
+  local i: usize = 1
+  while i <= fmt.size do
+    local c = fmt:byte(i)
+    if c ~= #[B'%']# then
+      sb:writebyte(c); i = i + 1
+      continue
+    end
+    local spec_start = i
+    i = i + 1
+    if i > fmt.size then sb:writebyte(c); break end
+    if fmt:byte(i) == #[B'%']# then sb:writebyte(c); i = i + 1; continue end
+    local flags: stringbuilder
+    local left = false
+    local zero = false
+    while i <= fmt.size do
+      local f = fmt:byte(i)
+      if f == #[B'-']# then left = true
+      elseif f == #[B'0']# then zero = true
+      elseif f ~= #[B'+']# and f ~= #[B' ']# and f ~= #[B'#']# then break end
+      flags:writebyte(f)
+      i = i + 1
+    end
+    local width: integer = -1
+    if i <= fmt.size and fmt:byte(i) == #[B'*']# then
+      if ai > #args then return '', 'not enough arguments to satisfy format string' end
+      width = (@integer)(trunc(awkval.to_num(args[ai]))); ai = ai + 1
+      if width < 0 then left = true; width = -width; flags:writebyte(#[B'-']#) end
+      i = i + 1
+    else
+      while i <= fmt.size and isdigit(fmt:byte(i)) do
+        if width < 0 then width = 0 end
+        width = width * 10 + (fmt:byte(i) - #[B'0']#)
+        i = i + 1
+      end
+    end
+    local prec: integer = -1
+    if i <= fmt.size and fmt:byte(i) == #[B'.']# then
+      i = i + 1
+      prec = 0
+      if i <= fmt.size and fmt:byte(i) == #[B'*']# then
+        if ai > #args then return '', 'not enough arguments to satisfy format string' end
+        prec = (@integer)(trunc(awkval.to_num(args[ai]))); ai = ai + 1
+        i = i + 1
+      else
+        while i <= fmt.size and isdigit(fmt:byte(i)) do
+          prec = prec * 10 + (fmt:byte(i) - #[B'0']#)
+          i = i + 1
+        end
+      end
+    end
+    if i > fmt.size then
+      -- dangling conversion: print it literally
+      sb:write(fmt:subview(spec_start, fmt.size))
+      break
+    end
+    local conv = fmt:byte(i)
+    i = i + 1
+    local known = conv == #[B'd']# or conv == #[B'i']# or conv == #[B'o']# or conv == #[B'u']#
+      or conv == #[B'x']# or conv == #[B'X']# or conv == #[B'e']# or conv == #[B'E']#
+      or conv == #[B'f']# or conv == #[B'F']# or conv == #[B'g']# or conv == #[B'G']#
+      or conv == #[B'c']# or conv == #[B's']#
+    if not known then
+      sb:write(fmt:subview(spec_start, i - 1))
+      continue
+    end
+    if ai > #args then return '', 'not enough arguments to satisfy format string' end
+    local arg = args[ai]
+    ai = ai + 1
+    -- Rebuild the C spec without '*'.
+    local cspec: stringbuilder
+    cspec:writebyte(#[B'%']#)
+    cspec:write(flags:view())
+    if width >= 0 then cspec:writef('%d', width) end
+    if prec >= 0 then cspec:writef('.%d', prec) end
+    if conv == #[B's']# then
+      local s = awkval.to_str(arg, convfmt)
+      if prec >= 0 and (@integer)(s.size) > prec then s = s:subview(1, prec) end
+      pad(&sb, s, width, left)
+    elseif conv == #[B'c']# then
+      local ch: string
+      local one: [1]byte
+      if arg.kind == awkval.NUM or arg.kind == awkval.STRNUM then
+        one[0] = (@byte)((@int64)(trunc(awkval.to_num(arg))) & 0xff)
+        ch = (@string){data = &one[0], size = 1}
+      else
+        local s = awkval.to_str(arg, convfmt)
+        if s.size == 0 then one[0] = 0; ch = (@string){data = &one[0], size = 1}
+        else ch = s:subview(1, 1) end
+      end
+      pad(&sb, ch, width, left)
+    elseif conv == #[B'd']# or conv == #[B'i']# then
+      local v = awkval.to_num(arg)
+      if isnan(v) or isinf(v) then
+        pad(&sb, special_str(v), width, left)
+      elseif v > -TWO63 and v < TWO63 then
+        cspec:write('lld')
+        sb:write(cfmt_i(cspec:promote(), (@int64)(trunc(v))))
+      else
+        -- out of integer range: print the integral value through %.0f
+        local alt: stringbuilder
+        alt:writebyte(#[B'%']#); alt:write(flags:view())
+        if width >= 0 then alt:writef('%d', width) end
+        alt:write('.0f')
+        sb:write(cfmt_f(alt:promote(), trunc(v)))
+      end
+    elseif conv == #[B'o']# or conv == #[B'u']# or conv == #[B'x']# or conv == #[B'X']# then
+      local v = trunc(awkval.to_num(arg))
+      local u: uint64
+      if isnan(v) or isinf(v) then
+        pad(&sb, special_str(v), width, left)
+        continue
+      elseif v >= 0 and v < TWO64 then u = (@uint64)(v)
+      elseif v < 0 and v > -TWO63 then u = (@uint64)((@int64)(v))
+      else
+        local alt: stringbuilder
+        alt:writebyte(#[B'%']#); alt:write(flags:view())
+        if width >= 0 then alt:writef('%d', width) end
+        alt:write('.0f')
+        sb:write(cfmt_f(alt:promote(), v))
+        continue
+      end
+      cspec:write('ll'); cspec:writebyte(conv)
+      sb:write(cfmt_u(cspec:promote(), u))
+    else
+      cspec:writebyte(conv)
+      sb:write(cfmt_f(cspec:promote(), awkval.to_num(arg)))
+    end
+  end
+  return sb:promote(), ''
+end

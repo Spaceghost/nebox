@@ -142,6 +142,20 @@ function sys.truncate(path: cstring, len: clong): cint <cimport 'truncate', cinc
 function sys.getrandom(buf: pointer, n: csize, flags: cuint): clong <cimport 'getrandom', cinclude '<sys/random.h>'> end
 function sys.getgroups(n: cint, list: *[0]cuint): cint <cimport 'getgroups', cinclude '<unistd.h>'> end
 function sys.strtod(s: cstring, endp: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
+function sys.pipe(fds: *[2]cint): cint <cimport 'pipe', cinclude '<unistd.h>'> end
+function sys.dup2(oldfd: cint, newfd: cint): cint <cimport 'dup2', cinclude '<unistd.h>'> end
+function sys.execve(path: cstring, argv: *[0]cstring, envp: *[0]cstring): cint <cimport 'execve', cinclude '<unistd.h>'> end
+function sys.time(t: *clong): clong <cimport 'time', cinclude '<time.h>'> end
+-- libm entry points from nelibc (Nelua's math library would link the host libm).
+function sys.floor(x: float64): float64 <cimport 'floor', cinclude '<math.h>'> end
+function sys.fmod(x: float64, y: float64): float64 <cimport 'fmod', cinclude '<math.h>'> end
+function sys.pow(x: float64, y: float64): float64 <cimport 'pow', cinclude '<math.h>'> end
+function sys.sqrt(x: float64): float64 <cimport 'sqrt', cinclude '<math.h>'> end
+function sys.exp(x: float64): float64 <cimport 'exp', cinclude '<math.h>'> end
+function sys.log(x: float64): float64 <cimport 'log', cinclude '<math.h>'> end
+function sys.sin(x: float64): float64 <cimport 'sin', cinclude '<math.h>'> end
+function sys.cos(x: float64): float64 <cimport 'cos', cinclude '<math.h>'> end
+function sys.atan2(y: float64, x: float64): float64 <cimport 'atan2', cinclude '<math.h>'> end
 
 -- Raw operations through nelibc's backend table (value or negative errno).
 function sys.sys3(op: culong, a1: culong, a2: culong, a3: culong): clong <cimport 'nelibc_sys3', cinclude '<nelibc_sys.h>'> end

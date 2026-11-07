@@ -1,0 +1,66 @@
+-- awk: POSIX.1-2017 awk. Options -F fs, -f progfile (repeatable), -v
+-- assignment (repeatable), -- ; operands are files, "-" for stdin, or
+-- var=value assignments processed when reached.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.awk.lex'
+require 'nebox.awk.ast'
+require 'nebox.awk.parse'
+require 'nebox.awk.interp'
+
+local function usage(): integer
+  util.err('usage: awk [-F fs] [-v assignment]... program [argument...]')
+  util.err('       awk [-F fs] [-v assignment]... -f progfile... [argument...]')
+  return 2
+end
+
+-- The program text: the -f files joined by newlines, else the first operand.
+local function program_text(o: *util.Opts): (string, boolean)
+  local files = o:all('f')
+  if #files > 0 then
+    local sb: stringbuilder
+    for i = 1, #files do
+      local data, ok = util.readfile(files[i])
+      if not ok then
+        util.err("cannot open source file `" .. files[i] .. "' for reading")
+        return '', false
+      end
+      sb:write(data)
+      sb:writebyte(10)
+    end
+    return sb:promote(), true
+  end
+  if #o.operands == 0 then usage(); return '', false end
+  local src = o.operands[1]
+  o.operands:remove(1)
+  return src, true
+end
+
+global function applet_awk(args: sequence(string)): integer
+  local o = util.parse(args, 'F:f:v:')
+  if not o:ok() then
+    util.optfail(o)
+    return 2
+  end
+  local src, ok = program_text(&o)
+  if not ok then return 2 end
+  local prog: awkast.Program
+  prog:init()
+  local err = awkparse.parse(src, &prog)
+  if err.size > 0 then
+    util.err(err)
+    return 2
+  end
+  local fs: string = ''
+  local has_fs = false
+  if o:has('F') then
+    has_fs = true
+    fs = awklex_unescape(o:get('F'))
+  end
+  return awkrun_run(&prog, o:all('v'), o.operands, fs, has_fs)
+end

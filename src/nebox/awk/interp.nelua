@@ -1,0 +1,1456 @@
+-- awk tree-walking interpreter: variables, fields and records, pattern
+-- rules, statements, expressions, user functions and the builtins.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'span'
+require 'allocators.default'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+require 'nebox.awk.lex'
+require 'nebox.awk.ast'
+require 'nebox.awk.value'
+require 'nebox.awk.io'
+
+## local function B(c) return string.byte(c) end
+
+global awkrun = @record{}
+
+local Cell = awkval.Cell
+local Node = awkast.Node
+local T = awklex
+
+-- Statement completion kinds.
+local FLOW_NORMAL: integer <comptime> = 0
+local FLOW_BREAK: integer <comptime> = 1
+local FLOW_CONTINUE: integer <comptime> = 2
+local FLOW_NEXT: integer <comptime> = 3
+local FLOW_NEXTFILE: integer <comptime> = 4
+local FLOW_EXIT: integer <comptime> = 5
+local FLOW_RETURN: integer <comptime> = 6
+
+-- Record buffers: $0 lives in one of two buffers so a rebuild can read the
+-- fields (views into the other buffer) while writing.
+local RecBuf = @record{ data: *[0]byte, cap: usize, len: usize }
+
+local State = @record{
+  prog: *awkast.Program,
+  globals: sequence(Cell),
+  frame: span(Cell),
+  -- record and fields
+  bufs: [2]RecBuf,
+  cur: integer,
+  rec: string,
+  fields: sequence(Cell),
+  nf: integer,
+  split_valid: boolean,   -- fields reflect rec
+  rec_valid: boolean,     -- rec reflects fields
+  rec_fs: string,         -- FS in force when the record was set
+  -- control flow
+  jump: integer,          -- next/nextfile/exit escaping from a function body
+  exiting: boolean,
+  exit_code: integer,
+  retval: Cell,
+  range_active: sequence(boolean),
+  stage: byte,            -- ITEM_BEGIN / ITEM_MAIN / ITEM_END
+  depth: integer,         -- function call depth
+  -- main input
+  main: awkio.Reader,
+  main_open: boolean,
+  argi: integer,
+  saw_file: boolean,
+  stdin_done: boolean,
+  -- other streams
+  outs: sequence(awkio.Out),
+  ins: sequence(awkio.Reader),
+  -- random numbers
+  seed: float64,
+  rng: uint64,
+  -- dynamic regex cache
+  recache: hashmap(string, integer),
+  reprogs: sequence(regex.Prog),
+}
+
+local st: State
+
+local function P(i: integer): *Node return &st.prog.nodes[i] end
+local function L(i: integer): integer return st.prog.lists[i] end
+
+-- Fatal error: flush what was produced, report, exit 2.
+local function fatal(msg: string) <noreturn>
+  for i = 1, #st.outs do st.outs[i]:flush() end
+  util.flush()
+  util.err(msg)
+  sys._exit(2)
+end
+
+local function cstr(s: string): string
+  return string.copy(s)
+end
+
+----------------------------------------------------------------------
+-- Variables
+----------------------------------------------------------------------
+
+local function convfmt(): string
+  local c = st.globals[awkast.V_CONVFMT]
+  if c.kind == awkval.STR or c.kind == awkval.STRNUM then return c.str end
+  return '%.6g'
+end
+
+local function ofmt(): string
+  local c = st.globals[awkast.V_OFMT]
+  if c.kind == awkval.STR or c.kind == awkval.STRNUM then return c.str end
+  return '%.6g'
+end
+
+local function str_of(c: Cell): string
+  return awkval.to_str(c, convfmt())
+end
+
+-- String form for print: numbers go through OFMT.
+local function out_str(c: Cell): string
+  if c.kind == awkval.NUM then return awkval.num_to_str(c.num, ofmt()) end
+  return awkval.to_str(c, convfmt())
+end
+
+local function num_of(c: Cell): float64
+  return awkval.to_num(c)
+end
+
+local function global_str(id: integer): string
+  return str_of(st.globals[id])
+end
+
+local function global_num(id: integer): float64
+  return num_of(st.globals[id])
+end
+
+-- Store a scalar into a cell, copying strings that view transient buffers.
+local function store(p: *Cell, v: Cell)
+  if p.kind == awkval.ARRAY then fatal('attempt to use an array in a scalar context') end
+  if v.kind == awkval.ARRAY then fatal('attempt to use an array in a scalar context') end
+  if (v.kind == awkval.STR or v.kind == awkval.STRNUM) and v.view then
+    v.str = string.copy(v.str)
+    v.view = false
+  end
+  if v.kind == awkval.REF then v = awkval.uninit() end
+  $p = v
+end
+
+local function set_global_num(id: integer, v: float64)
+  st.globals[id] = awkval.num(v)
+end
+
+local function set_global_str(id: integer, s: string)
+  st.globals[id] = awkval.str(string.copy(s), false)
+end
+
+-- Scalar value of a cell, following parameter references.
+local function cell_value(p: *Cell): Cell
+  while p.kind == awkval.REF do p = p.ref end
+  if p.kind == awkval.ARRAY then fatal('attempt to use an array in a scalar context') end
+  return $p
+end
+
+-- Array behind a VAR/LOCAL node, creating it when the variable is untyped.
+local function array_of(node: integer): *awkval.Array
+  local n = P(node)
+  local p: *Cell
+  if n.kind == awkast.VAR then p = &st.globals[n.a]
+  elseif n.kind == awkast.LOCAL then p = &st.frame[(@usize)(n.a - 1)]
+  else fatal('attempt to use a scalar value as array') end
+  while p ~= nilptr and p.kind == awkval.REF do p = p.ref end
+  if p.kind == awkval.UNINIT then
+    p.kind = awkval.ARRAY
+    p.arr = awkval.new_array()
+  elseif p.kind ~= awkval.ARRAY then
+    fatal('attempt to use scalar as an array')
+  end
+  return (@*awkval.Array)(p.arr)
+end
+
+local function eval(node: integer): Cell <forwarddecl> end
+local function exec(node: integer): integer <forwarddecl> end
+
+-- Subscript: one expression, or several joined with SUBSEP.
+local function subscript(start: integer, count: integer): string
+  if count == 1 then return str_of(eval(L(start))) end
+  local sb: stringbuilder
+  local sep = global_str(awkast.V_SUBSEP)
+  for i = 0, < count do
+    if i > 0 then sb:write(sep) end
+    sb:write(str_of(eval(L(start + i))))
+  end
+  return sb:promote()
+end
+
+----------------------------------------------------------------------
+-- Records and fields
+----------------------------------------------------------------------
+
+local function buf_put(b: *RecBuf, s: string)
+  if b.cap < s.size + 1 then
+    local ncap = s.size + 1
+    if ncap < 256 then ncap = 256 end
+    if b.data == nilptr then b.data = (@*[0]byte)(default_allocator:alloc(ncap))
+    else b.data = (@*[0]byte)(default_allocator:realloc(b.data, ncap, b.cap)) end
+    b.cap = ncap
+  end
+  for i: usize = 0, < s.size do b.data[i] = s.data[i] end
+  b.len = s.size
+end
+
+-- Set $0 from a string (copied into the inactive buffer); fields are split
+-- lazily with the FS in force now.
+local function set_record(s: string)
+  local nxt = 1 - st.cur
+  buf_put(&st.bufs[nxt], s)
+  st.cur = nxt
+  st.rec = (@string){data = st.bufs[nxt].data, size = st.bufs[nxt].len}
+  st.split_valid = false
+  st.rec_valid = true
+  st.rec_fs = global_str(awkast.V_FS)
+end
+
+local function isblank(c: byte): boolean return c == 32 or c == 9 or c == 10 end
+
+-- Compile (with caching) a dynamic regular expression.
+local function dyn_regex(pat: string): *regex.Prog
+  local idx = st.recache:peek(pat)
+  if idx ~= nilptr then return &st.reprogs[$idx] end
+  local prog, err = regex.compile(pat, true, false)
+  if err.size > 0 then fatal('bad regular expression "' .. pat .. '": ' .. err) end
+  st.reprogs:push(prog)
+  local key = string.copy(pat)
+  st.recache[key] = #st.reprogs
+  return &st.reprogs[#st.reprogs]
+end
+
+local function push_field(out: *sequence(Cell), s: string)
+  out:push(awkval.strnum(s, true))
+end
+
+-- Split on runs of blanks (FS == " "), ignoring leading and trailing ones.
+local function split_blank(text: string, out: *sequence(Cell))
+  local i: usize = 0
+  local n = text.size
+  while i < n do
+    while i < n and isblank(text.data[i]) do i = i + 1 end
+    if i >= n then break end
+    local start = i
+    while i < n and not isblank(text.data[i]) do i = i + 1 end
+    push_field(out, (@string){data = &text.data[start], size = i - start})
+  end
+end
+
+local function split_byte(text: string, sep: byte, also_nl: boolean, out: *sequence(Cell))
+  if text.size == 0 then return end
+  local start: usize = 0
+  for i: usize = 0, < text.size do
+    local c = text.data[i]
+    if c == sep or (also_nl and c == 10) then
+      push_field(out, (@string){data = &text.data[start], size = i - start})
+      start = i + 1
+    end
+  end
+  push_field(out, (@string){data = &text.data[start], size = text.size - start})
+end
+
+local function split_regex(text: string, re: *regex.Prog, out: *sequence(Cell))
+  if text.size == 0 then return end
+  local pos: isize = 0
+  local caps: regex.Caps
+  while pos <= (@isize)(text.size) do
+    if not re:search(text, pos, &caps) then break end
+    local ms, me = caps.at[0], caps.at[1]
+    if me == ms then break end -- a null separator never splits
+    push_field(out, (@string){data = &text.data[pos], size = (@usize)(ms - pos)})
+    pos = me
+  end
+  push_field(out, (@string){data = &text.data[pos], size = text.size - (@usize)(pos)})
+end
+
+-- Field splitting with the POSIX FS rules; `re` overrides the string when
+-- the separator came from a regex literal. In paragraph mode (RS == "")
+-- newline separates fields as well. An empty separator splits into
+-- characters (undefined in POSIX; gawk and mawk do this for split()).
+local function split_text(text: string, fs: string, re: *regex.Prog, paragraph: boolean, out: *sequence(Cell))
+  out:clear()
+  if re == nilptr then
+    if fs == ' ' then split_blank(text, out); return end
+    if fs.size == 1 then split_byte(text, fs:byte(1), paragraph, out); return end
+    if fs.size == 0 then
+      for i: usize = 0, < text.size do
+        if not (paragraph and text.data[i] == 10) then
+          push_field(out, (@string){data = &text.data[i], size = 1})
+        end
+      end
+      return
+    end
+    re = dyn_regex(fs)
+  end
+  split_regex(text, re, out)
+  if paragraph then
+    local again: sequence(Cell)
+    for i = 1, #out do split_byte(out[i].str, 10, false, &again) end
+    out:clear()
+    for i = 1, #again do out:push(again[i]) end
+    again:destroy()
+  end
+end
+
+local function ensure_split()
+  if st.split_valid then return end
+  local paragraph = global_str(awkast.V_RS).size == 0
+  split_text(st.rec, st.rec_fs, nilptr, paragraph, &st.fields)
+  st.nf = #st.fields
+  st.split_valid = true
+end
+
+-- Rebuild $0 from the fields joined by OFS; field views are re-pointed into
+-- the new buffer.
+local function ensure_rec()
+  if st.rec_valid then return end
+  local ofs = global_str(awkast.V_OFS)
+  local sb: stringbuilder
+  local offs: sequence(usize)
+  for i = 1, st.nf do
+    if i > 1 then sb:write(ofs) end
+    offs:push((@usize)(#sb))
+    sb:write(str_of(st.fields[i]))
+  end
+  local joined = sb:view()
+  local nxt = 1 - st.cur
+  buf_put(&st.bufs[nxt], joined)
+  st.cur = nxt
+  st.rec = (@string){data = st.bufs[nxt].data, size = st.bufs[nxt].len}
+  for i = 1, st.nf do
+    local f = &st.fields[i]
+    if (f.kind == awkval.STR or f.kind == awkval.STRNUM) and f.view then
+      f.str = (@string){data = &st.bufs[nxt].data[offs[i]], size = f.str.size}
+    end
+  end
+  sb:destroy()
+  offs:destroy()
+  st.rec_valid = true
+end
+
+local function get_nf(): integer
+  ensure_split()
+  return st.nf
+end
+
+local function set_nf(n: integer)
+  if n < 0 then fatal('NF set to negative value') end
+  ensure_split()
+  if n < st.nf then
+    st.fields:resize((@usize)(n))
+  else
+    while #st.fields < n do st.fields:push(awkval.str('', false)) end
+  end
+  st.nf = n
+  st.rec_valid = false
+end
+
+local function get_field(i: integer): Cell
+  if i == 0 then
+    ensure_rec()
+    return awkval.strnum(st.rec, true)
+  end
+  if i < 0 then fatal(string.format('attempt to access field %d', i)) end
+  ensure_split()
+  if i > st.nf then return awkval.str('', false) end
+  return st.fields[i]
+end
+
+local function set_field(i: integer, v: Cell)
+  if i == 0 then
+    set_record(str_of(v))
+    return
+  end
+  if i < 0 then fatal(string.format('attempt to access field %d', i)) end
+  ensure_split()
+  if i > st.nf then
+    while #st.fields < i do st.fields:push(awkval.str('', false)) end
+    st.nf = i
+  end
+  store(&st.fields[i], v)
+  st.rec_valid = false
+end
+
+local function field_index(c: Cell): integer
+  local v = num_of(c)
+  if v ~= v then fatal('attempt to access field NaN') end
+  if v > 1e9 then fatal('field index too large') end
+  return (@integer)(v)
+end
+
+----------------------------------------------------------------------
+-- Lvalues
+----------------------------------------------------------------------
+
+-- Pointer to the cell an lvalue names (not for fields or NF).
+local function lvalue_cell(node: integer, writing: boolean): *Cell
+  local n = P(node)
+  if n.kind == awkast.VAR then
+    return &st.globals[n.a]
+  elseif n.kind == awkast.LOCAL then
+    local p = &st.frame[(@usize)(n.a - 1)]
+    if writing then
+      -- assigning a scalar to an untyped parameter types it locally
+      if p.kind == awkval.REF then
+        local tgt = p.ref
+        while tgt.kind == awkval.REF do tgt = tgt.ref end
+        if tgt.kind == awkval.ARRAY then fatal('attempt to use an array in a scalar context') end
+        p.kind = awkval.UNINIT
+      end
+      return p
+    end
+    while p.kind == awkval.REF do p = p.ref end
+    return p
+  elseif n.kind == awkast.INDEX then
+    local arr = array_of(n.a)
+    local key = subscript(n.b, n.c)
+    return arr:get(key)
+  end
+  fatal('internal error: bad lvalue')
+  return nilptr
+end
+
+local function read_lvalue(node: integer): Cell
+  local n = P(node)
+  if n.kind == awkast.FIELD then return get_field(field_index(eval(n.a))) end
+  if n.kind == awkast.VAR and n.a == awkast.V_NF then return awkval.num(get_nf()) end
+  return cell_value(lvalue_cell(node, false))
+end
+
+local function assign(node: integer, v: Cell)
+  local n = P(node)
+  if n.kind == awkast.FIELD then
+    set_field(field_index(eval(n.a)), v)
+    return
+  end
+  if n.kind == awkast.VAR and n.a == awkast.V_NF then
+    set_nf((@integer)(num_of(v)))
+    return
+  end
+  store(lvalue_cell(node, true), v)
+end
+
+-- A resolved lvalue, so compound assignments and ++/-- evaluate their
+-- subscript or field index exactly once.
+local Ref = @record{ kind: byte, p: *Cell, idx: integer }  -- 0 cell, 1 field, 2 NF
+
+local function ref_of(node: integer, writing: boolean): Ref
+  local n = P(node)
+  if n.kind == awkast.FIELD then return (@Ref){kind = 1, idx = field_index(eval(n.a))} end
+  if n.kind == awkast.VAR and n.a == awkast.V_NF then return (@Ref){kind = 2} end
+  return (@Ref){kind = 0, p = lvalue_cell(node, writing)}
+end
+
+local function ref_get(r: Ref): Cell
+  if r.kind == 1 then return get_field(r.idx) end
+  if r.kind == 2 then return awkval.num(get_nf()) end
+  return cell_value(r.p)
+end
+
+local function ref_set(r: Ref, v: Cell)
+  if r.kind == 1 then set_field(r.idx, v)
+  elseif r.kind == 2 then set_nf((@integer)(num_of(v)))
+  else store(r.p, v) end
+end
+
+----------------------------------------------------------------------
+-- Output streams and processes
+----------------------------------------------------------------------
+
+local function flush_all()
+  util.flush()
+  for i = 1, #st.outs do st.outs[i]:flush() end
+end
+
+local function find_out(name: string): integer
+  for i = 1, #st.outs do
+    if st.outs[i].name == name then return i end
+  end
+  return -1
+end
+
+local function find_in(name: string): integer
+  for i = 1, #st.ins do
+    if st.ins[i].name == name then return i end
+  end
+  return -1
+end
+
+-- Stream for a print redirection; -1 means stdout, -2 stderr.
+local function open_out(kind: integer, name: string): integer
+  if name == '/dev/stdout' or name == '-' then return -1 end
+  if name == '/dev/stderr' then return -2 end
+  local idx = find_out(name)
+  if idx > 0 then return idx end
+  local o: awkio.Out
+  if kind == awkast.REDIR_PIPE then
+    flush_all()
+    local pid, fd = awkio.spawn(name, awkio.SPAWN_WRITE)
+    if pid < 0 then fatal("cannot open pipe `" .. name .. "': " .. sys.errstr()) end
+    o:init(string.copy(name), awkio.OUT_PIPE, fd, pid)
+  else
+    local flags = sys.O_WRONLY | sys.O_CREAT
+    if kind == awkast.REDIR_APPEND then flags = flags | sys.O_APPEND else flags = flags | sys.O_TRUNC end
+    local fd = sys.open(cstr(name), flags, 0x1B6)
+    if fd < 0 then fatal("cannot redirect to `" .. name .. "': " .. sys.errstr()) end
+    o:init(string.copy(name), awkio.OUT_FILE, fd, 0)
+  end
+  st.outs:push(o)
+  return #st.outs
+end
+
+local function emit(stream: integer, s: string)
+  if stream == -1 then util.write(s)
+  elseif stream == -2 then
+    local done: usize = 0
+    while done < s.size do
+      local r = sys.write(2, &s.data[done], s.size - done)
+      if r < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        break
+      end
+      done = done + (@usize)(r)
+    end
+  else
+    st.outs[stream]:write(s)
+    if st.outs[stream].failed then fatal("write error on `" .. st.outs[stream].name .. "'") end
+  end
+end
+
+-- Reader for `getline < name` or `cmd | getline`, opened on first use.
+local function open_in(name: string, is_cmd: boolean): integer
+  local idx = find_in(name)
+  if idx > 0 then return idx end
+  local r: awkio.Reader
+  if is_cmd then
+    flush_all()
+    local pid, fd = awkio.spawn(name, awkio.SPAWN_READ)
+    if pid < 0 then return -1 end
+    r:init(string.copy(name), fd, pid, true)
+  else
+    local fd: cint = 0
+    if name ~= '-' and name ~= '/dev/stdin' then
+      fd = sys.open(cstr(name), sys.O_RDONLY, 0)
+      if fd < 0 then return -1 end
+    end
+    r:init(string.copy(name), fd, 0, false)
+  end
+  st.ins:push(r)
+  return #st.ins
+end
+
+-- close(name): 0 on success, the exit status for pipes, -1 when not open.
+local function close_stream(name: string): integer
+  local idx = find_out(name)
+  if idx > 0 then
+    local rc = st.outs[idx]:close()
+    st.outs:remove(idx)
+    return rc
+  end
+  idx = find_in(name)
+  if idx > 0 then
+    local r = &st.ins[idx]
+    local rc: integer = 0
+    r:close()
+    if r.is_cmd then rc = awkio.wait(r.pid) end
+    st.ins:remove(idx)
+    return rc
+  end
+  return -1
+end
+
+local function close_all()
+  for i = 1, #st.outs do st.outs[i]:close() end
+  st.outs:clear()
+  for i = 1, #st.ins do
+    st.ins[i]:close()
+    if st.ins[i].is_cmd then awkio.wait(st.ins[i].pid) end
+  end
+  st.ins:clear()
+  util.flush()
+end
+
+----------------------------------------------------------------------
+-- Main input
+----------------------------------------------------------------------
+
+local function is_name(s: string): boolean
+  if s.size == 0 then return false end
+  local c = s:byte(1)
+  if not ((c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95) then return false end
+  for i: usize = 2, s.size do
+    c = s:byte(i)
+    if not ((c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95) then return false end
+  end
+  return true
+end
+
+-- var=value operand (also -v): escape sequences expanded, value is a
+-- numeric string when it looks like a number. Returns false when not one.
+global function awkrun_assign_operand(arg: string, strict: boolean): boolean
+  local eq = arg:find('=', 1, true)
+  if eq <= 1 then
+    if strict then fatal("`" .. arg .. "' is not a variable assignment") end
+    return false
+  end
+  local name = arg:subview(1, eq - 1)
+  if not is_name(name) then
+    if strict then fatal("`" .. name .. "' is not a legal variable name") end
+    return false
+  end
+  if awklex_is_builtin(name) or st.prog:find_func(name) >= 0 then
+    if strict then fatal("cannot assign to `" .. name .. "'") end
+    return false
+  end
+  local id = st.prog:global_id(string.copy(name))
+  while #st.globals < id do st.globals:push(awkval.uninit()) end
+  local value = awklex_unescape(arg:subview(eq + 1, (@isize)(arg.size)))
+  if id == awkast.V_NF then set_nf((@integer)(awkval.str_to_num(value))) return true end
+  if st.globals[id].kind == awkval.ARRAY then fatal("cannot assign to array `" .. name .. "'") end
+  st.globals[id] = awkval.strnum(value, false)
+  return true
+end
+
+local function argv_at(i: integer): string
+  local c = st.globals[awkast.V_ARGV]
+  if c.kind ~= awkval.ARRAY then return '' end
+  local arr = (@*awkval.Array)(c.arr)
+  local key = awkval.num_to_str(i, '%.6g')
+  if not arr:has(key) then return '' end
+  return str_of(cell_value(arr:get(key)))
+end
+
+-- Advance to the next input file named by ARGV, processing assignment
+-- operands on the way. Returns false when the operands are exhausted.
+local function open_next_file(): boolean
+  while true do
+    local argc = (@integer)(global_num(awkast.V_ARGC))
+    if st.argi >= argc then break end
+    local arg = argv_at(st.argi)
+    st.argi = st.argi + 1
+    if arg.size == 0 then continue end
+    if awkrun_assign_operand(arg, false) then continue end
+    local fd: cint = 0
+    if arg ~= '-' then
+      if util.isdir(cstr(arg)) then fatal("cannot open file `" .. arg .. "' for reading: Is a directory") end
+      fd = sys.open(cstr(arg), sys.O_RDONLY, 0)
+      if fd < 0 then fatal("cannot open file `" .. arg .. "' for reading: " .. sys.errstr()) end
+    else
+      st.stdin_done = true
+    end
+    st.main:init(arg, fd, 0, false)
+    st.main_open = true
+    st.saw_file = true
+    set_global_str(awkast.V_FILENAME, arg)
+    set_global_num(awkast.V_FNR, 0)
+    return true
+  end
+  if not st.saw_file and not st.stdin_done then
+    st.stdin_done = true
+    st.main:init('-', 0, 0, false)
+    st.main_open = true
+    set_global_str(awkast.V_FILENAME, '-')
+    set_global_num(awkast.V_FNR, 0)
+    return true
+  end
+  return false
+end
+
+local function close_main()
+  if st.main_open then
+    st.main:close()
+    st.main_open = false
+  end
+end
+
+-- Next main-input record as a view; false at the end of all input.
+local function next_record(out: *string): boolean
+  while true do
+    if not st.main_open and not open_next_file() then return false end
+    if st.main:record(global_str(awkast.V_RS), out) then return true end
+    close_main()
+  end
+  return false
+end
+
+local function bump_nr()
+  set_global_num(awkast.V_NR, global_num(awkast.V_NR) + 1)
+  set_global_num(awkast.V_FNR, global_num(awkast.V_FNR) + 1)
+end
+
+----------------------------------------------------------------------
+-- Regular expression helpers
+----------------------------------------------------------------------
+
+-- Regex for a pattern operand: a literal /ere/ node, or a dynamic string.
+local function regex_of(node: integer): *regex.Prog
+  local n = P(node)
+  if n.kind == awkast.REGEX then return &st.prog.regexes[n.a] end
+  return dyn_regex(str_of(eval(node)))
+end
+
+local function matches(re: *regex.Prog, s: string): boolean
+  local caps: regex.Caps
+  return re:search(s, 0, &caps)
+end
+
+-- Expand a sub/gsub replacement for one match (POSIX: & is the matched
+-- text, \& a literal &, \\ a literal backslash, other backslashes literal).
+local function expand_repl(repl: string, matched: string, sb: *stringbuilder)
+  local i: usize = 1
+  while i <= repl.size do
+    local c = repl:byte(i)
+    if c == 92 and i < repl.size then
+      local d = repl:byte(i + 1)
+      if d == 38 then sb:writebyte(38); i = i + 2; continue end
+      if d == 92 then sb:writebyte(92); i = i + 2; continue end
+      sb:writebyte(92); i = i + 1
+    elseif c == 38 then
+      sb:write(matched); i = i + 1
+    else
+      sb:writebyte(c); i = i + 1
+    end
+  end
+end
+
+-- sub/gsub core: returns the new text and the number of replacements. An
+-- empty match directly after a non-empty match is skipped.
+local function substitute(re: *regex.Prog, repl: string, text: string, all: boolean): (string, integer)
+  local sb: stringbuilder
+  local caps: regex.Caps
+  local pos: isize = 0
+  local len = (@isize)(text.size)
+  local last_end: isize = -1
+  local count: integer = 0
+  while pos <= len do
+    if not re:search(text, pos, &caps) then break end
+    local ms, me = caps.at[0], caps.at[1]
+    if me == ms and ms == last_end then
+      if ms < len then sb:writebyte(text.data[ms]) end
+      pos = ms + 1
+      continue
+    end
+    sb:write(text:subview(pos + 1, ms))
+    expand_repl(repl, text:subview(ms + 1, me), &sb)
+    count = count + 1
+    if me > ms then
+      pos = me
+      last_end = me
+    else
+      if ms < len then sb:writebyte(text.data[ms]) end
+      pos = ms + 1
+    end
+    if not all then break end
+  end
+  if pos <= len then sb:write(text:subview(pos + 1, len)) end
+  if count == 0 then sb:destroy(); return text, 0 end
+  return sb:promote(), count
+end
+
+----------------------------------------------------------------------
+-- Builtins
+----------------------------------------------------------------------
+
+local function trunc(v: float64): float64
+  if v ~= v then return 0 end
+  if v >= 0 then return sys.floor(v) end
+  return -sys.floor(-v)
+end
+
+local function arg(start: integer, i: integer): Cell
+  return eval(L(start + i))
+end
+
+local function next_rand(): float64
+  -- xorshift64*: deterministic for a given srand seed
+  local x = st.rng
+  x = x ~ (x >> 12)
+  x = x ~ (x << 25)
+  x = x ~ (x >> 27)
+  st.rng = x
+  local r = (x * 0x2545F4914F6CDD1D) >> 11
+  return (@float64)(r) / 9007199254740992.0
+end
+
+local function seed_rng(seed: float64)
+  st.seed = seed
+  local s = (@uint64)((@int64)(trunc(seed)))
+  st.rng = s * 0x9E3779B97F4A7C15 + 0x1234567
+  if st.rng == 0 then st.rng = 0x9E3779B97F4A7C15 end
+  for _ = 1, 4 do next_rand() end
+end
+
+-- substr(s, m[, n]): m and n truncate toward zero; m below 1 counts from 1
+-- without shortening n (gawk --posix and the One True AWK agree; mawk
+-- shortens).
+local function bi_substr(s: string, m: float64, n: float64, has_n: boolean): string
+  local len = (@float64)(s.size)
+  m = trunc(m)
+  if m <= 0 then m = 1 end
+  if m > len then return '' end
+  local cnt: float64
+  if has_n then
+    cnt = trunc(n)
+    if cnt < 0 then cnt = 0 end
+    if cnt > len + 1 - m then cnt = len + 1 - m end
+  else
+    cnt = len + 1 - m
+  end
+  if cnt <= 0 then return '' end
+  local a = (@isize)(m)
+  return s:subview(a, a + (@isize)(cnt) - 1)
+end
+
+local function bi_index(s: string, t: string): integer
+  if t.size == 0 then return 1 end
+  if t.size > s.size then return 0 end
+  for i: usize = 0, s.size - t.size do
+    local ok = true
+    for j: usize = 0, < t.size do
+      if s.data[i + j] ~= t.data[j] then ok = false; break end
+    end
+    if ok then return (@integer)(i) + 1 end
+  end
+  return 0
+end
+
+local function case_map(s: string, upper: boolean): string
+  local out = string.copy(s)
+  for i: usize = 0, < out.size do
+    local c = out.data[i]
+    if upper and c >= 97 and c <= 122 then out.data[i] = c - 32 end
+    if not upper and c >= 65 and c <= 90 then out.data[i] = c + 32 end
+  end
+  return out
+end
+
+-- Argument of split()/sub()/gsub() that may be an array or lvalue.
+local function node_is_array_var(node: integer): boolean
+  local n = P(node)
+  if n.kind ~= awkast.VAR and n.kind ~= awkast.LOCAL then return false end
+  local p: *Cell
+  if n.kind == awkast.VAR then p = &st.globals[n.a] else p = &st.frame[(@usize)(n.a - 1)] end
+  while p.kind == awkval.REF do p = p.ref end
+  return p.kind == awkval.ARRAY
+end
+
+local function bi_split(n: *Node): Cell
+  local text = str_of(arg(n.b, 0))
+  local arr = array_of(L(n.b + 1))
+  local parts: sequence(Cell)
+  local paragraph = global_str(awkast.V_RS).size == 0
+  if n.c == 3 then
+    local fsnode = L(n.b + 2)
+    if P(fsnode).kind == awkast.REGEX then
+      split_text(text, '', &st.prog.regexes[P(fsnode).a], false, &parts)
+    else
+      split_text(text, str_of(eval(fsnode)), nilptr, false, &parts)
+    end
+  else
+    split_text(text, global_str(awkast.V_FS), nilptr, paragraph, &parts)
+  end
+  arr:clear()
+  for i = 1, #parts do
+    local key = awkval.num_to_str(i, '%.6g')
+    store(arr:get(key), parts[i])
+  end
+  local cnt = #parts
+  parts:destroy()
+  return awkval.num(cnt)
+end
+
+local function bi_sub(n: *Node, all: boolean): Cell
+  local re = regex_of(L(n.b))
+  local repl = str_of(arg(n.b, 1))
+  local r: Ref
+  local text: string
+  if n.c == 3 then
+    r = ref_of(L(n.b + 2), true)
+    text = str_of(ref_get(r))
+  else
+    ensure_rec()
+    text = st.rec
+  end
+  local result, count = substitute(re, repl, text, all)
+  if count > 0 then
+    if n.c == 3 then ref_set(r, awkval.str(result, false))
+    else set_record(result) end
+  end
+  return awkval.num(count)
+end
+
+local function bi_match(n: *Node): Cell
+  local s = str_of(arg(n.b, 0))
+  local re = regex_of(L(n.b + 1))
+  local caps: regex.Caps
+  local rstart: float64, rlength: float64 = 0, -1
+  if re:search(s, 0, &caps) then
+    rstart = (@float64)(caps.at[0]) + 1
+    rlength = (@float64)(caps.at[1] - caps.at[0])
+  end
+  set_global_num(awkast.V_RSTART, rstart)
+  set_global_num(awkast.V_RLENGTH, rlength)
+  return awkval.num(rstart)
+end
+
+local function bi_length(n: *Node): Cell
+  if n.c == 0 then
+    ensure_rec()
+    return awkval.num(st.rec.size)
+  end
+  local a = L(n.b)
+  if node_is_array_var(a) then return awkval.num(array_of(a):count()) end
+  return awkval.num(str_of(eval(a)).size)
+end
+
+local function bi_system(cmd: string): Cell
+  flush_all()
+  local pid, fd = awkio.spawn(cmd, awkio.SPAWN_NONE)
+  if pid < 0 then return awkval.num(-1) end
+  return awkval.num(awkio.wait(pid))
+end
+
+local function eval_builtin(n: *Node): Cell
+  local name = n.s
+  if name == 'length' then return bi_length(n)
+  elseif name == 'substr' then
+    local s = str_of(arg(n.b, 0))
+    local m = num_of(arg(n.b, 1))
+    local len: float64 = 0
+    if n.c == 3 then len = num_of(arg(n.b, 2)) end
+    return awkval.str(bi_substr(s, m, len, n.c == 3), true)
+  elseif name == 'index' then
+    return awkval.num(bi_index(str_of(arg(n.b, 0)), str_of(arg(n.b, 1))))
+  elseif name == 'split' then return bi_split(n)
+  elseif name == 'sub' then return bi_sub(n, false)
+  elseif name == 'gsub' then return bi_sub(n, true)
+  elseif name == 'match' then return bi_match(n)
+  elseif name == 'sprintf' then
+    local args: sequence(Cell)
+    for i = 1, < n.c do args:push(arg(n.b, i)) end
+    local s, err = awkval.sprintf(str_of(arg(n.b, 0)), &args, 1, convfmt())
+    args:destroy()
+    if err.size > 0 then fatal(err) end
+    return awkval.str(s, false)
+  elseif name == 'tolower' then return awkval.str(case_map(str_of(arg(n.b, 0)), false), false)
+  elseif name == 'toupper' then return awkval.str(case_map(str_of(arg(n.b, 0)), true), false)
+  elseif name == 'int' then return awkval.num(trunc(num_of(arg(n.b, 0))))
+  elseif name == 'sqrt' then return awkval.num(sys.sqrt(num_of(arg(n.b, 0))))
+  elseif name == 'exp' then return awkval.num(sys.exp(num_of(arg(n.b, 0))))
+  elseif name == 'log' then return awkval.num(sys.log(num_of(arg(n.b, 0))))
+  elseif name == 'sin' then return awkval.num(sys.sin(num_of(arg(n.b, 0))))
+  elseif name == 'cos' then return awkval.num(sys.cos(num_of(arg(n.b, 0))))
+  elseif name == 'atan2' then return awkval.num(sys.atan2(num_of(arg(n.b, 0)), num_of(arg(n.b, 1))))
+  elseif name == 'rand' then return awkval.num(next_rand())
+  elseif name == 'srand' then
+    local prev = st.seed
+    if n.c == 1 then seed_rng(num_of(arg(n.b, 0)))
+    else seed_rng((@float64)(sys.time(nilptr))) end
+    return awkval.num(prev)
+  elseif name == 'system' then return bi_system(str_of(arg(n.b, 0)))
+  elseif name == 'close' then return awkval.num(close_stream(str_of(arg(n.b, 0))))
+  end
+  fatal('unknown builtin ' .. name)
+  return awkval.uninit()
+end
+
+----------------------------------------------------------------------
+-- getline
+----------------------------------------------------------------------
+
+-- getline [var] [< file] | cmd | getline [var]; returns 1, 0 at EOF, -1 on
+-- error. Plain getline advances NR and FNR; the command form advances NR
+-- (POSIX; gawk and mawk leave NR alone there).
+local function eval_getline(n: *Node): Cell
+  local view: string
+  if n.a == 0 then
+    if not next_record(&view) then return awkval.num(0) end
+    if n.b < 0 then set_record(view) else assign(n.b, awkval.strnum(view, true)) end
+    bump_nr()
+    return awkval.num(1)
+  end
+  local src = str_of(eval(n.c))
+  local idx = open_in(src, n.a == 2)
+  if idx < 0 then return awkval.num(-1) end
+  if not st.ins[idx]:record(global_str(awkast.V_RS), &view) then return awkval.num(0) end
+  if n.b < 0 then set_record(view) else assign(n.b, awkval.strnum(view, true)) end
+  if n.a == 2 then set_global_num(awkast.V_NR, global_num(awkast.V_NR) + 1) end
+  return awkval.num(1)
+end
+
+----------------------------------------------------------------------
+-- Expressions
+----------------------------------------------------------------------
+
+local function arith(op: integer, x: float64, y: float64): float64
+  if op == T.PLUS then return x + y
+  elseif op == T.MINUS then return x - y
+  elseif op == T.STAR then return x * y
+  elseif op == T.SLASH then
+    if y == 0 then fatal('division by zero') end
+    return x / y
+  elseif op == T.PERCENT then
+    if y == 0 then fatal('division by zero in %') end
+    return sys.fmod(x, y)
+  elseif op == T.CARET then
+    return sys.pow(x, y)
+  end
+  return 0
+end
+
+local function call_function(n: *Node): Cell
+  local f = &st.prog.funcs[n.a]
+  local nparams = #f.params
+  local size = nparams > 0 and nparams or 1
+  local frame = default_allocator:spanalloc0(@Cell, (@usize)(size))
+  for i = 1, n.c do
+    local an = L(n.b + i - 1)
+    if i > nparams then eval(an); continue end -- extra arguments are evaluated and dropped
+    local k = P(an).kind
+    local handled = false
+    if k == awkast.VAR or k == awkast.LOCAL then
+      local p: *Cell
+      if k == awkast.VAR then p = &st.globals[P(an).a] else p = &st.frame[(@usize)(P(an).a - 1)] end
+      while p.kind == awkval.REF do p = p.ref end
+      if p.kind == awkval.ARRAY then
+        frame[(@usize)(i - 1)] = $p
+        handled = true
+      elseif p.kind == awkval.UNINIT and not (k == awkast.VAR and P(an).a == awkast.V_NF) then
+        frame[(@usize)(i - 1)] = (@Cell){kind = awkval.REF, ref = p}
+        handled = true
+      end
+    end
+    if not handled then
+      local v = eval(an)
+      store(&frame[(@usize)(i - 1)], v)
+    end
+  end
+  if st.depth > 10000 then fatal('function call nesting too deep') end
+  local saved = st.frame
+  st.frame = frame
+  st.depth = st.depth + 1
+  st.retval = awkval.uninit()
+  local flow = exec(f.body)
+  st.depth = st.depth - 1
+  st.frame = saved
+  default_allocator:spandealloc(frame)
+  if flow == FLOW_NEXT or flow == FLOW_NEXTFILE or flow == FLOW_EXIT then st.jump = flow end
+  local r = st.retval
+  st.retval = awkval.uninit()
+  return r
+end
+
+local function eval_cmp(n: *Node): Cell
+  local a = eval(n.a)
+  local b = eval(n.b)
+  local c = awkval.compare(a, b, convfmt())
+  local r = false
+  if n.c == T.LT then r = c < 0
+  elseif n.c == T.LE then r = c <= 0
+  elseif n.c == T.GT then r = c > 0
+  elseif n.c == T.GE then r = c >= 0
+  elseif n.c == T.EQ then r = c == 0
+  elseif n.c == T.NE then r = c ~= 0 end
+  return awkval.num(r and 1 or 0)
+end
+
+function eval(node: integer): Cell
+  local n = P(node)
+  local k = n.kind
+  if k == awkast.NUM then
+    return awkval.num(n.n)
+  elseif k == awkast.STR then
+    return awkval.str(n.s, false)
+  elseif k == awkast.GROUP then
+    return eval(n.a)
+  elseif k == awkast.VAR or k == awkast.LOCAL or k == awkast.INDEX or k == awkast.FIELD then
+    return read_lvalue(node)
+  elseif k == awkast.REGEX then
+    ensure_rec()
+    return awkval.num(matches(&st.prog.regexes[n.a], st.rec) and 1 or 0)
+  elseif k == awkast.ASSIGN then
+    local v = eval(n.b)
+    local r = ref_of(n.a, true)
+    if n.c ~= 0 then
+      v = awkval.num(arith(n.c, num_of(ref_get(r)), num_of(v)))
+    end
+    ref_set(r, v)
+    return v
+  elseif k == awkast.COND then
+    if awkval.truth(eval(n.a)) then return eval(n.b) end
+    return eval(n.c)
+  elseif k == awkast.OR then
+    if awkval.truth(eval(n.a)) then return awkval.num(1) end
+    return awkval.num(awkval.truth(eval(n.b)) and 1 or 0)
+  elseif k == awkast.AND then
+    if not awkval.truth(eval(n.a)) then return awkval.num(0) end
+    return awkval.num(awkval.truth(eval(n.b)) and 1 or 0)
+  elseif k == awkast.IN then
+    local key = subscript(n.a, n.b)
+    return awkval.num(array_of(n.c):has(key) and 1 or 0)
+  elseif k == awkast.MATCH then
+    local s = str_of(eval(n.a))
+    local re = regex_of(n.b)
+    local m = matches(re, s)
+    if n.c == 1 then m = not m end
+    return awkval.num(m and 1 or 0)
+  elseif k == awkast.CMP then
+    return eval_cmp(n)
+  elseif k == awkast.CONCAT then
+    local a = str_of(eval(n.a))
+    local b = str_of(eval(n.b))
+    return awkval.str(a .. b, false)
+  elseif k == awkast.BINOP then
+    local a = num_of(eval(n.a))
+    local b = num_of(eval(n.b))
+    return awkval.num(arith(n.c, a, b))
+  elseif k == awkast.UNARY then
+    local v = eval(n.a)
+    if n.c == T.NOT then return awkval.num(awkval.truth(v) and 0 or 1) end
+    if n.c == T.MINUS then return awkval.num(-num_of(v)) end
+    return awkval.num(num_of(v))
+  elseif k == awkast.PREINC then
+    local r = ref_of(n.a, true)
+    local v = num_of(ref_get(r)) + n.c
+    ref_set(r, awkval.num(v))
+    return awkval.num(v)
+  elseif k == awkast.POSTINC then
+    local r = ref_of(n.a, true)
+    local old = num_of(ref_get(r))
+    ref_set(r, awkval.num(old + n.c))
+    return awkval.num(old)
+  elseif k == awkast.CALL then
+    return call_function(n)
+  elseif k == awkast.BUILTIN then
+    return eval_builtin(n)
+  elseif k == awkast.GETLINE then
+    return eval_getline(n)
+  end
+  fatal('internal error: bad expression node')
+  return awkval.uninit()
+end
+
+----------------------------------------------------------------------
+-- Statements
+----------------------------------------------------------------------
+
+-- Output target of a print/printf statement.
+local function print_stream(n: *Node): integer
+  if n.c == awkast.REDIR_NONE then return -1 end
+  return open_out(n.c, str_of(eval(n.d)))
+end
+
+local function exec_print(n: *Node): integer
+  local sb: stringbuilder
+  if n.b == 0 then
+    ensure_rec()
+    sb:write(st.rec)
+  else
+    local ofs = global_str(awkast.V_OFS)
+    for i = 0, < n.b do
+      if i > 0 then sb:write(ofs) end
+      sb:write(out_str(eval(L(n.a + i))))
+      if st.jump ~= 0 then sb:destroy(); return st.jump end
+    end
+  end
+  sb:write(global_str(awkast.V_ORS))
+  local stream = print_stream(n)
+  emit(stream, sb:view())
+  sb:destroy()
+  return FLOW_NORMAL
+end
+
+local function exec_printf(n: *Node): integer
+  local args: sequence(Cell)
+  for i = 1, < n.b do
+    args:push(eval(L(n.a + i)))
+    if st.jump ~= 0 then args:destroy(); return st.jump end
+  end
+  local fmt = str_of(eval(L(n.a)))
+  local s, err = awkval.sprintf(fmt, &args, 1, convfmt())
+  args:destroy()
+  if err.size > 0 then fatal(err) end
+  local stream = print_stream(n)
+  emit(stream, s)
+  s:destroy()
+  return FLOW_NORMAL
+end
+
+local function exec_block(n: *Node): integer
+  for i = 0, < n.b do
+    local f = exec(L(n.a + i))
+    if f ~= FLOW_NORMAL then return f end
+  end
+  return FLOW_NORMAL
+end
+
+-- Loop bodies: break/continue are consumed here, others propagate.
+local function loop_flow(f: integer): (boolean, integer)
+  if f == FLOW_BREAK then return true, FLOW_NORMAL end
+  if f == FLOW_CONTINUE or f == FLOW_NORMAL then return false, FLOW_NORMAL end
+  return true, f
+end
+
+local function exec_forin(n: *Node): integer
+  local arr = array_of(n.b)
+  local keys = arr:keys()
+  local result = FLOW_NORMAL
+  for i = 1, #keys do
+    if not arr:has(keys[i]) then continue end
+    assign(n.a, awkval.strnum(keys[i], true))
+    local stop, f = loop_flow(exec(n.c))
+    if stop then result = f; break end
+  end
+  keys:destroy()
+  return result
+end
+
+local function cond(node: integer): boolean
+  local v = awkval.truth(eval(node))
+  return v
+end
+
+function exec(node: integer): integer
+  local n = P(node)
+  local k = n.kind
+  if k == awkast.BLOCK then
+    return exec_block(n)
+  elseif k == awkast.EXPR then
+    eval(n.a)
+    return st.jump
+  elseif k == awkast.PRINT then
+    return exec_print(n)
+  elseif k == awkast.PRINTF then
+    return exec_printf(n)
+  elseif k == awkast.IF then
+    local c = cond(n.a)
+    if st.jump ~= 0 then return st.jump end
+    if c then return exec(n.b) end
+    if n.c >= 0 then return exec(n.c) end
+    return FLOW_NORMAL
+  elseif k == awkast.WHILE then
+    while true do
+      local c = cond(n.a)
+      if st.jump ~= 0 then return st.jump end
+      if not c then break end
+      local stop, f = loop_flow(exec(n.b))
+      if stop then return f end
+    end
+    return FLOW_NORMAL
+  elseif k == awkast.DO then
+    while true do
+      local stop, f = loop_flow(exec(n.a))
+      if stop then return f end
+      local c = cond(n.b)
+      if st.jump ~= 0 then return st.jump end
+      if not c then break end
+    end
+    return FLOW_NORMAL
+  elseif k == awkast.FOR then
+    if n.a >= 0 then
+      local f = exec(n.a)
+      if f ~= FLOW_NORMAL then return f end
+    end
+    while true do
+      if n.b >= 0 then
+        local c = cond(n.b)
+        if st.jump ~= 0 then return st.jump end
+        if not c then break end
+      end
+      local stop, f = loop_flow(exec(n.d))
+      if stop then return f end
+      if n.c >= 0 then
+        f = exec(n.c)
+        if f ~= FLOW_NORMAL then return f end
+      end
+    end
+    return FLOW_NORMAL
+  elseif k == awkast.FORIN then
+    return exec_forin(n)
+  elseif k == awkast.BREAK then
+    return FLOW_BREAK
+  elseif k == awkast.CONTINUE then
+    return FLOW_CONTINUE
+  elseif k == awkast.NEXT then
+    if st.stage ~= awkast.ITEM_MAIN then fatal("`next' used in " .. (st.stage == awkast.ITEM_BEGIN and 'BEGIN' or 'END') .. ' action') end
+    return FLOW_NEXT
+  elseif k == awkast.NEXTFILE then
+    if st.stage ~= awkast.ITEM_MAIN then fatal("`nextfile' used in " .. (st.stage == awkast.ITEM_BEGIN and 'BEGIN' or 'END') .. ' action') end
+    return FLOW_NEXTFILE
+  elseif k == awkast.EXIT then
+    if n.a >= 0 then
+      local v = num_of(eval(n.a))
+      st.exit_code = (@integer)(trunc(v)) & 0xFF
+    end
+    st.exiting = true
+    return FLOW_EXIT
+  elseif k == awkast.RETURN then
+    if n.a >= 0 then
+      local v = eval(n.a)
+      store(&st.retval, v)
+    else
+      st.retval = awkval.uninit()
+    end
+    return FLOW_RETURN
+  elseif k == awkast.DELETE then
+    local arr = array_of(n.a)
+    if n.c == 0 then arr:clear() else arr:remove(subscript(n.b, n.c)) end
+    return FLOW_NORMAL
+  end
+  fatal('internal error: bad statement node')
+  return FLOW_NORMAL
+end
+
+----------------------------------------------------------------------
+-- Rules
+----------------------------------------------------------------------
+
+-- Does rule i select the current record? Range patterns keep their state
+-- in range_active.
+local function rule_matches(i: integer): boolean
+  local item = &st.prog.items[i]
+  if item.pat < 0 then return true end
+  if item.pat2 < 0 then return cond(item.pat) end
+  if not st.range_active[i] then
+    if not cond(item.pat) then return false end
+    st.range_active[i] = true
+  end
+  if cond(item.pat2) then st.range_active[i] = false end
+  return true
+end
+
+local function run_action(item: *awkast.Item): integer
+  if item.action < 0 then
+    ensure_rec()
+    util.write(st.rec)
+    util.write(global_str(awkast.V_ORS))
+    return FLOW_NORMAL
+  end
+  return exec(item.action)
+end
+
+-- Execute BEGIN or END rules in order; exit stops the sequence.
+local function run_stage(kind: byte)
+  st.stage = kind
+  for i = 1, #st.prog.items do
+    if st.prog.items[i].kind == kind then
+      run_action(&st.prog.items[i])
+      st.jump = 0
+      if st.exiting then return end
+    end
+  end
+end
+
+local function has_items(kind: byte): boolean
+  for i = 1, #st.prog.items do
+    if st.prog.items[i].kind == kind then return true end
+  end
+  return false
+end
+
+local function run_main()
+  st.stage = awkast.ITEM_MAIN
+  local view: string
+  while not st.exiting and next_record(&view) do
+    set_record(view)
+    bump_nr()
+    for i = 1, #st.prog.items do
+      local item = &st.prog.items[i]
+      if item.kind ~= awkast.ITEM_MAIN then continue end
+      local m = rule_matches(i)
+      if st.jump ~= 0 then
+        local f = st.jump
+        st.jump = 0
+        if f == FLOW_NEXTFILE then close_main() end
+        break
+      end
+      if not m then continue end
+      local f = run_action(item)
+      st.jump = 0
+      if f == FLOW_NEXT then break end
+      if f == FLOW_NEXTFILE then close_main(); break end
+      if f == FLOW_EXIT then break end
+    end
+  end
+end
+
+----------------------------------------------------------------------
+-- Setup and entry
+----------------------------------------------------------------------
+
+local function setup(prog: *awkast.Program, argv: sequence(string), fs: string, has_fs: boolean)
+  st.prog = prog
+  st.cur = 0
+  st.argi = 1
+  st.globals:reserve((@usize)(#prog.names) + 256) -- stable addresses for parameter references
+  for i = 1, #prog.names do st.globals:push(awkval.uninit()) end
+  set_global_str(awkast.V_FS, ' ')
+  set_global_str(awkast.V_OFS, ' ')
+  set_global_str(awkast.V_ORS, '\n')
+  set_global_str(awkast.V_RS, '\n')
+  set_global_str(awkast.V_SUBSEP, '\x1c')
+  set_global_str(awkast.V_CONVFMT, '%.6g')
+  set_global_str(awkast.V_OFMT, '%.6g')
+  set_global_str(awkast.V_FILENAME, '')
+  set_global_num(awkast.V_NR, 0)
+  set_global_num(awkast.V_FNR, 0)
+  set_global_num(awkast.V_RSTART, 0)
+  set_global_num(awkast.V_RLENGTH, -1)
+  if has_fs then set_global_str(awkast.V_FS, fs) end
+  -- ENVIRON
+  local env = awkval.new_array()
+  local i: integer = 0
+  while environ[i] ~= nilptr do
+    local e: string = environ[i]
+    local eq = e:find('=', 1, true)
+    if eq > 0 then
+      local key = string.copy(e:subview(1, eq - 1))
+      store(env:get(key), awkval.strnum(e:subview(eq + 1, (@isize)(e.size)), true))
+    end
+    i = i + 1
+  end
+  st.globals[awkast.V_ENVIRON] = (@Cell){kind = awkval.ARRAY, arr = env}
+  -- ARGV / ARGC
+  local av = awkval.new_array()
+  store(av:get('0'), awkval.str('awk', false))
+  for j = 1, #argv do
+    store(av:get(awkval.num_to_str(j, '%.6g')), awkval.strnum(argv[j], true))
+  end
+  st.globals[awkast.V_ARGV] = (@Cell){kind = awkval.ARRAY, arr = av}
+  set_global_num(awkast.V_ARGC, #argv + 1)
+  for j = 1, #prog.items do st.range_active:push(false) end
+  set_record('')
+  seed_rng(1) -- gawk reports 1 as the seed in force before the first srand
+end
+
+-- Run a parsed program. `assigns` are -v assignments, `argv` the operands.
+global function awkrun_run(prog: *awkast.Program, assigns: sequence(string), argv: sequence(string), fs: string, has_fs: boolean): integer
+  setup(prog, argv, fs, has_fs)
+  for i = 1, #assigns do awkrun_assign_operand(assigns[i], true) end
+  run_stage(awkast.ITEM_BEGIN)
+  if not st.exiting and (has_items(awkast.ITEM_MAIN) or has_items(awkast.ITEM_END)) then
+    run_main()
+  end
+  if st.exiting then
+    -- exit outside END still runs the END actions
+    st.exiting = false
+    run_stage(awkast.ITEM_END)
+  else
+    run_stage(awkast.ITEM_END)
+  end
+  close_main()
+  close_all()
+  return st.exit_code
+end

@@ -1,0 +1,154 @@
+-- awk syntax tree: a flat node arena indexed by integers (Nelua has no GC
+-- and no closures, so trees are indices, and child lists are slices of one
+-- shared integer sequence).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'hashmap'
+require 'nebox.regex'
+
+global awkast = @record{}
+
+-- Expression node kinds.
+global awkast.NUM: byte <comptime> = 1        -- n
+global awkast.STR: byte <comptime> = 2        -- s
+global awkast.REGEX: byte <comptime> = 3      -- a = regex index; as a value: $0 ~ re
+global awkast.VAR: byte <comptime> = 4        -- a = global id
+global awkast.LOCAL: byte <comptime> = 5      -- a = parameter index (1-based)
+global awkast.INDEX: byte <comptime> = 6      -- a = array node, b/c = subscript list
+global awkast.FIELD: byte <comptime> = 7      -- a = index expr
+global awkast.ASSIGN: byte <comptime> = 8     -- a = lvalue, b = rhs, c = op token (0 for '=')
+global awkast.COND: byte <comptime> = 9       -- a ? b : c
+global awkast.OR: byte <comptime> = 10
+global awkast.AND: byte <comptime> = 11
+global awkast.IN: byte <comptime> = 12        -- a/b = subscript list, c = array node
+global awkast.MATCH: byte <comptime> = 13     -- a ~ b, c = 1 for !~
+global awkast.CMP: byte <comptime> = 14       -- a op b, c = op token
+global awkast.CONCAT: byte <comptime> = 15
+global awkast.BINOP: byte <comptime> = 16     -- a op b, c = op token (+ - * / % ^)
+global awkast.UNARY: byte <comptime> = 17     -- c = op token (! - +), a = operand
+global awkast.PREINC: byte <comptime> = 18    -- a = lvalue, c = +1/-1
+global awkast.POSTINC: byte <comptime> = 19
+global awkast.CALL: byte <comptime> = 20      -- s = name, a = function index, b/c = args
+global awkast.BUILTIN: byte <comptime> = 21   -- s = name, b/c = args
+global awkast.GETLINE: byte <comptime> = 22   -- a = 0 plain, 1 file, 2 command; b = lvalue or -1; c = source
+global awkast.GROUP: byte <comptime> = 23     -- a = inner expression
+-- Statement node kinds.
+global awkast.BLOCK: byte <comptime> = 40     -- a/b = statement list
+global awkast.EXPR: byte <comptime> = 41      -- a
+global awkast.PRINT: byte <comptime> = 42     -- a/b = args, c = redirect kind, d = target
+global awkast.PRINTF: byte <comptime> = 43
+global awkast.IF: byte <comptime> = 44        -- a cond, b then, c else or -1
+global awkast.WHILE: byte <comptime> = 45     -- a cond, b body
+global awkast.DO: byte <comptime> = 46        -- a body, b cond
+global awkast.FOR: byte <comptime> = 47       -- a init, b cond, c step (-1 when absent), d body
+global awkast.FORIN: byte <comptime> = 48     -- a var lvalue, b array node, c body
+global awkast.BREAK: byte <comptime> = 49
+global awkast.CONTINUE: byte <comptime> = 50
+global awkast.NEXT: byte <comptime> = 51
+global awkast.NEXTFILE: byte <comptime> = 52
+global awkast.EXIT: byte <comptime> = 53      -- a expr or -1
+global awkast.RETURN: byte <comptime> = 54    -- a expr or -1
+global awkast.DELETE: byte <comptime> = 55    -- a array node, b/c subscripts (count 0: whole array)
+
+-- Redirection kinds for print/printf (c field).
+global awkast.REDIR_NONE: integer <comptime> = 0
+global awkast.REDIR_FILE: integer <comptime> = 1
+global awkast.REDIR_APPEND: integer <comptime> = 2
+global awkast.REDIR_PIPE: integer <comptime> = 3
+
+global awkast.Node = @record{
+  kind: byte,
+  a: integer, b: integer, c: integer, d: integer,
+  s: string,
+  n: float64,
+  line: integer,
+}
+
+-- Rule kinds.
+global awkast.ITEM_BEGIN: byte <comptime> = 0
+global awkast.ITEM_END: byte <comptime> = 1
+global awkast.ITEM_MAIN: byte <comptime> = 2
+
+global awkast.Item = @record{
+  kind: byte,
+  pat: integer,     -- -1 when absent
+  pat2: integer,    -- -1 unless a range pattern
+  action: integer,  -- -1 means { print }
+  in_range: boolean,
+}
+
+global awkast.Func = @record{
+  name: string,
+  params: sequence(string),
+  body: integer,
+}
+
+-- Fixed ids of the special variables (1-based, allocated first).
+global awkast.V_NF: integer <comptime> = 1
+global awkast.V_NR: integer <comptime> = 2
+global awkast.V_FNR: integer <comptime> = 3
+global awkast.V_FS: integer <comptime> = 4
+global awkast.V_OFS: integer <comptime> = 5
+global awkast.V_ORS: integer <comptime> = 6
+global awkast.V_RS: integer <comptime> = 7
+global awkast.V_SUBSEP: integer <comptime> = 8
+global awkast.V_CONVFMT: integer <comptime> = 9
+global awkast.V_OFMT: integer <comptime> = 10
+global awkast.V_FILENAME: integer <comptime> = 11
+global awkast.V_RSTART: integer <comptime> = 12
+global awkast.V_RLENGTH: integer <comptime> = 13
+global awkast.V_ENVIRON: integer <comptime> = 14
+global awkast.V_ARGC: integer <comptime> = 15
+global awkast.V_ARGV: integer <comptime> = 16
+global awkast.V_COUNT: integer <comptime> = 16
+
+global awkast.Program = @record{
+  nodes: sequence(awkast.Node),
+  lists: sequence(integer),
+  items: sequence(awkast.Item),
+  funcs: sequence(awkast.Func),
+  names: sequence(string),
+  name_ids: hashmap(string, integer),
+  regexes: sequence(regex.Prog),
+}
+
+-- Id of a global variable, allocating it on first sight.
+function awkast.Program:global_id(name: string): integer
+  local p = self.name_ids:peek(name)
+  if p ~= nilptr then return $p end
+  self.names:push(name)
+  local id = #self.names
+  self.name_ids[name] = id
+  return id
+end
+
+function awkast.Program:init()
+  local specials: []string = {'NF', 'NR', 'FNR', 'FS', 'OFS', 'ORS', 'RS', 'SUBSEP', 'CONVFMT',
+    'OFMT', 'FILENAME', 'RSTART', 'RLENGTH', 'ENVIRON', 'ARGC', 'ARGV'}
+  for i: integer = 0, < #specials do self:global_id(specials[i]) end
+end
+
+function awkast.Program:node(kind: byte, a: integer, b: integer, c: integer, d: integer, line: integer): integer
+  self.nodes:push((@awkast.Node){kind = kind, a = a, b = b, c = c, d = d, line = line})
+  return #self.nodes
+end
+
+-- Store a child list; returns (start, count) for the node's b/c fields.
+function awkast.Program:list(items: sequence(integer)): (integer, integer)
+  local start = #self.lists + 1
+  for i = 1, #items do self.lists:push(items[i]) end
+  return start, #items
+end
+
+function awkast.Program:at(i: integer): *awkast.Node
+  return &self.nodes[i]
+end
+
+function awkast.Program:find_func(name: string): integer
+  for i = 1, #self.funcs do
+    if self.funcs[i].name == name then return i end
+  end
+  return -1
+end

@@ -1,0 +1,819 @@
+-- awk parser: recursive descent over the token array, producing nodes in
+-- awkast.Program. Comments quote the POSIX.1-2017 awk grammar rules being
+-- implemented. Expression precedence, lowest to highest:
+--   ?: (right)  ||  &&  in  ~ !~  < <= != == > >=  concatenation
+--   + -  * / %  ! unary- unary+  ^ (right)  ++ --  $  ( )
+-- with assignment below all of them.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.regex'
+require 'nebox.awk.lex'
+require 'nebox.awk.ast'
+
+global awkparse = @record{}
+
+local Parser = @record{
+  toks: sequence(awklex.Token),
+  pos: integer,
+  prog: *awkast.Program,
+  err: string,
+  in_func: boolean,
+  params: sequence(string),
+  no_gt: boolean,     -- inside an unparenthesized print expression list
+  no_in: boolean,     -- inside a for(...) header being probed
+  loop_depth: integer,
+}
+
+local T = awklex
+
+function Parser:peek(): byte return self.toks[self.pos].kind end
+function Parser:peek2(): byte
+  if self.pos + 1 > #self.toks then return T.EOF end
+  return self.toks[self.pos + 1].kind
+end
+function Parser:tok(): *awklex.Token return &self.toks[self.pos] end
+function Parser:line(): integer return self.toks[self.pos].line end
+function Parser:advance() if self.pos < #self.toks then self.pos = self.pos + 1 end end
+
+function Parser:fail(msg: string)
+  if self.err.size == 0 then
+    self.err = string.format('syntax error at source line %d: %s', self:line(), msg)
+  end
+end
+
+function Parser:failed(): boolean return self.err.size > 0 end
+
+function Parser:accept(kind: byte): boolean
+  if self:peek() == kind then self:advance(); return true end
+  return false
+end
+
+local function kind_name(kind: byte): string
+  if kind == T.EOF then return 'end of program' end
+  if kind == T.NEWLINE then return 'newline' end
+  return 'token'
+end
+
+function Parser:expect(kind: byte, what: string)
+  if self:peek() ~= kind then
+    self:fail('expected ' .. what .. ', got ' .. kind_name(self:peek()))
+    return
+  end
+  self:advance()
+end
+
+-- newline_opt : /* empty */ | newline_opt NEWLINE
+function Parser:opt_newlines()
+  while self:peek() == T.NEWLINE do self:advance() end
+end
+
+-- Newlines and semicolons between statements and items.
+function Parser:skip_terminators()
+  while self:peek() == T.NEWLINE or self:peek() == T.SEMI do self:advance() end
+end
+
+function Parser:mk(kind: byte, a: integer, b: integer, c: integer, d: integer): integer
+  return self.prog:node(kind, a, b, c, d, self:line())
+end
+
+local function is_lvalue(p: *Parser, n: integer): boolean
+  if n < 0 then return false end
+  local k = p.prog:at(n).kind
+  return k == awkast.VAR or k == awkast.LOCAL or k == awkast.INDEX or k == awkast.FIELD
+end
+
+-- NAME resolves to a parameter inside a function, else to a global.
+function Parser:name_node(name: string): integer
+  if self.in_func then
+    for i = 1, #self.params do
+      if self.params[i] == name then return self:mk(awkast.LOCAL, i, 0, 0, 0) end
+    end
+  end
+  if self.prog:find_func(name) >= 0 then
+    self:fail("function name '" .. name .. "' used as a variable")
+  end
+  return self:mk(awkast.VAR, self.prog:global_id(name), 0, 0, 0)
+end
+
+function Parser:regex_node(text: string): integer
+  local prog, err = regex.compile(text, true, false)
+  if err.size > 0 then self:fail('bad regular expression /' .. text .. '/: ' .. err) end
+  self.prog.regexes:push(prog)
+  return self:mk(awkast.REGEX, #self.prog.regexes, 0, 0, 0)
+end
+
+function Parser:parse_expr(): integer <forwarddecl> end
+function Parser:parse_unary(): integer <forwarddecl> end
+function Parser:parse_primary(): integer <forwarddecl> end
+function Parser:parse_stmt(): integer <forwarddecl> end
+function Parser:parse_block(): integer <forwarddecl> end
+
+-- expr_list : expr | multiple_expr_list ; used for subscripts and arguments.
+-- Flags are reset inside brackets and parentheses.
+function Parser:parse_expr_list(close: byte, what: string): (integer, integer)
+  local items: sequence(integer)
+  local save_gt, save_in = self.no_gt, self.no_in
+  self.no_gt = false; self.no_in = false
+  self:opt_newlines()
+  if self:peek() ~= close then
+    while true do
+      items:push(self:parse_expr())
+      if self:failed() then break end
+      self:opt_newlines()
+      if not self:accept(T.COMMA) then break end
+      self:opt_newlines()
+    end
+  end
+  self:expect(close, what)
+  self.no_gt = save_gt; self.no_in = save_in
+  return self.prog:list(items)
+end
+
+-- Builtin arity rules; sub/gsub targets and split arrays are checked too.
+function Parser:check_builtin(name: string, start: integer, count: integer)
+  local lo, hi = 0, 0
+  if name == 'length' then lo, hi = 0, 1
+  elseif name == 'substr' then lo, hi = 2, 3
+  elseif name == 'index' or name == 'match' or name == 'atan2' then lo, hi = 2, 2
+  elseif name == 'split' or name == 'sub' or name == 'gsub' then lo, hi = 2, 3
+  elseif name == 'sprintf' then lo, hi = 1, 1000
+  elseif name == 'rand' then lo, hi = 0, 0
+  elseif name == 'srand' then lo, hi = 0, 1
+  else lo, hi = 1, 1 end
+  if count < lo or count > hi then
+    self:fail(string.format('%d is invalid as number of arguments for %s', count, name))
+    return
+  end
+  if (name == 'sub' or name == 'gsub') and count == 3 and not is_lvalue(self, self.prog.lists[start + 2]) then
+    self:fail(name .. ' third parameter is not a changeable object')
+  end
+  if name == 'split' then
+    local k = self.prog:at(self.prog.lists[start + 1]).kind
+    if k ~= awkast.VAR and k ~= awkast.LOCAL then self:fail('split second parameter is not an array') end
+  end
+end
+
+-- lvalue : NAME | NAME '[' expr_list ']' | '$' expr
+function Parser:parse_lvalue(): integer
+  local n = self:parse_primary()
+  if not self:failed() and not is_lvalue(self, n) then self:fail('expected an lvalue') end
+  return n
+end
+
+-- simple_get : GETLINE | GETLINE lvalue
+-- The optional lvalue is taken only when a NAME or '$' follows.
+function Parser:parse_getline_target(): integer
+  local k = self:peek()
+  if k == T.NAME or k == T.DOLLAR then return self:parse_lvalue() end
+  return -1
+end
+
+-- The operand of '$': a primary, or ++/--/- applied to one, so that $i++
+-- is ($i)++ while $++i is $(++i).
+function Parser:parse_field_operand(): integer
+  local k = self:peek()
+  if k == T.INCR or k == T.DECR then
+    self:advance()
+    local lv = self:parse_lvalue()
+    return self:mk(awkast.PREINC, lv, 0, k == T.INCR and 1 or -1, 0)
+  elseif k == T.MINUS then
+    self:advance()
+    local e = self:parse_primary()
+    return self:mk(awkast.UNARY, e, 0, T.MINUS, 0)
+  end
+  return self:parse_primary()
+end
+
+-- Primary expressions: constants, lvalues, grouping, calls, getline.
+function Parser:parse_primary(): integer
+  local t = self:tok()
+  local k = t.kind
+  if k == T.NUMBER then
+    self:advance()
+    local n = self:mk(awkast.NUM, 0, 0, 0, 0)
+    self.prog:at(n).n = t.n
+    return n
+  elseif k == T.STRING then
+    self:advance()
+    local n = self:mk(awkast.STR, 0, 0, 0, 0)
+    self.prog:at(n).s = t.s
+    return n
+  elseif k == T.ERE then
+    self:advance()
+    return self:regex_node(t.s)
+  elseif k == T.DOLLAR then
+    self:advance()
+    local e = self:parse_field_operand()
+    return self:mk(awkast.FIELD, e, 0, 0, 0)
+  elseif k == T.INCR or k == T.DECR then
+    self:advance()
+    local lv = self:parse_lvalue()
+    return self:mk(awkast.PREINC, lv, 0, k == T.INCR and 1 or -1, 0)
+  elseif k == T.MINUS or k == T.PLUS or k == T.NOT then
+    return self:parse_unary()
+  elseif k == T.LPAREN then
+    -- '(' expr ')' | '(' multiple_expr_list ')' In NAME
+    self:advance()
+    local start, count = self:parse_expr_list(T.RPAREN, "')'")
+    if self:failed() then return -1 end
+    if count == 0 then self:fail('empty parentheses'); return -1 end
+    if count > 1 then
+      if not self:accept(T.IN) then self:fail("expected 'in' after subscript list"); return -1 end
+      if self:peek() ~= T.NAME then self:fail('expected array name after in'); return -1 end
+      local name = self:tok().s
+      self:advance()
+      local arr = self:name_node(name)
+      return self:mk(awkast.IN, start, count, arr, 0)
+    end
+    return self:mk(awkast.GROUP, self.prog.lists[start], 0, 0, 0)
+  elseif k == T.NAME then
+    self:advance()
+    local v = self:name_node(t.s)
+    if self:accept(T.LBRACKET) then
+      local start, count = self:parse_expr_list(T.RBRACKET, "']'")
+      if count == 0 then self:fail('empty subscript') end
+      return self:mk(awkast.INDEX, v, start, count, 0)
+    end
+    return v
+  elseif k == T.FUNC_NAME then
+    -- non_unary_expr : FUNC_NAME '(' expr_list_opt ')'
+    self:advance()
+    self:expect(T.LPAREN, "'('")
+    local start, count = self:parse_expr_list(T.RPAREN, "')'")
+    local n = self:mk(awkast.CALL, -1, start, count, 0)
+    self.prog:at(n).s = t.s
+    return n
+  elseif k == T.BUILTIN then
+    -- BUILTIN_FUNC_NAME '(' expr_list_opt ')' | BUILTIN_FUNC_NAME (length only)
+    self:advance()
+    local start, count = 0, 0
+    if self:accept(T.LPAREN) then
+      start, count = self:parse_expr_list(T.RPAREN, "')'")
+    elseif t.s ~= 'length' then
+      self:fail("expected '(' after " .. t.s)
+      return -1
+    end
+    if self:failed() then return -1 end
+    self:check_builtin(t.s, start, count)
+    local n = self:mk(awkast.BUILTIN, 0, start, count, 0)
+    self.prog:at(n).s = t.s
+    return n
+  elseif k == T.GETLINE then
+    -- simple_get | simple_get '<' expr
+    self:advance()
+    local target = self:parse_getline_target()
+    if self:failed() then return -1 end
+    if self:accept(T.LT) then
+      local src = self:parse_unary()
+      return self:mk(awkast.GETLINE, 1, target, src, 0)
+    end
+    return self:mk(awkast.GETLINE, 0, target, -1, 0)
+  end
+  self:fail('unexpected ' .. kind_name(k) .. ' in expression')
+  return -1
+end
+
+-- Postfix ++/-- bind to lvalues.
+function Parser:parse_postfix(): integer
+  local n = self:parse_primary()
+  if self:failed() then return -1 end
+  local k = self:peek()
+  if (k == T.INCR or k == T.DECR) and is_lvalue(self, n) then
+    self:advance()
+    return self:mk(awkast.POSTINC, n, 0, k == T.INCR and 1 or -1, 0)
+  end
+  return n
+end
+
+-- expr '^' expr is right associative and binds tighter than unary minus,
+-- but its right operand may carry a sign: 2^-1.
+function Parser:parse_pow(): integer
+  local left = self:parse_postfix()
+  if self:failed() then return -1 end
+  if self:accept(T.CARET) then
+    local right = self:parse_unary()
+    return self:mk(awkast.BINOP, left, right, T.CARET, 0)
+  end
+  return left
+end
+
+-- '!' expr | '-' expr | '+' expr
+function Parser:parse_unary(): integer
+  local k = self:peek()
+  if k == T.NOT or k == T.MINUS or k == T.PLUS then
+    self:advance()
+    local e = self:parse_unary()
+    return self:mk(awkast.UNARY, e, 0, k, 0)
+  end
+  return self:parse_pow()
+end
+
+function Parser:parse_mul(): integer
+  local left = self:parse_unary()
+  while not self:failed() do
+    local k = self:peek()
+    if k ~= T.STAR and k ~= T.SLASH and k ~= T.PERCENT then break end
+    self:advance()
+    local right = self:parse_unary()
+    left = self:mk(awkast.BINOP, left, right, k, 0)
+  end
+  return left
+end
+
+function Parser:parse_additive(): integer
+  local left = self:parse_mul()
+  while not self:failed() do
+    local k = self:peek()
+    if k ~= T.PLUS and k ~= T.MINUS then break end
+    self:advance()
+    local right = self:parse_mul()
+    left = self:mk(awkast.BINOP, left, right, k, 0)
+  end
+  return left
+end
+
+-- Tokens that can begin a concatenated operand (non_unary_expr: no leading
+-- + - ! which would be read as binary operators or are not allowed).
+local function starts_operand(k: byte): boolean
+  return k == T.NUMBER or k == T.STRING or k == T.ERE or k == T.NAME or k == T.FUNC_NAME
+    or k == T.BUILTIN or k == T.DOLLAR or k == T.LPAREN or k == T.INCR or k == T.DECR
+    or k == T.NOT
+end
+
+-- non_unary_expr : non_unary_expr non_unary_expr  (concatenation)
+function Parser:parse_concat(): integer
+  local left = self:parse_additive()
+  while not self:failed() and starts_operand(self:peek()) do
+    if self:peek() == T.IN then break end
+    local right = self:parse_additive()
+    left = self:mk(awkast.CONCAT, left, right, 0, 0)
+  end
+  return left
+end
+
+-- unary_input_function / non_unary_input_function :
+--   expr '|' simple_get   (binds tighter than comparison)
+function Parser:parse_pipe_getline(): integer
+  local left = self:parse_concat()
+  while not self:failed() and self:peek() == T.PIPE and self:peek2() == T.GETLINE and not self.no_gt do
+    self:advance(); self:advance()
+    local target = self:parse_getline_target()
+    left = self:mk(awkast.GETLINE, 2, target, left, 0)
+  end
+  return left
+end
+
+-- Comparisons are non-associative. '>' is not a comparison inside an
+-- unparenthesized print list (it is output redirection there).
+function Parser:parse_cmp(): integer
+  local left = self:parse_pipe_getline()
+  if self:failed() then return -1 end
+  local k = self:peek()
+  if k == T.LT or k == T.LE or k == T.NE or k == T.EQ or k == T.GE or (k == T.GT and not self.no_gt) then
+    self:advance()
+    local right = self:parse_pipe_getline()
+    return self:mk(awkast.CMP, left, right, k, 0)
+  end
+  return left
+end
+
+-- expr '~' expr | expr NO_MATCH expr
+function Parser:parse_match(): integer
+  local left = self:parse_cmp()
+  while not self:failed() do
+    local k = self:peek()
+    if k ~= T.TILDE and k ~= T.NOMATCH then break end
+    self:advance()
+    local right = self:parse_cmp()
+    left = self:mk(awkast.MATCH, left, right, k == T.NOMATCH and 1 or 0, 0)
+  end
+  return left
+end
+
+-- expr In NAME
+function Parser:parse_in(): integer
+  local left = self:parse_match()
+  while not self:failed() and self:peek() == T.IN and not self.no_in do
+    self:advance()
+    if self:peek() ~= T.NAME then self:fail('expected array name after in'); return -1 end
+    local name = self:tok().s
+    self:advance()
+    local arr = self:name_node(name)
+    local items: sequence(integer)
+    items:push(left)
+    local start, count = self.prog:list(items)
+    left = self:mk(awkast.IN, start, count, arr, 0)
+  end
+  return left
+end
+
+-- expr AND newline_opt expr
+function Parser:parse_and(): integer
+  local left = self:parse_in()
+  while not self:failed() and self:peek() == T.AND do
+    self:advance(); self:opt_newlines()
+    local right = self:parse_in()
+    left = self:mk(awkast.AND, left, right, 0, 0)
+  end
+  return left
+end
+
+-- expr OR newline_opt expr
+function Parser:parse_or(): integer
+  local left = self:parse_and()
+  while not self:failed() and self:peek() == T.OR do
+    self:advance(); self:opt_newlines()
+    local right = self:parse_and()
+    left = self:mk(awkast.OR, left, right, 0, 0)
+  end
+  return left
+end
+
+-- expr '?' expr ':' expr  (right associative)
+function Parser:parse_ternary(): integer
+  local c = self:parse_or()
+  if self:failed() then return -1 end
+  if self:accept(T.QUESTION) then
+    self:opt_newlines()
+    local a = self:parse_ternary()
+    self:opt_newlines()
+    self:expect(T.COLON, "':'")
+    self:opt_newlines()
+    local b = self:parse_ternary()
+    return self:mk(awkast.COND, c, a, b, 0)
+  end
+  return c
+end
+
+local function is_assign_op(k: byte): boolean
+  return k == T.ASSIGN or k == T.ADD_ASSIGN or k == T.SUB_ASSIGN or k == T.MUL_ASSIGN
+    or k == T.DIV_ASSIGN or k == T.MOD_ASSIGN or k == T.POW_ASSIGN
+end
+
+-- lvalue '=' expr | lvalue ADD_ASSIGN expr | ...  (right associative)
+function Parser:parse_expr(): integer
+  local left = self:parse_ternary()
+  if self:failed() then return -1 end
+  local k = self:peek()
+  if is_assign_op(k) then
+    if not is_lvalue(self, left) then self:fail('assignment to a non-lvalue'); return -1 end
+    self:advance()
+    self:opt_newlines()
+    local right = self:parse_expr()
+    local op: integer = 0
+    if k == T.ADD_ASSIGN then op = T.PLUS
+    elseif k == T.SUB_ASSIGN then op = T.MINUS
+    elseif k == T.MUL_ASSIGN then op = T.STAR
+    elseif k == T.DIV_ASSIGN then op = T.SLASH
+    elseif k == T.MOD_ASSIGN then op = T.PERCENT
+    elseif k == T.POW_ASSIGN then op = T.CARET end
+    return self:mk(awkast.ASSIGN, left, right, op, 0)
+  end
+  return left
+end
+
+local function ends_simple(k: byte): boolean
+  return k == T.NEWLINE or k == T.SEMI or k == T.RBRACE or k == T.EOF
+end
+
+-- simple_print_statement with optional output_redirection:
+--   Print print_expr_list_opt | Print '(' multiple_expr_list ')'
+--   output_redirection : '>' expr | APPEND expr | '|' expr
+function Parser:parse_print(is_printf: boolean): integer
+  local start, count = 0, 0
+  local parsed = false
+  if self:peek() == T.LPAREN then
+    -- Try the grouped form; back off when the parenthesis begins an expression.
+    local save = self.pos
+    self:advance()
+    start, count = self:parse_expr_list(T.RPAREN, "')'")
+    local k = self:peek()
+    if not self:failed() and (ends_simple(k) or k == T.GT or k == T.APPEND or k == T.PIPE) then
+      parsed = true
+    else
+      self.err = ''
+      self.pos = save
+    end
+  end
+  if not parsed then
+    local items: sequence(integer)
+    local k = self:peek()
+    if not (ends_simple(k) or k == T.GT or k == T.APPEND or k == T.PIPE) then
+      local save_gt = self.no_gt
+      self.no_gt = true
+      while true do
+        items:push(self:parse_expr())
+        if self:failed() then break end
+        if not self:accept(T.COMMA) then break end
+        self:opt_newlines()
+      end
+      self.no_gt = save_gt
+    end
+    start, count = self.prog:list(items)
+  end
+  if self:failed() then return -1 end
+  if is_printf and count == 0 then self:fail('printf: no format'); return -1 end
+  local redir: integer = awkast.REDIR_NONE
+  local target: integer = -1
+  local k = self:peek()
+  if k == T.GT or k == T.APPEND or k == T.PIPE then
+    self:advance()
+    if k == T.GT then redir = awkast.REDIR_FILE
+    elseif k == T.APPEND then redir = awkast.REDIR_APPEND
+    else redir = awkast.REDIR_PIPE end
+    local save_gt = self.no_gt
+    self.no_gt = true
+    target = self:parse_concat()
+    self.no_gt = save_gt
+  end
+  return self:mk(is_printf and awkast.PRINTF or awkast.PRINT, start, count, redir, target)
+end
+
+-- simple_statement : Delete NAME '[' expr_list ']' | Delete NAME | expr
+--   | print ... ; terminated by ';' or NEWLINE (or the closing brace).
+function Parser:parse_simple(): integer
+  local k = self:peek()
+  local n: integer = -1
+  if k == T.PRINT then
+    self:advance(); n = self:parse_print(false)
+  elseif k == T.PRINTF then
+    self:advance(); n = self:parse_print(true)
+  elseif k == T.DELETE then
+    self:advance()
+    if self:peek() ~= T.NAME then self:fail('expected array name after delete'); return -1 end
+    local arr = self:name_node(self:tok().s)
+    self:advance()
+    local start, count = 0, 0
+    if self:accept(T.LBRACKET) then
+      start, count = self:parse_expr_list(T.RBRACKET, "']'")
+    end
+    n = self:mk(awkast.DELETE, arr, start, count, 0)
+  elseif k == T.NEXT then
+    self:advance(); n = self:mk(awkast.NEXT, 0, 0, 0, 0)
+  elseif k == T.NEXTFILE then
+    self:advance(); n = self:mk(awkast.NEXTFILE, 0, 0, 0, 0)
+  elseif k == T.BREAK then
+    self:advance()
+    if self.loop_depth == 0 then self:fail('break outside a loop') end
+    n = self:mk(awkast.BREAK, 0, 0, 0, 0)
+  elseif k == T.CONTINUE then
+    self:advance()
+    if self.loop_depth == 0 then self:fail('continue outside a loop') end
+    n = self:mk(awkast.CONTINUE, 0, 0, 0, 0)
+  elseif k == T.EXIT or k == T.RETURN then
+    self:advance()
+    if k == T.RETURN and not self.in_func then self:fail('return used outside function context'); return -1 end
+    local e: integer = -1
+    if not ends_simple(self:peek()) then e = self:parse_expr() end
+    n = self:mk(k == T.EXIT and awkast.EXIT or awkast.RETURN, e, 0, 0, 0)
+  else
+    local e = self:parse_expr()
+    n = self:mk(awkast.EXPR, e, 0, 0, 0)
+  end
+  return n
+end
+
+-- terminated_statement ends in ';' or NEWLINE; a '}' may follow directly.
+function Parser:terminate()
+  local k = self:peek()
+  if k == T.SEMI or k == T.NEWLINE then self:advance(); return end
+  if k == T.RBRACE or k == T.EOF then return end
+  self:fail('unexpected ' .. kind_name(k) .. ' after statement')
+end
+
+-- Optional else after the then-branch: skip terminators only when an
+-- 'else' actually follows.
+function Parser:parse_else(): integer
+  local save = self.pos
+  self:skip_terminators()
+  if self:accept(T.ELSE) then
+    self:opt_newlines()
+    return self:parse_stmt()
+  end
+  self.pos = save
+  return -1
+end
+
+-- for '(' simple_statement_opt ';' expr_opt ';' simple_statement_opt ')'
+--   newline_opt terminated_statement
+-- for '(' NAME In NAME ')' newline_opt terminated_statement
+function Parser:parse_for(): integer
+  self:expect(T.LPAREN, "'('")
+  if self:peek() == T.NAME and self:peek2() == T.IN then
+    local save = self.pos
+    local v = self:name_node(self:tok().s)
+    self:advance(); self:advance()
+    if self:peek() == T.NAME and self:peek2() == T.RPAREN then
+      local arr = self:name_node(self:tok().s)
+      self:advance(); self:advance()
+      self:opt_newlines()
+      self.loop_depth = self.loop_depth + 1
+      local body = self:parse_stmt()
+      self.loop_depth = self.loop_depth - 1
+      return self:mk(awkast.FORIN, v, arr, body, 0)
+    end
+    self.pos = save
+  end
+  local init: integer, cond: integer, step: integer = -1, -1, -1
+  if self:peek() ~= T.SEMI then init = self:parse_simple() end
+  self:expect(T.SEMI, "';'")
+  self:opt_newlines()
+  if self:peek() ~= T.SEMI then cond = self:parse_expr() end
+  self:expect(T.SEMI, "';'")
+  self:opt_newlines()
+  if self:peek() ~= T.RPAREN then step = self:parse_simple() end
+  self:expect(T.RPAREN, "')'")
+  self:opt_newlines()
+  self.loop_depth = self.loop_depth + 1
+  local body = self:parse_stmt()
+  self.loop_depth = self.loop_depth - 1
+  return self:mk(awkast.FOR, init, cond, step, body)
+end
+
+-- terminated_statement : action newline_opt | If '(' expr ')' ... | While ...
+--   | Do newline_opt terminated_statement While '(' expr ')' | ';' | simple ';'
+function Parser:parse_stmt(): integer
+  local k = self:peek()
+  if k == T.LBRACE then
+    local b = self:parse_block()
+    return b
+  elseif k == T.SEMI then
+    self:advance()
+    local items: sequence(integer)
+    local start, count = self.prog:list(items)
+    return self:mk(awkast.BLOCK, start, count, 0, 0)
+  elseif k == T.IF then
+    self:advance()
+    self:expect(T.LPAREN, "'('")
+    local c = self:parse_expr()
+    self:expect(T.RPAREN, "')'")
+    self:opt_newlines()
+    local a = self:parse_stmt()
+    if self:failed() then return -1 end
+    local b = self:parse_else()
+    return self:mk(awkast.IF, c, a, b, 0)
+  elseif k == T.WHILE then
+    self:advance()
+    self:expect(T.LPAREN, "'('")
+    local c = self:parse_expr()
+    self:expect(T.RPAREN, "')'")
+    if self:peek() == T.SEMI then
+      self:advance()
+      local items: sequence(integer)
+      local start, count = self.prog:list(items)
+      return self:mk(awkast.WHILE, c, self:mk(awkast.BLOCK, start, count, 0, 0), 0, 0)
+    end
+    self:opt_newlines()
+    self.loop_depth = self.loop_depth + 1
+    local body = self:parse_stmt()
+    self.loop_depth = self.loop_depth - 1
+    return self:mk(awkast.WHILE, c, body, 0, 0)
+  elseif k == T.DO then
+    self:advance()
+    self:opt_newlines()
+    self.loop_depth = self.loop_depth + 1
+    local body = self:parse_stmt()
+    self.loop_depth = self.loop_depth - 1
+    self:skip_terminators()
+    self:expect(T.WHILE, "'while'")
+    self:expect(T.LPAREN, "'('")
+    local c = self:parse_expr()
+    self:expect(T.RPAREN, "')'")
+    self:terminate()
+    return self:mk(awkast.DO, body, c, 0, 0)
+  elseif k == T.FOR then
+    self:advance()
+    return self:parse_for()
+  end
+  local n = self:parse_simple()
+  if self:failed() then return -1 end
+  self:terminate()
+  return n
+end
+
+-- action : '{' newline_opt '}' | '{' newline_opt terminated_statement_list '}'
+function Parser:parse_block(): integer
+  local line = self:line()
+  self:expect(T.LBRACE, "'{'")
+  local items: sequence(integer)
+  self:skip_terminators()
+  while not self:failed() and self:peek() ~= T.RBRACE do
+    if self:peek() == T.EOF then self:fail('unexpected end of program, missing }'); break end
+    items:push(self:parse_stmt())
+    self:skip_terminators()
+  end
+  self:expect(T.RBRACE, "'}'")
+  local start, count = self.prog:list(items)
+  return self.prog:node(awkast.BLOCK, start, count, 0, 0, line)
+end
+
+-- item : Function NAME '(' param_list_opt ')' newline_opt action
+--      | Function FUNC_NAME '(' param_list_opt ')' newline_opt action
+function Parser:parse_function()
+  local k = self:peek()
+  if k ~= T.NAME and k ~= T.FUNC_NAME then self:fail('expected function name'); return end
+  local name = self:tok().s
+  self:advance()
+  if self.prog:find_func(name) >= 0 then self:fail("function '" .. name .. "' redefined"); return end
+  if self.prog.name_ids:has(name) and self.prog:global_id(name) > awkast.V_COUNT then
+    self:fail("function name '" .. name .. "' previously used as a variable"); return
+  end
+  self:expect(T.LPAREN, "'('")
+  local f: awkast.Func
+  f.name = name
+  self:opt_newlines()
+  while self:peek() == T.NAME do
+    local p = self:tok().s
+    for i = 1, #f.params do
+      if f.params[i] == p then self:fail("duplicate parameter '" .. p .. "'") end
+    end
+    if p == name then self:fail("parameter named like its function '" .. p .. "'") end
+    f.params:push(p)
+    self:advance()
+    self:opt_newlines()
+    if not self:accept(T.COMMA) then break end
+    self:opt_newlines()
+  end
+  self:expect(T.RPAREN, "')'")
+  self:opt_newlines()
+  self.prog.funcs:push(f)
+  local idx = #self.prog.funcs
+  self.in_func = true
+  self.params = f.params
+  self.prog.funcs[idx].body = self:parse_block()
+  self.in_func = false
+end
+
+-- item : pattern action | pattern | pattern ',' pattern [action]
+--      | Begin action | End action
+function Parser:parse_item()
+  local k = self:peek()
+  if k == T.FUNCTION then
+    self:advance()
+    self:parse_function()
+    return
+  end
+  local item: awkast.Item = {kind = awkast.ITEM_MAIN, pat = -1, pat2 = -1, action = -1}
+  if k == T.BEGIN or k == T.END then
+    self:advance()
+    item.kind = k == T.BEGIN and awkast.ITEM_BEGIN or awkast.ITEM_END
+    if self:peek() ~= T.LBRACE then self:fail((k == T.BEGIN and 'BEGIN' or 'END') .. ' blocks must have an action part'); return end
+    item.action = self:parse_block()
+    self.prog.items:push(item)
+    return
+  end
+  if k ~= T.LBRACE then
+    item.pat = self:parse_expr()
+    if self:failed() then return end
+    if self:accept(T.COMMA) then
+      self:opt_newlines()
+      item.pat2 = self:parse_expr()
+      if self:failed() then return end
+    end
+  end
+  if self:peek() == T.LBRACE then
+    item.action = self:parse_block()
+  else
+    local t = self:peek()
+    if t ~= T.NEWLINE and t ~= T.SEMI and t ~= T.EOF then self:fail('expected action or end of rule') end
+  end
+  self.prog.items:push(item)
+end
+
+-- program : item_list | item_list item
+function Parser:parse_program()
+  self:skip_terminators()
+  while not self:failed() and self:peek() ~= T.EOF do
+    self:parse_item()
+    self:skip_terminators()
+  end
+end
+
+-- Resolve user function calls once every definition has been seen.
+function Parser:resolve_calls()
+  for i = 1, #self.prog.nodes do
+    local n = self.prog:at(i)
+    if n.kind == awkast.CALL then
+      local f = self.prog:find_func(n.s)
+      if f < 0 then
+        self.err = string.format("function '%s' not defined", n.s)
+        return
+      end
+      n.a = f
+    end
+  end
+end
+
+-- Parse `src` into prog. Returns "" or an error message.
+function awkparse.parse(src: string, prog: *awkast.Program): string
+  local lx: awklex.Lexer = {src = src}
+  local err = lx:run()
+  if err.size > 0 then return err end
+  local p: Parser = {toks = lx.toks, pos = 1, prog = prog}
+  p:parse_program()
+  if p.err.size > 0 then return p.err end
+  p:resolve_calls()
+  return p.err
+end

@@ -1,0 +1,253 @@
+-- awk I/O: buffered record readers (files, stdin, command pipes), buffered
+-- output streams (files, pipes), and child processes run through /bin/sh.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'allocators.default'
+require 'nebox.sys'
+require 'nebox.util'
+
+global awkio = @record{}
+
+global awkio.Reader = @record{
+  name: string,
+  fd: cint,
+  pid: cint,          -- child pid for command readers, else 0
+  is_cmd: boolean,
+  buf: *[0]byte,
+  cap: usize,
+  len: usize,
+  pos: usize,
+  eof: boolean,
+}
+
+local READCHUNK: usize <comptime> = 65536
+
+function awkio.Reader:init(name: string, fd: cint, pid: cint, is_cmd: boolean)
+  self.name = name
+  self.fd = fd
+  self.pid = pid
+  self.is_cmd = is_cmd
+  self.cap = READCHUNK
+  self.buf = (@*[0]byte)(default_allocator:alloc(self.cap))
+  self.len = 0
+  self.pos = 0
+  self.eof = false
+end
+
+-- Pull more bytes; returns false at end of input or on error.
+function awkio.Reader:fill(): boolean
+  if self.eof then return false end
+  if self.pos > 0 then
+    local n = self.len - self.pos
+    for i: usize = 0, < n do self.buf[i] = self.buf[self.pos + i] end
+    self.len = n
+    self.pos = 0
+  end
+  if self.len == self.cap then
+    local ncap = self.cap * 2
+    self.buf = (@*[0]byte)(default_allocator:realloc(self.buf, ncap, self.cap))
+    self.cap = ncap
+  end
+  while true do
+    local r = sys.read(self.fd, &self.buf[self.len], self.cap - self.len)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      self.eof = true
+      return false
+    end
+    if r == 0 then self.eof = true; return false end
+    self.len = self.len + (@usize)(r)
+    return true
+  end
+  return false
+end
+
+function awkio.Reader:view(from: usize, to: usize): string
+  return (@string){data = &self.buf[from], size = to - from}
+end
+
+-- Next record separated by the single byte `sep`. The result is a view into
+-- the reader's buffer, valid until the next read.
+function awkio.Reader:record_byte(sep: byte, out: *string): boolean
+  local scan = self.pos
+  while true do
+    local i = scan
+    while i < self.len and self.buf[i] ~= sep do i = i + 1 end
+    if i < self.len then
+      $out = self:view(self.pos, i)
+      self.pos = i + 1
+      return true
+    end
+    scan = self.len - self.pos  -- relative offset; fill() may move data
+    if not self:fill() then
+      if self.pos < self.len then
+        $out = self:view(self.pos, self.len)
+        self.pos = self.len
+        return true
+      end
+      return false
+    end
+    scan = self.pos + scan
+  end
+  return false
+end
+
+-- Paragraph mode (RS == ""): records are separated by one or more blank
+-- lines; leading newlines are skipped and a trailing newline is dropped.
+function awkio.Reader:record_paragraph(out: *string): boolean
+  -- skip leading newlines
+  while true do
+    while self.pos < self.len and self.buf[self.pos] == 10 do self.pos = self.pos + 1 end
+    if self.pos < self.len then break end
+    if not self:fill() then return false end
+  end
+  local scan: usize = 0 -- offset from pos already known to hold no "\n\n"
+  while true do
+    local i = self.pos + scan
+    local found = false
+    while i + 1 < self.len do
+      if self.buf[i] == 10 and self.buf[i + 1] == 10 then found = true; break end
+      i = i + 1
+    end
+    if found then
+      $out = self:view(self.pos, i)
+      self.pos = i + 2
+      return true
+    end
+    scan = (self.len - self.pos > 0) and (self.len - self.pos - 1) or 0
+    if not self:fill() then
+      if self.pos < self.len then
+        local stop = self.len
+        if self.buf[stop - 1] == 10 then stop = stop - 1 end
+        $out = self:view(self.pos, stop)
+        self.pos = self.len
+        return true
+      end
+      return false
+    end
+  end
+  return false
+end
+
+function awkio.Reader:record(rs: string, out: *string): boolean
+  if rs.size == 0 then return self:record_paragraph(out) end
+  return self:record_byte(rs:byte(1), out)
+end
+
+function awkio.Reader:close()
+  if self.fd > 0 then sys.close(self.fd) end
+  if self.buf ~= nilptr then default_allocator:dealloc(self.buf) end
+  self.buf = nilptr
+  self.fd = -1
+end
+
+-- Output streams.
+global awkio.OUT_FILE: byte <comptime> = 1
+global awkio.OUT_PIPE: byte <comptime> = 2
+
+global awkio.Out = @record{
+  name: string,
+  kind: byte,
+  fd: cint,
+  pid: cint,
+  buf: *[0]byte,
+  len: usize,
+  failed: boolean,
+}
+
+local OUTCAP: usize <comptime> = 65536
+
+function awkio.Out:init(name: string, kind: byte, fd: cint, pid: cint)
+  self.name = name
+  self.kind = kind
+  self.fd = fd
+  self.pid = pid
+  self.buf = (@*[0]byte)(default_allocator:alloc(OUTCAP))
+  self.len = 0
+end
+
+local function write_all(fd: cint, p: *[0]byte, n: usize): boolean
+  local done: usize = 0
+  while done < n do
+    local r = sys.write(fd, &p[done], n - done)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return false
+    end
+    done = done + (@usize)(r)
+  end
+  return true
+end
+
+function awkio.Out:flush(): boolean
+  if self.len == 0 then return true end
+  local ok = write_all(self.fd, self.buf, self.len)
+  self.len = 0
+  if not ok then self.failed = true end
+  return ok
+end
+
+function awkio.Out:write(s: string)
+  if s.size >= OUTCAP then
+    self:flush()
+    if not write_all(self.fd, s.data, s.size) then self.failed = true end
+    return
+  end
+  if self.len + s.size > OUTCAP then self:flush() end
+  for i: usize = 0, < s.size do self.buf[self.len + i] = s.data[i] end
+  self.len = self.len + s.size
+end
+
+-- Wait for a child; exit status, or 256 + signal number when killed.
+function awkio.wait(pid: cint): integer
+  local status: cint = 0
+  while sys.waitpid(pid, &status, 0) < 0 do
+    if sys.errno() ~= sys.EINTR then return -1 end
+  end
+  if (status & 0x7F) == 0 then return (status >> 8) & 0xFF end
+  return 256 + (status & 0x7F)
+end
+
+-- Flush, close and (for pipes) wait; returns the close status.
+function awkio.Out:close(): integer
+  local ok = self:flush()
+  sys.close(self.fd)
+  default_allocator:dealloc(self.buf)
+  self.buf = nilptr
+  local rc: integer = 0
+  if self.kind == awkio.OUT_PIPE then rc = awkio.wait(self.pid) end
+  if not ok and rc == 0 then rc = -1 end
+  return rc
+end
+
+global awkio.SPAWN_NONE: integer <comptime> = 0
+global awkio.SPAWN_WRITE: integer <comptime> = 1   -- we write the child's stdin
+global awkio.SPAWN_READ: integer <comptime> = 2    -- we read the child's stdout
+
+-- Run `sh -c cmd`. Returns (pid, fd) where fd is our end of the pipe, or
+-- (-1, -1) on failure. Callers flush every output stream first.
+function awkio.spawn(cmd: string, mode: integer): (cint, cint)
+  local ccmd = string.copy(cmd) -- NUL-terminated for execve
+  local fds: [2]cint = {-1, -1}
+  if mode ~= awkio.SPAWN_NONE and sys.pipe(&fds) ~= 0 then return -1, -1 end
+  local pid = sys.fork()
+  if pid < 0 then
+    if mode ~= awkio.SPAWN_NONE then sys.close(fds[0]); sys.close(fds[1]) end
+    return -1, -1
+  end
+  if pid == 0 then
+    if mode == awkio.SPAWN_WRITE then
+      sys.dup2(fds[0], 0); sys.close(fds[0]); sys.close(fds[1])
+    elseif mode == awkio.SPAWN_READ then
+      sys.dup2(fds[1], 1); sys.close(fds[0]); sys.close(fds[1])
+    end
+    local argv: [4]cstring = {'sh', '-c', (@cstring)(ccmd.data), nilptr}
+    sys.execve('/bin/sh', &argv, environ)
+    sys._exit(127)
+  end
+  if mode == awkio.SPAWN_WRITE then sys.close(fds[0]); return pid, fds[1] end
+  if mode == awkio.SPAWN_READ then sys.close(fds[1]); return pid, fds[0] end
+  return pid, -1
+end

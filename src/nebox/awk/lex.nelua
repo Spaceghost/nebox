@@ -1,0 +1,421 @@
+-- awk lexer: turns program text into a token array. Tokenizing up front
+-- lets the parser backtrack (print grouping, (i,j) in arr) with an index.
+-- Grammar references are to POSIX.1-2017 XCU awk "Grammar" and "Lexical
+-- Conventions".
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+
+## local function B(c) return string.byte(c) end
+
+global awklex = @record{}
+
+-- Token kinds.
+global awklex.EOF: byte <comptime> = 0
+global awklex.NEWLINE: byte <comptime> = 1
+global awklex.NUMBER: byte <comptime> = 2
+global awklex.STRING: byte <comptime> = 3
+global awklex.ERE: byte <comptime> = 4
+global awklex.NAME: byte <comptime> = 5
+global awklex.FUNC_NAME: byte <comptime> = 6   -- NAME immediately followed by '('
+global awklex.BUILTIN: byte <comptime> = 7     -- builtin function name (s holds it)
+-- keywords
+global awklex.BEGIN: byte <comptime> = 10
+global awklex.END: byte <comptime> = 11
+global awklex.FUNCTION: byte <comptime> = 12
+global awklex.IF: byte <comptime> = 13
+global awklex.ELSE: byte <comptime> = 14
+global awklex.WHILE: byte <comptime> = 15
+global awklex.FOR: byte <comptime> = 16
+global awklex.DO: byte <comptime> = 17
+global awklex.BREAK: byte <comptime> = 18
+global awklex.CONTINUE: byte <comptime> = 19
+global awklex.NEXT: byte <comptime> = 20
+global awklex.NEXTFILE: byte <comptime> = 21
+global awklex.EXIT: byte <comptime> = 22
+global awklex.RETURN: byte <comptime> = 23
+global awklex.DELETE: byte <comptime> = 24
+global awklex.IN: byte <comptime> = 25
+global awklex.GETLINE: byte <comptime> = 26
+global awklex.PRINT: byte <comptime> = 27
+global awklex.PRINTF: byte <comptime> = 28
+-- punctuation and operators
+global awklex.LBRACE: byte <comptime> = 40
+global awklex.RBRACE: byte <comptime> = 41
+global awklex.LPAREN: byte <comptime> = 42
+global awklex.RPAREN: byte <comptime> = 43
+global awklex.LBRACKET: byte <comptime> = 44
+global awklex.RBRACKET: byte <comptime> = 45
+global awklex.SEMI: byte <comptime> = 46
+global awklex.COMMA: byte <comptime> = 47
+global awklex.PLUS: byte <comptime> = 48
+global awklex.MINUS: byte <comptime> = 49
+global awklex.STAR: byte <comptime> = 50
+global awklex.SLASH: byte <comptime> = 51
+global awklex.PERCENT: byte <comptime> = 52
+global awklex.CARET: byte <comptime> = 53
+global awklex.NOT: byte <comptime> = 54
+global awklex.GT: byte <comptime> = 55
+global awklex.LT: byte <comptime> = 56
+global awklex.PIPE: byte <comptime> = 57
+global awklex.QUESTION: byte <comptime> = 58
+global awklex.COLON: byte <comptime> = 59
+global awklex.TILDE: byte <comptime> = 60
+global awklex.DOLLAR: byte <comptime> = 61
+global awklex.ASSIGN: byte <comptime> = 62
+global awklex.ADD_ASSIGN: byte <comptime> = 63
+global awklex.SUB_ASSIGN: byte <comptime> = 64
+global awklex.MUL_ASSIGN: byte <comptime> = 65
+global awklex.DIV_ASSIGN: byte <comptime> = 66
+global awklex.MOD_ASSIGN: byte <comptime> = 67
+global awklex.POW_ASSIGN: byte <comptime> = 68
+global awklex.EQ: byte <comptime> = 69
+global awklex.LE: byte <comptime> = 70
+global awklex.GE: byte <comptime> = 71
+global awklex.NE: byte <comptime> = 72
+global awklex.INCR: byte <comptime> = 73
+global awklex.DECR: byte <comptime> = 74
+global awklex.AND: byte <comptime> = 75
+global awklex.OR: byte <comptime> = 76
+global awklex.NOMATCH: byte <comptime> = 77
+global awklex.APPEND: byte <comptime> = 78
+
+global awklex.Token = @record{
+  kind: byte,
+  s: string,      -- text for NAME/FUNC_NAME/BUILTIN/STRING/ERE
+  n: float64,     -- value for NUMBER
+  line: integer,
+}
+
+global awklex.Lexer = @record{
+  src: string,
+  pos: usize,       -- 1-based
+  line: integer,
+  toks: sequence(awklex.Token),
+  err: string,
+}
+
+local function isdigit(c: byte): boolean return c >= #[B'0']# and c <= #[B'9']# end
+local function isalpha(c: byte): boolean
+  return (c >= #[B'a']# and c <= #[B'z']#) or (c >= #[B'A']# and c <= #[B'Z']#) or c == #[B'_']#
+end
+local function isalnum(c: byte): boolean return isalpha(c) or isdigit(c) end
+
+function awklex.Lexer:peek(off: usize): byte
+  local p = self.pos + off
+  if p > self.src.size then return 0 end
+  return self.src:byte(p)
+end
+
+function awklex.Lexer:push(kind: byte, s: string, n: float64)
+  self.toks:push((@awklex.Token){kind = kind, s = s, n = n, line = self.line})
+end
+
+-- Does the previous token end an operand? Then '/' is division, not a regex.
+function awklex.Lexer:regex_allowed(): boolean
+  if #self.toks == 0 then return true end
+  local k = self.toks[#self.toks].kind
+  if k == awklex.NUMBER or k == awklex.STRING or k == awklex.ERE or k == awklex.NAME
+    or k == awklex.FUNC_NAME or k == awklex.BUILTIN or k == awklex.RPAREN
+    or k == awklex.RBRACKET or k == awklex.DOLLAR or k == awklex.INCR or k == awklex.DECR then
+    return false
+  end
+  return true
+end
+
+-- Keyword table ("Lexical Conventions": tokens recognized before NAME).
+local function keyword(s: string): byte
+  if s == 'BEGIN' then return awklex.BEGIN
+  elseif s == 'END' then return awklex.END
+  elseif s == 'function' then return awklex.FUNCTION
+  elseif s == 'if' then return awklex.IF
+  elseif s == 'else' then return awklex.ELSE
+  elseif s == 'while' then return awklex.WHILE
+  elseif s == 'for' then return awklex.FOR
+  elseif s == 'do' then return awklex.DO
+  elseif s == 'break' then return awklex.BREAK
+  elseif s == 'continue' then return awklex.CONTINUE
+  elseif s == 'next' then return awklex.NEXT
+  elseif s == 'nextfile' then return awklex.NEXTFILE
+  elseif s == 'exit' then return awklex.EXIT
+  elseif s == 'return' then return awklex.RETURN
+  elseif s == 'delete' then return awklex.DELETE
+  elseif s == 'in' then return awklex.IN
+  elseif s == 'getline' then return awklex.GETLINE
+  elseif s == 'print' then return awklex.PRINT
+  elseif s == 'printf' then return awklex.PRINTF
+  end
+  return 0
+end
+
+global function awklex_is_builtin(s: string): boolean
+  return s == 'length' or s == 'substr' or s == 'index' or s == 'split' or s == 'sub'
+    or s == 'gsub' or s == 'match' or s == 'sprintf' or s == 'tolower' or s == 'toupper'
+    or s == 'int' or s == 'sqrt' or s == 'exp' or s == 'log' or s == 'sin' or s == 'cos'
+    or s == 'atan2' or s == 'rand' or s == 'srand' or s == 'system' or s == 'close'
+end
+
+-- Expand the escape sequences of a string literal, a -v value or a command
+-- line assignment ("Lexical Conventions", table of escape sequences). An
+-- unknown \c yields c, as gawk does; POSIX leaves it undefined.
+global function awklex_unescape(s: string): string
+  local sb: stringbuilder
+  local i: usize = 1
+  while i <= s.size do
+    local c = s:byte(i)
+    if c ~= #[B'\\']# or i == s.size then
+      sb:writebyte(c); i = i + 1
+      continue
+    end
+    i = i + 1
+    local e = s:byte(i)
+    if e == #[B'n']# then sb:writebyte(10)
+    elseif e == #[B't']# then sb:writebyte(9)
+    elseif e == #[B'r']# then sb:writebyte(13)
+    elseif e == #[B'a']# then sb:writebyte(7)
+    elseif e == #[B'b']# then sb:writebyte(8)
+    elseif e == #[B'f']# then sb:writebyte(12)
+    elseif e == #[B'v']# then sb:writebyte(11)
+    elseif e == 10 then -- backslash-newline inside a string continues it
+    elseif e >= #[B'0']# and e <= #[B'7']# then
+      local v: integer = 0
+      local digits: integer = 0
+      while digits < 3 and i <= s.size and s:byte(i) >= #[B'0']# and s:byte(i) <= #[B'7']# do
+        v = v * 8 + (s:byte(i) - #[B'0']#)
+        i = i + 1; digits = digits + 1
+      end
+      sb:writebyte((@byte)(v & 0xff))
+      continue
+    else
+      sb:writebyte(e) -- \\ \" \/ and unknown escapes
+    end
+    i = i + 1
+  end
+  return sb:promote()
+end
+
+local function regex_special(b: byte): boolean
+  return b == #[B'.']# or b == #[B'[']# or b == #[B']']# or b == #[B'(']# or b == #[B')']#
+    or b == #[B'*']# or b == #[B'+']# or b == #[B'?']# or b == #[B'{']# or b == #[B'}']#
+    or b == #[B'|']# or b == #[B'^']# or b == #[B'$']# or b == #[B'\\']# or b == #[B'/']#
+end
+
+-- Resolve the awk-level escapes of an ERE token (\n \t \/ \" \ddd ...) to
+-- bytes, keeping regex escapes such as \. \\ \( for the regex compiler. A
+-- resolved byte that is special in an ERE is re-escaped.
+global function awklex_ere_text(s: string): string
+  local sb: stringbuilder
+  local i: usize = 1
+  while i <= s.size do
+    local c = s:byte(i)
+    if c ~= #[B'\\']# or i == s.size then
+      sb:writebyte(c); i = i + 1
+      continue
+    end
+    local e = s:byte(i + 1)
+    local b: integer = -1
+    local consumed: usize = 2
+    if e == #[B'n']# then b = 10
+    elseif e == #[B't']# then b = 9
+    elseif e == #[B'r']# then b = 13
+    elseif e == #[B'a']# then b = 7
+    elseif e == #[B'b']# then b = 8
+    elseif e == #[B'f']# then b = 12
+    elseif e == #[B'v']# then b = 11
+    elseif e == #[B'/']# then b = #[B'/']#
+    elseif e == #[B'"']# then b = #[B'"']#
+    elseif e >= #[B'0']# and e <= #[B'7']# then
+      local v: integer = 0
+      local j = i + 1
+      local digits: integer = 0
+      while digits < 3 and j <= s.size and s:byte(j) >= #[B'0']# and s:byte(j) <= #[B'7']# do
+        v = v * 8 + (s:byte(j) - #[B'0']#)
+        j = j + 1; digits = digits + 1
+      end
+      b = v & 0xff
+      consumed = j - i
+    end
+    if b < 0 then
+      sb:writebyte(c); sb:writebyte(e) -- regex escape, pass through
+    else
+      if regex_special((@byte)(b)) then sb:writebyte(#[B'\\']#) end
+      sb:writebyte((@byte)(b))
+    end
+    i = i + consumed
+  end
+  return sb:promote()
+end
+
+function awklex.Lexer:fail(msg: string)
+  if self.err.size == 0 then
+    self.err = string.format('syntax error at source line %d: %s', self.line, msg)
+  end
+end
+
+-- Lex a numeric constant: digits [. digits] [e [+-] digits] | . digits.
+function awklex.Lexer:number()
+  local start = self.pos
+  while isdigit(self:peek(0)) do self.pos = self.pos + 1 end
+  if self:peek(0) == #[B'.']# then
+    self.pos = self.pos + 1
+    while isdigit(self:peek(0)) do self.pos = self.pos + 1 end
+  end
+  local c = self:peek(0)
+  if c == #[B'e']# or c == #[B'E']# then
+    local save = self.pos
+    self.pos = self.pos + 1
+    local d = self:peek(0)
+    if d == #[B'+']# or d == #[B'-']# then self.pos = self.pos + 1 end
+    if isdigit(self:peek(0)) then
+      while isdigit(self:peek(0)) do self.pos = self.pos + 1 end
+    else
+      self.pos = save
+    end
+  end
+  local text = string.copy(self.src:subview(start, self.pos - 1))
+  local v = sys.strtod(text, nilptr)
+  self:push(awklex.NUMBER, '', v)
+end
+
+-- Lex a string literal; the closing quote may not be preceded by a newline.
+function awklex.Lexer:str()
+  self.pos = self.pos + 1 -- opening quote
+  local start = self.pos
+  while true do
+    local c = self:peek(0)
+    if c == 0 or c == 10 then self:fail('unterminated string'); return end
+    if c == #[B'"']# then break end
+    if c == #[B'\\']# then
+      if self:peek(1) == 10 then self.line = self.line + 1 end
+      self.pos = self.pos + 1
+    end
+    self.pos = self.pos + 1
+  end
+  local raw = self.src:subview(start, self.pos - 1)
+  self.pos = self.pos + 1 -- closing quote
+  self:push(awklex.STRING, awklex_unescape(raw), 0)
+end
+
+-- Lex /ere/: ends at the first unescaped '/'.
+function awklex.Lexer:ere()
+  self.pos = self.pos + 1
+  local start = self.pos
+  while true do
+    local c = self:peek(0)
+    if c == 0 or c == 10 then self:fail('unterminated regexp'); return end
+    if c == #[B'/']# then break end
+    if c == #[B'\\']# then self.pos = self.pos + 1 end
+    self.pos = self.pos + 1
+  end
+  local raw = self.src:subview(start, self.pos - 1)
+  self.pos = self.pos + 1
+  self:push(awklex.ERE, awklex_ere_text(raw), 0)
+end
+
+function awklex.Lexer:word()
+  local start = self.pos
+  while isalnum(self:peek(0)) do self.pos = self.pos + 1 end
+  local w = string.copy(self.src:subview(start, self.pos - 1))
+  local k = keyword(w)
+  if k ~= 0 then self:push(k, w, 0); return end
+  if awklex_is_builtin(w) then self:push(awklex.BUILTIN, w, 0); return end
+  if self:peek(0) == #[B'(']# then self:push(awklex.FUNC_NAME, w, 0); return end
+  self:push(awklex.NAME, w, 0)
+end
+
+-- Two-character operators first, then single characters.
+function awklex.Lexer:op()
+  local c = self:peek(0)
+  local d = self:peek(1)
+  local kind: byte = 0
+  local len: usize = 2
+  if c == #[B'+']# and d == #[B'+']# then kind = awklex.INCR
+  elseif c == #[B'-']# and d == #[B'-']# then kind = awklex.DECR
+  elseif c == #[B'+']# and d == #[B'=']# then kind = awklex.ADD_ASSIGN
+  elseif c == #[B'-']# and d == #[B'=']# then kind = awklex.SUB_ASSIGN
+  elseif c == #[B'*']# and d == #[B'=']# then kind = awklex.MUL_ASSIGN
+  elseif c == #[B'/']# and d == #[B'=']# then kind = awklex.DIV_ASSIGN
+  elseif c == #[B'%']# and d == #[B'=']# then kind = awklex.MOD_ASSIGN
+  elseif c == #[B'^']# and d == #[B'=']# then kind = awklex.POW_ASSIGN
+  elseif c == #[B'=']# and d == #[B'=']# then kind = awklex.EQ
+  elseif c == #[B'<']# and d == #[B'=']# then kind = awklex.LE
+  elseif c == #[B'>']# and d == #[B'=']# then kind = awklex.GE
+  elseif c == #[B'!']# and d == #[B'=']# then kind = awklex.NE
+  elseif c == #[B'!']# and d == #[B'~']# then kind = awklex.NOMATCH
+  elseif c == #[B'&']# and d == #[B'&']# then kind = awklex.AND
+  elseif c == #[B'|']# and d == #[B'|']# then kind = awklex.OR
+  elseif c == #[B'>']# and d == #[B'>']# then kind = awklex.APPEND
+  else
+    len = 1
+    if c == #[B'{']# then kind = awklex.LBRACE
+    elseif c == #[B'}']# then kind = awklex.RBRACE
+    elseif c == #[B'(']# then kind = awklex.LPAREN
+    elseif c == #[B')']# then kind = awklex.RPAREN
+    elseif c == #[B'[']# then kind = awklex.LBRACKET
+    elseif c == #[B']']# then kind = awklex.RBRACKET
+    elseif c == #[B';']# then kind = awklex.SEMI
+    elseif c == #[B',']# then kind = awklex.COMMA
+    elseif c == #[B'+']# then kind = awklex.PLUS
+    elseif c == #[B'-']# then kind = awklex.MINUS
+    elseif c == #[B'*']# then kind = awklex.STAR
+    elseif c == #[B'/']# then kind = awklex.SLASH
+    elseif c == #[B'%']# then kind = awklex.PERCENT
+    elseif c == #[B'^']# then kind = awklex.CARET
+    elseif c == #[B'!']# then kind = awklex.NOT
+    elseif c == #[B'>']# then kind = awklex.GT
+    elseif c == #[B'<']# then kind = awklex.LT
+    elseif c == #[B'|']# then kind = awklex.PIPE
+    elseif c == #[B'?']# then kind = awklex.QUESTION
+    elseif c == #[B':']# then kind = awklex.COLON
+    elseif c == #[B'~']# then kind = awklex.TILDE
+    elseif c == #[B'$']# then kind = awklex.DOLLAR
+    elseif c == #[B'=']# then kind = awklex.ASSIGN
+    else
+      self:fail(string.format("unexpected character '%s'", string.char(c)))
+      self.pos = self.pos + 1
+      return
+    end
+  end
+  self.pos = self.pos + len
+  self:push(kind, '', 0)
+end
+
+-- Tokenize the whole program. Returns "" or an error message.
+function awklex.Lexer:run(): string
+  self.pos = 1
+  self.line = 1
+  while self.err.size == 0 do
+    local c = self:peek(0)
+    if c == 0 then break end
+    if c == 32 or c == 9 or c == 13 then
+      self.pos = self.pos + 1
+    elseif c == 10 then
+      self:push(awklex.NEWLINE, '', 0)
+      self.line = self.line + 1
+      self.pos = self.pos + 1
+    elseif c == #[B'\\']# and self:peek(1) == 10 then -- line continuation
+      self.line = self.line + 1
+      self.pos = self.pos + 2
+    elseif c == #[B'\\']# and self:peek(1) == 13 and self:peek(2) == 10 then
+      self.line = self.line + 1
+      self.pos = self.pos + 3
+    elseif c == #[B'#']# then
+      while self:peek(0) ~= 0 and self:peek(0) ~= 10 do self.pos = self.pos + 1 end
+    elseif isdigit(c) or (c == #[B'.']# and isdigit(self:peek(1))) then
+      self:number()
+    elseif c == #[B'"']# then
+      self:str()
+    elseif c == #[B'/']# and self:regex_allowed() then
+      self:ere()
+    elseif isalpha(c) then
+      self:word()
+    else
+      self:op()
+    end
+  end
+  self:push(awklex.EOF, '', 0)
+  return self.err
+end
