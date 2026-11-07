@@ -197,6 +197,21 @@ Stated here rather than worked around:
   patches and perturbed targets (2,000 cases, no difference; `make test` runs
   200). Not supported: ed scripts (`-e`), `-D`, `-l`, `--merge`, `--posix`,
   git diffs (renames, modes, binary), version control lookups.
+- `dd` is a port of GNU coreutils 9.1 `src/dd.c` (read from its source):
+  every operand (`iseek`/`oseek` too), conversion and flag, GNU's number
+  syntax (`b c w k K M G T P E Z Y`, `kB`/`KiB` second suffixes, a `B`
+  suffix meaning bytes, one `x` multiplication and the `0x` warning), `bs=`
+  copying each read as it came while `ibs`/`obs` gather partial reads,
+  skipping by `lseek` or by reading, `conv=sparse` with the final
+  `ftruncate`, `oflag=direct`'s unaligned last write, `iflag=nocache`
+  advice, the statistics lines with gnulib `human_readable` rounding,
+  `status=progress`, and statistics on SIGUSR1 (not under `POSIXLY_CORRECT`)
+  and SIGINT. Diagnostics use GNU's wording and shell-escape quoting.
+  `tests/dd_compare.py` runs 154 fixed cases plus random ones against GNU dd
+  and compares output, diagnostics, exit status and the files left behind
+  (only the timing part of the statistics is masked); SIGUSR1, SIGINT and
+  progress output were compared by hand. `--help` is shorter than GNU's;
+  the rate uses double rather than long double arithmetic.
 - `diff` follows GNU diffutils 3.8's algorithm step by step (`find_identical_ends`
   on bytes with horizon lines, `discard_confusing_lines`, the middle-snake
   `compareseq` with its cost cut-off, `shift_boundaries`), so its edit

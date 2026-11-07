@@ -188,6 +188,10 @@ function sys.errno(): cint
   return $errno_location()
 end
 
+function sys.seterrno(e: cint)
+  $errno_location() = e
+end
+
 function sys.errstr(): string
   return sys.strerror(sys.errno())
 end

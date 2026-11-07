@@ -94,6 +94,59 @@ function util.die(s: string): integer
   return 1
 end
 
+-- GNU quotearg's shell-escape styles in the C locale, as coreutils prints
+-- file names in diagnostics: quoteaf (always quoted) and quotef (quoted only
+-- when needed; a ':' also needs it). Bytes outside printable ASCII become
+-- $'\ooo' pieces; a name with a single quote and no other trouble is
+-- double-quoted.
+local function shell_escape(s: string, always: boolean, colon: boolean): string
+  local need = always or s.size == 0
+  local ctrl, squote, dq_bad = false, false, false
+  for i = 1, s.size do
+    local c = s:byte(i)
+    if c < 32 or c >= 127 then ctrl = true; need = true
+    elseif c == 39 then squote = true; need = true
+    elseif c == 32 or c == 33 or c == 34 or c == 36 or c == 38 or c == 40 or c == 41 or c == 42
+        or c == 59 or c == 60 or c == 61 or c == 62 or c == 63 or c == 91 or c == 92 or c == 94
+        or c == 96 or c == 124 then need = true
+    elseif (c == 35 or c == 126) and i == 1 then need = true
+    elseif c == 58 and colon then need = true end
+    if c == 34 or c == 36 or c == 92 or c == 96 then dq_bad = true end
+  end
+  if not need then return s end
+  local sb: stringbuilder
+  if squote and not ctrl and not dq_bad then
+    sb:write('"', s, '"')
+    return sb:promote()
+  end
+  local inq = false   -- inside '...'
+  local indollar = false
+  sb:write("'"); inq = true
+  for i = 1, s.size do
+    local c = s:byte(i)
+    if c < 32 or c >= 127 then
+      if not indollar then
+        if inq then sb:write("'"); inq = false end
+        sb:write("$'"); indollar = true
+      end
+      if c == 7 then sb:write('\\a') elseif c == 8 then sb:write('\\b')
+      elseif c == 9 then sb:write('\\t') elseif c == 10 then sb:write('\\n')
+      elseif c == 11 then sb:write('\\v') elseif c == 12 then sb:write('\\f')
+      elseif c == 13 then sb:write('\\r')
+      else sb:writef('\\%03o', c) end
+    else
+      if indollar then sb:write("'"); indollar = false end
+      if not inq then sb:write("'"); inq = true end
+      if c == 39 then sb:write("'\\''") else sb:writebyte(c) end
+    end
+  end
+  if inq or indollar then sb:write("'") end
+  return sb:promote()
+end
+
+function util.quoteaf(s: string): string return shell_escape(s, true, false) end
+function util.quotef(s: string): string return shell_escape(s, false, true) end
+
 -- Option parsing: short flags only, POSIX style. `spec` lists the accepted
 -- letters; a letter followed by ':' takes a value. Parsing stops at the first
 -- operand, at "--", or at "-" (which is an operand).
