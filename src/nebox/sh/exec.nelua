@@ -77,7 +77,8 @@ global shexec.State = @record{
   -- jobs
   jobs: sequence(shexec.Job),
   -- getopts
-  optind_seen: integer,
+  optind_seen: integer,   -- the OPTIND value getopts last stored
+  optind_real: integer,   -- the argument getopts is in (OPTIND is one past it mid-group)
   optpos: integer,
   -- command path cache
   cmd_hash: hashmap(string, string),
@@ -795,7 +796,8 @@ local function exec_simple(n: *N.Node): integer
   local bidx, special = shexec.builtin_lookup(name)
   local fn = shst.funcs:peek(name)
   if bidx > 0 and special then
-    for i = 1, #assigns do do_assign(assigns[i], false) end
+    -- assignments persist; before `exec cmd` they also reach cmd's environment
+    for i = 1, #assigns do do_assign(assigns[i], name == 'exec' and #args > 1) end
     local save: sequence(shexec.Saved)
     if n.r1 > 0 and not shexec.apply_redirs(n.r0, n.r1, &save) then
       shexec.restore_redirs(&save)
@@ -1151,6 +1153,7 @@ function shexec.init(arg0: string)
   if not has_ps2 then shexec.setvar('PS2', '> ') end
   shexec.setvar('OPTIND', '1')
   shst.optind_seen = 1
+  shst.optind_real = 1
   shst.optpos = 0
   shexec.setvar('PPID', string.format('%d', sys.getppid()))
   -- PWD: keep the inherited value when it names the current directory

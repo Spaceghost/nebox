@@ -117,7 +117,22 @@ local function bi_eval(args: sequence(string)): integer
     sb:write(args[i])
   end
   if #sb == 0 then return 0 end
-  return shexec.run_string(sb:promote(), shst.lineno)
+  local text = sb:promote()
+  if command_wrapped then
+    -- Under `command`, a syntax error returns instead of exiting the shell.
+    -- The parser exits on error, so check the text in a child first.
+    local pid = shexec.fork_child()
+    if pid < 0 then return rberr('eval: cannot fork: ' .. sys.errstr()) end
+    if pid == 0 then
+      local lx: shlex.Lexer
+      lx:init_text(text)
+      lx.srcs[1].line = shst.lineno
+      shparse.program(&lx)
+      sys._exit(0)
+    end
+    if shexec.wait_pid(pid, false) ~= 0 then return 2 end
+  end
+  return shexec.run_string(text, shst.lineno)
 end
 
 local function bi_exec(args: sequence(string)): integer
@@ -495,7 +510,8 @@ local function bi_cd(args: sequence(string)): integer
   local print_it = false
   if i > #args then
     local h, set = shexec.getvar('HOME')
-    if not set or h.size == 0 then return rberr('cd: HOME not set') end
+    -- HOME unset or empty: implementation-defined (XCU cd); do nothing, as dash does
+    if not set or h.size == 0 then return 0 end
     dir = h
   else
     dir = args[i]
@@ -554,11 +570,21 @@ local function bi_pwd(args: sequence(string)): integer
     elseif args[i] == '--' then
     else return rberr('pwd: Illegal option ' .. args[i]) end
   end
+  local cwd = getcwd_str()
   if not physical then
+    -- -L: $PWD if it is an absolute name of the current directory without . or ..
     local pwd, set = shexec.getvar('PWD')
-    if set and pwd.size > 0 and pwd:byte(1) == #[B'/']# then util.line(pwd); return 0 end
+    if set and pwd.size > 0 and pwd:byte(1) == #[B'/']# and canon(pwd) == pwd then
+      local a: sys.Stat
+      local b: sys.Stat
+      if sys.stat(pwd, &a) == 0 and sys.stat('.', &b) == 0 and a.st_ino == b.st_ino and a.st_dev == b.st_dev then
+        util.line(pwd)
+        return 0
+      end
+    end
   end
-  util.line(getcwd_str())
+  if cwd.size == 0 then return rberr('pwd: ' .. sys.errstr()) end
+  util.line(cwd)
   return 0
 end
 
@@ -590,7 +616,7 @@ local function bi_read(args: sequence(string)): integer
     if not N.is_name(args[i]) then return rberr('read: ' .. args[i] .. ': bad variable name') end
     names:push(args[i]); i = i + 1
   end
-  if #names == 0 then names:push('REPLY') end
+  if #names == 0 then return rberr('read: arg count') end
   util.flush()
   -- read one line, byte by byte so the input position is left after it
   local line: stringbuilder
@@ -633,6 +659,17 @@ local function bi_read(args: sequence(string)): integer
       -- the rest of the line, trailing IFS whitespace removed
       local stop = n
       while stop > pos and not escaped[stop] and read_ws(sep, text.data[stop - 1]) do stop = stop - 1 end
+      -- if the rest is one field ended by a non-whitespace IFS delimiter,
+      -- that delimiter (and IFS whitespace before it) is not part of it
+      if stop > pos and not escaped[stop] and read_sep(sep, text.data[stop - 1]) then
+        local e = stop - 1
+        while e > pos and not escaped[e] and read_ws(sep, text.data[e - 1]) do e = e - 1 end
+        local inner = false
+        for k = pos, < e do
+          if not escaped[k + 1] and read_sep(sep, text.data[k]) then inner = true; break end
+        end
+        if not inner then stop = e end
+      end
       for k = pos, < stop do sb:writebyte(text.data[k]) end
       pos = n
     else
@@ -652,9 +689,14 @@ local function bi_read(args: sequence(string)): integer
   return 0
 end
 
+-- Record getopts' position. Inside a group of options (-ab), OPTIND
+-- already names the next argument, as dash does; the current one is kept
+-- internally.
 local function finish(ind: integer, pos: integer)
-  shexec.setvar('OPTIND', string.format('%d', ind))
-  shst.optind_seen = ind
+  local shown = pos > 0 and ind + 1 or ind
+  shexec.setvar('OPTIND', string.format('%d', shown))
+  shst.optind_seen = shown
+  shst.optind_real = ind
   shst.optpos = pos
 end
 
@@ -672,7 +714,7 @@ local function bi_getopts(args: sequence(string)): integer
   local oi, _ = shexec.getvar('OPTIND')
   local optind, ok = util.toint(oi)
   if not ok or optind < 1 then optind = 1 end
-  if optind ~= shst.optind_seen then shst.optpos = 0 end
+  if optind ~= shst.optind_seen then shst.optpos = 0 else optind = shst.optind_real end
   local silent = optstring.size > 0 and optstring:byte(1) == #[B':']#
   if optind > #opargs then
     shexec.setvar(name, '?')
@@ -784,7 +826,7 @@ local function bi_kill(args: sequence(string)): integer
       local v, ok = util.toint(args[k])
       if ok and v > 128 then v = v - 128 end
       local n = ok and shexec.signame(v) or ''
-      if n.size == 0 then shexec.errmsg('kill: ' .. args[k] .. ': invalid signal number'); rc = 1
+      if n.size == 0 then shexec.errmsg('kill: ' .. args[k] .. ': invalid signal number'); rc = 2
       else util.line(n) end
     end
     return rc
@@ -1040,6 +1082,10 @@ local function bi_echo(args: sequence(string)): integer
     i = i + 1
   end
   if newline and not stop then util.writebyte(10) end
+  if not util.flush() then
+    shexec.errmsg('echo: ' .. sys.errstr())
+    return 1
+  end
   return 0
 end
 
@@ -1054,6 +1100,10 @@ local function bi_printf(args: sequence(string)): integer
   util.applet = 'printf'
   local rc = applet_printf(rest_args(args))
   util.applet = saved
+  if not util.flush() then
+    shexec.errmsg('printf: ' .. sys.errstr())
+    return 1
+  end
   return rc
 end
 
@@ -1098,9 +1148,19 @@ local function describe(name: string, verbose: boolean, path_only: boolean, path
     end
     return true
   end
-  local path, _ = shexec.find_command(name, pathstr, false)
-  if path.size == 0 or (name:find('/', 1, true) > 0 and sys.access(path, sys.X_OK) ~= 0) then
-    return false
+  local path: string
+  if name:find('/', 1, true) > 0 then
+    -- XCU command -v: names containing a slash are written as absolute pathnames
+    if not util.exists(name) or util.isdir(name) then return false end
+    path = name
+    if name:byte(1) ~= #[B'/']# then
+      local pwd, set = shexec.getvar('PWD')
+      if not set or pwd.size == 0 or pwd:byte(1) ~= #[B'/']# then pwd = getcwd_str() end
+      path = canon(util.join(pwd, name))
+    end
+  else
+    path = shexec.find_command(name, pathstr, false)
+    if path.size == 0 then return false end
   end
   if verbose then util.line(name .. ' is ' .. path) else util.line(path) end
   return true
