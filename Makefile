@@ -36,6 +36,7 @@ $(NELIBC_LIB):
 
 test: $(OUT)/nebox
 	sh tests/run.sh $(abspath $(OUT)/nebox)
+	python3 tests/sh_interactive.py $(abspath $(OUT)/nebox)
 
 clean:
 	rm -rf $(OUT)

@@ -18,6 +18,22 @@ require 'nebox.sh.parse'
 require 'nebox.sh.arith'
 require 'nebox.sh.expand'
 
+-- Error recovery for the interactive shell. setjmp must run in the frame of
+-- the prompt loop, so it is a macro over one static jmp_buf.
+##[==[
+cemitdecl[[
+#include <setjmp.h>
+extern jmp_buf nebox_sh_recover_jb;
+#define nebox_sh_setjmp() setjmp(nebox_sh_recover_jb)
+#define nebox_sh_longjmp() longjmp(nebox_sh_recover_jb, 1)
+]]
+cemitdefn[[
+jmp_buf nebox_sh_recover_jb;
+]]
+]==]
+local function nebox_sh_setjmp(): cint <cimport, nodecl> end
+local function nebox_sh_longjmp(): void <cimport, nodecl> end
+
 ## local function B(c) return string.byte(c) end
 
 global shexec = @record{}
@@ -84,6 +100,9 @@ global shexec.State = @record{
   cmd_hash: hashmap(string, string),
   -- the top-level input (for `sh -c`, scripts and stdin)
   main_lexer: *shlex.Lexer,
+  -- interactive shell (-i): errors return to the prompt instead of exiting
+  interactive: boolean,
+  recover_armed: boolean,
 }
 
 global shst: shexec.State
@@ -124,15 +143,26 @@ function shexec.exit_shell(code: integer) <noreturn>
   sys._exit((@cint)(code))
 end
 
+-- An error that exits a non-interactive shell (POSIX 2.8.1). The interactive
+-- shell itself goes back to its prompt; its subshells still exit.
+function shexec.error_exit(code: integer) <noreturn>
+  if shst.interactive and shst.recover_armed and not shst.in_subshell and sys.getpid() == shst.shell_pid then
+    shst.status = code
+    util.flush()
+    nebox_sh_longjmp()
+  end
+  shexec.exit_shell(code)
+end
+
 function shexec.fatal(msg: string) <noreturn>
   shexec.errmsg(msg)
-  shexec.exit_shell(2)
+  shexec.error_exit(2)
 end
 
 local function on_syntax_error(msg: string, line: integer)
   shst.lineno = line
   shexec.errmsg(msg)
-  shexec.exit_shell(2)
+  shexec.error_exit(2)
 end
 
 local function on_expand_error(msg: string)
@@ -197,6 +227,12 @@ end
 function shexec.run_traps()
   if not shst.got_signal or shst.in_trap then return end
   shst.got_signal = false
+  if shst.interactive and shst.pending[2] and not shst.trap_set[2] and not shst.in_subshell then
+    shst.pending[2] = false
+    util.flush()
+    do local nl: string = '\n'; sys.write(2, nl.data, 1) end
+    shexec.error_exit(130)
+  end
   shst.in_trap = true
   for sig: integer = 1, 64 do
     if shst.pending[sig] then
@@ -263,6 +299,7 @@ local function option_string(): string
   if shst.o_nounset then sb:writebyte(#[B'u']#) end
   if shst.o_verbose then sb:writebyte(#[B'v']#) end
   if shst.o_xtrace then sb:writebyte(#[B'x']#) end
+  if shst.interactive then sb:writebyte(#[B'i']#) end
   return sb:promote()
 end
 
@@ -401,6 +438,14 @@ end
 -- Reset what a subshell must not inherit.
 local function reset_child()
   shst.in_subshell = true
+  if shst.interactive then
+    -- the dispositions an interactive shell takes for itself go back to the defaults
+    local own: []integer = {2, 3, 15, 28}
+    for k = 0, < #own do
+      local sig = own[k]
+      if not shst.trap_set[sig] and not shst.ignored_on_entry[sig] then shexec.set_handler(sig, 0) end
+    end
+  end
   for sig: integer = 1, 64 do
     if shst.trap_set[sig] and shst.traps[sig].size > 0 then
       shexec.set_handler(sig, 0)
@@ -803,7 +848,7 @@ local function exec_simple(n: *N.Node): integer
     local save: sequence(shexec.Saved)
     if n.r1 > 0 and not shexec.apply_redirs(n.r0, n.r1, &save) then
       shexec.restore_redirs(&save)
-      shexec.exit_shell(2)
+      shexec.error_exit(2)
     end
     local st = shexec.builtin_call(bidx, args)
     if n.r1 > 0 and name ~= 'exec' then shexec.restore_redirs(&save) end
@@ -1087,6 +1132,15 @@ function shexec.run_lexer(lx: *shlex.Lexer): integer
     end
   end
   return status
+end
+
+-- Run one parsed command (the interactive loop's entry into the executor).
+function shexec.exec_top(node: integer): integer
+  local st = exec_node(node)
+  if shst.flow == shexec.FLOW_BREAK or shst.flow == shexec.FLOW_CONTINUE or shst.flow == shexec.FLOW_RETURN then
+    shst.flow = shexec.FLOW_NONE
+  end
+  return st
 end
 
 function run_string(text: string, line: integer): integer

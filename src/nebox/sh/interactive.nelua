@@ -1,0 +1,376 @@
+-- The interactive shell (sh -i, or sh on a terminal): prompts (PS1 with
+-- parameter, command and arithmetic expansion, then `!` as the history
+-- number; PS2 for continuation lines), the line editor with history in
+-- $HISTFILE (default ~/.sh_history, $HISTSIZE entries, default 1000) and
+-- completion, the $ENV file, POSIX 2.11 signal dispositions (SIGINT caught
+-- and ending the command being run, SIGTERM and SIGQUIT ignored), and
+-- recovery from errors back to the prompt (POSIX 2.8.1).
+-- Not implemented: job control (`set -m`, fg, bg, jobs, ^Z).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.sh.ast'
+require 'nebox.sh.lex'
+require 'nebox.sh.parse'
+require 'nebox.sh.expand'
+require 'nebox.sh.exec'
+require 'nebox.sh.builtins'
+require 'nebox.sh.lineedit'
+
+##[==[
+cemitdecl[[
+#include <setjmp.h>
+]]
+]==]
+local function nebox_sh_setjmp(): cint <cimport, nodecl> end
+
+global shint = @record{}
+
+local editor: lineedit.Editor
+local std_saved: [3]cint = {-1, -1, -1}
+
+local function getvar_or(name: string, def: string): string
+  local v, set = shexec.getvar(name)
+  if set then return v end
+  return def
+end
+
+-- PS1/PS2 expansion: like an unquoted here-document, then `!` -> history
+-- number and `!!` -> `!` (POSIX: PS1).
+local function expand_prompt(ps: string, bang: boolean): string
+  if ps.size == 0 then return '' end
+  local mark = shast.mark()
+  local wi = shlex.scan_text(ps, shst.lineno)
+  local s = shexp.expand_one(wi)
+  shast.release(mark)
+  if not bang then return s end
+  local sb: stringbuilder
+  local i: usize = 0
+  while i < s.size do
+    local c = s.data[i]
+    if c == 33 then
+      if i + 1 < s.size and s.data[i + 1] == 33 then
+        sb:writebyte(33); i = i + 2
+      else
+        sb:write(#editor.history + 1); i = i + 1
+      end
+    else
+      sb:writebyte(c); i = i + 1
+    end
+  end
+  return sb:promote()
+end
+
+local function read_line(first: boolean): (string, boolean)
+  shexec.run_traps()
+  local prompt: string
+  if first then prompt = expand_prompt(getvar_or('PS1', '$ '), true)
+  else prompt = expand_prompt(getvar_or('PS2', '> '), false) end
+  local line, st = editor:read(prompt)
+  prompt:destroy()
+  if st == lineedit.READ_EOF then return '', false end
+  if st == lineedit.READ_INTR then
+    shst.status = 130
+    shexec.error_exit(130)   -- abandon the command being typed
+  end
+  local sb: stringbuilder
+  sb:write(line)
+  sb:writebyte(10)
+  line:destroy()
+  return sb:promote(), true
+end
+
+----------------------------------------------------------------------
+-- Completion
+----------------------------------------------------------------------
+
+local function is_sep(c: byte): boolean
+  return c == 32 or c == 9 or c == 10 or c == 59 or c == 38 or c == 124 or c == 40 or c == 41 or c == 60 or c == 62
+end
+
+local function needs_escape(c: byte): boolean
+  return c == 32 or c == 9 or c == 34 or c == 39 or c == 92 or c == 36 or c == 96 or c == 38 or c == 59
+    or c == 124 or c == 60 or c == 62 or c == 40 or c == 41 or c == 42 or c == 63 or c == 91 or c == 35
+    or c == 33 or c == 123 or c == 125 or c == 126
+end
+
+local function escape_word(s: string, keep_tilde: boolean): string
+  local sb: stringbuilder
+  for i: usize = 0, < s.size do
+    local c = s.data[i]
+    if needs_escape(c) and not (keep_tilde and i == 0 and c == 126) then sb:writebyte(92) end
+    sb:writebyte(c)
+  end
+  return sb:promote()
+end
+
+local function unescape_word(s: string): string
+  local sb: stringbuilder
+  local i: usize = 0
+  local q: byte = 0
+  while i < s.size do
+    local c = s.data[i]
+    if q ~= 0 then
+      if c == q then q = 0 else sb:writebyte(c) end
+    elseif c == 39 or c == 34 then q = c
+    elseif c == 92 and i + 1 < s.size then i = i + 1; sb:writebyte(s.data[i])
+    else sb:writebyte(c) end
+    i = i + 1
+  end
+  return sb:promote()
+end
+
+-- Start of the word before the cursor (respecting backslashes and quotes).
+local function word_start(line: string, cursor: integer): integer
+  local start = 0
+  local i = 0
+  local q: byte = 0
+  while i < cursor do
+    local c = line.data[i]
+    if q ~= 0 then
+      if c == q then q = 0 end
+    elseif c == 92 then i = i + 1
+    elseif c == 39 or c == 34 then q = c
+    elseif is_sep(c) then start = i + 1 end
+    i = i + 1
+  end
+  return start
+end
+
+-- Is the word at `start` in command position?
+local function command_position(line: string, start: integer): boolean
+  local i = start - 1
+  while i >= 0 and (line.data[i] == 32 or line.data[i] == 9) do i = i - 1 end
+  if i < 0 then return true end
+  local c = line.data[i]
+  if c == 59 or c == 38 or c == 124 or c == 40 or c == 10 then return true end
+  -- after a reserved word that starts a command
+  local e = i + 1
+  while i >= 0 and not is_sep(line.data[i]) do i = i - 1 end
+  local w = line:sub(i + 2, e)
+  return w == 'then' or w == 'else' or w == 'elif' or w == 'do' or w == 'if' or w == 'while'
+    or w == 'until' or w == '!' or w == '{' or w == 'time'
+end
+
+local function push_unique(items: *sequence(string), seen: *hashmap(string, boolean), s: string)
+  if seen:peek(s) ~= nilptr then s:destroy() return end
+  seen[string.copy(s)] = true
+  items:push(s)
+end
+
+local function starts_with(s: string, p: string): boolean
+  if p.size > s.size then return false end
+  for i: usize = 0, < p.size do
+    if s.data[i] ~= p.data[i] then return false end
+  end
+  return true
+end
+
+local function complete_command(prefix: string, items: *sequence(string))
+  local seen: hashmap(string, boolean)
+  local bnames = shbi.names()
+  for i = 1, #bnames do
+    if starts_with(bnames[i], prefix) then push_unique(items, &seen, string.copy(bnames[i])) end
+  end
+  bnames:destroy()
+  for k, _ in pairs(shst.funcs) do
+    if starts_with(k, prefix) then push_unique(items, &seen, string.copy(k)) end
+  end
+  for k, _ in pairs(shlex.aliases) do
+    if starts_with(k, prefix) then push_unique(items, &seen, string.copy(k)) end
+  end
+  local reserved: []string = {'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'case', 'esac', 'while', 'until', 'for', 'in'}
+  for i = 0, < #reserved do
+    if starts_with(reserved[i], prefix) then push_unique(items, &seen, string.copy(reserved[i])) end
+  end
+  local path = getvar_or('PATH', '')
+  local i: usize = 0
+  while i <= path.size do
+    local j = i
+    while j < path.size and path.data[j] ~= 58 do j = j + 1 end
+    local dir = path:sub((@isize)(i + 1), (@isize)(j))
+    if dir.size == 0 then dir = '.' end
+    local names, ok = util.readnames(dir, false)
+    if ok then
+      for k = 1, #names do
+        local nm = names[k]
+        if starts_with(nm, prefix) then
+          local full = util.join(dir, nm)
+          local st: sys.Stat
+          if sys.stat(full, &st) == 0 and (st.st_mode & sys.S_IFMT) ~= sys.S_IFDIR and sys.access(full, 1) == 0 then
+            push_unique(items, &seen, string.copy(nm))
+          end
+          full:destroy()
+        end
+      end
+    end
+    i = j + 1
+  end
+  seen:destroy()
+end
+
+local function complete_path(word: string, items: *sequence(string))
+  -- split into directory part (as typed) and name prefix
+  local slash = 0
+  for k: usize = 0, < word.size do if word.data[k] == 47 then slash = (@integer)(k) + 1 end end
+  local typed_dir = word:sub(1, slash)
+  local prefix = word:sub(slash + 1)
+  local dir = typed_dir
+  if dir.size > 0 and dir.data[0] == 126 then  -- ~/...
+    local home = getvar_or('HOME', '')
+    local rest = dir:sub(2)
+    if rest.size == 0 or rest.data[0] == 47 then dir = home .. rest end
+  end
+  if dir.size == 0 then dir = '.' end
+  local names, ok = util.readnames(dir, prefix.size > 0 and prefix.data[0] == 46)
+  if not ok then return end
+  util.sort(names, util.name_less)
+  for k = 1, #names do
+    local nm = names[k]
+    if starts_with(nm, prefix) and nm ~= '.' and nm ~= '..' then
+      local full = util.join(dir, nm)
+      local cand = typed_dir .. nm
+      if util.isdir(full) then cand = cand .. '/' end
+      items:push(cand)
+      full:destroy()
+    end
+  end
+end
+
+local function complete_var(prefix: string, items: *sequence(string))
+  for k, v in pairs(shst.vars) do
+    if v.set and starts_with(k, prefix) then items:push(k) end
+  end
+  util.sort($items, util.name_less)
+end
+
+local function completer(line: string, cursor: integer): (sequence(string), integer)
+  local items: sequence(string)
+  local start = word_start(line, cursor)
+  local raw = line:sub(start + 1, cursor)
+  -- $NAME
+  if raw.size > 0 and raw.data[0] == 36 then
+    local names: sequence(string)
+    local pre = raw:sub(2)
+    if pre.size > 0 and pre.data[0] == 123 then pre = pre:sub(2) end
+    complete_var(pre, &names)
+    local lead = raw:sub(1, (@isize)(raw.size - pre.size))
+    for i = 1, #names do items:push(lead .. names[i]) end
+    return items, start
+  end
+  local word = unescape_word(raw)
+  local is_path = false
+  for k: usize = 0, < word.size do if word.data[k] == 47 then is_path = true end end
+  local found: sequence(string)
+  if command_position(line, start) and not is_path and not (word.size > 0 and word.data[0] == 126) then
+    complete_command(word, &found)
+    util.sort(found, util.name_less)
+  else
+    complete_path(word, &found)
+  end
+  for i = 1, #found do
+    local e = escape_word(found[i], true)
+    -- keep a trailing '/' as typed; escaping never touches it
+    items:push(e)
+  end
+  return items, start
+end
+
+----------------------------------------------------------------------
+-- Loop
+----------------------------------------------------------------------
+
+local function history_path(): string
+  local hf, set = shexec.getvar('HISTFILE')
+  if set then return string.copy(hf) end
+  local home = getvar_or('HOME', '')
+  if home.size == 0 then return '' end
+  return util.join(home, '.sh_history')
+end
+
+-- Back to a sane state after an error unwound to the prompt.
+local function recover(lx: *shlex.Lexer)
+  for fd: cint = 0, 2 do
+    if std_saved[fd] >= 0 then sys.dup2(std_saved[fd], fd) end
+  end
+  shst.flow = shexec.FLOW_NONE
+  shst.loop_depth = 0
+  shst.func_depth = 0
+  shst.dot_depth = 0
+  shst.in_trap = false
+  shst.errexit_ignore = 0
+  editor:disable_raw()
+  lx:discard()
+end
+
+function shint.run(lx: *shlex.Lexer)
+  shst.interactive = true
+  -- POSIX 2.11: an interactive shell ignores SIGTERM and SIGQUIT, and catches
+  -- SIGINT so that it can end the current command instead of exiting.
+  if not shst.trap_set[15] then shexec.set_handler(15, 1) end
+  if not shst.trap_set[3] then shexec.set_handler(3, 1) end
+  if not shst.trap_set[2] then shexec.set_handler(2, 2) end
+  shexec.set_handler(28, 2)  -- SIGWINCH: interrupts the editor's read so it redraws
+  for fd: cint = 0, 2 do std_saved[fd] = sys.fcntl(fd, sys.F_DUPFD_CLOEXEC, 100) end
+  editor:init()
+  local hs, hset = shexec.getvar('HISTSIZE')
+  if hset then
+    local n, ok = util.toint(hs)
+    if ok and n >= 0 then editor.hist_max = n end
+  end
+  local hp = history_path()
+  if hp.size > 0 then editor:load_history(hp) end
+  editor.completer = completer
+  shlex.line_reader = read_line
+  lx:init_reader()
+  -- $ENV: parameter expansion of its value names a file to run (POSIX sh, ENV)
+  local envf, has_env = shexec.getvar('ENV')
+  shst.recover_armed = true
+  if nebox_sh_setjmp() ~= 0 then
+    recover(lx)
+  elseif has_env and envf.size > 0 and sys.getuid() == sys.geteuid() then
+    local path = expand_prompt(envf, false)
+    local text, ok = util.readfile(path)
+    if ok then shexec.run_string(text, 1) end
+  end
+  -- every command: read it (PS1 then PS2), add it to the history, run it
+  if nebox_sh_setjmp() ~= 0 then
+    recover(lx)
+  end
+  while true do
+    shst.pending[2] = false
+    shlex.first_line = true
+    shlex.cmd_start = -1
+    local s0: usize = #lx.srcs > 0 and lx.srcs[1].pos or 0
+    local node = shparse.next_command(lx)
+    if node < 0 then break end
+    -- the text of the command, for the history
+    if #lx.srcs > 0 then
+      local src = &lx.srcs[1]
+      if shlex.cmd_start >= 0 then s0 = (@usize)(shlex.cmd_start) end
+      local e = src.pos
+      if e > s0 and e <= src.size then
+        local sb: stringbuilder
+        for k: usize = s0, < e do sb:writebyte(src.data[k]) end
+        local t = sb:promote()
+        while t.size > 0 and (t.data[t.size - 1] == 10 or t.data[t.size - 1] == 32) do t.size = t.size - 1 end
+        editor:add_history(t)
+      end
+    end
+    if shst.o_noexec then continue end
+    shexec.exec_top(node)
+    if shst.pending[2] and not shst.trap_set[2] then
+      shst.pending[2] = false
+      util.flush()
+      do local nl: string = '\n'; sys.write(2, nl.data, 1) end
+    end
+    shexec.run_traps()
+  end
+  do local ex: string = 'exit\n'; sys.write(2, ex.data, ex.size) end
+  shexec.finish()
+end

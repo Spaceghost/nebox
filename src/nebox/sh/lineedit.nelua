@@ -1,0 +1,685 @@
+-- Line editor for the interactive shell: raw terminal mode through ioctl
+-- (TCGETS/TCSETSW, so no <termios.h> is needed), redraw that follows lines
+-- wrapping past the terminal width, UTF-8 aware cursor motion, emacs keys,
+-- a kill buffer, history with incremental reverse search, completion through
+-- a callback, and bracketed paste. Output goes to fd 2, as POSIX wants for
+-- prompts. Character width is one column per code point (no wide or
+-- zero-width tables).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+global lineedit = @record{}
+
+local TCGETS: culong <comptime> = 0x5401
+local TCSETSW: culong <comptime> = 0x5403
+local TIOCGWINSZ: culong <comptime> = 0x5413
+
+-- struct termios as the kernel's TCGETS sees it.
+local KTermios = @record{
+  c_iflag: uint32, c_oflag: uint32, c_cflag: uint32, c_lflag: uint32,
+  c_line: uint8, c_cc: [19]uint8,
+}
+local Winsize = @record{ws_row: uint16, ws_col: uint16, ws_xpixel: uint16, ws_ypixel: uint16}
+
+global lineedit.READ_OK: integer <comptime> = 0
+global lineedit.READ_EOF: integer <comptime> = 1
+global lineedit.READ_INTR: integer <comptime> = 2
+
+-- Completion callback: given the line and the cursor (bytes before it), return
+-- the candidates and the byte offset where the completed word starts. A
+-- candidate ending in '/' or ' ' is used as is; others get a trailing space
+-- when they are the only match.
+global lineedit.Completer = @function(line: string, cursor: integer): (sequence(string), integer)
+
+global lineedit.Editor = @record{
+  history: sequence(string),
+  hist_max: integer,
+  hist_file: string,
+  completer: lineedit.Completer,
+  -- editing state
+  buf: sequence(byte),
+  cursor: integer,          -- bytes before the cursor
+  prompt: string,
+  prompt_w: integer,
+  cols: integer,
+  cur_row: integer,         -- terminal row of the cursor, relative to the prompt's first row
+  hist_idx: integer,        -- #history + 1 is the line being typed
+  hist_saved: string,
+  kill: string,
+  killing: boolean,         -- this key killed text
+  prev_killing: boolean,    -- the previous key killed text: the next kill joins it
+  last_tab: boolean,
+  saved: KTermios,
+  have_saved: boolean,
+  raw: boolean,
+}
+
+local function out(s: string)
+  local off: usize = 0
+  while off < s.size do
+    local r = sys.write(2, &s.data[off], s.size - off)
+    if r <= 0 then
+      if r < 0 and sys.errno() == sys.EINTR then continue end
+      return
+    end
+    off = off + (@usize)(r)
+  end
+end
+
+local function is_cont(b: byte): boolean return b >= 0x80 and b < 0xc0 end
+
+-- Display width: one column per code point; ANSI CSI and OSC sequences and
+-- \001..\002 brackets (readline-style invisible markers) count zero.
+function lineedit.width(s: string): integer
+  local w = 0
+  local i: usize = 0
+  local hidden = false
+  while i < s.size do
+    local c = s.data[i]
+    if c == 1 then hidden = true; i = i + 1
+    elseif c == 2 then hidden = false; i = i + 1
+    elseif hidden then i = i + 1
+    elseif c == 27 then
+      i = i + 1
+      if i < s.size and s.data[i] == 91 then           -- [
+        i = i + 1
+        while i < s.size and (s.data[i] < 0x40 or s.data[i] > 0x7e) do i = i + 1 end
+        i = i + 1
+      elseif i < s.size and s.data[i] == 93 then       -- ]
+        while i < s.size and s.data[i] ~= 7 and not (s.data[i] == 27 and i + 1 < s.size and s.data[i + 1] == 92) do
+          i = i + 1
+        end
+        if i < s.size and s.data[i] == 27 then i = i + 1 end
+        i = i + 1
+      end
+    else
+      if not is_cont(c) then w = w + 1 end
+      i = i + 1
+    end
+  end
+  return w
+end
+
+local function strip_markers(s: string): string
+  local has = false
+  for i: usize = 0, < s.size do
+    if s.data[i] == 1 or s.data[i] == 2 then has = true; break end
+  end
+  if not has then return s end
+  local sb: stringbuilder
+  for i: usize = 0, < s.size do
+    if s.data[i] ~= 1 and s.data[i] ~= 2 then sb:writebyte(s.data[i]) end
+  end
+  return sb:promote()
+end
+
+local function term_cols(): integer
+  local ws: Winsize
+  if sys.ioctl(2, TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0 then return ws.ws_col end
+  if sys.ioctl(0, TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0 then return ws.ws_col end
+  local c = sys.getenv('COLUMNS')
+  if c ~= nilptr then
+    local v, ok = util.toint(sys.cstr((@*[0]cchar)(c)))
+    if ok and v > 0 then return v end
+  end
+  return 80
+end
+
+function lineedit.Editor:init()
+  self.hist_max = 1000
+  self.hist_idx = 1
+end
+
+function lineedit.Editor:enable_raw(): boolean
+  if self.raw then return true end
+  local t: KTermios
+  if sys.ioctl(0, TCGETS, &t) ~= 0 then return false end
+  self.saved = t
+  self.have_saved = true
+  -- cfmakeraw, keeping output post-processing and ISIG off so ^C is a key
+  t.c_iflag = t.c_iflag & ~(0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x400) -- IGNBRK BRKINT PARMRK ISTRIP INLCR IGNCR ICRNL IXON
+  t.c_lflag = t.c_lflag & ~(0x8 | 0x40 | 0x2 | 0x1 | 0x8000)                     -- ECHO ECHONL ICANON ISIG IEXTEN
+  t.c_cflag = (t.c_cflag & ~(0x30 | 0x100)) | 0x30                              -- CSIZE PARENB -> CS8
+  t.c_cc[6] = 1   -- VMIN
+  t.c_cc[5] = 0   -- VTIME
+  if sys.ioctl(0, TCSETSW, &t) ~= 0 then return false end
+  self.raw = true
+  out('\27[?2004h')  -- bracketed paste on
+  return true
+end
+
+function lineedit.Editor:disable_raw()
+  if not self.raw then return end
+  out('\27[?2004l')
+  sys.ioctl(0, TCSETSW, &self.saved)
+  self.raw = false
+end
+
+function lineedit.Editor:text(): string
+  -- (indexing an empty sequence would append to it, so copy byte by byte)
+  local sb: stringbuilder
+  for i = 1, #self.buf do sb:writebyte(self.buf[i]) end
+  return sb:promote()
+end
+
+function lineedit.Editor:set_text(s: string)
+  self.buf:clear()
+  for i: usize = 0, < s.size do self.buf:push(s.data[i]) end
+  self.cursor = (@integer)(s.size)
+end
+
+local function bytes_width(buf: *sequence(byte), from: integer, to: integer): integer
+  local w = 0
+  for i = from + 1, to do
+    if not is_cont(buf[i]) then w = w + 1 end
+  end
+  return w
+end
+
+-- Redraw prompt and buffer, which may span several terminal rows.
+function lineedit.Editor:refresh()
+  local cols = self.cols
+  local sb: stringbuilder
+  -- back to the prompt's first row
+  if self.cur_row > 0 then sb:write('\27[', self.cur_row, 'A') end
+  sb:write('\r\27[J')
+  sb:write(self.prompt)
+  for i = 1, #self.buf do sb:writebyte(self.buf[i]) end
+  local total = self.prompt_w + bytes_width(&self.buf, 0, #self.buf)
+  local end_row = total // cols
+  -- at an exact multiple of the width the terminal holds the cursor on the
+  -- last column; force the wrap so row arithmetic stays right
+  if total > 0 and total % cols == 0 then sb:write('\n') end
+  local pos = self.prompt_w + bytes_width(&self.buf, 0, self.cursor)
+  local row, col = pos // cols, pos % cols
+  if end_row > row then sb:write('\27[', end_row - row, 'A') end
+  sb:write('\r')
+  if col > 0 then sb:write('\27[', col, 'C') end
+  self.cur_row = row
+  local s = sb:promote()
+  out(s)
+  s:destroy()
+end
+
+local function cursor_prev(self: *lineedit.Editor): integer
+  local i = self.cursor
+  if i == 0 then return 0 end
+  i = i - 1
+  while i > 0 and is_cont(self.buf[i + 1]) do i = i - 1 end
+  return i
+end
+
+local function cursor_next(self: *lineedit.Editor): integer
+  local i = self.cursor
+  if i >= #self.buf then return #self.buf end
+  i = i + 1
+  while i < #self.buf and is_cont(self.buf[i + 1]) do i = i + 1 end
+  return i
+end
+
+local function is_word(b: byte): boolean
+  return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 or b >= 0x80
+end
+
+local function word_left(self: *lineedit.Editor): integer
+  local i = self.cursor
+  while i > 0 and not is_word(self.buf[i]) do i = i - 1 end
+  while i > 0 and is_word(self.buf[i]) do i = i - 1 end
+  return i
+end
+
+local function word_right(self: *lineedit.Editor): integer
+  local i = self.cursor
+  local n = #self.buf
+  while i < n and not is_word(self.buf[i + 1]) do i = i + 1 end
+  while i < n and is_word(self.buf[i + 1]) do i = i + 1 end
+  return i
+end
+
+-- Remove bytes [a, b) and return them.
+local function cut(self: *lineedit.Editor, a: integer, b: integer): string
+  if b <= a then return '' end
+  local sb: stringbuilder
+  for i = a + 1, b do sb:writebyte(self.buf[i]) end
+  for _ = a + 1, b do self.buf:remove(a + 1) end
+  if self.cursor > b then self.cursor = self.cursor - (b - a)
+  elseif self.cursor > a then self.cursor = a end
+  return sb:promote()
+end
+
+function lineedit.Editor:insert(s: string)
+  for i: usize = 0, < s.size do
+    self.buf:insert(self.cursor + 1, s.data[i])
+    self.cursor = self.cursor + 1
+  end
+end
+
+-- Consecutive kills build one kill-buffer entry (text killed backwards is
+-- prepended), as in readline.
+local function set_kill(self: *lineedit.Editor, s: string, backward: boolean)
+  self.killing = true
+  if s.size == 0 then return end
+  if self.prev_killing then
+    local joined = backward and (s .. self.kill) or (self.kill .. s)
+    self.kill:destroy()
+    s:destroy()
+    self.kill = joined
+  else
+    self.kill:destroy()
+    self.kill = s
+  end
+  self.prev_killing = true
+end
+
+----------------------------------------------------------------------
+-- History
+----------------------------------------------------------------------
+
+function lineedit.Editor:add_history(line: string)
+  if line.size == 0 or line:byte(1) == 32 then return end
+  -- one entry per line; a multi-line command is kept as typed
+  if #self.history > 0 and self.history[#self.history] == line then return end
+  self.history:push(string.copy(line))
+  while #self.history > self.hist_max and #self.history > 0 do
+    local old = self.history:remove(1)
+    old:destroy()
+  end
+  if self.hist_file.size > 0 then
+    local fd = sys.open(self.hist_file, sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND | sys.O_CLOEXEC, 384)
+    if fd >= 0 then
+      -- newlines inside an entry are stored as "\\\n" and joined back on load
+      local sb: stringbuilder
+      for i: usize = 0, < line.size do
+        if line.data[i] == 10 then sb:write('\\\n') else sb:writebyte(line.data[i]) end
+      end
+      sb:writebyte(10)
+      local s = sb:promote()
+      sys.write(fd, s.data, s.size)
+      s:destroy()
+      sys.close(fd)
+    end
+  end
+end
+
+function lineedit.Editor:load_history(path: string)
+  self.hist_file = string.copy(path)
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return end          -- no history yet
+  local data, ok = util.readfd(fd)
+  sys.close(fd)
+  if not ok then return end
+  local sb: stringbuilder
+  local i: usize = 0
+  while i < data.size do
+    local c = data.data[i]
+    if c == 92 and i + 1 < data.size and data.data[i + 1] == 10 then
+      sb:writebyte(10); i = i + 2
+    elseif c == 10 then
+      local e = sb:promote()
+      if e.size > 0 then self.history:push(e) end
+      sb = (@stringbuilder){}
+      i = i + 1
+    else
+      sb:writebyte(c); i = i + 1
+    end
+  end
+  local e = sb:promote()
+  if e.size > 0 then self.history:push(e) end
+  while #self.history > self.hist_max do
+    local old = self.history:remove(1)
+    old:destroy()
+  end
+  data:destroy()
+end
+
+local function history_move(self: *lineedit.Editor, delta: integer)
+  local n = #self.history
+  local idx = self.hist_idx + delta
+  if idx < 1 or idx > n + 1 then return end
+  if self.hist_idx == n + 1 then
+    self.hist_saved:destroy()
+    self.hist_saved = self:text()
+  end
+  self.hist_idx = idx
+  if idx == n + 1 then self:set_text(self.hist_saved) else self:set_text(self.history[idx]) end
+end
+
+----------------------------------------------------------------------
+-- Input
+----------------------------------------------------------------------
+
+-- One byte from the terminal; -1 at end of input, -2 on EINTR (a signal).
+local function read_byte(): integer
+  local b: byte
+  local r = sys.read(0, &b, 1)
+  if r == 1 then return b end
+  if r < 0 and sys.errno() == sys.EINTR then return -2 end
+  return -1
+end
+
+local function read_byte_retry(): integer
+  while true do
+    local c = read_byte()
+    if c ~= -2 then return c end
+  end
+  return -1
+end
+
+-- Read the rest of an escape sequence after ESC; returns its final form, e.g.
+-- "[A", "[3~", "[1;5C", "OH", "b" (Alt-b).
+local function read_escape(): string
+  local c = read_byte_retry()
+  if c < 0 then return '' end
+  local sb: stringbuilder
+  sb:writebyte((@byte)(c))
+  if c == 91 then                       -- CSI: parameters then a final byte
+    while true do
+      local d = read_byte_retry()
+      if d < 0 then break end
+      sb:writebyte((@byte)(d))
+      if d >= 0x40 and d <= 0x7e then break end
+    end
+  elseif c == 79 then                   -- SS3
+    local d = read_byte_retry()
+    if d >= 0 then sb:writebyte((@byte)(d)) end
+  end
+  return sb:promote()
+end
+
+local function read_paste(self: *lineedit.Editor)
+  -- bytes until ESC [ 2 0 1 ~
+  local sb: stringbuilder
+  while true do
+    local c = read_byte_retry()
+    if c < 0 then break end
+    if c == 27 then
+      local seq = read_escape()
+      if seq == '[201~' then seq:destroy(); break end
+      sb:writebyte(27); sb:write(seq)
+      seq:destroy()
+    elseif c == 13 then sb:writebyte(10)
+    else sb:writebyte((@byte)(c)) end
+  end
+  local s = sb:promote()
+  self:insert(s)
+  s:destroy()
+end
+
+local function common_prefix(items: *sequence(string)): string
+  if #items == 0 then return '' end
+  local p = items[1]
+  local n = p.size
+  for i = 2, #items do
+    local s = items[i]
+    local j: usize = 0
+    while j < n and j < s.size and s.data[j] == p.data[j] do j = j + 1 end
+    n = j
+  end
+  -- do not split a UTF-8 sequence
+  while n > 0 and n < p.size and is_cont(p.data[n]) do n = n - 1 end
+  return p:sub(1, (@isize)(n))
+end
+
+local function list_candidates(self: *lineedit.Editor, items: *sequence(string))
+  local maxw = 0
+  for i = 1, #items do
+    local w = lineedit.width(items[i])
+    if w > maxw then maxw = w end
+  end
+  local colw = maxw + 2
+  local ncol = self.cols // colw
+  if ncol < 1 then ncol = 1 end
+  local nrow = (#items + ncol - 1) // ncol
+  local sb: stringbuilder
+  sb:write('\r\n')
+  for r = 1, nrow do
+    for c = 0, < ncol do
+      local k = c * nrow + r
+      if k <= #items then
+        sb:write(items[k])
+        if c < ncol - 1 and k + nrow <= #items then
+          for _ = 1, colw - lineedit.width(items[k]) do sb:writebyte(32) end
+        end
+      end
+    end
+    sb:write('\r\n')
+  end
+  local s = sb:promote()
+  out(s)
+  s:destroy()
+  self.cur_row = 0
+end
+
+local function complete(self: *lineedit.Editor)
+  if not self.completer then out('\7') return end
+  local line = self:text()
+  local items, start = self.completer(line, self.cursor)
+  line:destroy()
+  if #items == 0 then out('\7'); self.last_tab = false; return end
+  local p = common_prefix(&items)
+  local word_len = self.cursor - start
+  if #items == 1 then
+    cut(self, start, self.cursor)
+    self:insert(items[1])
+    local last = items[1]:byte(-1)
+    if last ~= 47 and last ~= 32 then self:insert(' ') end
+    self.last_tab = false
+  elseif (@integer)(p.size) > word_len then
+    cut(self, start, self.cursor)
+    self:insert(p)
+    self.last_tab = false
+  elseif self.last_tab then
+    list_candidates(self, &items)
+    self.last_tab = false
+  else
+    out('\7')
+    self.last_tab = true
+  end
+  p:destroy()
+  for i = 1, #items do items[i]:destroy() end
+  items:destroy()
+end
+
+-- Incremental reverse search (Ctrl-R). Returns true when the found line is accepted.
+local function reverse_search(self: *lineedit.Editor): (boolean, integer)
+  local query: stringbuilder
+  local found = #self.history + 1
+  local orig_prompt, orig_w = self.prompt, self.prompt_w
+  local result = 0 -- 0 edit, 1 accept, 2 cancel, 3 eof
+  while true do
+    local q = query:view()
+    -- search from `found - 1` (or the end when the query changed) backwards
+    local shown: string = ''
+    if found <= #self.history then shown = self.history[found] end
+    local sp: stringbuilder
+    sp:write("(reverse-i-search)'", q, "': ")
+    self.prompt = sp:promote()
+    self.prompt_w = lineedit.width(self.prompt)
+    self:set_text(shown)
+    self.cursor = #self.buf
+    self:refresh()
+    self.prompt:destroy()
+    local c = read_byte_retry()
+    if c < 0 then result = 3; break end
+    if c == 18 then                                   -- Ctrl-R again: older match
+      local k = found - 1
+      while k >= 1 do
+        if q.size == 0 or self.history[k]:find(q, 1, true) > 0 then break end
+        k = k - 1
+      end
+      if k >= 1 then found = k else out('\7') end
+    elseif c == 127 or c == 8 then
+      local s = query:promote()
+      if s.size > 0 then s = s:sub(1, -2) end
+      query = (@stringbuilder){}
+      query:write(s)
+      found = #self.history + 1
+      local k = #self.history
+      while k >= 1 do
+        if s.size == 0 or self.history[k]:find(s, 1, true) > 0 then break end
+        k = k - 1
+      end
+      if s.size > 0 and k >= 1 then found = k end
+    elseif c == 7 or c == 3 then result = 2; break     -- Ctrl-G / Ctrl-C
+    elseif c == 13 or c == 10 then result = 1; break
+    elseif c >= 32 and c ~= 127 then
+      query:writebyte((@byte)(c))
+      local s = query:view()
+      local k = found <= #self.history and found or #self.history
+      while k >= 1 do
+        if self.history[k]:find(s, 1, true) > 0 then break end
+        k = k - 1
+      end
+      if k >= 1 then found = k else out('\7') end
+    else
+      result = 0; break                                -- any other key: edit the match
+    end
+  end
+  self.prompt, self.prompt_w = orig_prompt, orig_w
+  if result == 2 then self:set_text(self.hist_saved) end
+  query:destroy()
+  return result == 1, result == 3 and 1 or 0
+end
+
+-- Read one line with `prompt`. Without a terminal on fd 0, prints the prompt
+-- and reads up to a newline. Returns the line (without the newline) and a
+-- READ_* status.
+function lineedit.Editor:read(prompt: string): (string, integer)
+  local tty = sys.isatty(0) == 1 and sys.isatty(2) == 1
+  if not tty or not self:enable_raw() then
+    out(strip_markers(prompt))
+    local sb: stringbuilder
+    while true do
+      local c = read_byte()
+      if c == -2 then
+        local s = sb:promote()
+        s:destroy()
+        return '', lineedit.READ_INTR
+      end
+      if c < 0 then
+        local s = sb:promote()
+        if s.size == 0 then return s, lineedit.READ_EOF end
+        return s, lineedit.READ_OK
+      end
+      if c == 10 then break end
+      sb:writebyte((@byte)(c))
+    end
+    return sb:promote(), lineedit.READ_OK
+  end
+  self.prompt_w = lineedit.width(prompt)
+  self.prompt = strip_markers(prompt)  -- \1 and \2 only bracket invisible text
+  self.cols = term_cols()
+  self.buf:clear()
+  self.cursor = 0
+  self.cur_row = 0
+  self.hist_idx = #self.history + 1
+  self.last_tab = false
+  self.hist_saved:destroy()
+  self.hist_saved = ''
+  self:refresh()
+  local status = lineedit.READ_OK
+  while true do
+    local c = read_byte()
+    if c == -2 then                          -- a signal (SIGWINCH): re-measure and redraw
+      self.cols = term_cols()
+      self:refresh()
+      continue
+    end
+    if c < 0 then status = lineedit.READ_EOF; break end
+    if c ~= 9 then self.last_tab = false end
+    self.prev_killing = self.killing
+    self.killing = false
+    if c == 13 or c == 10 then break
+    elseif c == 3 then                       -- Ctrl-C
+      self.cursor = #self.buf
+      self:refresh()
+      out('^C')
+      status = lineedit.READ_INTR
+      break
+    elseif c == 4 then                       -- Ctrl-D
+      if #self.buf == 0 then status = lineedit.READ_EOF; break end
+      cut(self, self.cursor, cursor_next(self))
+    elseif c == 1 then self.cursor = 0
+    elseif c == 5 then self.cursor = #self.buf
+    elseif c == 2 then self.cursor = cursor_prev(self)
+    elseif c == 6 then self.cursor = cursor_next(self)
+    elseif c == 8 or c == 127 then cut(self, cursor_prev(self), self.cursor)
+    elseif c == 11 then
+      set_kill(self, cut(self, self.cursor, #self.buf), false)
+    elseif c == 21 then set_kill(self, cut(self, 0, self.cursor), true)
+    elseif c == 23 then                      -- Ctrl-W: back to whitespace
+      local i = self.cursor
+      while i > 0 and self.buf[i] == 32 do i = i - 1 end
+      while i > 0 and self.buf[i] ~= 32 do i = i - 1 end
+      set_kill(self, cut(self, i, self.cursor), true)
+    elseif c == 25 then self:insert(self.kill)
+    elseif c == 20 then                      -- Ctrl-T: transpose the bytes around the cursor (ASCII)
+      if self.cursor > 0 and #self.buf >= 2 then
+        if self.cursor == #self.buf then self.cursor = self.cursor - 1 end
+        local a, b = self.buf[self.cursor], self.buf[self.cursor + 1]
+        if a < 0x80 and b < 0x80 then
+          self.buf[self.cursor], self.buf[self.cursor + 1] = b, a
+          self.cursor = self.cursor + 1
+        end
+      end
+    elseif c == 12 then                      -- Ctrl-L
+      out('\27[H\27[2J')
+      self.cur_row = 0
+    elseif c == 16 then history_move(self, -1)
+    elseif c == 14 then history_move(self, 1)
+    elseif c == 18 then
+      self.hist_saved:destroy()
+      self.hist_saved = self:text()
+      local accept, eof = reverse_search(self)
+      if eof == 1 then status = lineedit.READ_EOF; break end
+      if accept then break end
+    elseif c == 9 then complete(self)
+    elseif c == 27 then
+      local seq = read_escape()
+      if seq == '[A' or seq == 'OA' then history_move(self, -1)
+      elseif seq == '[B' or seq == 'OB' then history_move(self, 1)
+      elseif seq == '[C' or seq == 'OC' then self.cursor = cursor_next(self)
+      elseif seq == '[D' or seq == 'OD' then self.cursor = cursor_prev(self)
+      elseif seq == '[H' or seq == 'OH' or seq == '[1~' or seq == '[7~' then self.cursor = 0
+      elseif seq == '[F' or seq == 'OF' or seq == '[4~' or seq == '[8~' then self.cursor = #self.buf
+      elseif seq == '[3~' then cut(self, self.cursor, cursor_next(self))
+      elseif seq == '[1;5C' or seq == '[1;3C' or seq == 'f' then self.cursor = word_right(self)
+      elseif seq == '[1;5D' or seq == '[1;3D' or seq == 'b' then self.cursor = word_left(self)
+      elseif seq == 'd' then set_kill(self, cut(self, self.cursor, word_right(self)), false)
+      elseif seq == '\127' or seq == '\8' then set_kill(self, cut(self, word_left(self), self.cursor), true)
+      elseif seq == '[200~' then read_paste(self)
+      end
+      seq:destroy()
+    elseif c >= 32 then
+      -- a printable byte, with the rest of its UTF-8 sequence
+      local n = 0
+      if c >= 0xf0 then n = 3 elseif c >= 0xe0 then n = 2 elseif c >= 0xc0 then n = 1 end
+      self.buf:insert(self.cursor + 1, (@byte)(c))
+      self.cursor = self.cursor + 1
+      for _ = 1, n do
+        local d = read_byte_retry()
+        if d < 0 then break end
+        self.buf:insert(self.cursor + 1, (@byte)(d))
+        self.cursor = self.cursor + 1
+      end
+    end
+    self:refresh()
+  end
+  if status ~= lineedit.READ_INTR then
+    self.cursor = #self.buf
+    self:refresh()
+  end
+  out('\r\n')
+  self:disable_raw()
+  if self.prompt.data ~= prompt.data then self.prompt:destroy() end
+  self.prompt = ''
+  if status == lineedit.READ_INTR then return '', status end
+  local s = self:text()
+  if status == lineedit.READ_EOF and s.size == 0 then return s, status end
+  return s, lineedit.READ_OK
+end

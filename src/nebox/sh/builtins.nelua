@@ -34,7 +34,7 @@ local command_wrapped: boolean = false
 local function sberr(msg: string): integer
   shexec.errmsg(msg)
   if command_wrapped then return 2 end
-  shexec.exit_shell(2)
+  shexec.error_exit(2)
   return 2
 end
 
@@ -1248,6 +1248,13 @@ local function lookup(name: string): (integer, boolean)
     if BUILTINS[i].name == name then return i + 1, BUILTINS[i].special end
   end
   return 0, false
+end
+
+-- Builtin names, for completion.
+function shbi.names(): sequence(string)
+  local out: sequence(string)
+  for i: integer = 0, < #BUILTINS do out:push(BUILTINS[i].name) end
+  return out
 end
 
 local function call(idx: integer, args: sequence(string)): integer

@@ -1,4 +1,4 @@
--- sh: POSIX.1-2017 shell command language, non-interactive. Usage:
+-- sh: POSIX.1-2017 shell command language; interactive with -i or on a terminal. Usage:
 --   sh [-abCefhnuvx] [-o option]... [+...] -c command_string [command_name [argument...]]
 --   sh [options] -s [argument...]
 --   sh [options] command_file [argument...]
@@ -13,6 +13,7 @@ require 'nebox.sh.lex'
 require 'nebox.sh.parse'
 require 'nebox.sh.exec'
 require 'nebox.sh.builtins'
+require 'nebox.sh.interactive'
 
 local function usage_error(msg: string): integer
   util.flush()
@@ -21,11 +22,45 @@ local function usage_error(msg: string): integer
   return 2
 end
 
-global function applet_sh(args: sequence(string)): integer
-  shexec.init('sh')
+-- nsh defaults, applied only to variables the environment does not set:
+-- a colored PS1 with the current directory's name (~ at $HOME), history in
+-- ${XDG_STATE_HOME:-~/.local/state}/nsh/history and, as ENV, the rc file
+-- ${XDG_CONFIG_HOME:-~/.config}/nsh/rc when it exists.
+local function nsh_defaults()
+  local env_ps1 = sys.getenv('PS1')
+  if env_ps1 == nilptr then
+    local mark = sys.geteuid() == 0 and '#' or '$'
+    shexec.setvar('PS1', '\1\27[1;36m\2$(case $PWD in "$HOME") echo "~";; /) echo /;; *) echo "${PWD##*/}";; esac)\1\27[0m\2 ' .. mark .. ' ')
+  end
+  local home, has_home = shexec.getvar('HOME')
+  if not has_home or home.size == 0 then return end
+  local _, has_hist = shexec.getvar('HISTFILE')
+  if not has_hist then
+    local state, has_state = shexec.getvar('XDG_STATE_HOME')
+    if not has_state or state.size == 0 then state = util.join(home, '.local/state') end
+    -- mkdir -p of the two levels nsh owns below an existing base
+    local dir = util.join(state, 'nsh')
+    sys.mkdir(util.dirname(state), 448)
+    sys.mkdir(state, 448)
+    sys.mkdir(dir, 448)
+    shexec.setvar('HISTFILE', util.join(dir, 'history'))
+  end
+  local _, has_env = shexec.getvar('ENV')
+  if not has_env then
+    local conf, has_conf = shexec.getvar('XDG_CONFIG_HOME')
+    if not has_conf or conf.size == 0 then conf = util.join(home, '.config') end
+    local rc = util.join(util.join(conf, 'nsh'), 'rc')
+    if util.exists(rc) then shexec.setvar('ENV', rc) end
+  end
+end
+
+local function run_sh(args: sequence(string), nsh: boolean): integer
+  shexec.init(nsh and 'nsh' or 'sh')
   shbi.init()
+  if nsh then nsh_defaults() end
   local cmode = false
   local smode = false
+  local imode = false
   local i: integer = 1
   while i <= #args do
     local a = args[i]
@@ -38,7 +73,7 @@ global function applet_sh(args: sequence(string)): integer
       local c = a:byte(j)
       if c == 99 then cmode = true            -- c
       elseif c == 115 then smode = true       -- s
-      elseif c == 105 then return usage_error('-i: interactive mode is not supported')
+      elseif c == 105 then imode = on              -- i
       elseif c == 109 then return usage_error('-m: job control is not supported')
       elseif c == 111 then                    -- o
         if i + 1 > #args then return usage_error('-o requires an argument') end
@@ -64,6 +99,9 @@ global function applet_sh(args: sequence(string)): integer
     lx:init_text(text)
   elseif smode or i > #args then
     for k = i, #args do shst.params:push(args[k]) end
+    if imode or (sys.isatty(0) == 1 and sys.isatty(2) == 1) then
+      shint.run(&lx)   -- does not return
+    end
     lx:init_fd(0, true)
   else
     local path = args[i]
@@ -76,4 +114,13 @@ global function applet_sh(args: sequence(string)): integer
   shexec.run_lexer(&lx)
   shexec.finish()
   return 0
+end
+
+global function applet_sh(args: sequence(string)): integer
+  return run_sh(args, false)
+end
+
+-- nsh: the same shell under its own name, with the defaults above.
+global function applet_nsh(args: sequence(string)): integer
+  return run_sh(args, true)
 end

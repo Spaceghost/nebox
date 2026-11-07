@@ -37,7 +37,7 @@ local applets: []Applet = {
   {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install},
   {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
   {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
-  {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'od', applet_od},
+  {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
   {'paste', applet_paste}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},

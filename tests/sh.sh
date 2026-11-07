@@ -692,8 +692,8 @@ exit=2" "sh -c 'shift 3' 2>&1"
 expect sh-error-exec-msg 'sh: line 1: nosuch: not found
 st=127
 exit=0' "sh -c 'exec nosuch' 2>&1; echo st=\$?"
-expect sh-error-i-unsupported 'sh: -i: interactive mode is not supported
-exit=2' "sh -i -c 'echo i' 2>&1"
+expect sh-i-with-c 'i
+exit=0' "sh -i -c 'echo i' 2>&1"
 expect sh-error-m-unsupported 'sh: -m: job control is not supported
 exit=2' "sh -m -c 'echo m' 2>&1"
 expect sh-error-set-m 'sh: line 1: set: -m: job control is not supported

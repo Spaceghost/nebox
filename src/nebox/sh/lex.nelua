@@ -55,7 +55,7 @@ global shlex.Src = @record{
   cap: usize,
   size: usize,
   pos: usize,
-  fd: cint,          -- -1 for in-memory text
+  fd: cint,          -- -1 for in-memory text, -2 for lines from shlex.line_reader
   eof: boolean,
   bytewise: boolean, -- read one byte at a time (shared, unseekable stdin)
   seekable: boolean,
@@ -82,6 +82,15 @@ global shlex.parse_text: function(text: string, line: integer): integer
 global shlex.on_error: function(msg: string, line: integer)
 -- Alias table, owned by the interpreter.
 global shlex.aliases: hashmap(string, string)
+-- Interactive input: returns the next line (with its newline) or false at
+-- end of input. `first` is true for the first line of a command (PS1), false
+-- for continuation lines (PS2).
+global shlex.line_reader: function(first: boolean): (string, boolean)
+-- Set by the interactive loop before each command; cleared by the first read.
+global shlex.first_line: boolean = false
+-- Offset of the first line of the command in the reader's buffer, -1 if the
+-- command started in text that was already buffered.
+global shlex.cmd_start: isize = -1
 -- Verbose (-v): echo input as it is read.
 global shlex.verbose: boolean = false
 
@@ -138,6 +147,31 @@ function shlex.Lexer:init_text(text: string)
   self.next_alias_ok = false
 end
 
+function shlex.Lexer:init_reader()
+  self.srcs:clear()
+  local s: shlex.Src
+  s.fd = -2
+  s.line = 1
+  self.srcs:push(s)
+  self.has_tok = false
+  self.heredocs:clear()
+  self.next_alias_ok = false
+end
+
+-- Drop what is left of the current input (after an error in an interactive
+-- shell): the rest of the line already read, pending tokens and here-documents.
+function shlex.Lexer:discard()
+  while #self.srcs > 1 do self.srcs:pop() end
+  if #self.srcs == 1 then
+    local s = &self.srcs[1]
+    s.pos = s.size
+    s.eof = false
+  end
+  self.has_tok = false
+  self.heredocs:clear()
+  self.next_alias_ok = false
+end
+
 function shlex.Lexer:init_fd(fd: cint, share: boolean)
   self.srcs:clear()
   self:push_fd(fd, share)
@@ -159,8 +193,44 @@ function shlex.Lexer:sync()
   end
 end
 
+local function reader_fill(s: *shlex.Src): boolean
+  if s.eof then return false end
+  local first = shlex.first_line
+  shlex.first_line = false
+  local line, ok = shlex.line_reader(first)
+  if not ok then s.eof = true; return false end
+  -- compact only before the first line of a command, so that the whole
+  -- command stays in the buffer from shlex.cmd_start (for the history)
+  if first and s.pos > 0 then
+    local n = s.size - s.pos
+    for i: usize = 0, < n do s.data[i] = s.data[s.pos + i] end
+    s.size = n
+    s.pos = 0
+  end
+  if s.size + line.size > s.cap then
+    local cap = s.cap * 2
+    if cap < s.size + line.size then cap = s.size + line.size + 256 end
+    local nd = (@*[0]byte)(default_allocator:alloc(cap))
+    for i: usize = 0, < s.size do nd[i] = s.data[i] end
+    if s.owned then default_allocator:dealloc(s.data) end
+    s.data = nd
+    s.cap = cap
+    s.owned = true
+  end
+  if first then shlex.cmd_start = (@isize)(s.size) end
+  for i: usize = 0, < line.size do s.data[s.size + i] = line.data[i] end
+  s.size = s.size + line.size
+  if shlex.verbose and line.size > 0 then
+    util.flush()
+    sys.write(2, line.data, line.size)
+  end
+  line:destroy()
+  return true
+end
+
 -- Pull more bytes from a descriptor source, keeping the unread tail.
 local function src_fill(s: *shlex.Src): boolean
+  if s.fd == -2 then return reader_fill(s) end
   if s.fd < 0 or s.eof then return false end
   if s.pos > 0 then
     local n = s.size - s.pos

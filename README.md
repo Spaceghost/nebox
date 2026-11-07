@@ -43,8 +43,8 @@ stdout, exit status, and the resulting directory tree.
 ```
 [ awk base64 basename cat chgrp chmod chown cksum cmp comm cp cut date df
 dirname du echo env expand expr factor false find fold free grep groups head
-hexdump hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc od
-paste printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
+hexdump hostname id install kill link ln ls md5sum mkdir mktemp mv nl nproc nsh
+od paste printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
 sha256sum shuf sleep sort split stat strings sync tac tail tee test timeout
 touch tr true truncate tsort tty unexpand uname uniq unlink wc which whoami
 xargs yes
@@ -88,7 +88,12 @@ Stated here rather than worked around:
   xorshift64* generator, so its sequence matches no other awk. Memory for
   string temporaries is not reclaimed until exit; records and fields are
   views into a reused buffer.
-- `sh` is a non-interactive POSIX.1-2017 shell (`src/nebox/sh/`: lexer,
+- `nsh` is `sh` under its own name with friendlier defaults when the
+  environment does not set them: a colored PS1 showing the current
+  directory's name (`~` at `$HOME`), history in
+  `${XDG_STATE_HOME:-~/.local/state}/nsh/history`, and
+  `${XDG_CONFIG_HOME:-~/.config}/nsh/rc` as `ENV` when it exists.
+- `sh` is a POSIX.1-2017 shell (`src/nebox/sh/`: lexer,
   parser to a tree, tree-walking interpreter). `tests/sh.sh` compares it
   with dash 0.5.12 and pins, as `expect`/`shx` cases, the places where
   nebox follows POSIX or a deliberate choice instead. Implemented: `-c`,
@@ -108,8 +113,22 @@ Stated here rather than worked around:
   echo false getopts hash kill pwd read test [ true type umask unalias
   wait`, plus `printf` through the `printf` applet); traps, `set -e`
   exceptions, `$!`/`wait` for asynchronous lists, `LINENO`, and
-  diagnostics as `sh: line N: ...`. Unimplemented: interactive use (`-i`
-  is refused; no prompts, history, `fc`, line editing or `ENV`); job control (`-m`/`set -o monitor`, `%job`
+  diagnostics as `sh: line N: ...`. Interactive use (`-i`, or no command
+  operand with a terminal on stdin and stderr; `src/nebox/sh/interactive.nelua`
+  and `lineedit.nelua`, tested on a pseudo-terminal by
+  `tests/sh_interactive.py`): PS1 (parameter, command and arithmetic
+  expansion, then `!`) and PS2 prompts on stderr; errors that end a
+  non-interactive shell return to the prompt (POSIX 2.8.1); SIGINT ends the
+  command being typed or run, SIGTERM and SIGQUIT are ignored; `ENV` is run
+  at startup; history in `HISTFILE` (default `~/.sh_history`, `HISTSIZE`
+  entries, default 1000; a line equal to the previous one or starting with a
+  space is not recorded); a line editor with emacs keys (motion by character
+  and word, kill and yank with consecutive kills joined, transpose, clear),
+  Up/Down history, Ctrl-R incremental search, Tab completion of commands
+  (built-ins, functions, aliases, reserved words, `PATH`), file names and
+  `$NAME`s, bracketed paste and lines wrapping past the terminal width.
+  Character width is one column per code point (no wide or combining
+  characters). Unimplemented: `fc`, vi mode, `set -o emacs/vi`; job control (`-m`/`set -o monitor`, `%job`
   operands, `jobs`, `bg`, `fg` report an error with status 2); `ulimit`;
   locales and multibyte characters (bytes only, C-locale classes and byte
   order for globbing). Not POSIX and refused: `local`, `;&` in `case`,
