@@ -1,0 +1,402 @@
+-- Local time and GNU-compatible time formatting.
+--
+-- Broken-down local time comes from nelibc's localtime_r (TZ, TZif zone
+-- files, POSIX TZ strings, /etc/localtime when TZ is unset). Formatting is
+-- done here rather than by strftime so that every applet prints what GNU
+-- coreutils prints: this is a port of the C-locale behavior of gnulib's
+-- nstrftime as used by coreutils 9.1 (flags _ - 0 + ^ #, field widths, the
+-- E and O modifiers, %N, %q, %P, %s and %:z %::z %:::z).
+## pragmas.nogc = true
+
+require 'string'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+global util.Time = @record{
+  t: integer,       -- seconds since the Epoch
+  ns: integer,      -- nanoseconds, for %N
+  tm: sys.Tm,
+  zone: string,     -- abbreviation for %Z
+}
+
+local tz_ready = false
+
+-- glibc resolves a relative TZ value (TZ=Japan, TZ=UTC, TZ=:Asia/Tokyo,
+-- TZ=Asia/Tokyo) as a zone file under $TZDIR or /usr/share/zoneinfo before
+-- trying it as a POSIX TZ string. nelibc looks for a zone file only when
+-- the value contains '/' or starts with ':', and only under
+-- /usr/share/zoneinfo, so a name such as "Japan" or "EST5EDT" would be read
+-- as a POSIX string. When the named file exists and is TZif data, hand
+-- nelibc its absolute path instead. This edits the process environment;
+-- the applets that format times never start children.
+local function tz_prepare()
+  if tz_ready then return end
+  tz_ready = true
+  local z = sys.getenv('TZ')
+  if z == nilptr then return end
+  local name: string = z
+  if name.size > 0 and name:byte(1) == ':'_b then name = name:sub(2) end
+  if name.size == 0 or name:byte(1) == '/'_b then return end
+  local dir: string = '/usr/share/zoneinfo'
+  local d = sys.getenv('TZDIR')
+  if d ~= nilptr then
+    local ds: string = d
+    if ds.size > 0 then dir = ds end
+  end
+  local path = dir .. '/' .. name
+  local fd = sys.open(path, sys.O_RDONLY, 0)
+  if fd < 0 then return end
+  local magic: [4]byte
+  local n = sys.read(fd, &magic[0], 4)
+  sys.close(fd)
+  if n == 4 and magic[0] == 'T'_b and magic[1] == 'Z'_b and magic[2] == 'i'_b and magic[3] == 'f'_b then
+    sys.setenv('TZ', path, 1)
+  end
+end
+
+-- Break t down in the local time zone, or in UTC as `date -u` (TZ=UTC0)
+-- does. False when the year does not fit.
+function util.breaktime(t: integer, ns: integer, utc: boolean): (util.Time, boolean)
+  local r: util.Time
+  r.t = t; r.ns = ns
+  local tt: clong = (@clong)(t)
+  if utc then
+    if sys.gmtime_r(&tt, &r.tm) == nilptr then return r, false end
+    r.tm.tm_gmtoff = 0
+    r.zone = 'UTC'
+    return r, true
+  end
+  tz_prepare()
+  if sys.localtime_r(&tt, &r.tm) == nilptr then return r, false end
+  if r.tm.tm_zone ~= nilptr then
+    local zs: string = r.tm.tm_zone
+    r.zone = string.copy(zs)
+  end
+  return r, true
+end
+
+-- Seconds since the Epoch for a local wall-clock time, as mktime resolves
+-- it. False when that wall time does not exist in the zone (it falls in a
+-- forward transition) or is out of range: GNU touch and date reject those.
+function util.localsecs(y: integer, mo: integer, d: integer, hh: integer, mm: integer, ss: integer): (integer, boolean)
+  tz_prepare()
+  local tm: sys.Tm
+  tm.tm_year = (@cint)(y - 1900); tm.tm_mon = (@cint)(mo - 1); tm.tm_mday = (@cint)(d)
+  tm.tm_hour = (@cint)(hh); tm.tm_min = (@cint)(mm); tm.tm_sec = (@cint)(ss)
+  tm.tm_isdst = -1
+  local t = sys.mktime(&tm)
+  -- mktime's -1 is also a valid time; the round trip below decides
+  local back: sys.Tm
+  local tt: clong = t
+  if sys.localtime_r(&tt, &back) == nilptr then return 0, false end
+  if back.tm_year ~= (@cint)(y - 1900) or back.tm_mon ~= (@cint)(mo - 1) or back.tm_mday ~= (@cint)(d) or
+      back.tm_hour ~= (@cint)(hh) or back.tm_min ~= (@cint)(mm) or back.tm_sec ~= (@cint)(ss) then
+    return 0, false
+  end
+  return (@integer)(t), true
+end
+
+local DAYS: [7]string = {'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'}
+local MONTHS: [12]string = {'January', 'February', 'March', 'April', 'May', 'June', 'July',
+  'August', 'September', 'October', 'November', 'December'}
+
+local function isdigit(c: byte): boolean return c >= '0'_b and c <= '9'_b end
+
+local function isleap(y: integer): boolean
+  return y %%% 4 == 0 and (y %%% 100 ~= 0 or y %%% 400 == 0)
+end
+
+local function iabs(v: integer): integer if v < 0 then return -v end return v end
+
+-- gnulib width_add: pad s to width (zeros for the 0 and + flags, spaces
+-- otherwise, nothing for -), converting case as the ^ # flags ask.
+local function tf_text(sb: *stringbuilder, s: string, width: integer, pad: byte, up: boolean, low: boolean)
+  if pad ~= '-'_b and width > (@integer)(s.size) then
+    local z: byte = (pad == '0'_b or pad == '+'_b) and '0'_b or ' '_b
+    for _ = (@integer)(s.size) + 1, width do sb:writebyte(z) end
+  end
+  for i: usize = 1, s.size do
+    local c = s:byte(i)
+    if low then
+      if c >= 'A'_b and c <= 'Z'_b then c = c + 32 end
+    elseif up then
+      if c >= 'a'_b and c <= 'z'_b then c = c - 32 end
+    end
+    sb:writebyte(c)
+  end
+end
+
+-- gnulib do_number_body: v is the magnitude; colons is the tz_colon_mask
+-- that puts ':' between digit pairs for %:z and %::z.
+local function tf_number(sb: *stringbuilder, digits: integer, neg: boolean, v: integer, width: integer,
+    pad: byte, sign: boolean, colons: integer)
+  local buf: [48]byte
+  local pos: integer = 48
+  local u: uint64 = (@uint64)(v)
+  local m = colons
+  repeat
+    if m & 1 ~= 0 then pos = pos - 1; buf[pos] = ':'_b end
+    m = m >> 1
+    pos = pos - 1; buf[pos] = (@byte)(48 + u % 10); u = u // 10
+  until u == 0 and m == 0
+  if pad == 0 then pad = '0'_b end
+  if width < 0 then width = digits end
+  local sc: byte = 0
+  if neg then sc = '-'_b elseif sign then sc = '+'_b end
+  local numlen = 48 - pos
+  local shortage = width - (sc ~= 0 and 1 or 0) - numlen
+  local padding: integer = 0
+  if pad ~= '-'_b and shortage > 0 then padding = shortage end
+  if sc ~= 0 then
+    if pad == '_'_b then
+      for _ = 1, padding do sb:writebyte(' '_b) end
+      width = width - padding
+    end
+    sb:writebyte(sc)
+    width = width - 1
+  end
+  tf_text(sb, (@string){data = (@*[0]byte)(&buf[pos]), size = (@usize)(numlen)}, width, pad, false, false)
+end
+
+-- gnulib do_yearish: the year padding (yr_spec) of %F reaches the year
+-- fields, and the + flag adds a sign to years past 9999 or wider than usual.
+local function tf_year(sb: *stringbuilder, digits: integer, neg: boolean, v: integer, width: integer,
+    pad: byte, yr_spec: byte)
+  if pad == 0 then pad = yr_spec end
+  local sign = pad == '+'_b and ((digits == 2 and 99 or 9999) < v or digits < width)
+  tf_number(sb, digits, neg, v, width, pad, sign, 0)
+end
+
+local function iso_week_days(yday: integer, wday: integer): integer
+  local big: integer = (366 /// 7 + 2) * 7
+  return yday - (yday - wday + 4 + big) %%% 7 + 4 - 1
+end
+
+-- Conversions that reject the E or O modifier, as gnulib does.
+local E_BAD: string = 'aAbBhdDeFgGHIjklmMNSUVwW'
+local O_BAD: string = 'aAcDFqxXY'
+
+local function tf_format(sb: *stringbuilder, fmt: string, f: *util.Time, upcase: boolean, yr_spec: byte, width0: integer)
+  local tm = &f.tm
+  local n = fmt.size
+  local i: usize = 1
+  local width: integer = width0
+  while i <= n do
+    local c = fmt:byte(i)
+    if c ~= '%'_b then
+      sb:writebyte(c); i = i + 1; width = -1
+      continue
+    end
+    local start = i
+    local pad: byte = 0
+    local up = upcase
+    local low = false
+    local change = false
+    local j = i + 1
+    while j <= n do
+      local d = fmt:byte(j)
+      if d == '_'_b or d == '-'_b or d == '+'_b or d == '0'_b then pad = d
+      elseif d == '^'_b then up = true
+      elseif d == '#'_b then change = true
+      else break end
+      j = j + 1
+    end
+    if j <= n and isdigit(fmt:byte(j)) then
+      width = 0
+      while j <= n and isdigit(fmt:byte(j)) do
+        width = width * 10 + (fmt:byte(j) - '0'_b)
+        if width > 0x7fffffff then width = 0x7fffffff end
+        j = j + 1
+      end
+    end
+    local modifier: byte = 0
+    if j <= n and (fmt:byte(j) == 'E'_b or fmt:byte(j) == 'O'_b) then modifier = fmt:byte(j); j = j + 1 end
+    if j > n then
+      -- '%' (with flags) at the end of the format is copied as is
+      tf_text(sb, fmt:sub(start, n), width, pad, up, low)
+      break
+    end
+    local conv = fmt:byte(j)
+    local nexti = j + 1
+    local bad = false
+    local colons: integer = 0
+    if conv == ':'_b then
+      local k = j
+      while k <= n and fmt:byte(k) == ':'_b do k = k + 1 end
+      if k <= n and fmt:byte(k) == 'z'_b then
+        colons = (@integer)(k - j); j = k; conv = 'z'_b; nexti = k + 1
+      else
+        bad = true
+      end
+    end
+    if modifier == 'E'_b and E_BAD:find(string.char(conv), 1, true) > 0 then bad = true end
+    if modifier == 'O'_b and O_BAD:find(string.char(conv), 1, true) > 0 then bad = true end
+    local year: integer = tm.tm_year + 1900
+    if bad then
+      tf_text(sb, fmt:sub(start, j), width, pad, up, low)
+    elseif conv == '%'_b then
+      if j == start + 1 then
+        tf_text(sb, '%', width, pad, up, low)
+      else
+        -- "%5%": the directive up to here is copied and the second '%'
+        -- starts over, as gnulib does
+        tf_text(sb, fmt:sub(start, j - 1), width, pad, up, low)
+        nexti = j
+      end
+    elseif conv == 'a'_b or conv == 'A'_b then
+      if change then up = true; low = false end
+      local name = DAYS[tm.tm_wday]
+      if conv == 'a'_b then name = name:sub(1, 3) end
+      tf_text(sb, name, width, pad, up, low)
+    elseif conv == 'b'_b or conv == 'h'_b or conv == 'B'_b then
+      if change then up = true; low = false end
+      local name = MONTHS[tm.tm_mon]
+      if conv ~= 'B'_b then name = name:sub(1, 3) end
+      tf_text(sb, name, width, pad, up, low)
+    elseif conv == 'c'_b or conv == 'D'_b or conv == 'x'_b or conv == 'r'_b or conv == 'R'_b or
+        conv == 'T'_b or conv == 'X'_b or conv == 'F'_b then
+      local sub: string
+      local subwidth: integer = -1
+      local pad2: byte = pad
+      local tail: string = ''
+      if conv == 'c'_b or conv == 'x'_b then
+        -- gnulib hands %c and %x to the C library's strftime, without the
+        -- flags; glibc prints %Y there as a plain number and %y as
+        -- (year % 100 + 100) % 100, which differ from %Y/%y for years
+        -- before 1000 and before 0
+        if conv == 'c'_b then
+          sub = '%a %b %e %H:%M:%S '; tail = string.format('%d', year)
+        else
+          sub = '%m/%d/'; tail = string.format('%02d', (tm.tm_year %%% 100 + 100) %%% 100)
+        end
+        pad2 = 0
+      elseif conv == 'D'_b then sub = '%m/%d/%y'
+      elseif conv == 'r'_b then sub = '%I:%M:%S %p'
+      elseif conv == 'R'_b then sub = '%H:%M'
+      elseif conv == 'T'_b or conv == 'X'_b then sub = '%H:%M:%S'
+      else
+        -- %F is %+4Y-%m-%d; a width applies to the year
+        sub = '%Y-%m-%d'
+        if pad == 0 and width < 0 then pad = '+'_b; subwidth = 4
+        else subwidth = width - 6; if subwidth < 0 then subwidth = 0 end end
+        pad2 = pad
+      end
+      local inner: stringbuilder
+      tf_format(&inner, sub, f, up, pad2, subwidth)
+      inner:write(tail)
+      local s = inner:promote()
+      tf_text(sb, s, width, pad, false, false)
+    elseif conv == 'C'_b then
+      local negy = tm.tm_year < -1900
+      local early = not negy and tm.tm_year < 0
+      local century: integer = (tm.tm_year - (early and 99 or 0)) /// 100 + 19
+      tf_year(sb, 2, negy, iabs(century), width, pad, yr_spec)
+    elseif conv == 'y'_b then
+      local yy: integer = tm.tm_year %%% 100
+      if yy < 0 then yy = tm.tm_year < -1900 and -yy or yy + 100 end
+      tf_year(sb, 2, false, yy, width, pad, yr_spec)
+    elseif conv == 'Y'_b then
+      tf_year(sb, 4, tm.tm_year < -1900, iabs(year), width, pad, yr_spec)
+    elseif conv == 'G'_b or conv == 'g'_b or conv == 'V'_b then
+      local adj: integer = 0
+      local days = iso_week_days(tm.tm_yday, tm.tm_wday)
+      if days < 0 then
+        adj = -1
+        days = iso_week_days(tm.tm_yday + 365 + (isleap(year - 1) and 1 or 0), tm.tm_wday)
+      else
+        local dd = iso_week_days(tm.tm_yday - (365 + (isleap(year) and 1 or 0)), tm.tm_wday)
+        if dd >= 0 then adj = 1; days = dd end
+      end
+      if conv == 'g'_b then
+        local yy: integer = (tm.tm_year %%% 100 + adj) %%% 100
+        if yy < 0 then yy = tm.tm_year < -1900 - adj and -yy or yy + 100 end
+        tf_year(sb, 2, false, yy, width, pad, yr_spec)
+      elseif conv == 'G'_b then
+        tf_year(sb, 4, tm.tm_year < -1900 - adj, iabs(year + adj), width, pad, yr_spec)
+      else
+        tf_number(sb, 2, false, days /// 7 + 1, width, pad, false, 0)
+      end
+    elseif conv == 'd'_b then tf_number(sb, 2, false, tm.tm_mday, width, pad, false, 0)
+    elseif conv == 'e'_b then tf_number(sb, 2, false, tm.tm_mday, width, pad == 0 and '_'_b or pad, false, 0)
+    elseif conv == 'H'_b then tf_number(sb, 2, false, tm.tm_hour, width, pad, false, 0)
+    elseif conv == 'k'_b then tf_number(sb, 2, false, tm.tm_hour, width, pad == 0 and '_'_b or pad, false, 0)
+    elseif conv == 'I'_b or conv == 'l'_b then
+      local h12: integer = tm.tm_hour %%% 12
+      if h12 == 0 then h12 = 12 end
+      if conv == 'l'_b and pad == 0 then pad = '_'_b end
+      tf_number(sb, 2, false, h12, width, pad, false, 0)
+    elseif conv == 'j'_b then tf_number(sb, 3, false, tm.tm_yday + 1, width, pad, false, 0)
+    elseif conv == 'm'_b then tf_number(sb, 2, false, tm.tm_mon + 1, width, pad, false, 0)
+    elseif conv == 'M'_b then tf_number(sb, 2, false, tm.tm_min, width, pad, false, 0)
+    elseif conv == 'S'_b then tf_number(sb, 2, false, tm.tm_sec, width, pad, false, 0)
+    elseif conv == 'q'_b then tf_number(sb, 1, false, tm.tm_mon /// 3 + 1, width, pad, false, 0)
+    elseif conv == 'u'_b then tf_number(sb, 1, false, (tm.tm_wday + 6) %%% 7 + 1, width, pad, false, 0)
+    elseif conv == 'w'_b then tf_number(sb, 1, false, tm.tm_wday, width, pad, false, 0)
+    elseif conv == 'U'_b then tf_number(sb, 2, false, (tm.tm_yday - tm.tm_wday + 7) /// 7, width, pad, false, 0)
+    elseif conv == 'W'_b then
+      tf_number(sb, 2, false, (tm.tm_yday - (tm.tm_wday + 6) %%% 7 + 7) /// 7, width, pad, false, 0)
+    elseif conv == 's'_b then tf_number(sb, 1, f.t < 0, iabs(f.t), width, pad, false, 0)
+    elseif conv == 'n'_b then tf_text(sb, '\n', width, pad, up, low)
+    elseif conv == 't'_b then tf_text(sb, '\t', width, pad, up, low)
+    elseif conv == 'p'_b or conv == 'P'_b then
+      if conv == 'P'_b then low = true end
+      if change then up = false; low = true end
+      tf_text(sb, tm.tm_hour >= 12 and 'PM' or 'AM', width, pad, up, low)
+    elseif conv == 'Z'_b then
+      if change then up = false; low = true end
+      tf_text(sb, f.zone, width, pad, up, low)
+    elseif conv == 'N'_b then
+      -- the first `width` digits; with an explicit width, trailing zeros
+      -- become padding on the right
+      local v = f.ns
+      local w = width
+      if w <= 0 then w = 9 end
+      local nd: integer = 9
+      while w < nd or (1 < nd and v %%% 10 == 0) do nd = nd - 1; v = v /// 10 end
+      local digs: [9]byte
+      for k = nd - 1, 0, -1 do digs[k] = (@byte)(48 + v %%% 10); v = v /// 10 end
+      if pad == 0 then pad = '0'_b end
+      sb:write((@string){data = (@*[0]byte)(&digs[0]), size = (@usize)(nd)})
+      tf_text(sb, '', w - nd, pad, false, false)
+    elseif conv == 'z'_b then
+      local diff: integer = tm.tm_gmtoff
+      local neg = diff < 0 or (diff == 0 and f.zone.size > 0 and f.zone:byte(1) == '-'_b)
+      local ad = iabs(diff)
+      local hh, mm, ss = ad // 3600, ad // 60 % 60, ad % 60
+      if colons == 3 then
+        if ss ~= 0 then colons = 2 elseif mm ~= 0 then colons = 1 else colons = -1 end
+      end
+      if colons == 0 then tf_number(sb, 5, neg, hh * 100 + mm, width, pad, true, 0)
+      elseif colons == 1 then tf_number(sb, 6, neg, hh * 100 + mm, width, pad, true, 4)
+      elseif colons == 2 then tf_number(sb, 9, neg, hh * 10000 + mm * 100 + ss, width, pad, true, 20)
+      elseif colons == -1 then tf_number(sb, 3, neg, hh, width, pad, true, 0)
+      else tf_text(sb, fmt:sub(start, j), width, pad, up, low) end
+    else
+      tf_text(sb, fmt:sub(start, j), width, pad, up, low)
+    end
+    i = nexti
+    width = -1
+  end
+end
+
+-- Format a broken-down time as GNU nstrftime does in the C locale.
+function util.timestr(fmt: string, f: *util.Time): string
+  local sb: stringbuilder
+  tf_format(&sb, fmt, f, false, 0, -1)
+  return sb:promote()
+end
+
+-- Local time with a format; the seconds as a number if the year does not fit.
+function util.timefmt(t: integer, fmt: string): string
+  local f, ok = util.breaktime(t, 0, false)
+  if not ok then return string.format('%d', t) end
+  return util.timestr(fmt, &f)
+end
+
+-- "%Y-%m-%d %H:%M:%S.%N %z" in local time: stat %x/%y/%z and diff headers.
+function util.fulltime(t: integer, ns: integer): string
+  local f, ok = util.breaktime(t, ns, false)
+  if not ok then return string.format('%d.%09d', t, ns) end
+  return util.timestr('%Y-%m-%d %H:%M:%S.%N %z', &f)
+end

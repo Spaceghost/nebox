@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.clock'
 
 -- Directory children, sorted, without . and ..
 local function children(path: string): sequence(string)
@@ -130,9 +131,9 @@ local function stat_format(fmt: string, path: string, st: *sys.Stat)
     elseif d == 89 then util.writef('%d', st.st_mtim.tv_sec)
     elseif d == 90 then util.writef('%d', st.st_ctim.tv_sec)
     elseif d == 87 then util.write('0')
-    elseif d == 120 then util.write(util.timefmt(st.st_atim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_atim.tv_nsec))
-    elseif d == 121 then util.write(util.timefmt(st.st_mtim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_mtim.tv_nsec))
-    elseif d == 122 then util.write(util.timefmt(st.st_ctim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_ctim.tv_nsec))
+    elseif d == 120 then util.write(util.fulltime(st.st_atim.tv_sec, st.st_atim.tv_nsec))
+    elseif d == 121 then util.write(util.fulltime(st.st_mtim.tv_sec, st.st_mtim.tv_nsec))
+    elseif d == 122 then util.write(util.fulltime(st.st_ctim.tv_sec, st.st_ctim.tv_nsec))
     elseif d == 116 then util.writef('%x', (st.st_rdev >> 8) & 0xFFF)
     elseif d == 84 then util.writef('%x', (st.st_rdev & 0xFF) | ((st.st_rdev >> 12) & 0xFFF00))
     else util.writebyte(37); util.writebyte(d) end

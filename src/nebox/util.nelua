@@ -374,15 +374,6 @@ function util.modestr(mode: cuint): string
   return string.copy((@string){data=&out[0], size=10})
 end
 
--- Format a UTC timestamp with strftime.
-function util.timefmt(t: clong, fmt: string): string
-  local tm: sys.Tm
-  sys.gmtime_r(&t, &tm)
-  local buf: [256]cchar
-  local n = sys.strftime(&buf[0], 256, fmt, &tm)
-  return string.copy((@string){data=(@*[0]byte)(&buf[0]), size=n})
-end
-
 -- Expand backslash escapes as echo -e / printf do. Returns the string and
 -- whether a \c (stop output) was seen.
 function util.unescape(s: string): (string, boolean)

@@ -757,6 +757,36 @@ same diff-N 'diff -N nosuch words.txt | head -1; echo $?'
 same diff-dir 'cp words.txt sub/; diff words.txt sub; echo $?'
 same diff-long 'seq 1000 > a; seq 1000 | sed "500s/.*/X/;700d;900a Y" > b; diff a b'
 same diff-all-diff 'seq 3 > a; seq 4 6 > b; diff a b'
+# local time: date, stat, ls -l, diff -u and touch against GNU with explicit TZ
+# values (zone files, POSIX TZ strings, odd names) and fixed instants
+same date-tz-zones 'for z in UTC Japan EST5EDT EST5 "<+0530>-5:30" :Asia/Kolkata Asia/Kolkata "" XYZ JST-9 Europe/Dublin Australia/Lord_Howe America/St_Johns Etc/GMT+5 "NZST-12NZDT,M9.5.0,M4.1.0/3" America "<+05>-5" "EST+5EDT,M3.2.0/2,M11.1.0/2" XYZ-3:30 Factory GMT0 :UTC; do for t in 0 1700000000; do TZ=$z date -d @$t "+[$z] %F %T %z %:z %::z %:::z %Z %s"; done; done'
+same date-tz-unset '(unset TZ; date -d @1700000000 "+%F %T %z %Z")'
+same date-tz-dst-ny 'for t in 1710053999 1710054000 1730611799 1730611800 1730615399 1730615400 -5000000000 99999999999; do TZ=America/New_York date -d @$t "+%F %T %z %Z %s"; done'
+same date-tz-dst-half 'for t in 1712413800 1712415600 1712417400 1696087800 1696089600 1696091400; do TZ=Australia/Lord_Howe date -d @$t "+%F %T %z %:::z %Z"; done'
+same date-tz-lmt 'for t in -2000000000 -3000000000; do TZ=Asia/Kolkata date -d @$t "+%F %T %z %::z %:::z %Z"; done'
+same date-tz-default 'TZ=America/New_York date -d @0; TZ=America/New_York date -R -d @0; TZ=Asia/Kolkata date -R -d @0; TZ=America/New_York date -u -d @0; TZ=Asia/Tokyo date -u -d @0 "+%Z %z"'
+same date-tz-years 'for t in -62167219200 -62198755200 -100000000000 253402300800 -67768040609740800 99999999999999999 67767976233316800; do TZ=America/New_York date -d @$t "+%Y|%C|%y|%G|%g|%F|%s|%c|%x|%D"; echo $?; done'
+same date-fmt-flags 'for c in a A b B c C d D e F g G h H I j k l m M n N p P q r R s S t T u U V w W x X y Y z Z % + Q : 1; do for p in "" E O ^ "#" - _ 0 + 6 _6 -6 06 ^6 "#6" +6 +2 3 _1 12 _12 +12 -12 ^# 0_ _0; do printf "%s=[%s] " "$p$c" "$(TZ=America/New_York date -d @1710053999 "+%$p$c")"; done; echo; done'
+same date-fmt-tz 'TZ=Asia/Kolkata date -d @0 "+%::::z|%:5z|%4z|%8:z|%10::z|%_z|%-z|%0:z|%:|%::x|%E:z|%-:::z|%_10:::z|end%"; TZ=America/New_York date -d @0 "+%6%d|%%|%-%|x%5"'
+same date-fmt-week 'for t in 0 86400 1104537600 1135987200 1167523200 1199145600 1230681600 1262217600 1293753600 1609372800 1609459200 1640995200 -86400 -31536000; do TZ=UTC date -d @$t "+%G-W%V-%u %g %U %W %j %a"; done'
+same date-fmt-ns '/usr/bin/touch -d @1710053999.123456780 n1; /usr/bin/touch -d @1710053999.0000012 n2; for f in n1 n2; do TZ=America/New_York date -r $f "+%N|%-N|%_N|%3N|%-3N|%_3N|%12N|%-12N|%_12N|%+12N|%1N|%9N|%T.%6N %Z"; done'
+same date-bad 'date -d @0 +%F extra; echo $?; date -R -d @0 +%F; echo $?'
+same stat-tz '/usr/bin/touch -d @1710053999.5 f; /usr/bin/touch -a -d @1730611800 f; for z in America/New_York Asia/Kolkata UTC; do TZ=$z stat -c "%y|%x" f; TZ=$z stat f | grep -E "^(Access|Modify): [0-9]"; done'
+same ls-l-tz '/usr/bin/touch -d @1000000000 old; for z in America/New_York Asia/Kolkata; do TZ=$z ls -l old | cut -d" " -f6-; done; touch new; ls -l new | cut -d" " -f6- | sed "s/[0-9][0-9]:[0-9][0-9]/HH:MM/"'
+same diff-u-tz '/usr/bin/touch -d @1710053999.25 a; seq 2 > b; /usr/bin/touch -d @1730611800 b; for z in America/New_York Asia/Kolkata; do TZ=$z diff -u a b | head -2; done'
+same touch-tz 'export TZ=America/New_York; touch -d "2024-07-01 12:00:00" a; touch -d "2024-11-03 01:30:00" b; touch -d 2024-01-15 c; touch -t 202411030130 d; touch -t 201612312359.60 e; stat -c "%Y %n" a b c d e; touch -d "2024-03-10 02:30:00" f; echo $?; touch -t 202403100230 f; echo $?; touch -d "2020-02-30" f; echo $?; touch -d "2016-12-31 23:59:60" f; echo $?; ls'
+same touch-tz-half 'TZ=Australia/Lord_Howe touch -d "2024-04-07 01:45:00" a; TZ=Australia/Lord_Howe touch -d "2023-10-01 02:15:00" b; echo $?; stat -c "%Y %n" a'
+same date-tz-tzdir 'TZDIR=/usr/share/zoneinfo/America TZ=New_York date -d @0 "+%T %Z"; TZDIR=/usr/share/zoneinfo/Asia TZ=:Kolkata date -d @0 "+%T %Z"; TZDIR= TZ=Japan date -d @0 "+%T %Z"'
+# limits pinned (README "Known limits"): with an unknown zone name nelibc
+# keeps UTC and its abbreviation; GNU (glibc) shows the name's leading
+# letters as the abbreviation
+expect date-tz-unknown-name '+0000 UTC
++0000 UTC
+exit=0' 'TZ=Foo/Bar date -d @0 "+%z %Z"; TZ=:Foo date -d @0 "+%z %Z"'
+# ... and a TZDIR without the zone falls back to /usr/share/zoneinfo, where
+# GNU treats the name as a POSIX string (Asia, +0000)
+expect date-tz-tzdir-missing '09:00:00 JST
+exit=0' 'TZDIR=/nonexistent TZ=Asia/Tokyo date -d @0 "+%T %Z"'
 # awk
 . "$(dirname -- "$0")/awk.sh"
 # sh

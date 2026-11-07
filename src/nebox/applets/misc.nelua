@@ -6,6 +6,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.clock'
 
 -- dd ------------------------------------------------------------------------
 global function applet_dd(args: sequence(string)): integer
@@ -244,8 +245,8 @@ end
 
 local function diff_timestamp(path: string): string
   local st: sys.Stat
-  if sys.stat(path, &st) ~= 0 then return '1970-01-01 00:00:00.000000000 +0000' end
-  return util.timefmt(st.st_mtim.tv_sec, '%Y-%m-%d %H:%M:%S') .. string.format('.%09d +0000', st.st_mtim.tv_nsec)
+  if sys.stat(path, &st) ~= 0 then return util.fulltime(0, 0) end
+  return util.fulltime(st.st_mtim.tv_sec, st.st_mtim.tv_nsec)
 end
 
 local function print_lines(prefix: string, lines: sequence(string), lo: integer, hi: integer, nonl: boolean, total: integer)

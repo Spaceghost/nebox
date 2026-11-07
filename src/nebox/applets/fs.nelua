@@ -6,6 +6,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.clock'
 
 local function digits(v: integer): integer
   local n: integer = 1
@@ -70,9 +71,17 @@ local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths, 
   local size: string = string.format('%d', (@integer)(st.st_size))
   if human then size = util.human((@integer)(st.st_size)) end
   local fmt = string.format('%%s %%%dd %%-%ds %%-%ds %%%ds %%s %%s', w.nlink, w.uid, w.gid, w.size)
+  -- GNU: the time of day for the past six months (half of 365.2425 days),
+  -- the year for anything older or in the future
+  local now: sys.Timespec
+  sys.clock_gettime(sys.CLOCK_REALTIME, &now)
+  local ms, mn = st.st_mtim.tv_sec, st.st_mtim.tv_nsec
+  local hs = now.tv_sec - 15778476
+  local recent = (hs < ms or (hs == ms and now.tv_nsec < mn)) and
+    (ms < now.tv_sec or (ms == now.tv_sec and mn < now.tv_nsec))
   util.write(string.format(fmt, util.modestr(st.st_mode), (@integer)(st.st_nlink),
     u, g, size,
-    util.timefmt(st.st_mtim.tv_sec, '%b %e %H:%M'), shown))
+    util.timefmt(st.st_mtim.tv_sec, recent and '%b %e %H:%M' or '%b %e  %Y'), shown))
   if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
     local buf: [4096]byte
     local n = sys.readlink(path, &buf[0], #buf)
@@ -295,7 +304,7 @@ global function applet_rm(args: sequence(string)): integer
   return rc
 end
 
--- "@SECONDS", "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", or "YYYY-MM-DDTHH:MM[:SS]" as UTC.
+-- "@SECONDS", "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", or "YYYY-MM-DDTHH:MM[:SS]" in local time.
 global function parse_datetime(s: string): (clong, boolean)
   if s.size > 1 and s:byte(1) == 64 then
     local v, ok = util.toint(s:sub(2))
@@ -309,17 +318,10 @@ global function parse_datetime(s: string): (clong, boolean)
   if #nums >= 4 then hh = nums[4] end
   if #nums >= 5 then mm = nums[5] end
   if #nums >= 6 then ss = nums[6] end
-  if m < 1 or m > 12 or d < 1 or d > 31 or hh > 23 or mm > 59 or ss > 60 then return 0, false end
-  -- days from civil (Howard Hinnant)
-  local yy = y
-  if m <= 2 then yy = yy - 1 end
-  local era = (yy >= 0 and yy or yy - 399) // 400
-  local yoe = yy - era * 400
-  local mp = (m + 9) % 12
-  local doy = (153 * mp + 2) // 5 + d - 1
-  local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
-  local days = era * 146097 + doe - 719468
-  return (@clong)(days * 86400 + hh * 3600 + mm * 60 + ss), true
+  if m < 1 or m > 12 or d < 1 or d > 31 or hh > 23 or mm > 59 or ss > 59 then return 0, false end
+  -- local wall time; one that a DST change skips is rejected, as GNU does
+  local t, ok = util.localsecs(y, m, d, hh, mm, ss)
+  return (@clong)(t), ok
 end
 
 -- touch -t: [[CC]YY]MMDDhhmm[.ss]
@@ -343,15 +345,17 @@ global function parse_touch_t(s: string): (clong, boolean)
   elseif body.size == 8 then
     local ts: sys.Timespec
     sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
-    local tm: sys.Tm
-    sys.gmtime_r(&ts.tv_sec, &tm)
-    y = (@integer)(tm.tm_year) + 1900
+    local now, _ = util.breaktime(ts.tv_sec, 0, false)
+    y = (@integer)(now.tm.tm_year) + 1900
   else return 0, false end
   local mo, ok1 = util.toint(body:sub(1, 2))
   local d, ok2 = util.toint(body:sub(3, 4))
   local hh, ok3 = util.toint(body:sub(5, 6))
   local mm, ok4 = util.toint(body:sub(7, 8))
-  return parse_datetime(string.format('%d-%d-%d %d:%d:%d', y, mo, d, hh, mm, ss))
+  -- second 60 (a leap second) is accepted as the next minute's first
+  local leap: integer = ss == 60 and 1 or 0
+  local t, ok = parse_datetime(string.format('%d-%d-%d %d:%d:%d', y, mo, d, hh, mm, ss - leap))
+  return t + leap, ok
 end
 
 global function applet_touch(args: sequence(string)): integer

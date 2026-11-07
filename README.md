@@ -169,16 +169,37 @@ Stated here rather than worked around:
   backend table; `free` reads /proc/meminfo.
 - `tsort` reproduces GNU's output order (sorted zero-degree queue, successors
   in reverse input order).
-- `stat` shows times in UTC and has no `%w`/birth time or device-name
-  formatting beyond `%d`/`%D`/`%t`/`%T`.
+- `stat` has no `%w`/birth time or device-name formatting beyond
+  `%d`/`%D`/`%t`/`%T`; `%x %y %z` and the default output show local time
+  with nanoseconds and `%z` offset, as GNU does (`stat-tz`).
 - `xargs` runs commands with `fork`+`execvp`; no `-P`, `-L`, or `-s` limits.
 - `timeout` polls the child every 2 ms rather than using signals; `-k` is
   accepted but ignored.
 - `mktemp` draws names from `getrandom`; `groups`/`whoami` know only the
   current process.
-- `date` prints UTC. nelibc has no zone database, so there is no local time.
-  `-d` understands only `@SECONDS`; setting the date is unsupported.
-- `ls` prints one entry per line in every mode (no columns); sorting flags -r -t -S and -h -i -n -A are supported. `-l` and `id`
+- Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)
+  comes from nelibc's `localtime_r`/`mktime`: TZif zone files, POSIX TZ
+  strings (`EST5EDT`, `<+0530>-5:30`, `NZST-12NZDT,M9.5.0,M4.1.0/3`), and
+  `/etc/localtime` when TZ is unset. A relative zone name is looked up
+  under `$TZDIR` or `/usr/share/zoneinfo` first, as glibc does (`TZ=Japan`
+  reads the zone file, not a POSIX string). Cases compare against GNU with
+  explicit TZ values, DST transitions (America/New_York, the half-hour
+  Australia/Lord_Howe), historical offsets with seconds and years from -1199 to
+  2147483647 (`date-tz-*`, `touch-tz*`). Unset TZ is only exercised with a
+  UTC `/etc/localtime` (the test container's). Differences from GNU: an
+  unknown zone (`TZ=Foo/Bar`, `TZ=:Foo`) is UTC with the abbreviation `UTC`
+  where GNU shows `Foo` (`date-tz-unknown-name`); a `$TZDIR` that lacks the
+  zone falls back to `/usr/share/zoneinfo` where GNU parses the name as a
+  POSIX string (`date-tz-tzdir-missing`). `touch` rejects a wall time that a
+  DST change skips and takes the first of a repeated hour, as GNU does.
+- `date` formats with GNU's nstrftime rules in the C locale: every
+  conversion, the `_ - 0 + ^ #` flags, widths, `E`/`O`, `%N` (and `%-N`),
+  `%q`, `%P`, `%s`, `%:z %::z %:::z` (`date-fmt-*`). `-u`, `-R`, `-r FILE`;
+  `-d` understands only `@SECONDS`. No `-I`, `--rfc-3339`, `-f`, long
+  options, or setting the date.
+- `ls` prints one entry per line in every mode (no columns); sorting flags -r -t -S and -h -i -n -A are supported. `-l`
+  shows the year instead of the time for files older than six months or in
+  the future, as GNU does (`ls-l-tz`). `-l` and `id`
   resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
   has no `getpwuid`); unknown ids print as numbers.
 - `id` lists supplementary groups from `getgroups`; `-G` is supported.

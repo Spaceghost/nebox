@@ -112,7 +112,8 @@ function sys.isatty(fd: cint): cint <cimport 'isatty', cinclude '<unistd.h>'> en
 function sys.nanosleep(req: *sys.Timespec, rem: *sys.Timespec): cint <cimport 'nanosleep', cinclude '<time.h>'> end
 function sys.clock_gettime(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_gettime', cinclude '<time.h>'> end
 function sys.gmtime_r(t: *clong, out: *sys.Tm): *sys.Tm <cimport 'gmtime_r', cinclude '<time.h>'> end
-function sys.strftime(buf: cstring, n: csize, fmt: cstring, tm: *sys.Tm): csize <cimport 'strftime', cinclude '<time.h>'> end
+function sys.localtime_r(t: *clong, out: *sys.Tm): *sys.Tm <cimport 'localtime_r', cinclude '<time.h>'> end
+function sys.mktime(tm: *sys.Tm): clong <cimport 'mktime', cinclude '<time.h>'> end
 function sys.uname(u: *sys.Utsname): cint <cimport 'uname', cinclude '<sys/utsname.h>'> end
 function sys.gethostname(buf: cstring, n: csize): cint <cimport 'gethostname', cinclude '<unistd.h>'> end
 function sys.getpid(): cint <cimport 'getpid', cinclude '<unistd.h>'> end
