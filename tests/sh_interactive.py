@@ -132,6 +132,23 @@ def _():
     sh.close()
 
 
+@case('a recalled multi-line entry is laid out on its rows and runs again')
+def _():
+    sh = Shell(cols=30)
+    sh.send('for i in 1 2; do\r')
+    sh.expect('> ')
+    sh.run('echo item$i; done', 'item2\r\n')
+    sh.prompt()
+    sh.send(UP)
+    # the second line is drawn on its own row (the tty's ONLCR adds a CR)
+    sh.expect('for i in 1 2; do\r\r\necho item$i; done')
+    sh.send('\r')
+    sh.expect('item1\r\nitem2\r\n')
+    sh.prompt()
+    sh.run('echo after', 'after\r\n')
+    sh.close()
+
+
 @case('history recall with Up and Ctrl-P, saved to $HISTFILE')
 def _():
     sh = Shell()

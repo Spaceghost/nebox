@@ -182,21 +182,38 @@ function lineedit.Editor:refresh()
   if self.cur_row > 0 then sb:write('\27[', self.cur_row, 'A') end
   sb:write('\r\27[J')
   sb:write(self.prompt)
-  for i = 1, #self.buf do sb:writebyte(self.buf[i]) end
-  local total = self.prompt_w + bytes_width(&self.buf, 0, #self.buf)
-  local end_row = total // cols
+  -- lay the buffer out as the terminal will: wrapping at the width and a
+  -- new row for each newline in a multi-line entry
+  local row, col = self.prompt_w // cols, self.prompt_w % cols
+  local crow, ccol = row, col
+  local pending = false   -- the last character filled its row; the terminal has not wrapped yet
+  for i = 1, #self.buf do
+    if i - 1 == self.cursor then crow, ccol = row, col end
+    local b = self.buf[i]
+    if b == 10 then
+      sb:write('\r\n')
+      if not pending then row = row + 1 end
+      col = 0
+      pending = false
+    else
+      sb:writebyte(b)
+      if not is_cont(b) then
+        col = col + 1
+        if col == cols then row = row + 1; col = 0; pending = true else pending = false end
+      end
+    end
+  end
+  if self.cursor >= #self.buf then crow, ccol = row, col end
   -- at an exact multiple of the width the terminal holds the cursor on the
   -- last column; force the wrap so row arithmetic stays right
-  if total > 0 and total % cols == 0 then sb:write('\n') end
-  local pos = self.prompt_w + bytes_width(&self.buf, 0, self.cursor)
-  local row, col = pos // cols, pos % cols
-  if end_row > row then sb:write('\27[', end_row - row, 'A') end
+  if pending then sb:write('\n') end
+  if row > crow then sb:write('\27[', row - crow, 'A') end
   sb:write('\r')
-  if col > 0 then sb:write('\27[', col, 'C') end
-  self.cur_row = row
-  local s = sb:promote()
-  out(s)
-  s:destroy()
+  if ccol > 0 then sb:write('\27[', ccol, 'C') end
+  self.cur_row = crow
+  local str = sb:promote()
+  out(str)
+  str:destroy()
 end
 
 local function cursor_prev(self: *lineedit.Editor): integer
