@@ -154,57 +154,6 @@ global function applet_hostname(args: sequence(string)): integer
   return 0
 end
 
-global function applet_id(args: sequence(string)): integer
-  local o = util.parsel(args, 'ugrnG', &longopts.id, #longopts.id)
-  if not o:ok() then return util.optfail(o) end
-  local uid, euid = sys.getuid(), sys.geteuid()
-  local gid, egid = sys.getgid(), sys.getegid()
-  local u: integer = (@integer)(o:has('r') and uid or euid)
-  local g: integer = (@integer)(o:has('r') and gid or egid)
-  if o:has('G') then
-    local list: [256]cuint
-    local n = sys.getgroups(256, &list[0])
-    local names = o:has('n')
-    local ids: sequence(integer)
-    ids:push((@integer)(egid))
-    for i: integer = 0, < n do
-      local sg = (@integer)(list[i])
-      if sg ~= (@integer)(egid) then ids:push(sg) end
-    end
-    for k, id in ipairs(ids) do
-      if k > 1 then util.writebyte(32) end
-      if names then util.write(util.idname(util.groupname(id), id)) else util.writef('%d', id) end
-    end
-    util.writebyte(10)
-    return 0
-  end
-  if o:has('u') then
-    if o:has('n') then util.line(util.idname(util.username(u), u)) else util.writef('%d\n', u) end
-    return 0
-  end
-  if o:has('g') then
-    if o:has('n') then util.line(util.idname(util.groupname(g), g)) else util.writef('%d\n', g) end
-    return 0
-  end
-  local function show(label: string, id: integer, name: string)
-    util.write(label); util.writef('%d', id)
-    if name.size > 0 then util.write('(' .. name .. ')') end
-  end
-  show('uid=', (@integer)(uid), util.username((@integer)(uid)))
-  show(' gid=', (@integer)(gid), util.groupname((@integer)(gid)))
-  if euid ~= uid then show(' euid=', (@integer)(euid), util.username((@integer)(euid))) end
-  if egid ~= gid then show(' egid=', (@integer)(egid), util.groupname((@integer)(egid))) end
-  show(' groups=', (@integer)(gid), util.groupname((@integer)(gid)))
-  local list: [256]cuint
-  local n = sys.getgroups(256, &list[0])
-  for i: integer = 0, < n do
-    local sg = (@integer)(list[i])
-    if sg == (@integer)(gid) then continue end
-    show(',', sg, util.groupname(sg))
-  end
-  util.writebyte(10)
-  return 0
-end
 
 local SigName = @record{name: string, num: cint}
 local signals: []SigName = {

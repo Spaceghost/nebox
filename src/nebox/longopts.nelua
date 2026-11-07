@@ -13,11 +13,6 @@ global longopts.cat: []util.LongOpt = {
   {'show-nonprinting', 0, 118}, {'show-ends', 0, 69}, {'show-tabs', 0, 84}, {'show-all', 0, 65},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.wc: []util.LongOpt = {
-  {'bytes', 0, 99}, {'chars', 0, 109}, {'lines', 0, 108}, {'words', 0, 119},
-  {'debug', 0, util.UNSUPPORTED}, {'files0-from', 1, util.UNSUPPORTED}, {'max-line-length', 0, 76},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.mkdir: []util.LongOpt = {
   {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
@@ -59,7 +54,7 @@ global longopts.ln: []util.LongOpt = {
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
 global longopts.touch: []util.LongOpt = {
-  {'time', 1, util.UNSUPPORTED}, {'no-create', 0, 99}, {'date', 1, 100}, {'reference', 1, 114},
+  {'time', 1, 200}, {'no-create', 0, 99}, {'date', 1, 100}, {'reference', 1, 114},
   {'no-dereference', 0, 104}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
 global longopts.sort: []util.LongOpt = {
@@ -126,11 +121,6 @@ global longopts.shuf: []util.LongOpt = {
 global longopts.truncate: []util.LongOpt = {
   {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
-global longopts.id: []util.LongOpt = {
-  {'context', 0, util.UNSUPPORTED}, {'group', 0, 103}, {'groups', 0, 71}, {'name', 0, 110},
-  {'real', 0, 114}, {'user', 0, 117}, {'zero', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
 }
 global longopts.uname: []util.LongOpt = {
   {'all', 0, 97}, {'kernel-name', 0, 115}, {'sysname', 0, 115}, {'nodename', 0, 110},

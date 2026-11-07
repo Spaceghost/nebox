@@ -1,0 +1,263 @@
+-- id: a port of GNU coreutils 9.1 src/id.c and group-list.c over nelibc's
+-- getpwnam/getpwuid/getgrgid/getgrouplist: USER operands (names or
+-- numbers), -u -g -G -n -r -z, the default uid=/gid=/groups= format, and
+-- GNU's option conflicts. There is no SELinux context (-Z is refused).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwnam(name: cstring): *Passwd <cimport 'getpwnam', cinclude '<pwd.h>'> end
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
+local function c_getgrouplist(user: cstring, gid: cuint, groups: *[0]cuint, n: *cint): cint <cimport 'getgrouplist', cinclude '<grp.h>'> end
+local function c_getgroups(n: cint, list: *[0]cuint): cint <cimport 'getgroups', cinclude '<unistd.h>'> end
+
+local ruid: cuint
+local euid: cuint
+local rgid: cuint
+local egid: cuint
+local just_user: boolean
+local just_group: boolean
+local just_group_list: boolean
+local use_name: boolean
+local use_real: boolean
+local opt_zero: boolean
+local ok: boolean
+local multiple_users: boolean
+
+-- xgetgroups (gnulib mgetgroups)
+local function getgroups_for(username: string, has_user: boolean, gid: cuint): (sequence(cuint), boolean)
+  local out: sequence(cuint)
+  if has_user then
+    local max: cint = 10
+    while true do
+      local buf: sequence(cuint)
+      buf:resize((@usize)(max))
+      local last = max
+      local ng = c_getgrouplist(username, gid, (@*[0]cuint)(&buf[1]), &max)
+      if ng < 0 and last == max then max = max * 2 end
+      if ng >= 0 then
+        for k = 1, max do out:push(buf[k]) end
+        buf:destroy()
+        return out, true
+      end
+      buf:destroy()
+    end
+  end
+  local n = c_getgroups(0, nilptr)
+  if n < 0 then return out, false end
+  local maxn = n
+  if maxn == 0 or gid ~= 0xffffffff then maxn = maxn + 1 end
+  local buf: sequence(cuint)
+  buf:resize((@usize)(maxn))
+  local off = gid ~= 0xffffffff and 1 or 0
+  local ng = c_getgroups(maxn - off, (@*[0]cuint)(&buf[1 + off]))
+  if ng < 0 then buf:destroy(); return out, false end
+  if gid ~= 0xffffffff then buf[1] = gid; ng = ng + 1 end
+  -- pairwise duplicates of the first entry and of neighbours go
+  if ng > 0 then
+    local first = buf[1]
+    out:push(first)
+    for k = 2, ng do
+      local v = buf[k]
+      if v ~= first and v ~= out[#out] then out:push(v) end
+    end
+  end
+  buf:destroy()
+  return out, true
+end
+
+local function print_group(gid: cuint, names: boolean): boolean
+  if names then
+    local grp = c_getgrgid(gid)
+    if grp == nilptr then
+      util.err('cannot find name for group ID ' .. tostring(gid))
+      util.write(tostring(gid))
+      return false
+    end
+    util.write((@string)(grp.gr_name))
+    return true
+  end
+  util.write(tostring(gid))
+  return true
+end
+
+local function print_group_list(username: string, has_user: boolean, delim: byte): boolean
+  local good = true
+  local pwd: *Passwd = nilptr
+  if has_user then
+    pwd = c_getpwuid(ruid)
+    if pwd == nilptr then good = false end
+  end
+  if not print_group(rgid, use_name) then good = false end
+  if egid ~= rgid then
+    util.writebyte(delim)
+    if not print_group(egid, use_name) then good = false end
+  end
+  local groups, gok = getgroups_for(username, has_user, pwd ~= nilptr and pwd.pw_gid or egid)
+  if not gok then
+    if has_user then util.err('failed to get groups for user ' .. util.quote(username) .. ': ' .. sys.errstr())
+    else util.err('failed to get groups for the current process: ' .. sys.errstr()) end
+    return false
+  end
+  for _, g in ipairs(groups) do
+    if g ~= rgid and g ~= egid then
+      util.writebyte(delim)
+      if not print_group(g, use_name) then good = false end
+    end
+  end
+  return good
+end
+
+local function print_full_info(username: string, has_user: boolean)
+  util.write('uid=' .. tostring(ruid))
+  local pwd = c_getpwuid(ruid)
+  if pwd ~= nilptr then util.write('(' .. (@string)(pwd.pw_name) .. ')') end
+  util.write(' gid=' .. tostring(rgid))
+  local grp = c_getgrgid(rgid)
+  if grp ~= nilptr then util.write('(' .. (@string)(grp.gr_name) .. ')') end
+  if euid ~= ruid then
+    util.write(' euid=' .. tostring(euid))
+    local p2 = c_getpwuid(euid)
+    if p2 ~= nilptr then util.write('(' .. (@string)(p2.pw_name) .. ')') end
+  end
+  if egid ~= rgid then
+    util.write(' egid=' .. tostring(egid))
+    local g2 = c_getgrgid(egid)
+    if g2 ~= nilptr then util.write('(' .. (@string)(g2.gr_name) .. ')') end
+  end
+  local primary: cuint
+  if has_user then primary = pwd ~= nilptr and pwd.pw_gid or 0xffffffff else primary = egid end
+  local groups, gok = getgroups_for(username, has_user, primary)
+  if not gok then
+    if has_user then util.err('failed to get groups for user ' .. util.quote(username) .. ': ' .. sys.errstr())
+    else util.err('failed to get groups for the current process: ' .. sys.errstr()) end
+    ok = false
+    return
+  end
+  if #groups > 0 then util.write(' groups=') end
+  for k, g in ipairs(groups) do
+    if k > 1 then util.writebyte(44) end
+    util.write(tostring(g))
+    local gg = c_getgrgid(g)
+    if gg ~= nilptr then util.write('(' .. (@string)(gg.gr_name) .. ')') end
+  end
+end
+
+local function print_stuff(pw_name: string, has_user: boolean)
+  if just_user then
+    local uid = use_real and ruid or euid
+    if use_name then
+      local pwd = c_getpwuid(uid)
+      if pwd == nilptr then
+        util.err('cannot find name for user ID ' .. tostring(uid))
+        ok = false
+        util.write(tostring(uid))
+      else
+        util.write((@string)(pwd.pw_name))
+      end
+    else
+      util.write(tostring(uid))
+    end
+  elseif just_group then
+    if not print_group(use_real and rgid or egid, use_name) then ok = false end
+  elseif just_group_list then
+    if not print_group_list(pw_name, has_user, opt_zero and 0 or 32) then ok = false end
+  else
+    print_full_info(pw_name, has_user)
+  end
+  if opt_zero and just_group_list and multiple_users then
+    util.writebyte(0); util.writebyte(0)
+  else
+    util.writebyte(opt_zero and 0 or 10)
+  end
+end
+
+global function applet_id(args: sequence(string)): integer
+  local longs: []util.LongOpt = {
+    {'context', 0, 90}, {'group', 0, 103}, {'groups', 0, 71}, {'name', 0, 110}, {'real', 0, 114},
+    {'user', 0, 117}, {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'agnruzGZ', &longs, #longs)
+  g.quiet = true
+  just_user = false; just_group = false; just_group_list = false; use_name = false; use_real = false
+  opt_zero = false; ok = true; multiple_users = false
+  local function usage_fail(msg: string): integer
+    if #msg > 0 then util.err(msg) end
+    util.flush()
+    local m = "Try 'id --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  local function die(msg: string): integer
+    util.err(msg); util.flush(); c_exit(1); return 1
+  end
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 97 then -- -a: ignored, for Solaris compatibility
+    elseif c == 90 then return die('--context (-Z) works only on an SELinux-enabled kernel')
+    elseif c == 103 then just_group = true
+    elseif c == 110 then use_name = true
+    elseif c == 114 then use_real = true
+    elseif c == 117 then just_user = true
+    elseif c == 122 then opt_zero = true
+    elseif c == 71 then just_group_list = true end
+  end
+  local users = g:operands()
+  local count = (just_user and 1 or 0) + (just_group and 1 or 0) + (just_group_list and 1 or 0)
+  if count > 1 then return die('cannot print "only" of more than one choice') end
+  local default_format = count == 0
+  if default_format and (use_real or use_name) then return die('cannot print only names or real IDs in default format') end
+  if default_format and opt_zero then return die('option --zero not permitted in default format') end
+  if #users >= 1 then
+    multiple_users = #users > 1
+    for _, spec in ipairs(users) do
+      local pwd: *Passwd = nilptr
+      local pw_name = ''
+      if #spec > 0 then
+        -- parse_user_spec: a name first, then a number (+N forces a number)
+        local numeric = spec:byte(1) == 43
+        if not numeric then
+          pwd = c_getpwnam(spec)
+          if pwd ~= nilptr then pw_name = spec end
+        end
+        if pwd == nilptr then
+          local s = numeric and spec:sub(2) or spec
+          local v, vok = util.toint(s)
+          if vok and v >= 0 and #s > 0 then pwd = c_getpwuid((@cuint)(v)) end
+        end
+      end
+      if pwd == nilptr then
+        -- GNU reports errno; for an empty operand nothing reset the ENOENT
+        -- its SELinux probe left behind
+        util.err(util.quote(spec) .. ': no such user' .. (#spec == 0 and ': No such file or directory' or ''))
+        ok = false
+      else
+        if #pw_name == 0 then pw_name = (@string)(pwd.pw_name) end
+        ruid = pwd.pw_uid; euid = pwd.pw_uid
+        rgid = pwd.pw_gid; egid = pwd.pw_gid
+        print_stuff(pw_name, true)
+      end
+    end
+  else
+    euid = sys.geteuid(); ruid = sys.getuid()
+    egid = sys.getegid(); rgid = sys.getgid()
+    print_stuff('', false)
+  end
+  util.flush()
+  return ok and 0 or 1
+end

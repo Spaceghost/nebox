@@ -124,6 +124,13 @@ Stated here rather than worked around:
   trailing "/", "/." and "/.." checks and symlink-loop detection.
   `tests/realpath_compare.py`: 2042 random cases over a symlink fixture, 0
   mismatches.
+- `wc` ports wc.c (C locale): -c and -m as separate columns in GNU's order,
+  compute_number_width, `--files0-from`, the bytes-only path that honours
+  the file offset, counts printed after read errors. `id` ports id.c and
+  group-list.c over nelibc's passwd/group functions: USER operands, -u -g
+  -G -n -r -z, GNU's conflicts (no SELinux, so -Z is refused as on a
+  non-SELinux kernel). `touch --time=WORD` and `-f` are accepted.
+  `tests/wcid_compare.py`: 1546 cases, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
@@ -457,7 +464,6 @@ Stated here rather than worked around:
   six months or in the future, as GNU does (`ls-l-tz`). `-l` and `id`
   resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
   has no `getpwuid`); unknown ids print as numbers.
-- `id` lists supplementary groups from `getgroups`; `-G` is supported.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `printf` (the applet and the `sh` builtin) has `%s %b %c %d %i %u %o
   %x %X %f %F %e %E %g %G %%` with flags, width and precision; no `*`

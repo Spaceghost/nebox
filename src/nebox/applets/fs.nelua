@@ -946,8 +946,23 @@ global function parse_touch_t(s: string): (clong, boolean)
 end
 
 global function applet_touch(args: sequence(string)): integer
-  local o = util.parsel(args, 'camhd:r:t:', &longopts.touch, #longopts.touch)
+  local o = util.parsel(args, 'acd:fhmr:t:', &longopts.touch, #longopts.touch)
   if not o:ok() then return util.optfail(o) end
+  -- --time=WORD: atime/access/use is -a, mtime/modify is -m (XARGMATCH)
+  for idx, k in ipairs(o.keys) do
+    if k == 200 then
+      local names: []string = {'atime', 'access', 'use', 'mtime', 'modify'}
+      local values: []integer = {97, 97, 97, 109, 109}
+      local v = util.argmatch('--time', o.vals[idx], &names, &values, 5)
+      if v < 0 then
+        util.flush()
+        local m = "Try 'touch --help' for more information.\n"
+        sys.write(2, m.data, m.size)
+        return 1
+      end
+      o.set[v] = true
+    end
+  end
   if #o.operands == 0 then return util.die('missing file operand') end
   local times: [2]sys.Timespec
   local have_time = false
