@@ -18,10 +18,6 @@ global longopts.wc: []util.LongOpt = {
   {'debug', 0, util.UNSUPPORTED}, {'files0-from', 1, util.UNSUPPORTED}, {'max-line-length', 0, 76},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.tee: []util.LongOpt = {
-  {'append', 0, 97}, {'ignore-interrupts', 0, 105}, {'output-error', 2, util.UNSUPPORTED},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.mkdir: []util.LongOpt = {
   {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
@@ -152,10 +148,6 @@ global longopts.uname: []util.LongOpt = {
   {'kernel-release', 0, 114}, {'release', 0, 114}, {'kernel-version', 0, 118}, {'machine', 0, 109},
   {'processor', 0, 112}, {'hardware-platform', 0, 105}, {'operating-system', 0, 111},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
-global longopts.mktemp: []util.LongOpt = {
-  {'directory', 0, 100}, {'quiet', 0, 113}, {'dry-run', 0, 117}, {'suffix', 1, util.UNSUPPORTED},
-  {'tmpdir', 2, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
 global longopts.stat: []util.LongOpt = {
   {'dereference', 0, 76}, {'file-system', 0, util.UNSUPPORTED}, {'format', 1, 99},

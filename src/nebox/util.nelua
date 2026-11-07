@@ -324,6 +324,35 @@ function util.Getopt:next(): integer
   return c
 end
 
+-- gnulib XARGMATCH: an exact or unambiguous-prefix match of ARG among
+-- NAMES (synonyms share a value in VALUES). On failure it reports GNU's
+-- "invalid/ambiguous argument" lines and returns -1; the caller then prints
+-- its usage hint.
+function util.argmatch(context: string, arg: string, names: *[0]string, values: *[0]integer, n: integer): integer
+  local found = -1
+  local ambiguous = false
+  for k = 0, < n do
+    if names[k] == arg then return values[k] end
+    if #arg <= #names[k] and names[k]:sub(1, #arg) == arg then
+      if found < 0 then found = k
+      elseif values[found] ~= values[k] then ambiguous = true end
+    end
+  end
+  if found >= 0 and not ambiguous then return values[found] end
+  util.err((ambiguous and 'ambiguous' or 'invalid') .. ' argument ' .. util.quote(arg) .. " for '" .. context .. "'")
+  util.flush()
+  local sb: stringbuilder
+  sb:write('Valid arguments are:')
+  for k = 0, < n do
+    if k > 0 and values[k] == values[k - 1] then sb:write(", '", names[k], "'")
+    else sb:write("\n  - '", names[k], "'") end
+  end
+  sb:write('\n')
+  local m = sb:promote()
+  sys.write(2, m.data, m.size)
+  return -1
+end
+
 -- Option parsing: short flags only, POSIX style. `spec` lists the accepted
 -- letters; a letter followed by ':' takes a value. Parsing stops at the first
 -- operand, at "--", or at "-" (which is an operand).

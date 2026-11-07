@@ -113,6 +113,11 @@ Stated here rather than worked around:
   dumps disabled (RLIMIT_CORE). Signal names come from `src/nebox/sig.nelua`
   (gnulib sig2str/str2sig). `tests/timeout_compare.py`: 44 cases, 0
   mismatches.
+- `tee` ports tee.c (-a -i -p, `--output-error[=warn|warn-nopipe|exit|exit-nopipe]`,
+  unbuffered writes, SIGPIPE ignored only when asked); `mktemp` ports
+  mktemp.c with gnulib gen_tempname (-d -p/--tmpdir[=DIR] -q -t -u
+  --suffix, getrandom names, GNU's template checks). `util.argmatch` is
+  gnulib's XARGMATCH. `tests/teemktemp_compare.py`: 47 cases, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows
@@ -386,7 +391,7 @@ Stated here rather than worked around:
   `%d`/`%D`/`%t`/`%T`; `%x %y %z` and the default output show local time
   with nanoseconds and `%z` offset, as GNU does (`stat-tz`).
 - `xargs` runs commands with `fork`+`execvp`; no `-P`, `-L`, or `-s` limits.
-- `mktemp` draws names from `getrandom`; `groups`/`whoami` know only the
+- `groups`/`whoami` know only the
   current process.
 - Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)
   comes from nelibc's `localtime_r`/`mktime`: TZif zone files, POSIX TZ

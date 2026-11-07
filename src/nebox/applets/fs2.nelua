@@ -239,44 +239,6 @@ local function fill_template(t: string): (string, boolean)
   return sb:promote(), true
 end
 
-global function applet_mktemp(args: sequence(string)): integer
-  local o = util.parsel(args, 'dqutp:', &longopts.mktemp, #longopts.mktemp)
-  if not o:ok() then return util.optfail(o) end
-  local template: string = 'tmp.XXXXXXXXXX'
-  local explicit = false
-  if #o.operands > 1 then return util.die("too many templates") end
-  if #o.operands == 1 then template = o.operands[1]; explicit = true end
-  local dir: string = ''
-  if o:has('p') then dir = o:get('p') end
-  if not explicit or o:has('t') then
-    if dir.size == 0 then
-      local env = sys.getenv('TMPDIR')
-      if env ~= nilptr then dir = env else dir = '/tmp' end
-    end
-  end
-  if explicit and not o:has('t') and template:find('/', 1, true) > 0 and dir.size > 0 then
-    return util.die("invalid template, '" .. template .. "', contains directory separator")
-  end
-  if dir.size > 0 then template = util.join(dir, template) end
-  for _ = 1, 100 do
-    local name, ok = fill_template(template)
-    if not ok then return util.die("too few X's in template '" .. o.operands[1] .. "'") end
-    if o:has('u') then util.line(name); return 0 end
-    local r: cint
-    if o:has('d') then
-      r = sys.mkdir(name, 0x1C0)
-    else
-      r = sys.open(name, sys.O_WRONLY | sys.O_CREAT | sys.O_EXCL, 0x180)
-      if r >= 0 then sys.close(r); r = 0 end
-    end
-    if r == 0 then util.line(name); return 0 end
-    if sys.errno() ~= sys.EEXIST then
-      if not o:has('q') then util.err('mktemp: failed to create ' .. (o:has('d') and 'directory' or 'file') .. ' via template \'' .. template .. '\': ' .. sys.errstr()) end
-      return 1
-    end
-  end
-  return 1
-end
 
 -- truncate: -s [+-]SIZE, -c no-create, -r REF
 global function applet_truncate(args: sequence(string)): integer

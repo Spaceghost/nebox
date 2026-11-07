@@ -1,0 +1,179 @@
+-- mktemp: a port of GNU coreutils 9.1 src/mktemp.c with gnulib's
+-- gen_tempname_len. -d -p/--tmpdir[=DIR] -q -t -u --suffix, the default
+-- template tmp.XXXXXXXXXX, GNU's template checks and diagnostics.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'stringbuilder'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_getrandom(buf: pointer, n: csize, flags: cuint): clong <cimport 'getrandom', cinclude '<sys/random.h>'> end
+
+local LETTERS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+-- gnulib last_component: leading slashes skipped, then the part after the
+-- last run of slashes that is followed by something.
+local function last_component(s: string): string
+  local base = 1
+  while base <= #s and s:byte(base) == 47 do base = base + 1 end
+  local last_was_slash = false
+  for k = base, #s do
+    if s:byte(k) == 47 then last_was_slash = true
+    elseif last_was_slash then base = k; last_was_slash = false end
+  end
+  return s:sub(base)
+end
+
+-- gen_tempname_len: kind 0 file, 1 directory, 2 no create. Returns the
+-- name and true, or false with errno set.
+local function gen_tempname(tmpl: string, suff_len: integer, x_len: integer, kind: integer): (string, boolean)
+  local start = #tmpl - suff_len - x_len + 1
+  local attempts = 62 * 62 * 62
+  for _ = 1, attempts do
+    local rnd: [64]byte
+    if c_getrandom(&rnd, (@csize)(x_len < 64 and x_len or 64), 0) < 0 then
+      for k = 0, 63 do rnd[k] = (@byte)(sys.getpid() + k * 31) end
+    end
+    local sb: stringbuilder
+    sb:write(tmpl:sub(1, start - 1))
+    for k = 0, < x_len do
+      local r = rnd[k % 64]
+      sb:writebyte(LETTERS:byte((r % 62) + 1))
+    end
+    sb:write(tmpl:sub(start + x_len))
+    local name = sb:promote()
+    if kind == 0 then
+      local fd = sys.open(name, sys.O_RDWR | sys.O_CREAT | sys.O_EXCL, 0x180)
+      if fd >= 0 then sys.close(fd); return name, true end
+    elseif kind == 1 then
+      if sys.mkdir(name, 0x1C0) == 0 then return name, true end
+    else
+      local st: sys.Stat
+      if sys.lstat(name, &st) ~= 0 then
+        if sys.errno() == sys.ENOENT then return name, true end
+        return '', false
+      end
+      sys.seterrno(sys.EEXIST)
+    end
+    if sys.errno() ~= sys.EEXIST then return '', false end
+  end
+  sys.seterrno(sys.EEXIST)
+  return '', false
+end
+
+global function applet_mktemp(args: sequence(string)): integer
+  local SUFFIX_OPTION: integer <comptime> = 200
+  local longs: []util.LongOpt = {
+    {'directory', 0, 100}, {'quiet', 0, 113}, {'dry-run', 0, 117}, {'suffix', 1, SUFFIX_OPTION},
+    {'tmpdir', 2, 112}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'dp:qtuV', &longs, #longs)
+  g.quiet = true
+  local dest_dir_arg = ''
+  local have_dir_arg = false
+  local suppress = false
+  local use_dest_dir = false
+  local deprecated_t = false
+  local create_directory = false
+  local dry_run = false
+  local suffix = ''
+  local have_suffix = false
+  local function usage_fail(msg: string): integer
+    if #msg > 0 then util.err(msg) end
+    util.flush()
+    local m = "Try 'mktemp --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 100 then create_directory = true
+    elseif c == 112 then
+      dest_dir_arg = g.has_optarg and g.optarg or ''
+      have_dir_arg = g.has_optarg
+      use_dest_dir = true
+    elseif c == 113 then suppress = true
+    elseif c == 116 then use_dest_dir = true; deprecated_t = true
+    elseif c == 117 then dry_run = true
+    elseif c == SUFFIX_OPTION then suffix = g.optarg; have_suffix = true
+    elseif c == 86 then util.line('mktemp (nebox) after GNU coreutils 9.1'); util.flush(); return 0 end
+  end
+  local operands = g:operands()
+  if #operands >= 2 then return usage_fail('too many templates') end
+  local template: string
+  if #operands == 0 then use_dest_dir = true; template = 'tmp.XXXXXXXXXX'
+  else template = operands[1] end
+  local suffix_len: integer
+  if have_suffix then
+    if #template == 0 or template:byte(#template) ~= 88 then
+      die('with --suffix, template ' .. util.quote(template) .. ' must end in X')
+    end
+    template = template .. suffix
+    suffix_len = #suffix
+  else
+    local last_x = 0
+    for k = #template, 1, -1 do if template:byte(k) == 88 then last_x = k; break end end
+    suffix = last_x > 0 and template:sub(last_x + 1) or ''
+    suffix_len = #suffix
+  end
+  if suffix_len > 0 and last_component(suffix) ~= suffix then
+    die('invalid suffix ' .. util.quote(suffix) .. ', contains directory separator')
+  end
+  local x_count = 0
+  do
+    local k = #template - suffix_len
+    while k >= 1 and template:byte(k) == 88 do x_count = x_count + 1; k = k - 1 end
+  end
+  if x_count < 3 then die('too few X\'s in template ' .. util.quote(template)) end
+  if use_dest_dir then
+    local dest_dir: string
+    local env = sys.getenv('TMPDIR')
+    local envs = env ~= nilptr and (@string)(env) or ''
+    if deprecated_t then
+      if #envs > 0 then dest_dir = envs
+      elseif have_dir_arg and #dest_dir_arg > 0 then dest_dir = dest_dir_arg
+      else dest_dir = '/tmp' end
+      if last_component(template) ~= template then
+        die('invalid template, ' .. util.quote(template) .. ', contains directory separator')
+      end
+    else
+      if have_dir_arg and #dest_dir_arg > 0 then dest_dir = dest_dir_arg
+      else dest_dir = #envs > 0 and envs or '/tmp' end
+      if #template > 0 and template:byte(1) == 47 then
+        die('invalid template, ' .. util.quote(template) .. '; with --tmpdir, it may not be absolute')
+      end
+    end
+    -- file_name_concat
+    if #dest_dir > 0 and dest_dir:byte(#dest_dir) == 47 then template = dest_dir .. template
+    else template = dest_dir .. '/' .. template end
+  end
+  local kind = dry_run and 2 or (create_directory and 1 or 0)
+  local name, ok = gen_tempname(template, suffix_len, x_count, kind)
+  if not ok then
+    if not suppress then
+      util.err('failed to create ' .. (create_directory and 'directory' or 'file') .. ' via template '
+        .. util.quote(template) .. ': ' .. sys.errstr())
+    end
+    return 1
+  end
+  util.line(name)
+  if not util.flush() and not dry_run then
+    local e = sys.errno()
+    if create_directory then sys.rmdir(name) else sys.unlink(name) end
+    if not suppress then util.err('write error: ' .. sys.strerror(e)) end
+    return 1
+  end
+  return 0
+end

@@ -1,0 +1,124 @@
+-- tee: a port of GNU coreutils 9.1 src/tee.c. -a, -i, -p and
+-- --output-error[=warn|warn-nopipe|exit|exit-nopipe], unbuffered writes to
+-- every output, "-" taken as a file name as POSIX requires.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local OE_SIGPIPE: integer <comptime> = 0
+local OE_WARN: integer <comptime> = 1
+local OE_WARN_NOPIPE: integer <comptime> = 2
+local OE_EXIT: integer <comptime> = 3
+local OE_EXIT_NOPIPE: integer <comptime> = 4
+
+local function set_ignored(n: cint)
+  local sa: sys.Sigaction
+  sa.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_IGN))
+  sys.sigaction(n, &sa, nilptr)
+end
+
+local function write_all(fd: cint, buf: *[0]byte, n: integer): boolean
+  local off = 0
+  while off < n do
+    local w = sys.write(fd, &buf[off], (@csize)(n - off))
+    if w < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return false
+    end
+    off = off + w
+  end
+  return true
+end
+
+global function applet_tee(args: sequence(string)): integer
+  local append = false
+  local ignore_interrupts = false
+  local output_error = OE_SIGPIPE
+  local longs: []util.LongOpt = {
+    {'append', 0, 97}, {'ignore-interrupts', 0, 105}, {'output-error', 2, 112},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'aip', &longs, #longs)
+  g.quiet = true
+  local function usage_fail(msg: string): integer
+    if #msg > 0 then util.err(msg) end
+    util.flush()
+    local m = "Try 'tee --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 97 then append = true
+    elseif c == 105 then ignore_interrupts = true
+    elseif c == 112 then
+      if g.has_optarg then
+        local names: []string = {'warn', 'warn-nopipe', 'exit', 'exit-nopipe'}
+        local values: []integer = {OE_WARN, OE_WARN_NOPIPE, OE_EXIT, OE_EXIT_NOPIPE}
+        local v = util.argmatch('--output-error', g.optarg, &names, &values, 4)
+        if v < 0 then return usage_fail('') end
+        output_error = v
+      else
+        output_error = OE_WARN_NOPIPE
+      end
+    end
+  end
+  if ignore_interrupts then set_ignored(sys.SIGINT) end
+  if output_error ~= OE_SIGPIPE then set_ignored(sys.SIGPIPE) end
+  local files = g:operands()
+  local fds: sequence(cint)
+  local names: sequence(string)
+  fds:push(1); names:push('standard output')
+  local ok = true
+  local n_outputs = 1
+  local exit_on_error = output_error == OE_EXIT or output_error == OE_EXIT_NOPIPE
+  for _, f in ipairs(files) do
+    local flags = sys.O_WRONLY | sys.O_CREAT | (append and sys.O_APPEND or sys.O_TRUNC)
+    local fd = sys.open(f, flags, 0x1B6)
+    if fd < 0 then
+      util.err(util.quotef(f) .. ': ' .. sys.errstr())
+      if exit_on_error then util.flush(); c_exit(1) end
+      ok = false
+      fds:push(-1)
+    else
+      fds:push(fd)
+      n_outputs = n_outputs + 1
+    end
+    names:push(f)
+  end
+  util.flush()
+  local buf: [8192]byte
+  local nread: clong = 0
+  while n_outputs > 0 do
+    nread = sys.read(0, &buf, #buf)
+    if nread < 0 and sys.errno() == sys.EINTR then continue end
+    if nread <= 0 then break end
+    for i = 1, #fds do
+      if fds[i] >= 0 and not write_all(fds[i], &buf, nread) then
+        local e = sys.errno()
+        local fail = e ~= sys.EPIPE or output_error == OE_EXIT or output_error == OE_WARN
+        if fail then
+          util.err(util.quotef(names[i]) .. ': ' .. sys.strerror(e))
+          if exit_on_error then util.flush(); c_exit(1) end
+          ok = false
+        end
+        if i > 1 then sys.close(fds[i]) end
+        fds[i] = -1
+        n_outputs = n_outputs - 1
+      end
+    end
+  end
+  if nread < 0 then util.err('read error: ' .. sys.errstr()); ok = false end
+  for i = 2, #fds do
+    if fds[i] >= 0 and sys.close(fds[i]) ~= 0 then util.err(util.quotef(names[i]) .. ': ' .. sys.errstr()); ok = false end
+  end
+  return ok and 0 or 1
+end
