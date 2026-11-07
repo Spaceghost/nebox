@@ -131,6 +131,10 @@ Stated here rather than worked around:
   -G -n -r -z, GNU's conflicts (no SELinux, so -Z is refused as on a
   non-SELinux kernel). `touch --time=WORD` and `-f` are accepted.
   `tests/wcid_compare.py`: 1546 cases, 0 mismatches.
+- `expand` and `unexpand` port expand.c, unexpand.c and expand-common.c:
+  tab lists with `/N` and `+N`, the obsolete `-N` forms, -i, -a,
+  `--first-only`, lines continuing across files. `tests/expand_compare.py`:
+  2000 random cases, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows

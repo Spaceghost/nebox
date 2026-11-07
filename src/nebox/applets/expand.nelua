@@ -1,0 +1,341 @@
+-- expand and unexpand: ports of GNU coreutils 9.1 expand.c, unexpand.c and
+-- expand-common.c. Tab lists with "/N" (repeat every N after the last
+-- stop) and "+N" (every N after it), the obsolete -N forms, -i, -a,
+-- --first-only, lines continuing across input files, GNU's messages.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+
+local tab_list: sequence(uint64)
+local tab_size: uint64
+local max_column_width: uint64
+local extend_size: uint64
+local increment_size: uint64
+local exit_status: integer
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function add_tab_stop(tabval: uint64)
+  local prev: uint64 = #tab_list > 0 and tab_list[#tab_list] or 0
+  local width: uint64 = prev <= tabval and tabval - prev or 0
+  tab_list:push(tabval)
+  if max_column_width < width then max_column_width = width end
+end
+
+local function parse_tab_stops(stops: string)
+  local have_tabval = false
+  local tabval: uint64 = 0
+  local extend, increment = false, false
+  local num_start = 0
+  local ok = true
+  local i = 1
+  while i <= #stops do
+    local c = stops:byte(i)
+    if c == 44 or c == 32 or c == 9 then
+      if have_tabval then
+        if extend then
+          if extend_size ~= 0 then util.err("'/' specifier only allowed with the last value"); ok = false; break end
+          extend_size = tabval
+        elseif increment then
+          if increment_size ~= 0 then util.err("'+' specifier only allowed with the last value"); ok = false; break end
+          increment_size = tabval
+        else
+          add_tab_stop(tabval)
+        end
+      end
+      have_tabval = false
+    elseif c == 47 then
+      if have_tabval then util.err("'/' specifier not at start of number: " .. util.quote(stops:sub(i))); ok = false end
+      extend = true; increment = false
+    elseif c == 43 then
+      if have_tabval then util.err("'+' specifier not at start of number: " .. util.quote(stops:sub(i))); ok = false end
+      increment = true; extend = false
+    elseif c >= 48 and c <= 57 then
+      if not have_tabval then tabval = 0; have_tabval = true; num_start = i end
+      local d: uint64 = c - 48
+      if tabval > (UMAX - d) // 10 then
+        local e = num_start
+        while e <= #stops and stops:byte(e) >= 48 and stops:byte(e) <= 57 do e = e + 1 end
+        util.err('tab stop is too large ' .. util.quote(stops:sub(num_start, e - 1)))
+        ok = false
+        i = e - 1
+      else
+        tabval = tabval * 10 + d
+      end
+    else
+      util.err('tab size contains invalid character(s): ' .. util.quote(stops:sub(i)))
+      ok = false
+      break
+    end
+    i = i + 1
+  end
+  if ok and have_tabval then
+    if extend then
+      if extend_size ~= 0 then util.err("'/' specifier only allowed with the last value"); ok = false end
+      extend_size = tabval
+    elseif increment then
+      if increment_size ~= 0 then util.err("'+' specifier only allowed with the last value"); ok = false end
+      increment_size = tabval
+    else
+      add_tab_stop(tabval)
+    end
+  end
+  if not ok then util.flush(); c_exit(1) end
+end
+
+local function finalize_tab_stops()
+  local prev: uint64 = 0
+  for _, t in ipairs(tab_list) do
+    if t == 0 then die('tab size cannot be 0') end
+    if t <= prev then die('tab sizes must be ascending') end
+    prev = t
+  end
+  if increment_size ~= 0 and extend_size ~= 0 then die("'/' specifier is mutually exclusive with '+'") end
+  if #tab_list == 0 then
+    tab_size = extend_size ~= 0 and extend_size or (increment_size ~= 0 and increment_size or 8)
+    max_column_width = tab_size
+  elseif #tab_list == 1 and extend_size == 0 and increment_size == 0 then
+    tab_size = tab_list[1]
+  else
+    tab_size = 0
+  end
+end
+
+local function get_next_tab_column(column: uint64, tab_index: *integer, last_tab: *boolean): uint64
+  $last_tab = false
+  if tab_size ~= 0 then return column + (tab_size - column % tab_size) end
+  while $tab_index < #tab_list do
+    local tab = tab_list[$tab_index + 1]
+    if column < tab then return tab end
+    $tab_index = $tab_index + 1
+  end
+  if extend_size ~= 0 then return column + (extend_size - column % extend_size) end
+  if increment_size ~= 0 then
+    local end_tab = tab_list[#tab_list]
+    return column + (increment_size - ((column - end_tab) % increment_size))
+  end
+  $last_tab = true
+  return 0
+end
+
+-- getc over the file list, moving to the next file at EOF (next_file).
+local Files = @record{names: sequence(string), idx: integer, fd: cint, buf: [65536]byte, pos: integer, len: integer, open: boolean}
+
+local function open_next(f: *Files): boolean
+  while f.idx < #f.names do
+    f.idx = f.idx + 1
+    local name = f.names[f.idx]
+    if name == '-' then f.fd = 0; f.open = true; f.pos = 0; f.len = 0; return true end
+    local fd = sys.open(name, sys.O_RDONLY, 0)
+    if fd >= 0 then f.fd = fd; f.open = true; f.pos = 0; f.len = 0; return true end
+    util.err(util.quotef(name) .. ': ' .. sys.errstr())
+    exit_status = 1
+  end
+  return false
+end
+
+local function getc(f: *Files): integer
+  while true do
+    if not f.open then return -1 end
+    if f.pos < f.len then
+      local c = f.buf[f.pos]
+      f.pos = f.pos + 1
+      return c
+    end
+    local n = sys.read(f.fd, &f.buf[0], #f.buf)
+    if n < 0 and sys.errno() == sys.EINTR then continue end
+    if n > 0 then f.pos = 0; f.len = n; continue end
+    if n < 0 then util.err(util.quotef(f.names[f.idx]) .. ': ' .. sys.errstr()); exit_status = 1 end
+    if f.fd ~= 0 then sys.close(f.fd) end
+    f.open = false
+    if not open_next(f) then return -1 end
+  end
+end
+
+local function isblank(c: integer): boolean return c == 32 or c == 9 end
+
+local function reset_state()
+  tab_list:clear(); tab_size = 0; max_column_width = 0; extend_size = 0; increment_size = 0; exit_status = 0
+end
+
+global function applet_expand(args: sequence(string)): integer
+  reset_state()
+  local longs: []util.LongOpt = {
+    {'tabs', 1, 116}, {'initial', 0, 105}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'it:0::1::2::3::4::5::6::7::8::9::', &longs, #longs)
+  g.quiet = true
+  local convert_entire_line = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 or c == util.UNSUPPORTED then
+      util.err(c == 63 and g.errmsg or ("option '--" .. g.longname .. "' is not supported"))
+      util.flush()
+      local m = "Try 'expand --help' for more information.\n"
+      sys.write(2, m.data, m.size)
+      return 1
+    end
+    if c == 105 then convert_entire_line = false
+    elseif c == 116 then parse_tab_stops(g.optarg)
+    elseif c >= 48 and c <= 57 then parse_tab_stops(string.char(c) .. (g.has_optarg and g.optarg or '')) end
+  end
+  finalize_tab_stops()
+  local f: Files
+  f.names = g:operands()
+  if #f.names == 0 then f.names:push('-') end
+  if not open_next(&f) then util.flush(); return exit_status end
+  while true do
+    local convert = true
+    local column: uint64 = 0
+    local tab_index: integer = 0
+    local c: integer
+    repeat
+      c = getc(&f)
+      if convert then
+        if c == 9 then
+          local last_tab = false
+          local next_tab = get_next_tab_column(column, &tab_index, &last_tab)
+          if last_tab then next_tab = column + 1 end
+          if next_tab < column then die('input line is too long') end
+          column = column + 1
+          while column < next_tab do util.writebyte(32); column = column + 1 end
+          c = 32
+        elseif c == 8 then
+          if column > 0 then column = column - 1 end
+          if tab_index > 0 then tab_index = tab_index - 1 end
+        else
+          column = column + 1
+          if column == 0 then die('input line is too long') end
+        end
+        convert = convert and (convert_entire_line or isblank(c))
+      end
+      if c < 0 then util.flush(); return exit_status end
+      util.writebyte((@byte)(c))
+    until c == 10
+  end
+end
+
+global function applet_unexpand(args: sequence(string)): integer
+  reset_state()
+  local CONVERT_FIRST_ONLY_OPTION: integer <comptime> = 200
+  local longs: []util.LongOpt = {
+    {'tabs', 1, 116}, {'all', 0, 97}, {'first-only', 0, CONVERT_FIRST_ONLY_OPTION},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, ',0123456789at:', &longs, #longs)
+  g.quiet = true
+  local convert_entire_line = false
+  local first_only = false
+  local have_tabval = false
+  local tabval: uint64 = 0
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 or c == util.UNSUPPORTED then
+      util.err(c == 63 and g.errmsg or ("option '--" .. g.longname .. "' is not supported"))
+      util.flush()
+      local m = "Try 'unexpand --help' for more information.\n"
+      sys.write(2, m.data, m.size)
+      return 1
+    end
+    if c == 97 then convert_entire_line = true
+    elseif c == 116 then convert_entire_line = true; parse_tab_stops(g.optarg)
+    elseif c == CONVERT_FIRST_ONLY_OPTION then first_only = true
+    elseif c == 44 then
+      if have_tabval then add_tab_stop(tabval) end
+      have_tabval = false
+    elseif c >= 48 and c <= 57 then
+      if not have_tabval then tabval = 0; have_tabval = true end
+      local d: uint64 = c - 48
+      if tabval > (UMAX - d) // 10 then die('tab stop value is too large') end
+      tabval = tabval * 10 + d
+    end
+  end
+  if first_only then convert_entire_line = false end
+  if have_tabval then add_tab_stop(tabval) end
+  finalize_tab_stops()
+  local f: Files
+  f.names = g:operands()
+  if #f.names == 0 then f.names:push('-') end
+  if not open_next(&f) then util.flush(); return exit_status end
+  local pending_blank: sequence(byte)
+  pending_blank:resize((@usize)(max_column_width > 0 and max_column_width or 1))
+  while true do
+    local convert = true
+    local column: uint64 = 0
+    local next_tab: uint64 = 0
+    local tab_index: integer = 0
+    local one_blank_before_tab_stop = false
+    local prev_blank = true
+    local pending: integer = 0
+    local c: integer
+    repeat
+      c = getc(&f)
+      local skip_output = false
+      if convert then
+        local blank = isblank(c)
+        if blank then
+          local last_tab = false
+          next_tab = get_next_tab_column(column, &tab_index, &last_tab)
+          if last_tab then convert = false end
+          if convert then
+            if next_tab < column then die('input line is too long') end
+            local replaced = true
+            if c == 9 then
+              column = next_tab
+              if pending > 0 then pending_blank[1] = 9 end
+            else
+              column = column + 1
+              if not (prev_blank and column == next_tab) then
+                if column == next_tab then one_blank_before_tab_stop = true end
+                if pending + 1 > #pending_blank then pending_blank:push(0) end
+                pending_blank[pending + 1] = (@byte)(c)
+                pending = pending + 1
+                prev_blank = true
+                skip_output = true
+                replaced = false
+              else
+                pending_blank[1] = 9
+                c = 9
+              end
+            end
+            if replaced then pending = one_blank_before_tab_stop and 1 or 0 end
+          end
+        elseif c == 8 then
+          if column > 0 then column = column - 1 end
+          next_tab = column
+          if tab_index > 0 then tab_index = tab_index - 1 end
+        else
+          column = column + 1
+          if column == 0 then die('input line is too long') end
+        end
+        if not skip_output then
+          if pending > 0 then
+            if pending > 1 and one_blank_before_tab_stop then pending_blank[1] = 9 end
+            util.writebytes(&pending_blank[1], (@usize)(pending))
+            pending = 0
+            one_blank_before_tab_stop = false
+          end
+          prev_blank = blank
+          convert = convert and (convert_entire_line or blank)
+        end
+      end
+      if not skip_output then
+        if c < 0 then util.flush(); return exit_status end
+        util.writebyte((@byte)(c))
+      end
+    until c == 10 and not skip_output
+  end
+end

@@ -234,32 +234,6 @@ local function next_stop(stops: sequence(integer), col: integer): integer
   return col + 1
 end
 
-global function applet_expand(args: sequence(string)): integer
-  local o = util.parsel(args, 'it:', &longopts.expand, #longopts.expand)
-  if not o:ok() then return util.optfail(o) end
-  local stops, ok = tabstops(o:has('t') and o:get('t') or '8')
-  if not ok then return util.die("tab size contains invalid character(s): '" .. o:get('t') .. "'") end
-  if #o.operands == 0 then o.operands:push('-') end
-  local rc: integer = 0
-  for _, path in ipairs(o.operands) do
-    local data, dok = util.readfile(path)
-    if not dok then rc = 1; continue end
-    local col: integer = 0
-    local initial = true
-    for i: usize = 0, < data.size do
-      local c = data.data[i]
-      if c == 9 and (initial or not o:has('i')) then
-        local target = next_stop(stops, col)
-        while col < target do util.writebyte(32); col = col + 1 end
-      else
-        if c ~= 32 and c ~= 9 then initial = false end
-        util.writebyte(c)
-        if c == 10 then col = 0; initial = true elseif c == 8 then if col > 0 then col = col - 1 end else col = col + 1 end
-      end
-    end
-  end
-  return rc
-end
 
 -- Convert blanks spanning [pstart, upto) into tabs and spaces. A lone blank
 -- that happens to reach a stop stays a space, as GNU does.
@@ -276,46 +250,6 @@ local function flushblanks(stops: sequence(integer), pstart: integer, upto: inte
 end
 
 -- unexpand: leading blanks only unless -a; -t sets stops (implies -a)
-global function applet_unexpand(args: sequence(string)): integer
-  local o = util.parsel(args, 'at:', &longopts.unexpand, #longopts.unexpand)
-  if not o:ok() then return util.optfail(o) end
-  local stops, ok = tabstops(o:has('t') and o:get('t') or '8')
-  if not ok then return util.die("tab size contains invalid character(s): '" .. o:get('t') .. "'") end
-  local all = o:has('a') or o:has('t')
-  if #o.operands == 0 then o.operands:push('-') end
-  local rc: integer = 0
-  for _, path in ipairs(o.operands) do
-    local data, dok = util.readfile(path)
-    if not dok then rc = 1; continue end
-    local col: integer = 0      -- current output column
-    local pend: integer = 0     -- pending blanks start column (blanks seen since `pstart`)
-    local pstart: integer = -1
-    local initial = true
-    for i: usize = 0, < data.size do
-      local c = data.data[i]
-      if (c == 32 or c == 9) and (initial or all) then
-        if pstart < 0 then pstart = col end
-        if c == 9 then col = next_stop(stops, col) else col = col + 1 end
-        if c == 9 then
-          -- a literal tab: emit everything pending as tabs
-          local cc = pstart
-          while cc < col do
-            local ns = next_stop(stops, cc)
-            util.writebyte(9); cc = ns
-          end
-          pstart = -1
-        end
-      else
-        flushblanks(stops, pstart, col); pstart = -1
-        initial = false
-        util.writebyte(c)
-        if c == 10 then col = 0; initial = true elseif c == 8 then if col > 0 then col = col - 1 end else col = col + 1 end
-      end
-    end
-    flushblanks(stops, pstart, col)
-  end
-  return rc
-end
 
 
 -- strings: printable runs of at least -n N (default 4) bytes
