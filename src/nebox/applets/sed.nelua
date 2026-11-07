@@ -347,7 +347,10 @@ end
 local function addr_match(a: *Addr): boolean
   if a.kind == ADDR_LINE then return sed.lineno == a.line
   elseif a.kind == ADDR_LAST then return is_last()
-  elseif a.kind == ADDR_RE then return a.re:test(sed.ps)
+  elseif a.kind == ADDR_RE then
+    local m = a.re:test(sed.ps)
+    if a.re.toocomplex then util.err('pattern too complex'); sed.quit = true; sed.exitcode = 4 end
+    return m
   elseif a.kind == ADDR_STEP then
     if a.step <= 0 then return sed.lineno == a.line end
     return sed.lineno >= a.line and (sed.lineno - a.line) % a.step == 0
@@ -495,10 +498,24 @@ local function do_subst(c: *Cmd): boolean
   local count: integer = 0
   local replaced = false
   local n: isize = (@isize)(text.size)
+  local prev_end: isize = -1
   while pos <= n do
-    if not c.re:search(text, pos, &caps) then break end
-    count = count + 1
+    local m = c.re:search(text, pos, &caps)
+    if c.re.toocomplex then
+      util.err('pattern too complex'); sed.quit = true; sed.exitcode = 4
+      return false
+    end
+    if not m then break end
     local ms, me = caps.at[0], caps.at[1]
+    if ms == me and ms == prev_end then
+      -- GNU sed: an empty match right after the previous match is skipped
+      -- and not counted.
+      if ms < n then sb:writebyte(text.data[ms]) end
+      pos = ms + 1
+      continue
+    end
+    prev_end = me
+    count = count + 1
     sb:write(text:sub(pos + 1, ms))
     local take = (c.nth == 0 and (c.allm or count == 1)) or (c.nth > 0 and (count == c.nth or (c.allm and count > c.nth)))
     if take then
@@ -565,7 +582,9 @@ local function run_cycle()
     local name = c.name
     if name == 58 then pc = pc + 1; continue end
     if name == 125 then pc = pc + 1; continue end
-    if not selected(c) then
+    local sel = selected(c)
+    if sed.quit then autoprint = false; break end   -- regex aborted (pattern too complex)
+    if not sel then
       if name == 123 then pc = c.target + 1 else pc = pc + 1 end
       continue
     end
@@ -575,6 +594,8 @@ local function run_cycle()
         sed.tflag = true
         if c.print then print_ps(sed.ps) end
         if c.wfile.size > 0 then write_to(c.wfile, sed.ps) end
+      elseif sed.quit then
+        autoprint = false; break
       end
       pc = pc + 1
     elseif name == 121 then

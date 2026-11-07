@@ -1102,12 +1102,12 @@ global function applet_grep(args: sequence(string)): integer
   if not fixed then
     local err: string
     prog, err = grep_compile(patterns, o:has('E'), fold, o:has('w'), o:has('x'))
-    if err.size > 0 then util.err('grep: ' .. err); return 2 end
+    if err.size > 0 then util.err(err); return 2 end
   end
   local maxcount: integer = -1
   if o:has('m') then
     local v, ok = util.toint(o:get('m'))
-    if not ok then util.err("grep: invalid max count"); return 2 end
+    if not ok then util.err('invalid max count'); return 2 end
     maxcount = v
   end
   -- expand -r directories into files
@@ -1159,6 +1159,7 @@ global function applet_grep(args: sequence(string)): integer
         end
       else
         m = prog:search(line, 0, &caps)
+        if prog.toocomplex then util.err('pattern too complex'); return 2 end
       end
       if m ~= invert then
         count = count + 1
@@ -1178,6 +1179,7 @@ global function applet_grep(args: sequence(string)): integer
                 pos = caps.at[0] + 1
               end
             end
+            if prog.toocomplex then util.err('pattern too complex'); return 2 end
           else
             if withname then util.write(path); util.writebyte(58) end
             if o:has('n') then util.writef('%d:', n) end

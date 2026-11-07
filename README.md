@@ -56,12 +56,28 @@ per applet in `DIR`.
 
 Stated here rather than worked around:
 
-- `grep` and `expr` use nebox's own regex engine (`src/nebox/regex.nelua`):
-  POSIX BRE and ERE with brackets, classes, intervals, groups, alternation,
-  back-references, and the GNU `\w \W \s \S \b \B \< \>` escapes. Matching
-  is leftmost-first (backtracking), not POSIX leftmost-longest, which only
-  differs for alternations whose branches are prefixes of each other. No
-  multibyte locales. `grep` has no `-A/-B/-C` context or `-z`.
+- `grep`, `sed`, `expr` and `find -regex` use nebox's own regex engine
+  (`src/nebox/regex.nelua`): POSIX BRE and ERE with brackets, named classes,
+  intervals, groups, alternation, back-references, and the GNU
+  `\w \W \s \S \b \B \< \>` escapes. Matching is a Pike VM with GNU (glibc)
+  leftmost-longest semantics: the earliest start wins, then the longest match
+  (`re-alt-prefix-*`, `re-expr-longest`); subexpression spans are those of
+  the first path, in alternative order, that reaches that match, so
+  `(a|ab)(c|bcd)(d*)` on `abcd` gives `[a][bcd][]` as GNU does rather than
+  the strict POSIX `[ab][cd][]` (`re-alt-groups*`); an empty iteration of a
+  repeated group never overwrites an earlier capture (`re-star-group-*`,
+  `re-empty-branch*`); back-references match the span chosen that way
+  (`re-backref-*`). `sed s///g` skips an empty match that is adjacent to the
+  previous match and does not count it for `s///N` (`re-sed-g-empty*`,
+  `re-sed-n-empty`). Programs without back-references run in time linear in
+  the line length (`re-pathological`). Programs with back-references are
+  bounded to 65536 simultaneous states and stop with "pattern too complex"
+  (grep exit 2, sed exit 4, expr exit 2) where GNU keeps searching
+  (`re-too-complex*`; `re-pathological-backref` stays within the bound).
+  Not implemented: multibyte locales (bytes only; `-i` folds ASCII; the test
+  harness runs in the C locale, so this has no case), equivalence classes
+  `[=a=]` and collating symbols `[.a.]` (`re-equiv-unsupported` pins the
+  current non-matching behavior). `grep` has no `-A/-B/-C` context or `-z`.
 - `sed` covers -n -e -f -E -s -i[SUFFIX], every address form, and the
   commands `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F`.
   `s` flags: g p N i/I w; replacement escapes `& \1..\9 \n \U \L \u \l \E`.

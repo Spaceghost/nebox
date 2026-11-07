@@ -278,7 +278,9 @@ function Expr:regex_match(s: string, pat: string): string
   local prog, err = regex.compile('^' .. pat, false, false)
   if err.size > 0 then self.err = err; return '' end
   local caps: regex.Caps
-  if prog:matchat(s, 0, &caps) then
+  local m = prog:matchat(s, 0, &caps)
+  if prog.toocomplex then self.err = 'pattern too complex'; return '' end
+  if m then
     if prog.nsub >= 1 then
       if caps.at[2] < 0 then return '' end
       return s:sub(caps.at[2] + 1, caps.at[3])
