@@ -80,6 +80,8 @@ same printf-basic 'printf "%s=%d\n" x 42 y 7'
 same printf-width 'printf "[%5s][%-5s][%05d][%x][%o][%c]\n" ab cd 42 255 8 hello'
 same printf-escape 'printf "a\tb\\\\n\n"'
 same printf-percent 'printf "100%%\n"'
+same printf-float 'printf "%e|%g|%.1f|%E|%G|%F|%08.3f|%-8.2e|\n" 12345.678 0.0001 2.25 1.5 2e10 3 3.14159 -42; printf "%f\n" 1x; echo st=$?'
+same printf-b 'printf "%b|%5b|%-4b|\n" "a\tb\0101" x y; printf "%b\n" "x\cy" z; echo after'
 # cat / head / tail
 same cat-file 'cat words.txt'
 same cat-stdin 'cat < words.txt'

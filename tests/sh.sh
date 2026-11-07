@@ -7,6 +7,8 @@ printf '#!/bin/sh\nexec %s "$@"\n' "$DASH" > "$W/refbin/sh"
 chmod +x "$W/refbin/sh"
 REFPATH="$W/refbin:"
 
+# The two runs happen in directories named ref and got; scripts that print
+# the top directory's name pass it through this sed, which maps it to TOP.
 # shc NAME SCRIPT: run SCRIPT through `sh -c` (no single quotes in SCRIPT)
 shc() { same "$1" "sh -c '$2'"; }
 # shf NAME SCRIPT: run SCRIPT from a file operand
@@ -374,7 +376,10 @@ shf sh-redir-input 'printf "x\ny\n" > f; cat < f; read l < f; echo "$l"; while r
 shf sh-redir-fd-numbers 'echo out 1>f; echo err 2>e 1>&2; cat f e; echo both >f 2>&1; cat f; echo swap 2>&1 1>/dev/null | cat'
 shf sh-redir-dup-order 'echo x 2>&1 >/dev/null | cat; echo y >/dev/null 2>&1 | cat; echo z 1>&2 2>/dev/null; echo end'
 shf sh-redir-exec 'exec 3>g; echo hi >&3; echo there 1>&3; exec 3>&-; cat g; echo zz >&3 2>/dev/null; echo st=$?; exec 4<g; read l <&4; echo $l; read l <&4; echo $l; exec 4<&-'
-shf sh-redir-exec-stdout 'exec >eo; echo redirected; exec 2>&1; echo err >&2; exec >/dev/tty 2>/dev/null || exec 1>&2; cat eo 2>/dev/null || true'
+# a failed redirection on exec (a special builtin) exits the shell; the
+# diagnostic lands in eo, so only its line count is compared
+printf '%s\n' 'exec >eo; echo redirected; exec 2>&1; echo err >&2; exec >nosuchdir/x; echo not-reached' > "$W/fixture/case.sh"
+same sh-redir-exec-stdout 'sh case.sh; echo st=$?; head -n 2 eo; wc -l < eo; rm eo'
 shf sh-redir-noclobber 'echo a > f; set -C; echo b > f 2>/dev/null; echo "st=$?"; echo c >| f; cat f; echo d >> f; cat f; echo e > /dev/null; echo st=$?; set +C; echo f > f; cat f; : > f1; set -C; : > f1 2>/dev/null; echo st=$?; : >| f1; echo $?'
 shf sh-redir-rdwr 'echo rw <> h; cat h; printf "abc" > i; exec 5<>i; read -r x <&5; echo "$x"; exec 5>&-'
 shf sh-redir-close 'echo zz >&- 2>/dev/null; echo st=$?; exec 3>f; exec 3>&-; echo q >&3 2>/dev/null; echo st=$?'
@@ -457,7 +462,7 @@ shf sh-case-quoted-special 'case "a]b" in a]b) echo q;; esac; case "[" in "[") e
 shf sh-brace-group '{ echo a; echo b; } > fo; cat fo; { echo c
 }
 echo d; { false; }; echo $?'
-shf sh-subshell 'x=1; (x=2; echo $x); echo $x; (cd /; pwd); pwd | sed "s,.*/,,"; (exit 3); echo $?; (echo in; exit 4); echo $?; ( (echo nested) )'
+shf sh-subshell 'x=1; (x=2; echo $x); echo $x; (cd /; pwd); pwd | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"; (exit 3); echo $?; (echo in; exit 4); echo $?; ( (echo nested) )'
 shf sh-subshell-traps-reset 'trap "echo t" EXIT; (echo sub); echo main; (trap "echo subt" EXIT; echo sub2); echo end'
 shf sh-subshell-redirect '(echo a; echo b) > so; cat so; (cat) < so'
 shf sh-compound-in-pipeline 'for i in 1 2; do echo $i; done | cat; { echo a; echo b; } | wc -l; if true; then echo t; fi | cat'
@@ -532,15 +537,15 @@ same sh-special-builtin-via-command "sh -c 'command shift 5; echo after \$?' 2>/
 # regular built-ins
 shf sh-cd-basic 'cd sub; pwd | sed "s,.*/,,"; cd deep; pwd | sed "s,.*/,,"; cd ..; pwd | sed "s,.*/,,"; cd ../..; cd nosuch 2>/dev/null; echo st=$?; cd /; pwd; cd /tmp; echo $PWD $OLDPWD; cd -; pwd'
 shf sh-cd-home 'HOME=$PWD/sub; cd; pwd | sed "s,.*/,,"; cd /; HOME=; cd 2>/dev/null; echo st=$?; unset HOME; cd 2>/dev/null; echo st=$?'
-shf sh-cd-cdpath 'CDPATH=$PWD/sub; cd deep | sed "s,.*/,,"; pwd | sed "s,.*/,,"; cd /; CDPATH=nonexist:$OLDPWD/../sub; cd deep | sed "s,.*/,,"; cd /; CDPATH=sub; cd deep 2>/dev/null; echo st=$?; cd "$OLDPWD" >/dev/null; cd ./sub; pwd | sed "s,.*/,,"'
-shf sh-cd-logical 'mkdir -p a/b; ln -s a/b link2; cd link2; pwd | sed "s,.*/fixture,F,;s,.*/got,F,;s,.*/ref,F,"; cd ..; pwd | sed "s,.*/,,"; cd link2; cd -P .; pwd | sed "s,.*/,,"; cd ../..; pwd | sed "s,.*/,,"'
+shf sh-cd-cdpath 'CDPATH=$PWD/sub; cd deep | sed "s,.*/,,"; pwd | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"; cd /; CDPATH=nonexist:$OLDPWD/../sub; cd deep | sed "s,.*/,,"; cd /; CDPATH=sub; cd deep 2>/dev/null; echo st=$?; cd "$OLDPWD" >/dev/null; cd ./sub; pwd | sed "s,.*/,,"'
+shf sh-cd-logical 'mkdir -p a/b; ln -s a/b link2; cd link2; pwd | sed "s,.*/got/,TOP/,;s,.*/ref/,TOP/,"; cd ..; pwd | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"; cd link2; cd -P .; pwd | sed "s,.*/,,"; cd ../..; pwd | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"'
 shf sh-cd-physical 'mkdir -p a/b; ln -s a/b link2; cd -P link2; pwd | sed "s,.*/,,"; echo "$PWD" | sed "s,.*/,,"; cd -L ..; pwd | sed "s,.*/,,"'
-shf sh-cd-dash-prints 'cd sub; cd - | sed "s,.*/,,"; cd - | sed "s,.*/,,"; cd - > /dev/null; pwd | sed "s,.*/,,"'
+shf sh-cd-dash-prints 'cd sub; cd - | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"; cd - | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"; cd - > /dev/null; pwd | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"'
 shf sh-cd-dotdot-canonical 'cd sub/deep/../deep; pwd | sed "s,.*/,,"; echo "$PWD" | sed "s,.*/sub/,,"; cd ./../.; pwd | sed "s,.*/,,"'
 shf sh-cd-options 'cd -x 2>/dev/null; echo st=$?; pwd -x 2>/dev/null; echo st=$?; cd -- sub; pwd | sed "s,.*/,,"'
-shf sh-pwd 'pwd | sed "s,.*/,,"; cd sub; pwd -L | sed "s,.*/,,"; pwd -P | sed "s,.*/,,"; PWD=/bogus; pwd | sed "s,.*/,,"'
+shf sh-pwd 'pwd | sed "s,.*/ref\$,TOP,;s,.*/got\$,TOP,;s,.*/,,"; cd sub; pwd -L | sed "s,.*/,,"; pwd -P | sed "s,.*/,,"; PWD=/bogus; pwd | sed "s,.*/,,"'
 shf sh-command-v 'f() { :; }; alias ll="ls -l"
-command -v f; command -v if; command -v nosuch; echo st=$?; command -v ll; command -v cd; command -v echo; command -v cat | sed "s,/.*/,/P/,"; command -v ./case.sh; command -v nosuch/x; echo st=$?'
+command -v f; command -v if; command -v nosuch; echo st=$?; command -v ll; command -v cd; command -v echo; command -v cat | sed "s,/.*/,/P/,"; command -v ./case.sh | sed "s,.*/,/P/,"; command -v nosuch/x; echo st=$?'
 shf sh-command-V 'f() { :; }; alias ll="ls -l"
 command -V f; command -V if; command -V echo; command -V ll; command -V cd; command -V nosuch; echo st=$?; command -V cat | sed "s, /.*, PATH,"'
 shf sh-type 'f() { :; }; alias ll="ls -l"
@@ -557,7 +562,19 @@ shf sh-getopts-reset 'set -- -a -b; getopts ab o; echo $o; OPTIND=1; getopts ab 
 same sh-getopts-usage "sh -c 'getopts; echo after \$?' 2>/dev/null; sh -c 'getopts a; echo after \$?' 2>/dev/null"
 shf sh-hash 'hash -r; hash cat ls; hash | sed "s,/.*/,/P/," | sort; hash -r; hash; echo st=$?; hash nosuchcmd 2>/dev/null; echo st=$?; hash echo; hash | wc -l'
 shf sh-kill 'sleep 10 & p=$!; kill $p; wait $p; echo $?; sleep 10 & p=$!; kill -s KILL $p; wait $p; echo $?; sleep 10 & p=$!; kill -9 $p; wait $p; echo $?; sleep 10 & p=$!; kill -TERM $p; wait $p; echo $?; kill -0 $$; echo $?'
-shf sh-kill-l 'kill -l 15; kill -l 143; kill -l 9; kill -l 2 1; kill -l | head -3; kill -l HUP 2>/dev/null; echo st=$?'
+# kill -l: POSIX takes one exit_status operand and lists signal names only;
+# nebox accepts several operands and lists from HUP (dash prints only the
+# first operand and lists a leading "0")
+shx sh-kill-l 'TERM
+TERM
+KILL
+INT
+HUP
+HUP
+INT
+QUIT
+st=2
+exit=0' 'kill -l 15; kill -l 143; kill -l 9; kill -l 2 1; kill -l | head -3; kill -l HUP 2>/dev/null; echo st=$?'
 same sh-kill-errors "sh -c 'kill; echo after \$?' 2>/dev/null; sh -c 'kill -s NOPE 1; echo after \$?' 2>/dev/null; sh -c 'kill 999999; echo after \$?' 2>/dev/null; sh -c 'kill -l 300; echo after \$?' 2>/dev/null"
 shf sh-read-basic 'printf "a b  c\n" | { read x y; echo "[$x][$y]"; }; printf "x\n" | { read; echo "[$REPLY]"; echo st=$?; }; printf " a b \n" | { read x; echo "[$x]"; }'
 shf sh-read-backslash 'printf "a\\\\\nb c\n" | { read x; echo "[$x]"; }; printf "a\\\\nb\n" | { read -r x; echo "[$x]"; read -r y; echo "st=$?"; }; printf "a\\\\ b c\n" | { read x y; echo "[$x][$y]"; }; printf "a\\\\:b\n" | { IFS=: read x y; echo "[$x][$y]"; }'
@@ -576,9 +593,18 @@ shf sh-wait 'wait 12345 2>/dev/null; echo "st=$?"; wait; echo "st=$?"; sleep 0.1
 shf sh-wait-multiple '(exit 1) & a=$!; (exit 2) & b=$!; wait $a; echo $?; wait $b; echo $?; wait $a; echo $?; true & false & wait; echo $?'
 shf sh-wait-twice 'sleep 0.1 & p=$!; wait $p; echo $?; wait $p; echo $?'
 shf sh-echo-builtin 'echo -n a; echo; echo -e x; echo "a\tb\\nc"; echo "\0101\0102"; echo a\\cb c; echo -n; echo -- x; echo -E y; echo - z; echo "\x41"; echo "\c"; echo x; echo -n -n y; echo'
-shf sh-printf-builtin 'printf "%s %d %5.2f|%-3s|%03d|%x|%o|%c|%b|%%\n" a 42 3.14159 b 7 255 8 hi "x\ty"; printf "%s\n" a b c; printf "%d\n" "" 0x1f 010; printf "\101\x42\n"; printf "%5s|%-5s|\n" ab cd; printf "a\n" extra; echo st=$?; printf "%.3s\n" abcdef; printf "%d\n" abc 2>/dev/null; echo st=$?'
+shf sh-printf-builtin 'printf "%s %d %5.2f|%-3s|%03d|%x|%o|%c|%b|%%\n" a 42 3.14159 b 7 255 8 hi "x\ty"; printf "%s\n" a b c; printf "%d\n" "" 0x1f 010; printf "\101\102\n"; printf "%5s|%-5s|\n" ab cd; printf "a\n" extra; echo st=$?; printf "%.3s\n" abcdef; printf "%d\n" abc 2>/dev/null; echo st=$?'
 shf sh-test-builtin '[ -t 1 ]; echo $?; test -n ""; echo $?; [ 1 -eq 1 ] && echo eq; [ ]; echo $?; [ a = a -a b = b ]; echo $?; [ ! x ]; echo $?; [ -e /tmp ]; echo $?; test 1 -lt 2 -o 3 -lt 2; echo $?; [ -z "" -a -n a ]; echo $?; [ "(" = "(" ]; echo $?; [ 1 ]; echo $?; [ -f words.txt -a -d sub -a ! -d words.txt ]; echo $?; [ x 2>/dev/null; echo $?; test; echo $?'
-shf sh-unsupported-builtins 'jobs 2>/dev/null; echo st=$?; bg 2>/dev/null; echo st=$?; fg 2>/dev/null; echo st=$?; local x 2>/dev/null; echo st=$?; ulimit 2>/dev/null; echo st=$?; echo continues'
+# jobs, bg, fg and ulimit are unimplemented and local is not POSIX: each
+# reports an error with status 2 and the script continues (dash implements
+# jobs and ulimit, and exits on local outside a function)
+shx sh-unsupported-builtins 'st=2
+st=2
+st=2
+st=2
+st=2
+continues
+exit=0' 'jobs 2>/dev/null; echo st=$?; bg 2>/dev/null; echo st=$?; fg 2>/dev/null; echo st=$?; local x 2>/dev/null; echo st=$?; ulimit 2>/dev/null; echo st=$?; echo continues'
 
 # traps
 shf sh-trap-exit 'trap "echo exiting \$?" EXIT; echo body; exit 3'
@@ -588,7 +614,20 @@ shf sh-trap-signals 'trap "echo usr" USR1; kill -USR1 $$; echo after; trap - USR
 shf sh-trap-ignore 'trap "" USR1; kill -USR1 $$; echo ignored; trap "" TERM; kill $$; echo still-here'
 shf sh-trap-print 'trap "echo x" INT; trap "" TERM; trap "echo e" EXIT; trap; trap - INT; trap; trap x EXIT 0; trap | sed "s/x/y/"; trap -- "echo q" QUIT; trap | grep QUIT'
 shf sh-trap-reset 'trap "echo nope" USR1; trap - USR1; kill -USR1 $$; echo not-reached' 
-shf sh-trap-bad 'trap "echo bad" NOPE 2>/dev/null; echo st=$?; trap "echo k" KILL 2>/dev/null; echo st=$?; trap 2>/dev/null; echo end'
+# -h (POSIX), -b and the ignoreeof/nolog names are accepted and change
+# nothing in a non-interactive shell without job control (dash rejects -h)
+shx sh-options-accepted 'h=0
+n=0
+i=0
+b=0
+done
+exit=0' 'set -h; echo h=$?; set -o nolog; echo n=$?; set -o ignoreeof; echo i=$?; set -b; echo b=$?; sleep 0.1 & wait; echo done'
+same sh-kill-job-operand "sh -c 'kill %1; echo k=\$?' 2>/dev/null"
+# traps on KILL and STOP are undefined by POSIX; nebox refuses them (dash records them)
+shx sh-trap-bad 'st=1
+st=1
+end
+exit=0' 'trap "echo bad" NOPE 2>/dev/null; echo st=$?; trap "echo k" KILL 2>/dev/null; echo st=$?; trap 2>/dev/null; echo end'
 shf sh-trap-numbers 'trap "echo ten" 10; kill -10 $$; trap "echo zero" 0; trap | grep EXIT'
 shf sh-trap-inherited-ignore 'trap "" USR1; sh -c "trap \"echo got\" USR1; kill -USR1 \$\$; echo after \$?"'
 shf sh-trap-subshell-reset 'trap "echo parent-trap" USR1; (kill -USR1 $$); echo main; (trap "echo sub" USR1; kill -USR1 $$); (trap; echo sub-traps-cleared) | sed "s/.*//"'
@@ -650,8 +689,9 @@ expect sh-error-redirect-msg 'sh: line 1: cannot open nosuch: No such file or di
 exit=2' "sh -c 'cat < nosuch' 2>&1"
 expect sh-error-shift-msg "sh: line 1: shift: can't shift that many
 exit=2" "sh -c 'shift 3' 2>&1"
-expect sh-error-exec-msg 'sh: line 1: exec: nosuch: not found
-exit=127' "sh -c 'exec nosuch' 2>&1 | sed 's/sh: line 1: nosuch/sh: line 1: exec: nosuch/'"
+expect sh-error-exec-msg 'sh: line 1: nosuch: not found
+st=127
+exit=0' "sh -c 'exec nosuch' 2>&1; echo st=\$?"
 expect sh-error-i-unsupported 'sh: -i: interactive mode is not supported
 exit=2' "sh -i -c 'echo i' 2>&1"
 expect sh-error-m-unsupported 'sh: -m: job control is not supported
@@ -665,13 +705,21 @@ after 2
 exit=0' "sh -c 'jobs; echo after \$?' 2>&1"
 
 # recorded choices where POSIX and dash disagree
-shx sh-choice-stdin-shared 'got [hello world]
-y=[]
-exit=1' 'read x
-echo "got [$x]"
-hello world
-read y
-echo "y=[$y]"'
+# a script read from standard input is read no further than the command
+# being run, so a command reading stdin sees the following lines (XCU sh,
+# INPUT FILES); dash reads ahead and its read gets nothing
+printf '%s\n' 'read x' 'hello world' 'echo "got [$x]"' 'read y; echo "y=[$y] $?"' > "$W/fixture/case.sh"
+expect sh-choice-stdin-shared 'got [hello world]
+y=[] 1
+exit=0' 'sh < case.sh'
+# \x in a printf format is not a POSIX escape (unspecified); nebox takes it
+# as hexadecimal like coreutils, dash prints it literally
+shx sh-choice-printf-hex 'AB
+exit=0' 'printf "\101\x42\n"'
+# command -v NAME-with-slash: an absolute pathname (XCU command); dash
+# prints the name as given
+expect sh-choice-command-v-abs 'ABS/words.txt
+exit=0' "sh -c 'command -v ./words.txt' | sed 's,^/.*/got/,ABS/,'"
 shx sh-choice-arith-recursive-var 'exit=2' 'y=1+1; echo $((y)) 2>/dev/null'
 expect sh-choice-cd-cdpath-slash '/tmp
 exit=0' "sh -c 'CDPATH=/ cd tmp'"
