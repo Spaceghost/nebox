@@ -351,28 +351,6 @@ global function applet_wc(args: sequence(string)): integer
   return rc
 end
 
--- Leading numeric value of a line for sort -n (integer or decimal, with sign).
-local function numkey(s: string): (float64)
-  local i: usize = 1
-  while i <= s.size and (s:byte(i) == 32 or s:byte(i) == 9) do i = i + 1 end
-  local neg = false
-  if i <= s.size and s:byte(i) == 45 then neg = true; i = i + 1 end
-  local v: float64 = 0
-  local any = false
-  while i <= s.size and s:byte(i) >= 48 and s:byte(i) <= 57 do
-    v = v * 10 + (s:byte(i) - 48); i = i + 1; any = true
-  end
-  if i <= s.size and s:byte(i) == 46 then
-    i = i + 1
-    local scale: float64 = 0.1
-    while i <= s.size and s:byte(i) >= 48 and s:byte(i) <= 57 do
-      v = v + (s:byte(i) - 48) * scale; scale = scale * 0.1; i = i + 1; any = true
-    end
-  end
-  if not any then return 0 end
-  return neg and -v or v
-end
-
 local function lower(b: byte): byte
   if b >= 65 and b <= 90 then return b + 32 end
   return b
@@ -388,193 +366,582 @@ local function cmp_fold(a: string, b: string): integer
   return a.size < b.size and -1 or 1
 end
 
-local sort_numeric, sort_reverse, sort_fold, sort_stable: boolean = false, false, false, false
-local sort_sep: integer = -1   -- -t byte, or -1 for blank runs
-local sort_blanks = false      -- global -b
+-- sort: GNU coreutils semantics in the C locale. Keys, field positions and
+-- the numeric, human-numeric and version comparisons follow sort.c,
+-- strnumcmp-in.h and gnulib filevercmp.c byte for byte.
 
-local SortKey = @record{ f1: integer, c1: integer, f2: integer, c2: integer, numeric: boolean, reverse: boolean, fold: boolean, b1: boolean, b2: boolean }
+local SortKey = @record{
+  sword: integer, schar: integer,   -- 0-based start field / char; sword -1 = line start
+  eword: integer, echar: integer,   -- 0-based end field / char; eword -1 = line end
+  skipsblanks: boolean, skipeblanks: boolean,
+  numeric: boolean, human: boolean, version: boolean,
+  fold: boolean,                    -- -f: translate to upper case
+  ignore: integer,                  -- 0 none, 1 nonprinting (-i), 2 nondictionary (-d)
+  reverse: boolean,
+}
 local sort_keys: sequence(SortKey)
+local sort_reverse, sort_stable, sort_unique: boolean = false, false, false
+local sort_sep: integer = -1   -- -t byte, or -1 for blank runs
+local sort_eol: byte = 10
 
-local function isblank(b: byte): boolean return b == 32 or b == 9 end
+-- Byte at 0-based index i, or 0 past the end (GNU NUL-terminates keys).
+local function at(s: string, i: integer): integer
+  if i < 0 or i >= (@integer)(s.size) then return 0 end
+  return (@integer)(s.data[i])
+end
+local function sblank(c: integer): boolean return c == 32 or c == 9 or c == 10 end
+local function sdigit(c: integer): boolean return c >= 48 and c <= 57 end
+local function salpha(c: integer): boolean return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) end
+local function salnum(c: integer): boolean return sdigit(c) or salpha(c) end
+local function sprint(c: integer): boolean return c >= 32 and c <= 126 end
 
--- Byte range [s, e) of field f (1-based) in line, GNU semantics: without -t a
--- field includes its leading blanks.
-local function field_span(line: string, f: integer): (integer, integer)
+local function key_ignored(k: SortKey, c: integer): boolean
+  if k.ignore == 2 then return not salnum(c) and not sblank(c) end
+  if k.ignore == 1 then return not sprint(c) end
+  return false
+end
+local function key_xlate(k: SortKey, c: integer): integer
+  if k.fold and c >= 97 and c <= 122 then return c - 32 end
+  return c
+end
+
+-- begfield: offset where key k starts in line.
+local function begfield(line: string, k: SortKey): integer
   local n = (@integer)(line.size)
-  local pos: integer = 0
-  local cur: integer = 1
+  local p: integer = 0
+  local sword = k.sword
   if sort_sep >= 0 then
-    while cur < f do
-      while pos < n and line.data[pos] ~= sort_sep do pos = pos + 1 end
-      if pos >= n then return n, n end
-      pos = pos + 1; cur = cur + 1
+    while p < n and sword > 0 do
+      sword = sword - 1
+      while p < n and at(line, p) ~= sort_sep do p = p + 1 end
+      if p < n then p = p + 1 end
     end
-    local e = pos
-    while e < n and line.data[e] ~= sort_sep do e = e + 1 end
-    return pos, e
+  else
+    while p < n and sword > 0 do
+      sword = sword - 1
+      while p < n and sblank(at(line, p)) do p = p + 1 end
+      while p < n and not sblank(at(line, p)) do p = p + 1 end
+    end
   end
-  while cur < f do
-    while pos < n and isblank(line.data[pos]) do pos = pos + 1 end
-    while pos < n and not isblank(line.data[pos]) do pos = pos + 1 end
-    if pos >= n then return n, n end
-    cur = cur + 1
-  end
-  local e = pos
-  while e < n and isblank(line.data[e]) do e = e + 1 end
-  while e < n and not isblank(line.data[e]) do e = e + 1 end
-  return pos, e
+  if k.skipsblanks then while p < n and sblank(at(line, p)) do p = p + 1 end end
+  p = p + k.schar
+  if p > n then p = n end
+  return p
 end
 
-local function key_text(line: string, k: SortKey): string
-  local s, e = field_span(line, k.f1)
+-- limfield: offset one past the end of key k in line.
+local function limfield(line: string, k: SortKey): integer
   local n = (@integer)(line.size)
-  if k.b1 or sort_blanks then while s < e and isblank(line.data[s]) do s = s + 1 end end
-  if k.c1 > 1 then s = s + k.c1 - 1; if s > e then s = e end end
-  local stop: integer = n
-  if k.f2 > 0 then
-    local s2, e2 = field_span(line, k.f2)
-    if k.c2 == 0 then stop = e2
-    else
-      if k.b2 or sort_blanks then while s2 < e2 and isblank(line.data[s2]) do s2 = s2 + 1 end end
-      stop = s2 + k.c2
-      if stop > e2 then stop = e2 end
+  local p: integer = 0
+  local eword, echar = k.eword, k.echar
+  if echar == 0 then eword = eword + 1 end
+  if sort_sep >= 0 then
+    while p < n and eword > 0 do
+      eword = eword - 1
+      while p < n and at(line, p) ~= sort_sep do p = p + 1 end
+      if p < n and (eword > 0 or echar > 0) then p = p + 1 end
+    end
+  else
+    while p < n and eword > 0 do
+      eword = eword - 1
+      while p < n and sblank(at(line, p)) do p = p + 1 end
+      while p < n and not sblank(at(line, p)) do p = p + 1 end
     end
   end
-  if stop < s then stop = s end
-  return line:sub(s + 1, stop)
+  if echar ~= 0 then
+    if k.skipeblanks then while p < n and sblank(at(line, p)) do p = p + 1 end end
+    p = p + echar
+    if p > n then p = n end
+  end
+  return p
 end
 
-local function cmp_plain(a: string, b: string): integer
-  if a < b then return -1 elseif b < a then return 1 end
+local function key_view(line: string, k: SortKey): string
+  local n = (@integer)(line.size)
+  local lim = n
+  if k.eword >= 0 then lim = limfield(line, k) end
+  local beg: integer = 0
+  if k.sword >= 0 then beg = begfield(line, k)
+  elseif k.skipsblanks then
+    while beg < lim and sblank(at(line, beg)) do beg = beg + 1 end
+  end
+  if lim < beg then lim = beg end
+  if lim == beg then return '' end
+  return (@string){data=&line.data[beg], size=(@usize)(lim - beg)}
+end
+
+-- Copy of s with ignored bytes dropped and -f translation applied.
+local function key_filtered(s: string, k: SortKey): string
+  local sb: stringbuilder
+  for i: usize = 0, < s.size do
+    local c = (@integer)(s.data[i])
+    if not key_ignored(k, c) then sb:writebyte((@byte)(key_xlate(k, c))) end
+  end
+  return sb:promote()
+end
+
+-- gnulib fraccompare: compare fractional parts starting at a[ai], b[bi].
+local function fraccompare(a: string, ai: integer, b: string, bi: integer): integer
+  if at(a, ai) == 46 and at(b, bi) == 46 then
+    while true do
+      ai = ai + 1; bi = bi + 1
+      if at(a, ai) ~= at(b, bi) then break end
+      if not sdigit(at(a, ai)) then return 0 end
+    end
+    if sdigit(at(a, ai)) and sdigit(at(b, bi)) then return at(a, ai) - at(b, bi) end
+    if sdigit(at(a, ai)) then
+      while at(a, ai) == 48 do ai = ai + 1 end
+      return sdigit(at(a, ai)) and 1 or 0
+    end
+    if sdigit(at(b, bi)) then
+      while at(b, bi) == 48 do bi = bi + 1 end
+      return sdigit(at(b, bi)) and -1 or 0
+    end
+    return 0
+  elseif at(a, ai) == 46 then
+    ai = ai + 1
+    while at(a, ai) == 48 do ai = ai + 1 end
+    return sdigit(at(a, ai)) and 1 or 0
+  elseif at(b, bi) == 46 then
+    bi = bi + 1
+    while at(b, bi) == 48 do bi = bi + 1 end
+    return sdigit(at(b, bi)) and -1 or 0
+  end
   return 0
 end
 
-local function cmp_key(a: string, b: string, numeric: boolean, fold: boolean): integer
-  if numeric then
-    local x, y = numkey(a), numkey(b)
-    if x < y then return -1 elseif x > y then return 1 end
-    return 0
-  elseif fold then
-    return cmp_fold(a, b)
+-- gnulib strnumcmp (C locale: '.' decimal point, no thousands separator).
+local function strnumcmp(a: string, ai: integer, b: string, bi: integer): integer
+  local tmpa, tmpb = at(a, ai), at(b, bi)
+  if tmpa == 45 then
+    repeat ai = ai + 1; tmpa = at(a, ai) until tmpa ~= 48
+    if tmpb ~= 45 then
+      if tmpa == 46 then repeat ai = ai + 1; tmpa = at(a, ai) until tmpa ~= 48 end
+      if sdigit(tmpa) then return -1 end
+      while tmpb == 48 do bi = bi + 1; tmpb = at(b, bi) end
+      if tmpb == 46 then repeat bi = bi + 1; tmpb = at(b, bi) until tmpb ~= 48 end
+      return sdigit(tmpb) and -1 or 0
+    end
+    repeat bi = bi + 1; tmpb = at(b, bi) until tmpb ~= 48
+    while tmpa == tmpb and sdigit(tmpa) do
+      ai = ai + 1; tmpa = at(a, ai)
+      bi = bi + 1; tmpb = at(b, bi)
+    end
+    if (tmpa == 46 and not sdigit(tmpb)) or (tmpb == 46 and not sdigit(tmpa)) then
+      return fraccompare(b, bi, a, ai)
+    end
+    local tmp = tmpb - tmpa
+    local loga, logb: integer = 0, 0
+    while sdigit(tmpa) do loga = loga + 1; ai = ai + 1; tmpa = at(a, ai) end
+    while sdigit(tmpb) do logb = logb + 1; bi = bi + 1; tmpb = at(b, bi) end
+    if loga ~= logb then return loga < logb and 1 or -1 end
+    if loga == 0 then return 0 end
+    return tmp
+  elseif tmpb == 45 then
+    repeat bi = bi + 1; tmpb = at(b, bi) until tmpb ~= 48
+    if tmpb == 46 then repeat bi = bi + 1; tmpb = at(b, bi) until tmpb ~= 48 end
+    if sdigit(tmpb) then return 1 end
+    while tmpa == 48 do ai = ai + 1; tmpa = at(a, ai) end
+    if tmpa == 46 then repeat ai = ai + 1; tmpa = at(a, ai) until tmpa ~= 48 end
+    return sdigit(tmpa) and 1 or 0
   end
-  return cmp_plain(a, b)
+  while tmpa == 48 do ai = ai + 1; tmpa = at(a, ai) end
+  while tmpb == 48 do bi = bi + 1; tmpb = at(b, bi) end
+  while tmpa == tmpb and sdigit(tmpa) do
+    ai = ai + 1; tmpa = at(a, ai)
+    bi = bi + 1; tmpb = at(b, bi)
+  end
+  if (tmpa == 46 and not sdigit(tmpb)) or (tmpb == 46 and not sdigit(tmpa)) then
+    return fraccompare(a, ai, b, bi)
+  end
+  local tmp = tmpa - tmpb
+  local loga, logb: integer = 0, 0
+  while sdigit(tmpa) do loga = loga + 1; ai = ai + 1; tmpa = at(a, ai) end
+  while sdigit(tmpb) do logb = logb + 1; bi = bi + 1; tmpb = at(b, bi) end
+  if loga ~= logb then return loga < logb and -1 or 1 end
+  if loga == 0 then return 0 end
+  return tmp
 end
 
+local function skip_blanks(s: string): integer
+  local i: integer = 0
+  while sblank(at(s, i)) do i = i + 1 end
+  return i
+end
+
+local function numcompare(a: string, b: string): integer
+  return strnumcmp(a, skip_blanks(a), b, skip_blanks(b))
+end
+
+-- -h: order of magnitude of the unit suffix (k K M G T P E Z Y).
+local function unit_order(c: integer): integer
+  if c == 75 or c == 107 then return 1 end
+  if c == 77 then return 2 end
+  if c == 71 then return 3 end
+  if c == 84 then return 4 end
+  if c == 80 then return 5 end
+  if c == 69 then return 6 end
+  if c == 90 then return 7 end
+  if c == 89 then return 8 end
+  return 0
+end
+
+local function find_unit_order(s: string, i: integer): integer
+  local neg = at(s, i) == 45
+  if neg then i = i + 1 end
+  local maxd: integer = 0
+  local ch = at(s, i); i = i + 1
+  while sdigit(ch) do
+    if ch > maxd then maxd = ch end
+    ch = at(s, i); i = i + 1
+  end
+  if ch == 46 then
+    ch = at(s, i); i = i + 1
+    while sdigit(ch) do
+      if ch > maxd then maxd = ch end
+      ch = at(s, i); i = i + 1
+    end
+  end
+  if maxd > 48 then
+    local o = unit_order(ch)
+    return neg and -o or o
+  end
+  return 0
+end
+
+local function human_numcompare(a: string, b: string): integer
+  local ai, bi = skip_blanks(a), skip_blanks(b)
+  local diff = find_unit_order(a, ai) - find_unit_order(b, bi)
+  if diff ~= 0 then return diff end
+  return strnumcmp(a, ai, b, bi)
+end
+
+-- gnulib filevercmp: length of s without its (\.[A-Za-z~][A-Za-z0-9~]*)*$ suffix.
+local function file_prefixlen(s: string): integer
+  local n = (@integer)(s.size)
+  local prefixlen: integer = 0
+  local i: integer = 0
+  while true do
+    if i == n then return prefixlen end
+    i = i + 1
+    prefixlen = i
+    while i + 1 < n and at(s, i) == 46 and (salpha(at(s, i + 1)) or at(s, i + 1) == 126) do
+      i = i + 2
+      while i < n and (salnum(at(s, i)) or at(s, i) == 126) do i = i + 1 end
+    end
+  end
+  return prefixlen
+end
+
+local function verorder(s: string, pos: integer, len: integer): integer
+  if pos == len then return -1 end
+  local c = at(s, pos)
+  if sdigit(c) then return 0 end
+  if salpha(c) then return c end
+  if c == 126 then return -2 end
+  return c + 256
+end
+
+local function verrevcmp(s1: string, l1: integer, s2: string, l2: integer): integer
+  local p1, p2: integer = 0, 0
+  while p1 < l1 or p2 < l2 do
+    local first_diff: integer = 0
+    while (p1 < l1 and not sdigit(at(s1, p1))) or (p2 < l2 and not sdigit(at(s2, p2))) do
+      local c1, c2 = verorder(s1, p1, l1), verorder(s2, p2, l2)
+      if c1 ~= c2 then return c1 - c2 end
+      p1 = p1 + 1; p2 = p2 + 1
+    end
+    while p1 < l1 and at(s1, p1) == 48 do p1 = p1 + 1 end
+    while p2 < l2 and at(s2, p2) == 48 do p2 = p2 + 1 end
+    while p1 < l1 and p2 < l2 and sdigit(at(s1, p1)) and sdigit(at(s2, p2)) do
+      if first_diff == 0 then first_diff = at(s1, p1) - at(s2, p2) end
+      p1 = p1 + 1; p2 = p2 + 1
+    end
+    if p1 < l1 and sdigit(at(s1, p1)) then return 1 end
+    if p2 < l2 and sdigit(at(s2, p2)) then return -1 end
+    if first_diff ~= 0 then return first_diff end
+  end
+  return 0
+end
+
+local function filevercmp(a: string, b: string): integer
+  local alen, blen = (@integer)(a.size), (@integer)(b.size)
+  if alen == 0 then return blen ~= 0 and -1 or 0 end
+  if blen == 0 then return 1 end
+  if at(a, 0) == 46 then
+    if at(b, 0) ~= 46 then return -1 end
+    local adot, bdot = alen == 1, blen == 1
+    if adot then return bdot and 0 or -1 end
+    if bdot then return 1 end
+    local adotdot = at(a, 1) == 46 and alen == 2
+    local bdotdot = at(b, 1) == 46 and blen == 2
+    if adotdot then return bdotdot and 0 or -1 end
+    if bdotdot then return 1 end
+  elseif at(b, 0) == 46 then
+    return 1
+  end
+  local aprefix, bprefix = file_prefixlen(a), file_prefixlen(b)
+  local one_pass = aprefix == alen and bprefix == blen
+  local result = verrevcmp(a, aprefix, b, bprefix)
+  if result ~= 0 or one_pass then return result end
+  return verrevcmp(a, alen, b, blen)
+end
+
+-- Plain byte comparison as GNU does it (memcmp, then length).
+local function bytecmp(a: string, b: string): integer
+  if a.size == 0 then return b.size ~= 0 and -1 or 0 end
+  if b.size == 0 then return 1 end
+  local n = a.size < b.size and a.size or b.size
+  for i: usize = 0, < n do
+    local x, y = (@integer)(a.data[i]), (@integer)(b.data[i])
+    if x ~= y then return x - y end
+  end
+  if a.size == b.size then return 0 end
+  return a.size < b.size and -1 or 1
+end
+
+local function compare_key(a: string, b: string, k: SortKey): integer
+  local ka, kb = key_view(a, k), key_view(b, k)
+  local diff: integer = 0
+  if k.numeric or k.human or k.version then
+    if k.ignore ~= 0 or k.fold then ka = key_filtered(ka, k); kb = key_filtered(kb, k) end
+    if k.numeric then diff = numcompare(ka, kb)
+    elseif k.human then diff = human_numcompare(ka, kb)
+    else diff = filevercmp(ka, kb) end
+  elseif k.ignore ~= 0 then
+    local na, nb = (@integer)(ka.size), (@integer)(kb.size)
+    local i, j: integer = 0, 0
+    while true do
+      while i < na and key_ignored(k, at(ka, i)) do i = i + 1 end
+      while j < nb and key_ignored(k, at(kb, j)) do j = j + 1 end
+      if not (i < na and j < nb) then break end
+      diff = key_xlate(k, at(ka, i)) - key_xlate(k, at(kb, j))
+      if diff ~= 0 then break end
+      i = i + 1; j = j + 1
+    end
+    if diff == 0 then diff = (i < na and 1 or 0) - (j < nb and 1 or 0) end
+  elseif k.fold then
+    local na, nb = (@integer)(ka.size), (@integer)(kb.size)
+    if na == 0 then diff = nb ~= 0 and -1 or 0
+    elseif nb == 0 then diff = 1
+    else
+      local i: integer = 0
+      while i < na and i < nb do
+        diff = key_xlate(k, at(ka, i)) - key_xlate(k, at(kb, i))
+        if diff ~= 0 then break end
+        i = i + 1
+      end
+      if diff == 0 then diff = na < nb and -1 or (na ~= nb and 1 or 0) end
+    end
+  else
+    diff = bytecmp(ka, kb)
+  end
+  return k.reverse and -diff or diff
+end
+
+-- GNU compare(): keys first, then the whole line unless -s or -u.
 local function sort_compare(a: string, b: string): integer
   if #sort_keys > 0 then
-    for _, k in ipairs(sort_keys) do
-      local ka, kb = key_text(a, k), key_text(b, k)
-      local hasmod = k.numeric or k.reverse or k.fold
-      local numeric = hasmod and k.numeric or (not hasmod and sort_numeric)
-      local fold = hasmod and k.fold or (not hasmod and sort_fold)
-      local rev = hasmod and k.reverse or (not hasmod and sort_reverse)
-      local r = cmp_key(ka, kb, numeric, fold)
-      if r ~= 0 then return rev and -r or r end
+    for i = 1, #sort_keys do
+      local diff = compare_key(a, b, sort_keys[i])
+      if diff ~= 0 then return diff end
     end
-    if sort_stable then return 0 end
-    local r = cmp_plain(a, b)
-    return sort_reverse and -r or r
+    if sort_unique or sort_stable then return 0 end
   end
-  local ka, kb = a, b
-  if sort_blanks then
-    local i: usize = 1
-    while i <= a.size and isblank(a:byte(i)) do i = i + 1 end
-    ka = a:sub(i)
-    i = 1
-    while i <= b.size and isblank(b:byte(i)) do i = i + 1 end
-    kb = b:sub(i)
-  end
-  local r = cmp_key(ka, kb, sort_numeric, sort_fold)
-  if r == 0 and not sort_stable then r = cmp_plain(a, b) end
-  return sort_reverse and -r or r
+  local diff = bytecmp(a, b)
+  return sort_reverse and -diff or diff
 end
 
 local function sort_less(a: string, b: string): boolean
   return sort_compare(a, b) < 0
 end
 
-local function parse_keyspec(spec: string): (SortKey, boolean)
-  local k: SortKey
-  local i: usize = 1
-  local v: integer = 0
-  local any = false
-  while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
-  if not any or v == 0 then return k, false end
-  k.f1 = v; k.c1 = 1
-  if i <= spec.size and spec:byte(i) == 46 then
-    i = i + 1; v = 0; any = false
-    while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
-    if not any then return k, false end
-    k.c1 = v
+-- Split on the line terminator; a final unterminated line still counts.
+local function sort_lines(data: string): sequence(string)
+  local out: sequence(string)
+  local start: usize = 0
+  for i: usize = 0, < data.size do
+    if data.data[i] == sort_eol then
+      out:push((@string){data=&data.data[start], size=i - start})
+      start = i + 1
+    end
   end
-  while i <= spec.size and spec:byte(i) ~= 44 do
-    local m = spec:byte(i)
-    if m == 110 then k.numeric = true elseif m == 114 then k.reverse = true
-    elseif m == 102 then k.fold = true elseif m == 98 then k.b1 = true
-    else return k, false end
+  if start < data.size then
+    out:push((@string){data=&data.data[start], size=data.size - start})
+  end
+  return out
+end
+
+local function badfieldspec(spec: string, msg: string): integer
+  util.err(msg .. ": invalid field specification '" .. spec .. "'")
+  return 2
+end
+
+-- Ordering letters shared by the global options and key modifiers.
+-- where: 0 = both blank sides (global), 1 = key start, 2 = key end.
+local function set_ordering(k: *SortKey, c: integer, where: integer): boolean
+  if c == 98 then
+    if where ~= 2 then k.skipsblanks = true end
+    if where ~= 1 then k.skipeblanks = true end
+  elseif c == 100 then k.ignore = 2
+  elseif c == 102 then k.fold = true
+  elseif c == 104 then k.human = true
+  elseif c == 105 then if k.ignore == 0 then k.ignore = 1 end
+  elseif c == 110 then k.numeric = true
+  elseif c == 114 then k.reverse = true
+  elseif c == 86 then k.version = true
+  else return false end
+  return true
+end
+
+local function default_key_compare(k: SortKey): boolean
+  return not (k.ignore ~= 0 or k.fold or k.skipsblanks or k.skipeblanks or k.numeric or k.human or k.version)
+end
+
+local function keynum(spec: string, start: integer): (integer, integer, boolean)
+  local v: integer = 0
+  local j = start
+  local n = (@integer)(spec.size)
+  while j < n and sdigit(at(spec, j)) do v = v * 10 + (at(spec, j) - 48); j = j + 1 end
+  return v, j, j > start
+end
+
+-- Parse POS1[,POS2] into k; returns 0 or an exit status after a diagnostic.
+local function parse_keyspec(spec: string, k: *SortKey): integer
+  local i: integer = 0
+  local n = (@integer)(spec.size)
+  local v: integer, ok: boolean
+  v, i, ok = keynum(spec, 0)
+  if not ok then return badfieldspec(spec, 'invalid number at field start') end
+  if v == 0 then return badfieldspec(spec, 'field number is zero') end
+  k.sword = v - 1; k.schar = 0
+  if at(spec, i) == 46 then
+    v, i, ok = keynum(spec, i + 1)
+    if not ok then return badfieldspec(spec, "invalid number after '.'") end
+    if v == 0 then return badfieldspec(spec, 'character offset is zero') end
+    k.schar = v - 1
+  end
+  if k.sword == 0 and k.schar == 0 then k.sword = -1 end
+  while i < n and at(spec, i) ~= 44 do
+    if not set_ordering(k, at(spec, i), 1) then return badfieldspec(spec, 'stray character in field spec') end
     i = i + 1
   end
-  if i <= spec.size and spec:byte(i) == 44 then
-    i = i + 1; v = 0; any = false
-    while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
-    if not any or v == 0 then return k, false end
-    k.f2 = v; k.c2 = 0
-    if i <= spec.size and spec:byte(i) == 46 then
-      i = i + 1; v = 0; any = false
-      while i <= spec.size and spec:byte(i) >= 48 and spec:byte(i) <= 57 do v = v * 10 + (spec:byte(i) - 48); i = i + 1; any = true end
-      if not any then return k, false end
-      k.c2 = v
+  k.eword = -1; k.echar = 0
+  if i < n then
+    v, i, ok = keynum(spec, i + 1)
+    if not ok then return badfieldspec(spec, "invalid number after ','") end
+    if v == 0 then return badfieldspec(spec, 'field number is zero') end
+    k.eword = v - 1
+    if at(spec, i) == 46 then
+      v, i, ok = keynum(spec, i + 1)
+      if not ok then return badfieldspec(spec, "invalid number after '.'") end
+      k.echar = v
     end
-    while i <= spec.size do
-      local m = spec:byte(i)
-      if m == 110 then k.numeric = true elseif m == 114 then k.reverse = true
-      elseif m == 102 then k.fold = true elseif m == 98 then k.b2 = true
-      else return k, false end
+    while i < n do
+      if not set_ordering(k, at(spec, i), 2) then return badfieldspec(spec, 'stray character in field spec') end
       i = i + 1
     end
   end
-  return k, true
+  return 0
+end
+
+local function sort_emit(l: string)
+  util.write(l)
+  util.writebyte(sort_eol)
 end
 
 global function applet_sort(args: sequence(string)): integer
-  local o = util.parse(args, 'rnufsbcCo:k:t:')
-  if not o:ok() then return util.optfail(o) end
-  sort_numeric, sort_reverse, sort_fold, sort_stable = o:has('n'), o:has('r'), o:has('f'), o:has('s')
-  sort_blanks = o:has('b')
+  local o = util.parse(args, 'bcCdfhimnrsuVzo:k:t:')
+  if not o:ok() then util.optfail(o); return 2 end
+  local gkey: SortKey
+  gkey.sword = -1; gkey.eword = -1
+  local flags = 'bdfhinrV'
+  for i: usize = 1, flags.size do
+    if o:has(flags:sub(i, i)) then set_ordering(&gkey, (@integer)(flags:byte(i)), 0) end
+  end
+  sort_reverse, sort_stable, sort_unique = o:has('r'), o:has('s'), o:has('u')
+  if o:has('z') then sort_eol = 0 else sort_eol = 10 end
   sort_sep = -1
   sort_keys:clear()
   if o:has('t') then
     local t = o:get('t')
+    if t.size == 0 then util.err('empty tab'); return 2 end
     if t == '\\0' then sort_sep = 0
-    elseif t.size ~= 1 then return util.die("multi-character tab '" .. t .. "'")
+    elseif t.size ~= 1 then util.err("multi-character tab '" .. t .. "'"); return 2
     else sort_sep = t:byte(1) end
   end
   for _, spec in ipairs(o:all('k')) do
-    local k, ok = parse_keyspec(spec)
-    if not ok then return util.die("invalid key spec '" .. spec .. "'") + 1 end
+    local k: SortKey
+    local rc = parse_keyspec(spec, &k)
+    if rc ~= 0 then return rc end
     sort_keys:push(k)
   end
+  -- Keys without ordering options of their own inherit the global ones.
+  for i = 1, #sort_keys do
+    local k = &sort_keys[i]
+    if default_key_compare($k) and not k.reverse then
+      k.ignore = gkey.ignore; k.fold = gkey.fold
+      k.skipsblanks = gkey.skipsblanks; k.skipeblanks = gkey.skipeblanks
+      k.numeric = gkey.numeric; k.human = gkey.human; k.version = gkey.version
+      k.reverse = gkey.reverse
+    end
+  end
+  if #sort_keys == 0 and not default_key_compare(gkey) then sort_keys:push(gkey) end
+  for i = 1, #sort_keys do
+    local k = sort_keys[i]
+    local kinds = (k.numeric and 1 or 0) + (k.human and 1 or 0) + (k.version and 1 or 0)
+    if kinds > 1 then
+      local s: string = (k.numeric and 'n' or '') .. (k.human and 'h' or '') .. (k.version and 'V' or '')
+      util.err("options '-" .. s .. "' are incompatible"); return 2
+    end
+  end
+  local check = o:has('c') or o:has('C')
+  if check and o:has('o') then
+    util.err("options '-" .. (o:has('c') and 'c' or 'C') .. "o' are incompatible"); return 2
+  end
   if #o.operands == 0 then o.operands:push('-') end
-  local all: sequence(string)
-  local rc: integer = 0
+  if check and #o.operands > 1 then
+    util.err("extra operand '" .. o.operands[2] .. "' not allowed with -" .. (o:has('c') and 'c' or 'C')); return 2
+  end
+  local inputs: sequence(sequence(string))
   for _, path in ipairs(o.operands) do
     local data, ok = util.readfile(path)
-    if not ok then rc = 2; continue end
-    for _, l in ipairs(util.lines(data)) do all:push(l) end
+    if not ok then return 2 end
+    inputs:push(sort_lines(data))
   end
-  if o:has('c') or o:has('C') then
+  if check then
+    local all = inputs[1]
     for i = 2, #all do
       local r = sort_compare(all[i - 1], all[i])
-      if r > 0 or (o:has('u') and r == 0) then
-        if o:has('c') then
-          util.errf('%s: %s:%d: disorder: %s\n', util.applet, o.operands[1], i, all[i])
-        end
+      if r > 0 or (sort_unique and r == 0) then
+        if o:has('c') then util.errf('%s:%d: disorder: %s', o.operands[1], i, all[i]) end
         return 1
       end
     end
     return 0
   end
-  util.sort(all, sort_less)
+  local all: sequence(string)
+  if o:has('m') then
+    -- GNU mergefps: take the smallest head, earlier file first on ties.
+    local pos: sequence(integer)
+    for i = 1, #inputs do pos:push(1) end
+    while true do
+      local best: integer = 0
+      for f = 1, #inputs do
+        if pos[f] <= #inputs[f] then
+          if best == 0 or sort_compare(inputs[f][pos[f]], inputs[best][pos[best]]) < 0 then best = f end
+        end
+      end
+      if best == 0 then break end
+      all:push(inputs[best][pos[best]])
+      pos[best] = pos[best] + 1
+    end
+  else
+    for f = 1, #inputs do
+      for _, l in ipairs(inputs[f]) do all:push(l) end
+    end
+    util.sort(all, sort_less)
+  end
   if o:has('o') then
     local fd = sys.open(o:get('o'), sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
     if fd < 0 then util.perror(o:get('o')); return 2 end
@@ -583,28 +950,14 @@ global function applet_sort(args: sequence(string)): integer
   local prev: string
   local have = false
   for _, l in ipairs(all) do
-    if o:has('u') and have then
-      local same: boolean
-      if #sort_keys > 0 then
-        same = true
-        for _, k in ipairs(sort_keys) do
-          local hasmod = k.numeric or k.reverse or k.fold
-          local numeric = hasmod and k.numeric or (not hasmod and sort_numeric)
-          local fold = hasmod and k.fold or (not hasmod and sort_fold)
-          if cmp_key(key_text(prev, k), key_text(l, k), numeric, fold) ~= 0 then same = false; break end
-        end
-      elseif sort_numeric then same = numkey(prev) == numkey(l)
-      elseif sort_fold then same = cmp_fold(prev, l) == 0
-      else same = prev == l end
-      if same then continue end
-    end
-    util.line(l)
+    if sort_unique and have and sort_compare(prev, l) == 0 then continue end
+    sort_emit(l)
     prev = l
     have = true
   end
   util.flush()
   util.setout(1)
-  return rc
+  return 0
 end
 
 global function applet_uniq(args: sequence(string)): integer

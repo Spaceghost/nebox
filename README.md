@@ -75,8 +75,12 @@ Stated here rather than worked around:
   order.
 - `od` supports -A -t (a c d u o x; sizes 1 2 4 8) -b -c -d -o -x -s -i -l -j
   -N -v; no floats or -w. `hexdump` offers -C -c -b -d -o -x -n -s -v only.
-- `sort` has -k (with n r f b modifiers and .C positions), -t, -b, -s, -c/-C,
-  -u, -o; no -M, -V, -h, or -z.
+- `sort` takes -b -c -C -d -f -h -i -m -n -o -r -s -t -u -V -z and -k with
+  `F[.C][OPTS][,F[.C][OPTS]]` positions and the modifiers b d f h i n r V,
+  following GNU's key inheritance, last-resort and -u/-c rules in the C locale
+  (bytes, no collation). -n compares digit strings like GNU, -h knows the
+  suffixes k K M G T P E Z Y, -V implements gnulib filevercmp. No -M, -g, -R,
+  --parallel, long options, or locales.
 - `tail -f` polls once a second; `-F` is treated as `-f`.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
@@ -96,7 +100,6 @@ Stated here rather than worked around:
   has no `getpwuid`); unknown ids print as numbers.
 - `id` lists supplementary groups from `getgroups`; `-G` is supported.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
-- `sort` offers `-r -n -u -f -o`; no `-k` keys or field separators.
 - `tr` has ranges, `[:class:]`, `[c*n]`, `-c`, `-d`, `-s`, and escapes; no equivalence classes.
 - `seq` is integer-only.
 - `chmod` takes octal modes and `[ugoa][+-=][rwxXst]` lists.
