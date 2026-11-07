@@ -324,6 +324,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   local name = p.text
   local f: byte = p.quoted and shexp.F_Q or (split and shexp.F_S or 0)
   local is_at = name == '@' or name == '*'
+  if p.a == N.OP_BAD then shexp.fatal('Bad substitution') return end
   if p.c == 1 then
     local v, set = param_value(name)
     local len: usize = v.size
@@ -405,10 +406,24 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   local prefix = op == N.OP_HASH or op == N.OP_HASH2
   local longest = op == N.OP_HASH2 or op == N.OP_PERCENT2
   if is_at then
+    -- applied to each positional parameter; "$@"-style fields stay separate,
+    -- "$*" joins them with the first IFS character
     local ps = shexp.params()
+    local star_q = name == '*' and p.quoted
+    local sepstr = ifs()
+    local _, ifs_set = shexp.getvar('IFS')
     for i = 1, #ps do
-      if i > 1 then out:add(32, p.quoted and shexp.F_Q or shexp.F_SEP) end
-      out:addstr(remove_pattern(ps[i], &pat, prefix, longest), f)
+      if i > 1 then
+        if not star_q then out:add(32, shexp.F_SEP)
+        elseif not ifs_set then out:add(32, shexp.F_Q)
+        elseif sepstr.size > 0 then out:add(sepstr:byte(1), shexp.F_Q) end
+      end
+      local r = remove_pattern(ps[i], &pat, prefix, longest)
+      if r.size == 0 then
+        if p.quoted then out:add(0, shexp.F_EMPTY) end
+      else
+        out:addstr(r, f)
+      end
     end
     return
   end

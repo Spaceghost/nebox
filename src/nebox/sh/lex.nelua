@@ -294,6 +294,25 @@ end
 
 local function scan_word(lx: *shlex.Lexer, mode: byte, outer: boolean, prefix: string): sequence(shast.Part) <forwarddecl> end
 
+-- An invalid ${...}: skip to the closing brace and record it, so the error
+-- is reported when (and only if) the expansion is performed, as dash does.
+local function bad_param(lx: *shlex.Lexer, sc: *Scan, p: *shast.Part)
+  local depth: integer = 0
+  while true do
+    local c = lx:peek()
+    if c < 0 then lx:fatal("Missing '}'") end
+    lx:advance()
+    if c == #[B'{']# then depth = depth + 1
+    elseif c == #[B'}']# then
+      if depth == 0 then break end
+      depth = depth - 1
+    end
+  end
+  p.a = shast.OP_BAD
+  p.b = 0
+  sc.parts:push($p)
+end
+
 -- Parse the text after "${": name, operator, argument word.
 local function scan_brace_param(lx: *shlex.Lexer, sc: *Scan, q: boolean)
   local p: shast.Part
@@ -321,7 +340,8 @@ local function scan_brace_param(lx: *shlex.Lexer, sc: *Scan, q: boolean)
     elseif is_special_param(c) then
       name:writebyte((@byte)(lx:next()))
     else
-      lx:fatal('Bad substitution')
+      bad_param(lx, sc, &p)
+      return
     end
   end
   p.text = name:promote()
@@ -331,7 +351,7 @@ local function scan_brace_param(lx: *shlex.Lexer, sc: *Scan, q: boolean)
     sc.parts:push(p)
     return
   end
-  if p.c == 1 then lx:fatal('Bad substitution') end
+  if p.c == 1 then bad_param(lx, sc, &p); return end
   local colon = false
   if c == #[B':']# then colon = true; lx:advance(); c = lx:peek() end
   local consumed = false
@@ -348,10 +368,14 @@ local function scan_brace_param(lx: *shlex.Lexer, sc: *Scan, q: boolean)
     if lx:peek() == #[B'%']# then lx:advance(); p.a = shast.OP_PERCENT2 else p.a = shast.OP_PERCENT end
     consumed = true
   else
-    lx:fatal('Bad substitution')
+    bad_param(lx, sc, &p)
+    return
   end
   if not consumed then lx:advance() end
-  local parts = scan_word(lx, consumed and M_BRACE_PAT or M_BRACE, q, '')
+  -- outer double quotes do not quote the pattern of # ## % %% (XCU 2.6.2)
+  local parts: sequence(shast.Part)
+  if consumed then parts = scan_word(lx, M_BRACE_PAT, false, '')
+  else parts = scan_word(lx, M_BRACE, q, '') end
   p.b = shast.word(parts, lx:line())
   sc.parts:push(p)
 end

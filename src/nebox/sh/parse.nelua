@@ -417,6 +417,15 @@ local function wrap_list(items: sequence(integer), line: integer): integer
   return node
 end
 
+-- An operator that can neither start a command nor end a list, seen right
+-- after a separator (`a; & b`, `a;& esac`): reported without a hint, as dash does.
+local function reject_stray_operator(lx: *shlex.Lexer)
+  local t = lx:peek_token(true)
+  if t.kind == T.T_AMP or t.kind == T.T_SEMI or t.kind == T.T_PIPE or t.kind == T.T_AND_IF or t.kind == T.T_OR_IF then
+    unexpected(lx, t, '')
+  end
+end
+
 -- term with newlines allowed between and around commands.
 function parse_compound_list(lx: *shlex.Lexer): integer
   local items: sequence(integer)
@@ -432,10 +441,12 @@ function parse_compound_list(lx: *shlex.Lexer): integer
       cmd = N.node(N.N_ASYNC, cmd, 0, 0, 0, t.line)
       items:push(cmd)
       linebreak(lx)
+      reject_stray_operator(lx)
     elseif t.kind == T.T_SEMI or t.kind == T.T_NEWLINE then
       lx:take()
       items:push(cmd)
       linebreak(lx)
+      reject_stray_operator(lx)
     else
       items:push(cmd)
       break

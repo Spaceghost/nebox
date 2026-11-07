@@ -29,6 +29,7 @@ global shast.OP_HASH: integer <comptime> = 9       -- ${x#p}
 global shast.OP_HASH2: integer <comptime> = 10     -- ${x##p}
 global shast.OP_PERCENT: integer <comptime> = 11   -- ${x%p}
 global shast.OP_PERCENT2: integer <comptime> = 12  -- ${x%%p}
+global shast.OP_BAD: integer <comptime> = 13       -- invalid ${...}: error when expanded
 
 global shast.Part = @record{
   kind: byte,
