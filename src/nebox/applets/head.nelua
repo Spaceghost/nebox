@@ -1,0 +1,375 @@
+-- head: a port of GNU coreutils 9.1 src/head.c. -n/-c with GNU's suffixes,
+-- -n -N and -c -N (all but the last N, with GNU's seekable and pipe
+-- strategies and the file offset left just after the output), -q -v -z,
+-- the obsolete -N[bkmclqvz] first argument, and GNU's diagnostics.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+local BUFSIZ: integer <comptime> = 8192
+
+local print_headers: boolean
+local presume_input_pipe: boolean
+local line_end: byte
+local first_file: boolean
+
+local function usage_fail(msg: string): integer
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'head --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  return 1
+end
+
+-- xdectoumax(s, 0, UINTMAX_MAX, "bkKmMGTPEZY0", msg, 0)
+local function string_to_integer(count_lines: boolean, s: string): uint64
+  local msg = count_lines and 'invalid number of lines' or 'invalid number of bytes'
+  local p = 1
+  while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
+  local function fail(errno_text: string)
+    util.err(msg .. ': ' .. util.quote(s) .. errno_text)
+    util.flush()
+    c_exit(1)
+  end
+  if p <= #s and s:byte(p) == 45 then fail('') end
+  if p <= #s and s:byte(p) == 43 then p = p + 1 end
+  local start = p
+  local v: uint64 = 0
+  local ovf = false
+  while p <= #s and s:byte(p) >= 48 and s:byte(p) <= 57 do
+    local d: uint64 = s:byte(p) - 48
+    if v > (UMAX - d) // 10 then ovf = true; v = UMAX elseif not ovf then v = v * 10 + d end
+    p = p + 1
+  end
+  if p == start then
+    local c: byte = p <= #s and s:byte(p) or 0
+    if c ~= 0 and ('bkKmMGTPEZY'):find(string.char(c), 1, true) > 0 then v = 1 else fail('') end
+  end
+  if p <= #s then
+    local c = s:byte(p)
+    local base: uint64 = 1024
+    local nsuf = 1
+    local power = 0
+    if c == 98 then
+      if v > UMAX // 512 then ovf = true; v = UMAX else v = v * 512 end
+    elseif c == 107 or c == 75 or c == 109 or c == 77 or c == 71 or c == 84 or c == 80 or c == 69 or c == 90 or c == 89 then
+      local c1: byte = p + 1 <= #s and s:byte(p + 1) or 0
+      if c1 == 105 and p + 2 <= #s and s:byte(p + 2) == 66 then nsuf = 3
+      elseif c1 == 66 or c1 == 68 then base = 1000; nsuf = 2 end
+      if c == 107 or c == 75 then power = 1 elseif c == 109 or c == 77 then power = 2
+      elseif c == 71 then power = 3 elseif c == 84 then power = 4 elseif c == 80 then power = 5
+      elseif c == 69 then power = 6 elseif c == 90 then power = 7 else power = 8 end
+      for _ = 1, power do
+        if v ~= 0 and v > UMAX // base then ovf = true; v = UMAX else v = v * base end
+      end
+    else
+      fail('')
+    end
+    p = p + nsuf
+    if p <= #s then fail('') end
+  end
+  if ovf then fail(': Value too large for defined data type') end
+  return v
+end
+
+local function write_header(name: string)
+  util.write(first_file and '==> ' or '\n==> ')
+  util.write(name)
+  util.write(' <==\n')
+  first_file = false
+end
+
+local function read_some(fd: cint, buf: *[0]byte, n: integer): integer
+  local r: clong
+  repeat r = sys.read(fd, buf, (@csize)(n)) until not (r < 0 and sys.errno() == sys.EINTR)
+  return r
+end
+
+-- copy_fd: exactly n bytes; -1 read error, -2 unexpected EOF
+local function copy_fd(fd: cint, n: uint64): integer
+  local buf: [8192]byte
+  while n > 0 do
+    local want: integer = n < 8192 and (@integer)(n) or 8192
+    local r = read_some(fd, &buf, want)
+    if r < 0 then return -1 end
+    n = n - (@uint64)(r)
+    if r == 0 and n ~= 0 then return -2 end
+    util.writebytes(&buf, (@usize)(r))
+  end
+  return 0
+end
+
+local function diagnose_copy(err: integer, name: string)
+  if err == -1 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr())
+  else util.err(util.quotef(name) .. ': file has shrunk too much') end
+end
+
+local function elseek(fd: cint, off: int64, whence: cint, name: string): int64
+  local r = sys.lseek(fd, off, whence)
+  if r < 0 then
+    if whence == sys.SEEK_SET then util.err(util.quotef(name) .. ': cannot seek to offset ' .. tostring(off) .. ': ' .. sys.errstr())
+    else util.err(util.quotef(name) .. ': cannot seek to relative offset ' .. tostring(off) .. ': ' .. sys.errstr()) end
+  end
+  return r
+end
+
+-- All but the last n_elide bytes or lines, holding back only what may be
+-- elided (GNU's pipe strategy); a seekable input is left just after the
+-- output.
+local function elide_tail_pipe(name: string, fd: cint, n_elide: uint64, count_lines: boolean, current_pos: int64): boolean
+  local pending: sequence(byte)
+  local nls: sequence(integer)    -- positions (1-based) of line ends in pending
+  local start = 1                 -- first byte of pending not yet written
+  local written: int64 = 0
+  local buf: [8192]byte
+  local ok = true
+  local function compact()
+    if start > 65536 then
+      local n = #pending - start + 1
+      for k = 1, n do pending[k] = pending[start + k - 1] end
+      pending:resize((@usize)(n))
+      for k = 1, #nls do nls[k] = nls[k] - (start - 1) end
+      start = 1
+    end
+  end
+  while true do
+    local r = read_some(fd, &buf, 8192)
+    if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); ok = false; break end
+    if r == 0 then break end
+    for k = 0, < r do
+      pending:push(buf[k])
+      if count_lines and buf[k] == line_end then nls:push(#pending) end
+    end
+    if count_lines then
+      -- keep n_elide complete lines (plus a partial one) back
+      while (@uint64)(#nls) > n_elide do
+        local e = nls[1]
+        util.writebytes(&pending[start], (@usize)(e - start + 1))
+        written = written + (e - start + 1)
+        start = e + 1
+        nls:remove(1)
+      end
+    else
+      local held = (@uint64)(#pending - start + 1)
+      if held > n_elide then
+        local out = (@integer)(held - n_elide)
+        util.writebytes(&pending[start], (@usize)(out))
+        written = written + out
+        start = start + out
+      end
+    end
+    compact()
+  end
+  if ok and count_lines and n_elide > 0 and #pending >= start and pending[#pending] ~= line_end then
+    -- the partial last line is one of the elided lines
+    if #nls > 0 and (@uint64)(#nls) >= n_elide then
+      local e = nls[1]
+      util.writebytes(&pending[start], (@usize)(e - start + 1))
+      written = written + (e - start + 1)
+    end
+  end
+  if ok and count_lines and n_elide == 0 and #pending >= start then
+    util.writebytes(&pending[start], (@usize)(#pending - start + 1))
+    written = written + (#pending - start + 1)
+  end
+  if ok and 0 <= current_pos and elseek(fd, current_pos + written, sys.SEEK_SET, name) < 0 then ok = false end
+  pending:destroy(); nls:destroy()
+  return ok
+end
+
+local function elide_tail_lines_seekable(name: string, fd: cint, n_lines: uint64, start_pos: int64, size: int64): boolean
+  local buffer: [8192]byte
+  local pos = size
+  local bytes_read: integer = (@integer)((pos - start_pos) % BUFSIZ)
+  if bytes_read == 0 then bytes_read = BUFSIZ end
+  pos = pos - bytes_read
+  if elseek(fd, pos, sys.SEEK_SET, name) < 0 then return false end
+  bytes_read = read_some(fd, &buffer, bytes_read)
+  if bytes_read < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+  local all_lines = n_lines == 0
+  if n_lines ~= 0 and bytes_read > 0 and buffer[bytes_read - 1] ~= line_end then n_lines = n_lines - 1 end
+  while true do
+    local n = bytes_read
+    while n > 0 do
+      if all_lines then n = n - 1
+      else
+        local k = n - 1
+        while k >= 0 and buffer[k] ~= line_end do k = k - 1 end
+        if k < 0 then break end
+        n = k
+      end
+      local was = n_lines
+      n_lines = n_lines - 1
+      if was == 0 then
+        if start_pos < pos then
+          if elseek(fd, start_pos, sys.SEEK_SET, name) < 0 then return false end
+          local err = copy_fd(fd, (@uint64)(pos - start_pos))
+          if err ~= 0 then diagnose_copy(err, name); return false end
+        end
+        util.writebytes(&buffer, (@usize)(n + 1))
+        return elseek(fd, pos + n + 1, sys.SEEK_SET, name) >= 0
+      end
+    end
+    if pos == start_pos then return true end
+    pos = pos - BUFSIZ
+    if elseek(fd, pos, sys.SEEK_SET, name) < 0 then return false end
+    bytes_read = read_some(fd, &buffer, BUFSIZ)
+    if bytes_read < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+    if bytes_read == 0 then return true end
+  end
+end
+
+local function head_lines(name: string, fd: cint, lines: uint64): boolean
+  local buffer: [8192]byte
+  while lines > 0 do
+    local r = read_some(fd, &buffer, BUFSIZ)
+    if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+    if r == 0 then break end
+    local w = 0
+    while w < r do
+      local c = buffer[w]
+      w = w + 1
+      if c == line_end then
+        lines = lines - 1
+        if lines == 0 then
+          local past = r - w
+          if sys.lseek(fd, -past, sys.SEEK_CUR) < 0 then
+            local st: sys.Stat
+            if sys.fstat(fd, &st) ~= 0 or (st.st_mode & sys.S_IFMT) == sys.S_IFREG then
+              elseek(fd, -past, sys.SEEK_CUR, name)
+            end
+          end
+          break
+        end
+      end
+    end
+    util.writebytes(&buffer, (@usize)(w))
+  end
+  return true
+end
+
+local function head_bytes(name: string, fd: cint, n: uint64): boolean
+  local buffer: [8192]byte
+  while n > 0 do
+    local want: integer = n < 8192 and (@integer)(n) or 8192
+    local r = read_some(fd, &buffer, want)
+    if r < 0 then util.err('error reading ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+    if r == 0 then break end
+    util.writebytes(&buffer, (@usize)(r))
+    n = n - (@uint64)(r)
+  end
+  return true
+end
+
+local function head(name: string, fd: cint, n_units: uint64, count_lines: boolean, elide: boolean): boolean
+  if print_headers then write_header(name) end
+  if elide then
+    local st: sys.Stat
+    if sys.fstat(fd, &st) ~= 0 then util.err('cannot fstat ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); return false end
+    local current_pos: int64 = -1
+    local t = st.st_mode & sys.S_IFMT
+    if not presume_input_pipe and (t == sys.S_IFREG or t == 0xA000) then
+      current_pos = elseek(fd, 0, sys.SEEK_CUR, name)
+      if current_pos < 0 then return false end
+    end
+    local size: int64 = st.st_size
+    local blksize: int64 = st.st_blksize
+    if presume_input_pipe or current_pos < 0 or size <= blksize then
+      return elide_tail_pipe(name, fd, n_units, count_lines, current_pos)
+    end
+    if count_lines then
+      return size <= current_pos or elide_tail_lines_seekable(name, fd, n_units, current_pos, size)
+    end
+    local diff = size - current_pos
+    local remaining: uint64 = diff < 0 and 0 or (@uint64)(diff)
+    if remaining <= n_units then return true end
+    local err = copy_fd(fd, remaining - n_units)
+    if err ~= 0 then diagnose_copy(err, name); return false end
+    return true
+  end
+  if count_lines then return head_lines(name, fd, n_units) end
+  return head_bytes(name, fd, n_units)
+end
+
+local PRESUME_INPUT_PIPE_OPTION: integer <comptime> = 200
+local head_longs: []util.LongOpt = {
+  {'bytes', 1, 99}, {'lines', 1, 110}, {'-presume-input-pipe', 0, PRESUME_INPUT_PIPE_OPTION},
+  {'quiet', 0, 113}, {'silent', 0, 113}, {'verbose', 0, 118}, {'zero-terminated', 0, 122},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
+global function applet_head(args: sequence(string)): integer
+  local NEVER, ALWAYS, MULTIPLE = 0, 1, 2
+  local header_mode = MULTIPLE
+  local n_units: uint64 = 10
+  local count_lines = true
+  local elide = false
+  print_headers = false; presume_input_pipe = false; line_end = 10; first_file = true
+  local rest: sequence(string)
+  for k = 1, #args do rest:push(args[k]) end
+  if #rest >= 1 and #rest[1] >= 2 and rest[1]:byte(1) == 45 and rest[1]:byte(2) >= 48 and rest[1]:byte(2) <= 57 then
+    local a = rest[1]
+    local p = 2
+    while p <= #a and a:byte(p) >= 48 and a:byte(p) <= 57 do p = p + 1 end
+    local digits = a:sub(2, p - 1)
+    local mult = ''
+    for q = p, #a do
+      local c = a:byte(q)
+      if c == 99 then count_lines = false; mult = ''
+      elseif c == 98 or c == 107 or c == 109 then count_lines = false; mult = string.char(c)
+      elseif c == 108 then count_lines = true
+      elseif c == 113 then header_mode = NEVER
+      elseif c == 118 then header_mode = ALWAYS
+      elseif c == 122 then line_end = 0
+      else return usage_fail('invalid trailing option -- ' .. string.char(c)) end
+    end
+    n_units = string_to_integer(count_lines, digits .. mult)
+    rest:remove(1)
+  end
+  local g = util.getopt(rest, 'c:n:qvz0123456789', &head_longs, #head_longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == PRESUME_INPUT_PIPE_OPTION then presume_input_pipe = true
+    elseif c == 99 or c == 110 then
+      count_lines = c == 110
+      local a = g.optarg
+      elide = #a > 0 and a:byte(1) == 45
+      if elide then a = a:sub(2) end
+      n_units = string_to_integer(count_lines, a)
+    elseif c == 113 then header_mode = NEVER
+    elseif c == 118 then header_mode = ALWAYS
+    elseif c == 122 then line_end = 0
+    elseif c >= 48 and c <= 57 then return usage_fail('invalid trailing option -- ' .. string.char(c)) end
+  end
+  local files = g:operands()
+  if header_mode == ALWAYS or (header_mode == MULTIPLE and #files > 1) then print_headers = true end
+  if not count_lines and elide and n_units > 0x7fffffffffffffff then
+    util.err('invalid number of bytes: ' .. util.quote(tostring(n_units)) .. ': Value too large for defined data type')
+    return 1
+  end
+  if #files == 0 then files:push('-') end
+  local ok = true
+  for _, f in ipairs(files) do
+    local fd: cint = 0
+    local name = f
+    if f == '-' then name = 'standard input'
+    else
+      fd = sys.open(f, sys.O_RDONLY, 0)
+      if fd < 0 then util.err('cannot open ' .. util.quoteaf(f) .. ' for reading: ' .. sys.errstr()); ok = false; continue end
+    end
+    if not head(name, fd, n_units, count_lines, elide) then ok = false end
+    if fd ~= 0 and sys.close(fd) ~= 0 then util.err('failed to close ' .. util.quoteaf(name) .. ': ' .. sys.errstr()); ok = false end
+  end
+  util.flush()
+  return ok and 0 or 1
+end

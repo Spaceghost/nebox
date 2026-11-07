@@ -86,6 +86,11 @@ Stated here rather than worked around:
   ports uniq.c (-c -d -D[=METHOD] -u -i -f -s -w -z, --group[=METHOD], the
   obsolete -N and +N forms, the OUTPUT operand). `tests/cutuniq_compare.py`:
   3045 random cases against GNU, 0 mismatches.
+- `head` ports head.c: GNU's count suffixes, `-n -N`/`-c -N` with its seekable
+  and pipe strategies (bounded memory on pipes, the file offset left just
+  after the output so `{ head -n 2; cat; } < f` works), -q -v -z, and the
+  obsolete `-N[bkmclqvz]` first argument. `tests/head_compare.py`: 1550 cases
+  against GNU, 0 mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows

@@ -238,49 +238,6 @@ local function head_stream(fd: cint, path: string, bytes: boolean, n: integer): 
   return true
 end
 
-global function applet_head(args: sequence(string)): integer
-  local files, bytes, count, verbose, ok = count_args(args)
-  if not ok then return 1 end
-  if #files == 0 then files:push('-') end
-  local rc: integer = 0
-  for idx, path in ipairs(files) do
-    if verbose then header(path, idx == 1) end
-    if count >= 0 then
-      local fd = util.openin(path)
-      if fd < 0 then rc = 1; continue end
-      if not head_stream(fd, path, bytes, count) then rc = 1 end
-      if fd ~= 0 then sys.close(fd) end
-      util.flush()
-      continue
-    end
-    -- negative count: all but the last N; needs the whole input
-    local data, rok = util.readfile(path)
-    if not rok then rc = 1; continue end
-    local n = count
-    if bytes then
-      n = (@integer)(data.size) + n; if n < 0 then n = 0 end
-      util.writebytes(data.data, (@usize)(n))
-    else
-      local total: integer = 0
-      for i: usize = 0, < data.size do if data.data[i] == 10 then total = total + 1 end end
-      if data.size > 0 and data.data[data.size - 1] ~= 10 then total = total + 1 end
-      n = total + n; if n < 0 then n = 0 end
-      local seen: integer = 0
-      local stop: usize = data.size
-      if n < total then
-        stop = 0
-        for i: usize = 0, < data.size do
-          if data.data[i] == 10 then
-            seen = seen + 1
-            if seen == n then stop = i + 1; break end
-          end
-        end
-      end
-      util.writebytes(data.data, stop)
-    end
-  end
-  return rc
-end
 
 global function applet_tail(args: sequence(string)): integer
   local files, bytes, count, verbose, ok = count_args(args)
