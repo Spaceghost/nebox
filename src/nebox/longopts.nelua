@@ -104,17 +104,6 @@ global longopts.basename: []util.LongOpt = {
 global longopts.dirname: []util.LongOpt = {
   {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.readlink: []util.LongOpt = {
-  {'canonicalize', 0, 102}, {'canonicalize-existing', 0, 101}, {'canonicalize-missing', 0, 109},
-  {'no-newline', 0, 110}, {'quiet', 0, 113}, {'silent', 0, 115}, {'verbose', 0, 118},
-  {'zero', 0, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
-global longopts.realpath: []util.LongOpt = {
-  {'canonicalize-existing', 0, 101}, {'canonicalize-missing', 0, 109},
-  {'relative-to', 1, util.UNSUPPORTED}, {'relative-base', 1, util.UNSUPPORTED}, {'quiet', 0, 113},
-  {'strip', 0, 115}, {'no-symlinks', 0, 115}, {'zero', 0, 122}, {'logical', 0, 76},
-  {'physical', 0, 80}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.fold: []util.LongOpt = {
   {'bytes', 0, 98}, {'spaces', 0, 115}, {'width', 1, 119}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},

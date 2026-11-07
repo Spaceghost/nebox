@@ -57,6 +57,7 @@ test: $(OUT)/nebox
 	python3 tests/nlcp_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/timeout_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/teemktemp_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 
 clean:
 	rm -rf $(OUT)

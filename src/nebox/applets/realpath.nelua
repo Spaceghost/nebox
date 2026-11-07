@@ -1,0 +1,227 @@
+-- readlink and realpath: ports of GNU coreutils 9.1 readlink.c, realpath.c
+-- and relpath.c over src/nebox/canonicalize.nelua.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.canonicalize'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local function usage_fail(prog: string, msg: string): integer
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try '" .. prog .. " --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  return 1
+end
+
+global function applet_readlink(args: sequence(string)): integer
+  local longs: []util.LongOpt = {
+    {'canonicalize', 0, 102}, {'canonicalize-existing', 0, 101}, {'canonicalize-missing', 0, 109},
+    {'no-newline', 0, 110}, {'quiet', 0, 113}, {'silent', 0, 115}, {'verbose', 0, 118}, {'zero', 0, 122},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'efmnqsvz', &longs, #longs)
+  g.quiet = true
+  local can_mode: integer = -1
+  local no_newline = false
+  local verbose = false
+  local use_nuls = false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail('readlink', g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail('readlink', "option '--" .. g.longname .. "' is not supported") end
+    if c == 101 then can_mode = canon.CAN_EXISTING
+    elseif c == 102 then can_mode = canon.CAN_ALL_BUT_LAST
+    elseif c == 109 then can_mode = canon.CAN_MISSING
+    elseif c == 110 then no_newline = true
+    elseif c == 113 or c == 115 then verbose = false
+    elseif c == 118 then verbose = true
+    elseif c == 122 then use_nuls = true end
+  end
+  local files = g:operands()
+  if #files == 0 then return usage_fail('readlink', 'missing operand') end
+  if #files > 1 then
+    if no_newline then util.err('ignoring --no-newline with multiple arguments') end
+    no_newline = false
+  end
+  local status = 0
+  for _, f in ipairs(files) do
+    local value: string
+    local err: cint = 0
+    local ok = false
+    if can_mode ~= -1 then
+      value, err = canon.canonicalize(f, can_mode)
+      ok = err == 0
+    else
+      local buf: [4096]cchar
+      local n = sys.readlink(f, &buf[0], #buf - 1)
+      if n >= 0 then
+        value = (@string){data = (@*[0]byte)(&buf[0]), size = (@usize)(n)}:copy()
+        ok = true
+      else
+        err = sys.errno()
+      end
+    end
+    if ok then
+      util.write(value)
+      if not no_newline then util.writebyte(use_nuls and 0 or 10) end
+    else
+      status = 1
+      if verbose then util.err(util.quotef(f) .. ': ' .. sys.strerror(err)) end
+    end
+  end
+  util.flush()
+  return status
+end
+
+-- path_prefix (both start with '/')
+local function path_prefix(prefix: string, path: string): boolean
+  local p, q = 2, 2
+  if p > #prefix then return not (q <= #path and path:byte(q) == 47) end
+  if prefix:byte(p) == 47 and p + 1 > #prefix then return q <= #path and path:byte(q) == 47 end
+  while p <= #prefix and q <= #path do
+    if prefix:byte(p) ~= path:byte(q) then break end
+    p = p + 1; q = q + 1
+  end
+  return p > #prefix and (q > #path or path:byte(q) == 47)
+end
+
+local function path_common_prefix(p1: string, p2: string): integer
+  local function at(s: string, i: integer): byte
+    if i >= 1 and i <= #s then return s:byte(i) end
+    return 0
+  end
+  if (at(p1, 2) == 47) ~= (at(p2, 2) == 47) then return 0 end
+  local i = 0
+  local ret = 0
+  while at(p1, i + 1) ~= 0 and at(p2, i + 1) ~= 0 do
+    if at(p1, i + 1) ~= at(p2, i + 1) then break end
+    if at(p1, i + 1) == 47 then ret = i + 1 end
+    i = i + 1
+  end
+  local c1, c2 = at(p1, i + 1), at(p2, i + 1)
+  if (c1 == 0 and c2 == 0) or (c1 == 0 and c2 == 47) or (c2 == 0 and c1 == 47) then ret = i end
+  return ret
+end
+
+-- relpath: the relative name written to sb, or false
+local function relpath(can_fname: string, can_reldir: string, sb: *stringbuilder): boolean
+  local common = path_common_prefix(can_reldir, can_fname)
+  if common == 0 then return false end
+  local relto = can_reldir:sub(common + 1)
+  local fsuf = can_fname:sub(common + 1)
+  if #relto > 0 and relto:byte(1) == 47 then relto = relto:sub(2) end
+  if #fsuf > 0 and fsuf:byte(1) == 47 then fsuf = fsuf:sub(2) end
+  if #relto > 0 then
+    sb:write('..')
+    for k = 1, #relto do if relto:byte(k) == 47 then sb:write('/..') end end
+    if #fsuf > 0 then sb:write('/'); sb:write(fsuf) end
+  else
+    sb:write(#fsuf > 0 and fsuf or '.')
+  end
+  return true
+end
+
+local function realpath_canon(fname: string, can_mode: integer, logical: boolean): (string, cint)
+  local v, err = canon.canonicalize(fname, can_mode)
+  if err == 0 and logical then
+    v, err = canon.canonicalize(v, can_mode & ~canon.CAN_NOLINKS)
+  end
+  return v, err
+end
+
+global function applet_realpath(args: sequence(string)): integer
+  local RELATIVE_TO_OPTION: integer <comptime> = 200
+  local RELATIVE_BASE_OPTION: integer <comptime> = 201
+  local longs: []util.LongOpt = {
+    {'canonicalize-existing', 0, 101}, {'canonicalize-missing', 0, 109}, {'relative-to', 1, RELATIVE_TO_OPTION},
+    {'relative-base', 1, RELATIVE_BASE_OPTION}, {'quiet', 0, 113}, {'strip', 0, 115}, {'no-symlinks', 0, 115},
+    {'zero', 0, 122}, {'logical', 0, 76}, {'physical', 0, 80},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'eLmPqsz', &longs, #longs)
+  g.quiet = true
+  local can_mode: integer = canon.CAN_ALL_BUT_LAST
+  local logical = false
+  local verbose = true
+  local use_nuls = false
+  local relative_to = ''
+  local relative_base = ''
+  local have_to, have_base = false, false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then return usage_fail('realpath', g.errmsg) end
+    if c == util.UNSUPPORTED then return usage_fail('realpath', "option '--" .. g.longname .. "' is not supported") end
+    if c == 101 then can_mode = (can_mode & ~3) | canon.CAN_EXISTING
+    elseif c == 109 then can_mode = (can_mode & ~3) | canon.CAN_MISSING
+    elseif c == 76 then can_mode = can_mode | canon.CAN_NOLINKS; logical = true
+    elseif c == 115 then can_mode = can_mode | canon.CAN_NOLINKS; logical = false
+    elseif c == 80 then can_mode = can_mode & ~canon.CAN_NOLINKS; logical = false
+    elseif c == 113 then verbose = false
+    elseif c == 122 then use_nuls = true
+    elseif c == RELATIVE_TO_OPTION then relative_to = g.optarg; have_to = true
+    elseif c == RELATIVE_BASE_OPTION then relative_base = g.optarg; have_base = true end
+  end
+  local files = g:operands()
+  if #files == 0 then return usage_fail('realpath', 'missing operand') end
+  -- GNU compares the option pointers: --relative-base alone also serves as
+  -- --relative-to
+  local base_aliases_to = have_base and not have_to
+  if base_aliases_to then relative_to = relative_base; have_to = true end
+  local need_dir = (can_mode & 3) == canon.CAN_EXISTING
+  local can_relative_to = ''
+  local have_can_to = false
+  local can_relative_base = ''
+  local have_can_base = false
+  local function isdir(p: string): boolean
+    local st: sys.Stat
+    return sys.stat(p, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR
+  end
+  if have_to then
+    local v, err = realpath_canon(relative_to, can_mode, logical)
+    if err ~= 0 then util.err(util.quotef(relative_to) .. ': ' .. sys.strerror(err)); util.flush(); c_exit(1) end
+    if need_dir and not isdir(v) then util.err(util.quotef(relative_to) .. ': ' .. sys.strerror(sys.ENOTDIR)); util.flush(); c_exit(1) end
+    can_relative_to = v; have_can_to = true
+  end
+  if have_base then
+    if base_aliases_to then
+      can_relative_base = can_relative_to; have_can_base = true
+    else
+      local v, err = realpath_canon(relative_base, can_mode, logical)
+      if err ~= 0 then util.err(util.quotef(relative_base) .. ': ' .. sys.strerror(err)); util.flush(); c_exit(1) end
+      if need_dir and not isdir(v) then util.err(util.quotef(relative_base) .. ': ' .. sys.strerror(sys.ENOTDIR)); util.flush(); c_exit(1) end
+      -- --relative-to does nothing when --relative-base is not its prefix
+      if path_prefix(v, can_relative_to) then
+        can_relative_base = v; have_can_base = true
+      else
+        can_relative_base = can_relative_to; have_can_base = true
+        have_can_to = false
+      end
+    end
+  end
+  local ok = true
+  for _, f in ipairs(files) do
+    local v, err = realpath_canon(f, can_mode, logical)
+    if err ~= 0 then
+      if verbose then util.err(util.quotef(f) .. ': ' .. sys.strerror(err)) end
+      ok = false
+      continue
+    end
+    local printed = false
+    if have_can_to and not (have_can_base and not path_prefix(can_relative_base, v)) then
+      local sb: stringbuilder
+      if relpath(v, can_relative_to, &sb) then util.write(sb:promote()); printed = true end
+    end
+    if not printed then util.write(v) end
+    util.writebyte(use_nuls and 0 or 10)
+  end
+  util.flush()
+  return ok and 0 or 1
+end

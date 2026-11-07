@@ -118,6 +118,12 @@ Stated here rather than worked around:
   mktemp.c with gnulib gen_tempname (-d -p/--tmpdir[=DIR] -q -t -u
   --suffix, getrandom names, GNU's template checks). `util.argmatch` is
   gnulib's XARGMATCH. `tests/teemktemp_compare.py`: 47 cases, 0 mismatches.
+- `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
+  a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
+  -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
+  trailing "/", "/." and "/.." checks and symlink-loop detection.
+  `tests/realpath_compare.py`: 2042 random cases over a symlink fixture, 0
+  mismatches.
 - `cat` follows GNU cat.c (-b -e -n -s -t -u -v -A -E -T; numbering,
   squeezing and a pending CR carry across files; "input file is output
   file"); `fold` follows fold.c (-b, -s, -w, obsolete -NUM); `rmdir` follows

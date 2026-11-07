@@ -1,0 +1,157 @@
+-- gnulib canonicalize_filename_mode (coreutils 9.1): an absolute name with
+-- no ".", "..", repeated slashes or (unless CAN_NOLINKS) symlinks, with
+-- CAN_EXISTING / CAN_ALL_BUT_LAST / CAN_MISSING existence rules, GNU's
+-- checks for trailing "/", "/." and "/..", and symlink-loop detection after
+-- 20 links by (parent directory, remaining name) pairs.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+
+global canon = @record{}
+global canon.CAN_EXISTING: integer <comptime> = 0
+global canon.CAN_ALL_BUT_LAST: integer <comptime> = 1
+global canon.CAN_MISSING: integer <comptime> = 2
+global canon.CAN_NOLINKS: integer <comptime> = 4
+
+local EINVAL: cint <comptime> = 22
+local ELOOP: cint <comptime> = 40
+
+local function file_accessible(path: string): boolean
+  return sys.access(path, sys.F_OK) == 0
+end
+
+local function suffix_requires_dir_check(s: string, i: integer): boolean
+  -- s from index i (1-based); i > #s means empty
+  while i <= #s and s:byte(i) == 47 do
+    repeat i = i + 1 until not (i <= #s and s:byte(i) == 47)
+    if i > #s then return true end
+    local c = s:byte(i)
+    i = i + 1
+    if c ~= 46 then return false end
+    if i > #s then return true end
+    if s:byte(i) == 46 and (i + 1 > #s or s:byte(i + 1) == 47) then return true end
+  end
+  return false
+end
+
+local Triple = @record{dev: culong, ino: culong, rest: string}
+
+-- The canonical name, or "" and an errno.
+function canon.canonicalize(name: string, can_mode: integer): (string, cint)
+  local logical = (can_mode & canon.CAN_NOLINKS) ~= 0
+  local can_exist = can_mode & 3
+  if #name == 0 then return '', sys.ENOENT end
+  local r: sequence(byte)
+  if name:byte(1) ~= 47 then
+    local buf: [4096]cchar
+    if sys.getcwd(&buf[0], #buf) == nilptr then return '', sys.errno() end
+    local cwd = sys.cstr(&buf[0])
+    for k = 1, #cwd do r:push(cwd:byte(k)) end
+  else
+    r:push(47)
+  end
+  local num_links = 0
+  local seen: sequence(Triple)
+  local s = name
+  local start = name:byte(1) == 47 and 1 or 1
+  local function rstr(rr: *sequence(byte)): string
+    local t = $rr
+    if #t == 0 then return '' end
+    return (@string){data = &t[1], size = (@usize)(#t)}:copy()
+  end
+  while start <= #s do
+    while start <= #s and s:byte(start) == 47 do start = start + 1 end
+    local e = start
+    while e <= #s and s:byte(e) ~= 47 do e = e + 1 end
+    local startlen = e - start
+    if startlen == 0 then break end
+    if startlen == 1 and s:byte(start) == 46 then
+      -- nothing
+    elseif startlen == 2 and s:byte(start) == 46 and s:byte(start + 1) == 46 then
+      if #r > 1 then
+        r:pop()
+        while #r > 0 and r[#r] ~= 47 do r:pop() end
+      end
+    else
+      if r[#r] ~= 47 then r:push(47) end
+      local comp_begin = #r + 1
+      for k = start, e - 1 do r:push(s:byte(k)) end
+      local path = rstr(&r)
+      local link: string = ''
+      local n: integer = -1
+      local err: cint = 0
+      if not logical then
+        local buf: [4096]cchar
+        local got = sys.readlink(path, &buf[0], #buf - 1)
+        if got >= 0 then
+          n = got
+          link = (@string){data = (@*[0]byte)(&buf[0]), size = (@usize)(got)}:copy()
+        else
+          err = sys.errno()
+        end
+      end
+      if n >= 0 then
+        local skip = false
+        if num_links < 20 then
+          num_links = num_links + 1
+        else
+          -- parent directory of this component
+          local parent = comp_begin > 1 and (@string){data = &r[1], size = (@usize)(comp_begin - 1)}:copy() or ''
+          local st: sys.Stat
+          if sys.stat(#parent > 0 and parent or '.', &st) ~= 0 then return '', sys.errno() end
+          local rest = s:sub(start)
+          for _, t in ipairs(seen) do
+            if t.dev == st.st_dev and t.ino == st.st_ino and t.rest == rest then
+              if can_exist == canon.CAN_MISSING then skip = true; break end
+              return '', ELOOP
+            end
+          end
+          if not skip then seen:push({st.st_dev, st.st_ino, rest}) end
+        end
+        if skip then
+          start = e
+          continue
+        end
+        s = link .. s:sub(e)
+        start = 1
+        e = 1
+        if #link > 0 and link:byte(1) == 47 then
+          r:clear()
+          r:push(47)
+        else
+          if #r > 1 then
+            r:pop()
+            while #r > 0 and r[#r] ~= 47 do r:pop() end
+          end
+        end
+        continue
+      else
+        local ok = can_exist == canon.CAN_MISSING
+        if not ok then
+          if suffix_requires_dir_check(s, e) then
+            ok = file_accessible(path .. '/./')
+            if not ok then err = sys.errno() end
+          elseif not logical then
+            ok = err == EINVAL
+          else
+            ok = e <= #s or file_accessible(path)
+            if not ok then err = sys.errno() end
+          end
+        end
+        if not ok and can_exist == canon.CAN_ALL_BUT_LAST and err == sys.ENOENT then
+          local k = e
+          while k <= #s and s:byte(k) == 47 do k = k + 1 end
+          if k > #s then ok = true end
+        end
+        if not ok then return '', err end
+      end
+    end
+    start = e
+  end
+  if #r > 1 and r[#r] == 47 then r:pop() end
+  local out = rstr(&r)
+  r:destroy()
+  return out, 0
+end

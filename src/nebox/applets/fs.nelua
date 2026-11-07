@@ -1130,40 +1130,6 @@ global function applet_ln(args: sequence(string)): integer
   return rc
 end
 
-global function applet_readlink(args: sequence(string)): integer
-  local o = util.parsel(args, 'fenmqsv', &longopts.readlink, #longopts.readlink)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then return util.die('missing operand') end
-  local rc: integer = 0
-  for _, p in ipairs(o.operands) do
-    if o:has('f') or o:has('e') or o:has('m') then
-      local buf: [4096]cchar
-      local r = sys.realpath(p, &buf[0])
-      if r == nilptr then
-        if o:has('f') then
-          -- all but the last component must exist
-          local d = sys.realpath(util.dirname(p), &buf[0])
-          if d ~= nilptr then util.line(util.join(sys.cstr(&buf[0]), util.basename(p))); continue end
-        end
-        if not o:has('q') and not o:has('s') then util.perror(p) end
-        rc = 1
-      else
-        util.line(sys.cstr(&buf[0]))
-      end
-    else
-      local buf: [4096]byte
-      local n = sys.readlink(p, &buf[0], #buf)
-      if n < 0 then
-        if o:has('v') then util.perror(p) end
-        rc = 1
-      else
-        util.writebytes(&buf[0], (@usize)(n))
-        if not o:has('n') then util.writebyte(10) end
-      end
-    end
-  end
-  return rc
-end
 
 global function applet_pwd(args: sequence(string)): integer
   local o = util.parsel(args, 'LP', &longopts.pwd, #longopts.pwd)

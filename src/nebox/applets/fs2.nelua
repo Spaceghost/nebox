@@ -317,50 +317,6 @@ local function normalize(p: string): string
   return sb:promote()
 end
 
-global function applet_realpath(args: sequence(string)): integer
-  local o = util.parsel(args, 'emsqzPL', &longopts.realpath, #longopts.realpath)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then return util.die('missing operand') end
-  local rc: integer = 0
-  for _, p in ipairs(o.operands) do
-    local out: string
-    local ok = true
-    if o:has('s') then
-      out = normalize(absolute(p))
-      if o:has('e') and not util.exists(out) then ok = false end
-    else
-      local buf: [4096]cchar
-      if sys.realpath(p, &buf[0]) ~= nilptr then
-        out = sys.cstr(&buf[0])
-      elseif o:has('e') then
-        ok = false
-      else
-        -- resolve the longest existing prefix, append the rest lexically
-        local full = normalize(absolute(p))
-        local prefix = full
-        local rest: string = ''
-        while prefix.size > 1 and sys.realpath(prefix, &buf[0]) == nilptr do
-          if not o:has('m') and rest.size > 0 then ok = false; break end
-          local base = util.basename(prefix)
-          rest = rest.size > 0 and (base .. '/' .. rest) or base
-          prefix = util.dirname(prefix)
-        end
-        if ok then
-          if sys.realpath(prefix, &buf[0]) == nilptr then ok = false
-          else out = util.join(sys.cstr(&buf[0]), rest) end
-        end
-      end
-    end
-    if not ok then
-      if not o:has('q') then util.perror(p) end
-      rc = 1
-    else
-      util.write(out)
-      util.writebyte(o:has('z') and 0 or 10)
-    end
-  end
-  return rc
-end
 
 global function applet_link(args: sequence(string)): integer
   if #args ~= 2 then
