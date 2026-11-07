@@ -117,14 +117,14 @@ global shexec.builtin_call: function(idx: integer, args: sequence(string)): inte
 
 function shexec.errmsg(msg: string)
   util.flush()
-  local s = 'sh: line ' .. string.format('%d', shst.lineno) .. ': ' .. msg .. '\n'
+  local s = util.applet .. ': line ' .. string.format('%d', shst.lineno) .. ': ' .. msg .. '\n'
   sys.write(2, s.data, s.size)
 end
 
 -- Diagnostic without the line prefix (builtin usage errors print as "sh: cmd: ...").
 function shexec.errplain(msg: string)
   util.flush()
-  local s = 'sh: ' .. msg .. '\n'
+  local s = util.applet .. ': ' .. msg .. '\n'
   sys.write(2, s.data, s.size)
 end
 

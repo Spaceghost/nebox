@@ -331,6 +331,7 @@ def _():
     sh.run('cd proj', '\x1b[1;36mproj\x1b[0m $ ')
     with open(os.path.join(home, '.local', 'state', 'nsh', 'history')) as f:
         assert f.read().splitlines() == ['ll', 'cd proj']
+    sh.run('echo (', 'nsh: line ')
     sh.close()
 
 

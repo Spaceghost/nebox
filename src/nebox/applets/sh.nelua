@@ -17,7 +17,7 @@ require 'nebox.sh.interactive'
 
 local function usage_error(msg: string): integer
   util.flush()
-  local s = 'sh: ' .. msg .. '\n'
+  local s = util.applet .. ': ' .. msg .. '\n'
   sys.write(2, s.data, s.size)
   return 2
 end
