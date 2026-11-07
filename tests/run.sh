@@ -373,6 +373,18 @@ same grep-ctx-o "$GR grep -o -C1 x f; grep -on -B1 x f; grep -ov -C1 x f; echo \
 same grep-ctx-quiet "$GR grep -l -C1 x f n; grep -q -C1 x f; echo \$?; grep -c -A5 x f"
 same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -C 1x x f; echo \$?; grep -B \"\" x f; echo \$?; grep -A \" +1\" x f; echo \$?; grep -A 99999999999999999999 x f | wc -l"
 same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
+# grep -z -Z -L -f -s, and -o -w (GNU grep 3.8)
+GZ='printf "alpha\nbeta\n" > ga; printf "gamma\n" > gb; : > gempty; printf "x\n\ny\n" > gblank; printf "alpha\ngamma\n" > gpats;'
+same grep-L "$GZ grep -L alpha ga gb; echo \$?; grep -L zzz ga; echo \$?; grep -L alpha ga; echo \$?; grep -Lv alpha ga gb; echo \$?"
+same grep-l-L-last "$GZ grep -l -L alpha ga gb; echo \$?; grep -L -l alpha ga gb; echo \$?; grep -L -c alpha ga gb"
+same grep-Z "$GZ grep -lZ a ga gb | od -c; grep -LZ alpha ga gb | od -c; grep -HZn alpha ga | od -c; grep -cZ a ga gb | od -c"
+same grep-z "printf 'one\ntwo\0three\0' | grep -z 'one.two' | od -c; printf 'one\ntwo\0three\0' | grep -z '^two'; echo \$?; printf 'one\ntwo\0three\0' | grep -z 'one\$'; echo \$?; printf 'a\0b\0a' | grep -zc a; printf 'a\0b\0a' | grep -zn a | od -c"
+same grep-z-ctx "printf 'a\0b\0c\0d\0a\0' | grep -z -A1 a | od -c; printf 'xa\0b\0' | grep -zo a | od -c; printf 'a\0b\0' | grep -zb b | od -c"
+same grep-f "$GZ grep -f gpats ga gb; echo \$?; grep -f gempty ga; echo \$?; grep -vf gempty ga; echo \$?; grep -c -f gblank ga; grep -e beta -f gpats ga gb; echo beta | grep -f - ga"
+same grep-f-missing "$GZ grep -f gnope ga 2>/dev/null; echo \$?"
+same grep-f-cluster "$GZ grep -nf gpats ga gb; grep -cfgpats ga"
+same grep-s "$GZ grep -s alpha gnope ga; echo \$?; grep -s alpha gnope; echo \$?; grep -q alpha gnope ga 2>/dev/null; echo \$?; grep -sq alpha gnope ga; echo \$?; grep alpha gnope 2>&1 >/dev/null | wc -l"
+same grep-o-w "printf 'cat, catalog cat.\ncat cat\nbobcat cat\n' | grep -ow cat; printf 'cat cat\n' | grep -bow cat; printf 'a-b a\n' | grep -ow 'a'; printf 'x \\\\(y\\\\) z\n' | grep -o -w -E '(y)|z'"
 same grep-F-o "printf \"a.c abc a.c\n[x]*\n\" | grep -Fo a.c; printf \"[x]*\n\" | grep -F -o \"[x]*\"; printf \"A.C\n\" | grep -Fio a.c; printf \"a\\\\\\\\b\n\" | grep -Fc \"a\\\\\\\\b\""
 same grep-b "grep -b a words.txt; grep -bn -e alpha -e delta words.txt; grep -bo l words.txt; grep -bc a words.txt"
 # regex leftmost-longest (GNU grep/sed/expr semantics; src/nebox/regex.nelua)

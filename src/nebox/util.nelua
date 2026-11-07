@@ -105,6 +105,7 @@ global util.Opts = @record{
   missing: string, -- option that lacked its value, or ""
   keys: sequence(byte),    -- every value-taking option seen, in order
   vals: sequence(string),  -- and its value
+  order: sequence(byte),   -- every option seen, in order (for "the last one wins")
 }
 
 -- Every value given for a repeatable option such as grep -e.
@@ -156,6 +157,7 @@ function util.parse(args: sequence(string), spec: string): util.Opts
         return o
       end
       o.set[c] = true
+      o.order:push(c)
       if takes then
         if j < a.size then
           o.value[c] = a:sub(j + 1)

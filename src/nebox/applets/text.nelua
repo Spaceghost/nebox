@@ -1038,7 +1038,12 @@ local function grep_compile(patterns: sequence(string), ere: boolean, icase: boo
   end
   local body = sb:promote()
   if whole then body = '^' .. open .. body .. close .. '$'
-  elseif word then body = open .. '^' .. bar .. '[^[:alnum:]_]' .. close .. open .. body .. close .. open .. '[^[:alnum:]_]' .. bar .. '$' .. close end
+  elseif word then
+    -- the trailing delimiter is a capturing group, numbered after the user's
+    -- groups, so that -o can print the word without it
+    local copen: string = ere and '(' or '\\('
+    body = open .. '^' .. bar .. '[^[:alnum:]_]' .. close .. open .. body .. close .. copen .. '[^[:alnum:]_]' .. bar .. '$' .. close
+  end
   return regex.compile(body, ere, icase)
 end
 
@@ -1077,13 +1082,17 @@ end
 local Grep = @record{
   prog: regex.Prog, caps: regex.Caps,
   invert: boolean, only: boolean, withname: boolean, lineno: boolean, byteoff: boolean,
+  word: boolean,                   -- -w: matches are wrapped in delimiter groups
+  nullname: boolean,               -- -Z: a NUL after file names
+  nopattern: boolean,              -- -f with no patterns at all: nothing matches
+  eol: byte,                       -- record terminator: '\n', or NUL with -z
   before: integer, after: integer, -- -1 when unset
   used: boolean,                   -- some group has been output (for "--")
   path: string,
 }
 
 function Grep:head(sep: byte, n: integer, off: integer)
-  if self.withname then util.write(self.path); util.writebyte(sep) end
+  if self.withname then util.write(self.path); util.writebyte(self.nullname and 0 or sep) end
   if self.lineno then util.writef('%d', n); util.writebyte(sep) end
   if self.byteoff then util.writef('%d', off); util.writebyte(sep) end
 end
@@ -1093,24 +1102,49 @@ end
 function Grep:prline(line: string, n: integer, off: integer, selected: boolean): boolean
   if not self.only then
     self:head(selected and 58 or 45, n, off)
-    util.line(line)
+    util.write(line); util.writebyte(self.eol)
     return true
   end
-  if selected ~= self.invert then
+  if selected ~= self.invert and not self.nopattern then
     local sep: byte = self.invert and 45 or 58
     local pos: isize = 0
+    local tg = self.prog.nsub          -- -w: the trailing delimiter group
     while pos <= (@isize)(line.size) and self.prog:search(line, pos, &self.caps) do
-      if self.caps.at[1] > self.caps.at[0] then
-        self:head(sep, n, off + self.caps.at[0])
-        util.line(line:sub(self.caps.at[0] + 1, self.caps.at[1]))
-        pos = self.caps.at[1]
-      else
-        pos = self.caps.at[0] + 1
+      local s, e = self.caps.at[0], self.caps.at[1]
+      if self.word then
+        -- the leading delimiter is one byte except at the start of the line,
+        -- the trailing one is the last group (empty at the end of the line)
+        if s > 0 then s = s + 1 end
+        if tg >= 1 and tg <= 9 and self.caps.at[2 * tg] >= 0 then e = self.caps.at[2 * tg] end
       end
+      if e > s then
+        self:head(sep, n, off + s)
+        util.write(line:sub(s + 1, e)); util.writebyte(self.eol)
+      end
+      -- resume at the end of the word, so its delimiter can start the next match
+      local nextpos = e > s and e or s + 1
+      if nextpos <= pos then nextpos = pos + 1 end
+      pos = nextpos
     end
     if self.prog.toocomplex then return false end
   end
   return true
+end
+
+-- Input records: lines, or NUL-terminated records with -z. A final record
+-- without its terminator still counts; nothing follows a final terminator.
+local function grep_records(data: string, eol: byte): sequence(string)
+  if eol == 10 then return util.lines(data) end
+  local out: sequence(string)
+  local start: usize = 0
+  for i: usize = 0, < data.size do
+    if data.data[i] == eol then
+      out:push(data:sub((@isize)(start + 1), (@isize)(i)))
+      start = i + 1
+    end
+  end
+  if start < data.size then out:push(data:sub((@isize)(start + 1))) end
+  return out
 end
 
 global function applet_grep(args: sequence(string)): integer
@@ -1138,7 +1172,7 @@ global function applet_grep(args: sequence(string)): integer
           digits = digits .. string.char(c)
         else
           sb:writebyte(c)
-          if c == 101 or c == 109 or c == 65 or c == 66 or c == 67 then
+          if c == 101 or c == 102 or c == 109 or c == 65 or c == 66 or c == 67 then
             takes = true
             for k: usize = j + 1, a.size do sb:writebyte(a:byte(k)) end
             break
@@ -1156,10 +1190,12 @@ global function applet_grep(args: sequence(string)): integer
       i = i + 1
     end
   end
-  local o = util.parse(rest, 'ivnclqHhFEGwxe:srom:A:B:C:b')
+  local o = util.parse(rest, 'ivnclLqHhFEGwxe:f:srom:A:B:C:bzZ')
   if not o:ok() then return util.optfail(o) + 1 end
   local g: Grep = {before = -1, after = -1, invert = o:has('v'), only = o:has('o'),
-    lineno = o:has('n'), byteoff = o:has('b')}
+    lineno = o:has('n'), byteoff = o:has('b'), word = o:has('w') and not o:has('x'),
+    nullname = o:has('Z'), eol = o:has('z') and 0 or 10}
+  local silent = o:has('s')
   -- -C and -NUM set a default that an explicit -A or -B overrides; the
   -- last of them wins, as in GNU grep.
   local defctx: integer = -1
@@ -1174,13 +1210,23 @@ global function applet_grep(args: sequence(string)): integer
   if g.before < 0 then g.before = defctx end
   local patterns: sequence(string)
   local operands = o.operands
-  if o:has('e') then
-    for _, e in ipairs(o:all('e')) do
-      for _, p in ipairs(util.lines(e)) do patterns:push(p) end
-      if e.size == 0 then patterns:push('') end
+  if o:has('e') or o:has('f') then
+    -- -e and -f patterns in command-line order; a pattern file holds one
+    -- pattern per line, and an empty file contributes none
+    for idx, k in ipairs(o.keys) do
+      if k == 101 then
+        local e = o.vals[idx]
+        for _, p in ipairs(util.lines(e)) do patterns:push(p) end
+        if e.size == 0 then patterns:push('') end
+      elseif k == 102 then
+        local data, ok = util.readfile(o.vals[idx])
+        if not ok then return 2 end
+        for _, p in ipairs(util.lines(data)) do patterns:push(p) end
+      end
     end
+    if #patterns == 0 then g.nopattern = true end
   else
-    if #operands == 0 then util.err('usage: grep [-ivnclqHhFEGwxorsb] [-A N] [-B N] [-C N] [-e] PATTERN [FILE...]'); return 2 end
+    if #operands == 0 then util.err('usage: grep [-ivnclLqHhFEGwxorsbzZ] [-A N] [-B N] [-C N] [-e PATTERN | -f FILE] PATTERN [FILE...]'); return 2 end
     for _, p in ipairs(util.lines(operands[1])) do patterns:push(p) end
     if operands[1].size == 0 then patterns:push('') end
     operands:remove(1)
@@ -1195,6 +1241,12 @@ global function applet_grep(args: sequence(string)): integer
   local err: string
   g.prog, err = grep_compile(patterns, ere, o:has('i'), o:has('w'), o:has('x'))
   if err.size > 0 then util.err(err); return 2 end
+  -- -l and -L: the last one given wins (GNU grep)
+  local list_with, list_without = false, false
+  for _, k in ipairs(o.order) do
+    if k == 108 then list_with, list_without = true, false
+    elseif k == 76 then list_with, list_without = false, true end
+  end
   local maxcount: integer = -1
   if o:has('m') then
     local v, ok = util.toint(o:get('m'))
@@ -1224,20 +1276,30 @@ global function applet_grep(args: sequence(string)): integer
     operands = expanded
   end
   g.withname = (#operands > 1 or o:has('H') or o:has('r')) and not o:has('h')
-  -- -c, -l and -q print no lines, so they take no context
-  local quiet = o:has('c') or o:has('l') or o:has('q')
+  -- -c, -l, -L and -q print no lines, so they take no context
+  local quiet = o:has('c') or list_with or list_without or o:has('q')
   local ctx = g.before >= 0 or g.after >= 0
   local anymatch = false
   local rc: integer = 0
   for _, path in ipairs(operands) do
-    local data, ok = util.readfile(path)
-    if not ok then rc = 2; continue end
+    local fd: cint = 0
+    if path ~= '-' then fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0) end
+    if fd < 0 then
+      if not silent then util.perror(path) end
+      rc = 2; continue
+    end
+    local data, ok = util.readfd(fd)
+    if fd > 0 then sys.close(fd) end
+    if not ok then
+      if not silent then util.perror(path) end
+      rc = 2; continue
+    end
     g.path = path
     local count: integer = 0
     local outleft = maxcount
     local lastout: integer = 0  -- last line printed in this file, 0 for none
     local pending: integer = 0  -- trailing context still to print
-    local lines = util.lines(data)
+    local lines = grep_records(data, g.eol)
     local offs: sequence(integer)
     local off: integer = 0
     for _, line in ipairs(lines) do offs:push(off); off = off + (@integer)(line.size) + 1 end
@@ -1250,7 +1312,7 @@ global function applet_grep(args: sequence(string)): integer
         lastout = n; pending = pending - 1
         continue
       end
-      local m = g.prog:search(line, 0, &g.caps)
+      local m = not g.nopattern and g.prog:search(line, 0, &g.caps)
       if g.prog.toocomplex then util.err('pattern too complex'); return 2 end
       if m == g.invert then
         if pending > 0 and not quiet then
@@ -1262,7 +1324,7 @@ global function applet_grep(args: sequence(string)): integer
       count = count + 1
       anymatch = true
       if o:has('q') then return 0 end
-      if o:has('l') then break end
+      if list_with or list_without then break end
       if not quiet then
         local p = n
         if g.before > 0 then
@@ -1281,10 +1343,10 @@ global function applet_grep(args: sequence(string)): integer
       end
       if outleft > 0 then outleft = outleft - 1 end
     end
-    if o:has('l') then
-      if count > 0 then util.line(path) end
+    if list_with or list_without then
+      if (count > 0) == list_with then util.write(path); util.writebyte(g.nullname and 0 or 10) end
     elseif o:has('c') then
-      if g.withname then util.write(path); util.writebyte(58) end
+      if g.withname then util.write(path); util.writebyte(g.nullname and 0 or 58) end
       util.writef('%d\n', count)
     end
   end

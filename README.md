@@ -166,7 +166,8 @@ Stated here rather than worked around:
   current non-matching behavior). `\`` and `\'` match only at the ends of
   the subject, as in GNU regex (`sed-buffer-anchors`); `.` and `[^...]`
   match a newline unless REG_NEWLINE is in effect (sed's `M` flag).
-- `grep` takes -i -v -n -b -c -l -q -H -h -r -F -E -G -w -x -o -e -m and
+- `grep` takes -i -v -n -b -c -l -L -q -s -H -h -r -F -E -G -w -x -o -e -f -m -z -Z
+  and
   the context options -A, -B, -C and -NUM, following GNU grep 3.8's prtext:
   `--` before a group that is not adjacent to the previous output (also
   across files), -C and -NUM as a default that -A/-B override whatever the
@@ -176,11 +177,19 @@ Stated here rather than worked around:
   those are the context lines) and the separators but no other context,
   `-b` giving the offset of the line or, with -o, of the match, and no
   context for -c/-l/-q (`grep-ctx-*`). -F strings are matched as quoted
-  BREs, so -F works with -o (`grep-F-o`). Not supported: -z, -L, -Z, -T,
-  -f, long options (`--group-separator` and the rest), binary-file
-  detection (a NUL byte does not make grep report "binary file matches"),
-  `-o -w`, which prints the delimiting characters with the word, and -s,
-  which is accepted but does not silence errors.
+  BREs, so -F works with -o (`grep-F-o`). -f reads one pattern per line
+  (an empty file gives no patterns, so nothing matches; `-f -` is standard
+  input), merged with -e patterns in command-line order. -L lists files
+  without a selected line; as in GNU grep 3.5 and later the exit status
+  still says whether any line was selected, and of -l and -L the last one
+  given wins. -z reads and writes NUL-terminated records (`.` matches a
+  newline inside a record, `^`/`$` only at its ends; the `--` separator and
+  -c counts still end in a newline); -Z writes a NUL after file names in
+  -l/-L/-c output and line prefixes. -s silences unreadable-file messages
+  but keeps exit status 2. `-o -w` prints the word without its delimiters
+  (`grep-o-w`). Not supported: -T, long options (`--group-separator` and the
+  rest), and binary-file detection (a NUL byte does not make grep report
+  "binary file matches").
 - `sed` covers -n -e -f -E -s -i[SUFFIX] -z, every address form (`I` and
   `M` after a regex address), and the commands
   `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F e`.
