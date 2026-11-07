@@ -128,6 +128,15 @@ Stated here rather than worked around:
   difference: GNU 9.1 indexes `--hex-suffixes=FROM` letters past its
   alphabet (undefined behavior); nebox uses the digit's value.
   `tests/split_compare.py`: 135 cases, 0 mismatches.
+- `shuf` ports shuf.c with gnulib randint.c, randperm.c (including the
+  sparse map for small samples of huge ranges) and randread.c: -e, -i, -n
+  (smallest wins, overflow ignored), -o after input is read (in-place
+  shuffles work), -r, -z, and `--random-source=FILE` consuming FILE's bytes
+  exactly as GNU does, so outputs match GNU byte for byte, reservoir
+  sampling for inputs over 8 MiB included. The source is opened only when
+  a draw is possible, as in GNU. Without it, bytes come from getrandom
+  (GNU seeds ISAAC from getrandom). `tests/shuf_compare.py`: 97 cases, 0
+  mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

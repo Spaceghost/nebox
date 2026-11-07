@@ -324,23 +324,22 @@ function util.Getopt:next(): integer
   return c
 end
 
--- gnulib xdectoumax/xnumtoumax: a decimal number with the suffixes listed
--- in SUFFIXES (gnulib xstrtol: b=512, k/K M G T P E Z Y with B/iB forms
--- when '0' is listed), within [MIN, MAX]. On failure it returns false and
--- GNU's message "MSG: 'S'[: strerror]".
-function util.xdectoumax(s: string, min: uint64, max: uint64, suffixes: string, msg: string): (boolean, uint64, string)
+-- gnulib xstrtoumax (base 10): 0 LONGINT_OK, 1 LONGINT_OVERFLOW (value
+-- saturated), 2 invalid (no digits, a '-', or a suffix not in SUFFIXES).
+-- Suffixes: b=512, B=1024, c=1, w=2, k/K M/m G/g T/t P E Z Y in powers of
+-- 1024, or of 1000 with a trailing B/D, or 1024 with iB, when SUFFIXES has '0'.
+function util.xstrtoumax(s: string, suffixes: string): (integer, uint64)
   local UMAX: uint64 = 0xffffffffffffffff
   local p = 1
-  local function fail(t: string): (boolean, uint64, string) return false, 0, msg .. ': ' .. util.quote(s) .. t end
   while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
-  if p <= #s and s:byte(p) == 45 then return fail('') end
+  if p <= #s and s:byte(p) == 45 then return 2, 0 end
   if p <= #s and s:byte(p) == 43 then p = p + 1 end
   local start = p
   local v: uint64 = 0
   local ovf = false
   while p <= #s and s:byte(p) >= 48 and s:byte(p) <= 57 do
     local d: uint64 = s:byte(p) - 48
-    if v > (UMAX - d) // 10 then ovf = true; v = UMAX elseif not ovf then v = v * 10 + d end
+    if ovf or v > (UMAX - d) // 10 then ovf = true; v = UMAX else v = v * 10 + d end
     p = p + 1
   end
   local function valid(c: byte): boolean
@@ -348,11 +347,11 @@ function util.xdectoumax(s: string, min: uint64, max: uint64, suffixes: string, 
   end
   if p == start then
     local c: byte = p <= #s and s:byte(p) or 0
-    if valid(c) then v = 1 else return fail('') end
+    if valid(c) then v = 1 else return 2, 0 end
   end
   if p <= #s then
     local c = s:byte(p)
-    if not valid(c) then return fail('') end
+    if not valid(c) then return 2, v end
     local base: uint64 = 1024
     local nsuf = 1
     local power = 0
@@ -361,26 +360,38 @@ function util.xdectoumax(s: string, min: uint64, max: uint64, suffixes: string, 
       if c1 == 105 and p + 2 <= #s and s:byte(p + 2) == 66 then nsuf = 3
       elseif c1 == 66 or c1 == 68 then base = 1000; nsuf = 2 end
     end
-    if c == 98 then
-      if v > UMAX // 512 then ovf = true; v = UMAX else v = v * 512 end
-    elseif c == 66 then
-      if v > UMAX // 1024 then ovf = true; v = UMAX else v = v * 1024 end
-    elseif c == 99 then -- c: 1
-    elseif c == 119 then
-      if v > UMAX // 2 then ovf = true; v = UMAX else v = v * 2 end
+    local mul: uint64 = 1
+    if c == 98 then mul = 512
+    elseif c == 66 then mul = 1024
+    elseif c == 99 then mul = 1
+    elseif c == 119 then mul = 2
     else
       if c == 107 or c == 75 then power = 1 elseif c == 109 or c == 77 then power = 2
       elseif c == 71 or c == 103 then power = 3 elseif c == 84 or c == 116 then power = 4
       elseif c == 80 then power = 5 elseif c == 69 then power = 6 elseif c == 90 then power = 7
-      elseif c == 89 then power = 8 else return fail('') end
+      elseif c == 89 then power = 8 else return 2, v end
+      mul = 0
+    end
+    if mul ~= 0 then
+      if v > UMAX // mul then ovf = true; v = UMAX else v = v * mul end
+    else
       for _ = 1, power do
         if v ~= 0 and v > UMAX // base then ovf = true; v = UMAX else v = v * base end
       end
     end
     p = p + nsuf
-    if p <= #s then return fail('') end
+    if p <= #s then return 2, v end
   end
-  if ovf then return fail(': Value too large for defined data type') end
+  return ovf and 1 or 0, v
+end
+
+-- gnulib xdectoumax: util.xstrtoumax within [MIN, MAX]. On failure it
+-- returns false and GNU's message "MSG: 'S'[: strerror]".
+function util.xdectoumax(s: string, min: uint64, max: uint64, suffixes: string, msg: string): (boolean, uint64, string)
+  local st, v = util.xstrtoumax(s, suffixes)
+  local function fail(t: string): (boolean, uint64, string) return false, 0, msg .. ': ' .. util.quote(s) .. t end
+  if st == 2 then return fail('') end
+  if st == 1 then return fail(': Value too large for defined data type') end
   if v < min or v > max then
     return fail(v > 0x3fffffff and ': Value too large for defined data type' or ': Numerical result out of range')
   end

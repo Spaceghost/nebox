@@ -103,11 +103,6 @@ global longopts.fold: []util.LongOpt = {
   {'bytes', 0, 98}, {'spaces', 0, 115}, {'width', 1, 119}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.shuf: []util.LongOpt = {
-  {'echo', 0, 101}, {'input-range', 1, 105}, {'head-count', 1, 110}, {'output', 1, 111},
-  {'random-source', 1, util.UNSUPPORTED}, {'repeat', 0, 114}, {'zero-terminated', 0, 122},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.truncate: []util.LongOpt = {
   {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
