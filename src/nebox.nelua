@@ -21,6 +21,7 @@ require 'nebox.applets.text3'
 require 'nebox.applets.misc'
 require 'nebox.applets.awk'
 require 'nebox.applets.sh'
+require 'nebox.applets.diff'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 

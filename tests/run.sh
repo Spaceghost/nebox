@@ -373,6 +373,32 @@ same grep-ctx-o "$GR grep -o -C1 x f; grep -on -B1 x f; grep -ov -C1 x f; echo \
 same grep-ctx-quiet "$GR grep -l -C1 x f n; grep -q -C1 x f; echo \$?; grep -c -A5 x f"
 same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -C 1x x f; echo \$?; grep -B \"\" x f; echo \$?; grep -A \" +1\" x f; echo \$?; grep -A 99999999999999999999 x f | wc -l"
 same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
+same touch-d-fraction "touch -d '2026-01-02 03:04:05.123456789' f; TZ=UTC stat -c '%y' f; touch -d '2026-01-02 03:04:05,5' g; TZ=UTC stat -c '%y' g"
+# diff (GNU diffutils 3.8); tests/diff_fuzz.py compares the edit scripts on random inputs
+DF='printf "a\nb\nc\n" > x; printf "a\nB\nc\nd" > y; touch -d "2026-01-02 03:04:05.123456789" x y; mkdir -p d1/sub d2/sub d1/only1 d1/o2; echo 1 > d1/f; echo 2 > d2/f; echo s > d1/sub/s; echo t > d2/sub/s; echo o > d1/o; mkdir d2/o; : > d2/o2; echo same > d1/eq; echo same > d2/eq;'
+same diff-formats "$DF TZ=UTC diff x y; echo \$?; TZ=UTC diff -c x y; TZ=America/Los_Angeles diff -u x y; diff -U0 x y; diff -C1 x y | tail -n +3; diff -e x y; echo \$?"
+same diff-same-qs "$DF diff x x; echo \$?; diff -s x x; echo \$?; diff -q x y; echo \$?; diff -qs x x"
+same diff-binary "printf 'a\0b\n' > b1; printf 'a\0c\n' > b2; diff b1 b2; echo \$?; diff -a b1 b2 | od -c | head -3"
+same diff-dirs "$DF diff d1 d2; echo \$?; diff -r d1 d2; echo \$?; diff -ru d1 d2 | grep -v '^[-+][-+][-+] '; diff -qr d1 d2; echo \$?"
+same diff-dir-file "$DF cp x d1/x; diff x d1; echo \$?; diff d1 y; echo \$?"
+same diff-N-dash "$DF diff -N x nonexist; echo \$?; diff -N nonexist x; echo \$?; diff -u -N x nonexist | tail -n +3; diff x nonexist 2>/dev/null; echo \$?"
+same diff-stdin "printf 'a\nb\nc\n' > x; printf 'a\n' | diff - x; echo \$?; printf 'a\nb\nc\n' | diff x -; echo \$?"
+same diff-ignore "printf 'a  b\nC\n\nx\n' > p; printf 'a b \nc\nx\n' > q; diff -b p q; echo \$?; diff -w p q; echo \$?; diff -i p q; echo \$?; diff -ibB p q; echo \$?; printf 'b\n' > r; printf 'b' > s; diff -b r s; echo \$?; diff -w -u r s | tail -n +3"
+same diff-ed-newline "printf 'a\nb' > p; printf 'a\nc\n' > q; diff -e p q 2>&1; echo \$?; printf 'a\nb\n' > r; diff -e p r 2>&1; echo \$?; printf 'x\n.\ny\n' > t; diff -e q t"
+same diff-empty-formats "printf 'a\nb\n' > p; : > e; diff -u e p | tail -n +3; diff -c p e | tail -n +3; diff e p; diff -e p e"
+same diff-usage "diff 2>/dev/null; echo \$?; diff x 2>/dev/null; echo \$?; diff -U x a b 2>/dev/null; echo \$?"
+# grep -z -Z -L -f -s, and -o -w (GNU grep 3.8)
+GZ='printf "alpha\nbeta\n" > ga; printf "gamma\n" > gb; : > gempty; printf "x\n\ny\n" > gblank; printf "alpha\ngamma\n" > gpats;'
+same grep-L "$GZ grep -L alpha ga gb; echo \$?; grep -L zzz ga; echo \$?; grep -L alpha ga; echo \$?; grep -Lv alpha ga gb; echo \$?"
+same grep-l-L-last "$GZ grep -l -L alpha ga gb; echo \$?; grep -L -l alpha ga gb; echo \$?; grep -L -c alpha ga gb"
+same grep-Z "$GZ grep -lZ a ga gb | od -c; grep -LZ alpha ga gb | od -c; grep -HZn alpha ga | od -c; grep -cZ a ga gb | od -c"
+same grep-z "printf 'one\ntwo\0three\0' | grep -z 'one.two' | od -c; printf 'one\ntwo\0three\0' | grep -z '^two'; echo \$?; printf 'one\ntwo\0three\0' | grep -z 'one\$'; echo \$?; printf 'a\0b\0a' | grep -zc a; printf 'a\0b\0a' | grep -zn a | od -c"
+same grep-z-ctx "printf 'a\0b\0c\0d\0a\0' | grep -z -A1 a | od -c; printf 'xa\0b\0' | grep -zo a | od -c; printf 'a\0b\0' | grep -zb b | od -c"
+same grep-f "$GZ grep -f gpats ga gb; echo \$?; grep -f gempty ga; echo \$?; grep -vf gempty ga; echo \$?; grep -c -f gblank ga; grep -e beta -f gpats ga gb; echo beta | grep -f - ga"
+same grep-f-missing "$GZ grep -f gnope ga 2>/dev/null; echo \$?"
+same grep-f-cluster "$GZ grep -nf gpats ga gb; grep -cfgpats ga"
+same grep-s "$GZ grep -s alpha gnope ga; echo \$?; grep -s alpha gnope; echo \$?; grep -q alpha gnope ga 2>/dev/null; echo \$?; grep -sq alpha gnope ga; echo \$?; grep alpha gnope 2>&1 >/dev/null | wc -l"
+same grep-o-w "printf 'cat, catalog cat.\ncat cat\nbobcat cat\n' | grep -ow cat; printf 'cat cat\n' | grep -bow cat; printf 'a-b a\n' | grep -ow 'a'; printf 'x \\\\(y\\\\) z\n' | grep -o -w -E '(y)|z'"
 same grep-F-o "printf \"a.c abc a.c\n[x]*\n\" | grep -Fo a.c; printf \"[x]*\n\" | grep -F -o \"[x]*\"; printf \"A.C\n\" | grep -Fio a.c; printf \"a\\\\\\\\b\n\" | grep -Fc \"a\\\\\\\\b\""
 same grep-b "grep -b a words.txt; grep -bn -e alpha -e delta words.txt; grep -bo l words.txt; grep -bc a words.txt"
 # regex leftmost-longest (GNU grep/sed/expr semantics; src/nebox/regex.nelua)
