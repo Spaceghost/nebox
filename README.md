@@ -197,9 +197,28 @@ Stated here rather than worked around:
   `%q`, `%P`, `%s`, `%:z %::z %:::z` (`date-fmt-*`). `-u`, `-R`, `-r FILE`;
   `-d` understands only `@SECONDS`. No `-I`, `--rfc-3339`, `-f`, long
   options, or setting the date.
-- `ls` prints one entry per line in every mode (no columns); sorting flags -r -t -S and -h -i -n -A are supported. `-l`
-  shows the year instead of the time for files older than six months or in
-  the future, as GNU does (`ls-l-tz`). `-l` and `id`
+- `ls` follows GNU ls 9.1 in the C locale with the options
+  `-1 -a -A -B -c -C -d -F -g -G -h -i -I PATTERN -k -l -m -n -N -o -p -q
+  -r -R -s -S -t -T COLS -u -v -w COLS -x -X`, permuted as getopt does:
+  the last of -C -x -m -l -1 picks the format (-1 does not undo -l), the
+  column layout is GNU's calculate_columns (columns at least 3 wide, filled
+  down for -C and across for -x, tab stops every 8 or `-T`/`TABSIZE`),
+  the width comes from -w (0 for no limit), else `COLUMNS` (an invalid
+  value is ignored with GNU's warning), else 80; -s/-i fields are padded
+  per listing; widths cover every command-line operand, directories
+  included; only printable bytes count toward a name's width; -q shows
+  them as `?`; -F marks `/ * @ | =` and, with -l, the symlink target's
+  type; command-line symlinks to directories are followed unless -d, -F
+  or -l; -c/-u sort by that time when -l is absent; -I uses FNM_PERIOD
+  (`ls-C-*`, `ls-s*`, `ls-i-columns`, `ls-sort-X-v`, `ls-u-c`, `ls-I-B`,
+  `ls-q`, `ls-lF`, `ls-l-dev`). -k changes nothing because `BLOCK_SIZE`
+  and `LS_BLOCK_SIZE` are not read. Not implemented: -f and -U (directory
+  order), -L and -H, -Q -b and the other quoting styles, -Z, --color and
+  every long option, ACL and SELinux markers, locales. On a terminal ls
+  defaults to -C with the width from COLUMNS or the terminal, but names
+  are not quoted as GNU quotes them there; no case covers it (the harness
+  has no terminal). `-l` shows the year instead of the time for files older than
+  six months or in the future, as GNU does (`ls-l-tz`). `-l` and `id`
   resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
   has no `getpwuid`); unknown ids print as numbers.
 - `id` lists supplementary groups from `getgroups`; `-G` is supported.

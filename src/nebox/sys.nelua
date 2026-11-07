@@ -109,6 +109,7 @@ function sys.opendir(path: cstring): *sys.DIR <cimport 'opendir', cinclude '<dir
 function sys.readdir(d: *sys.DIR): *sys.Dirent <cimport 'readdir', cinclude '<dirent.h>'> end
 function sys.closedir(d: *sys.DIR): cint <cimport 'closedir', cinclude '<dirent.h>'> end
 function sys.isatty(fd: cint): cint <cimport 'isatty', cinclude '<unistd.h>'> end
+function sys.ioctl(fd: cint, req: culong, arg: pointer): cint <cimport 'ioctl', cinclude '<sys/ioctl.h>'> end
 function sys.nanosleep(req: *sys.Timespec, rem: *sys.Timespec): cint <cimport 'nanosleep', cinclude '<time.h>'> end
 function sys.clock_gettime(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_gettime', cinclude '<time.h>'> end
 function sys.gmtime_r(t: *clong, out: *sys.Tm): *sys.Tm <cimport 'gmtime_r', cinclude '<time.h>'> end

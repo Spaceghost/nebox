@@ -664,7 +664,7 @@ local function verrevcmp(s1: string, l1: integer, s2: string, l2: integer): inte
   return 0
 end
 
-local function filevercmp(a: string, b: string): integer
+global function filevercmp(a: string, b: string): integer
   local alen, blen = (@integer)(a.size), (@integer)(b.size)
   if alen == 0 then return blen ~= 0 and -1 or 0 end
   if blen == 0 then return 1 end

@@ -14,170 +14,624 @@ local function digits(v: integer): integer
   return n
 end
 
--- Column widths for -l, computed per listing as GNU ls does.
-local LsWidths = @record{nlink: integer, uid: integer, gid: integer, size: integer}
+-- ls follows GNU ls 9.1 (ls.c) in the C locale: output formats, column
+-- layout (calculate_columns), field widths per listing, sort keys, indicators.
+local LS_LONG <comptime> = 0
+local LS_ONE <comptime> = 1
+local LS_VERT <comptime> = 2   -- -C
+local LS_HORIZ <comptime> = 3  -- -x
+local LS_COMMAS <comptime> = 4 -- -m
+local SORT_NAME <comptime> = 0
+local SORT_TIME <comptime> = 1
+local SORT_SIZE <comptime> = 2
+local SORT_EXT <comptime> = 3
+local SORT_VER <comptime> = 4
+local IND_NONE <comptime> = 0
+local IND_SLASH <comptime> = 1    -- -p
+local IND_CLASSIFY <comptime> = 2 -- -F
+local LS_UNLIMITED <comptime> = 0x1000000000000000
 
-local function owner(st: *sys.Stat): (string, string)
+local LsEnt = @record{
+  name: string,   -- as shown (after -q)
+  key: string,    -- the real name, for sorting
+  path: string,
+  st: sys.Stat,
+  ok: boolean,    -- st is valid
+  link: string,   -- symlink target, long format only
+  linkmode: cuint -- mode of the target, -lF only (0 if unknown)
+}
+
+-- Column widths, computed per listing as GNU ls does.
+local LsW = @record{inode: integer, blocks: integer, nlink: integer, uid: integer, gid: integer,
+  size: integer, major: integer, minor: integer}
+
+local Ls = @record{
+  format: integer, indicator: integer, sortby: integer, timekind: integer,
+  all: boolean, almost: boolean, recursive: boolean, reverse: boolean, human: boolean,
+  inode: boolean, blocks: boolean, numeric: boolean, showowner: boolean, showgroup: boolean,
+  dironly: boolean, qmark: boolean, nobackups: boolean,
+  ignores: sequence(string),
+  linelen: integer, tabsize: integer,
+  first: boolean, rc: integer,
+}
+
+local function ls_major(d: culong): integer return (@integer)(((d >> 8) & 0xfff) | ((d >> 32) & ~(@culong)(0xfff))) end
+local function ls_minor(d: culong): integer return (@integer)((d & 0xff) | ((d >> 12) & ~(@culong)(0xff))) end
+
+local function isdev(m: cuint): boolean
+  local k = m & sys.S_IFMT
+  return k == sys.S_IFCHR or k == sys.S_IFBLK
+end
+
+-- Display width in the C locale: non-printable bytes take no column.
+local function ls_width(s: string): integer
+  local n: integer = 0
+  for i: usize = 0, < s.size do
+    local b = s.data[i]
+    if b >= 32 and b < 127 then n = n + 1 end
+  end
+  return n
+end
+
+local function ls_qmark(s: string): string
+  local sb: stringbuilder
+  for i: usize = 0, < s.size do
+    local b = s.data[i]
+    if b >= 32 and b < 127 then sb:writebyte(b) else sb:writebyte(63) end
+  end
+  return sb:promote()
+end
+
+local function wleft(s: string, w: integer) -- right-aligned
+  for _ = (@integer)(s.size) + 1, w do util.writebyte(32) end
+  util.write(s)
+end
+
+local function wright(s: string, w: integer) -- left-aligned
+  util.write(s)
+  for _ = ls_width(s) + 1, w do util.writebyte(32) end
+end
+
+function Ls:time(st: *sys.Stat): sys.Timespec
+  if self.timekind == 1 then return st.st_ctim elseif self.timekind == 2 then return st.st_atim end
+  return st.st_mtim
+end
+
+function Ls:blockstr(nblocks: integer): string
+  if self.human then return util.human(nblocks * 512) end
+  return string.format('%d', (nblocks + 1) // 2)
+end
+
+function Ls:owner(st: *sys.Stat): (string, string)
+  if self.numeric then return string.format('%d', st.st_uid), string.format('%d', st.st_gid) end
   return util.idname(util.username((@integer)(st.st_uid)), (@integer)(st.st_uid)),
          util.idname(util.groupname((@integer)(st.st_gid)), (@integer)(st.st_gid))
 end
 
-local function widths_of(stats: sequence(sys.Stat), human: boolean, numeric: boolean): LsWidths
-  local w: LsWidths = {1, 1, 1, 1}
-  for _, st in ipairs(stats) do
-    local u, g = owner(&st)
-    if numeric then u = string.format('%d', st.st_uid); g = string.format('%d', st.st_gid) end
-    local d = digits((@integer)(st.st_nlink)); if d > w.nlink then w.nlink = d end
-    d = (@integer)(u.size); if d > w.uid then w.uid = d end
-    d = (@integer)(g.size); if d > w.gid then w.gid = d end
-    if human then d = (@integer)(util.human((@integer)(st.st_size)).size) else d = digits((@integer)(st.st_size)) end
-    if d > w.size then w.size = d end
+function Ls:sizestr(st: *sys.Stat): string
+  if self.human then return util.human((@integer)(st.st_size)) end
+  return string.format('%d', (@integer)(st.st_size))
+end
+
+function Ls:widths(ents: sequence(LsEnt)): LsW
+  local w: LsW
+  for _, e in ipairs(ents) do
+    if not e.ok then continue end
+    local st = &e.st
+    if self.inode then local d = digits((@integer)(st.st_ino)); if d > w.inode then w.inode = d end end
+    if self.format == LS_LONG or self.blocks then
+      local d = (@integer)(self:blockstr((@integer)(st.st_blocks)).size); if d > w.blocks then w.blocks = d end
+    end
+    if self.format == LS_LONG then
+      local d = digits((@integer)(st.st_nlink)); if d > w.nlink then w.nlink = d end
+      local u, g = self:owner(st)
+      d = ls_width(u); if d > w.uid then w.uid = d end
+      d = ls_width(g); if d > w.gid then w.gid = d end
+      if isdev(st.st_mode) then
+        local ma, mi = digits(ls_major(st.st_rdev)), digits(ls_minor(st.st_rdev))
+        if ma > w.major then w.major = ma end
+        if mi > w.minor then w.minor = mi end
+        d = w.major + 2 + w.minor
+      else
+        d = (@integer)(self:sizestr(st).size)
+      end
+      if d > w.size then w.size = d end
+    end
   end
   return w
 end
 
--- Order entries by time or size (newest/largest first), then name; -r flips.
-local function ls_order(stats: sequence(sys.Stat), names: sequence(string), bytime: boolean, bysize: boolean, reverse: boolean): sequence(integer)
-  local idx: sequence(integer)
-  for i = 1, #stats do idx:push(i) end
-  -- insertion sort keeps this simple and stable
-  for i = 2, #idx do
-    local j = i
-    while j > 1 do
-      local a, b = idx[j - 1], idx[j]
-      local r: integer = 0
-      if bytime then
-        local ta, tb = stats[a].st_mtim, stats[b].st_mtim
-        if ta.tv_sec ~= tb.tv_sec then r = ta.tv_sec > tb.tv_sec and -1 or 1
-        elseif ta.tv_nsec ~= tb.tv_nsec then r = ta.tv_nsec > tb.tv_nsec and -1 or 1 end
-      elseif bysize then
-        if stats[a].st_size ~= stats[b].st_size then r = stats[a].st_size > stats[b].st_size and -1 or 1 end
-      end
-      if r == 0 then
-        if names[a] < names[b] then r = -1 elseif names[b] < names[a] then r = 1 end
-      end
-      if reverse then r = -r end
-      if r <= 0 then break end
-      idx[j - 1] = b; idx[j] = a
-      j = j - 1
-    end
+-- GNU get_type_indicator; 0 for none.
+function Ls:indicatorof(mode: cuint): byte
+  if self.indicator == IND_NONE then return 0 end
+  local k = mode & sys.S_IFMT
+  if k == sys.S_IFREG then
+    if self.indicator == IND_CLASSIFY and (mode & 0x49) ~= 0 then return 42 end
+    return 0
   end
-  return idx
+  if k == sys.S_IFDIR then return 47 end
+  if self.indicator == IND_SLASH then return 0 end
+  if k == sys.S_IFLNK then return 64 end
+  if k == sys.S_IFIFO then return 124 end
+  if k == sys.S_IFSOCK then return 61 end
+  return 0
 end
 
-local function ls_long(path: string, shown: string, st: *sys.Stat, w: LsWidths, human: boolean, numeric: boolean)
-  local u, g = owner(st)
-  if numeric then u = string.format('%d', st.st_uid); g = string.format('%d', st.st_gid) end
-  local size: string = string.format('%d', (@integer)(st.st_size))
-  if human then size = util.human((@integer)(st.st_size)) end
-  local fmt = string.format('%%s %%%dd %%-%ds %%-%ds %%%ds %%s %%s', w.nlink, w.uid, w.gid, w.size)
+-- Width of an entry with its inode, block count and indicator.
+function Ls:frills(e: *LsEnt, w: *LsW): integer
+  local len: integer = 0
+  local commas = self.format == LS_COMMAS
+  if self.inode then len = len + 1 + (commas and digits((@integer)(e.st.st_ino)) or w.inode) end
+  if self.blocks then len = len + 1 + (commas and (@integer)(self:blockstr((@integer)(e.st.st_blocks)).size) or w.blocks) end
+  len = len + ls_width(e.name)
+  if e.ok and self:indicatorof(e.st.st_mode) ~= 0 then len = len + 1 end
+  return len
+end
+
+function Ls:printname(e: *LsEnt, w: *LsW)
+  local commas = self.format == LS_COMMAS
+  if self.inode then wleft(string.format('%d', e.st.st_ino), commas and 0 or w.inode); util.writebyte(32) end
+  if self.blocks then wleft(self:blockstr((@integer)(e.st.st_blocks)), commas and 0 or w.blocks); util.writebyte(32) end
+  util.write(e.name)
+  if e.ok then
+    local c = self:indicatorof(e.st.st_mode)
+    if c ~= 0 then util.writebyte(c) end
+  end
+end
+
+function Ls:indent(from: integer, to: integer)
+  while from < to do
+    if self.tabsize ~= 0 and to // self.tabsize > (from + 1) // self.tabsize then
+      util.writebyte(9); from = from + self.tabsize - from % self.tabsize
+    else
+      util.writebyte(32); from = from + 1
+    end
+  end
+end
+
+function Ls:long(e: *LsEnt, w: *LsW)
+  local st = &e.st
+  if self.inode then wleft(string.format('%d', st.st_ino), w.inode); util.writebyte(32) end
+  if self.blocks then wleft(self:blockstr((@integer)(st.st_blocks)), w.blocks); util.writebyte(32) end
+  util.write(util.modestr(st.st_mode)); util.writebyte(32)
+  wleft(string.format('%d', (@integer)(st.st_nlink)), w.nlink); util.writebyte(32)
+  local u, g = self:owner(st)
+  if self.showowner then wright(u, w.uid); util.writebyte(32) end
+  if self.showgroup then wright(g, w.gid); util.writebyte(32) end
+  if isdev(st.st_mode) then
+    local blanks = w.size - (w.major + 2 + w.minor)
+    if blanks < 0 then blanks = 0 end
+    wleft(string.format('%d', ls_major(st.st_rdev)), w.major + blanks); util.write(', ')
+    wleft(string.format('%d', ls_minor(st.st_rdev)), w.minor)
+  else
+    wleft(self:sizestr(st), w.size)
+  end
+  util.writebyte(32)
   -- GNU: the time of day for the past six months (half of 365.2425 days),
   -- the year for anything older or in the future
   local now: sys.Timespec
   sys.clock_gettime(sys.CLOCK_REALTIME, &now)
-  local ms, mn = st.st_mtim.tv_sec, st.st_mtim.tv_nsec
+  local t = self:time(st)
+  local ms, mn = t.tv_sec, t.tv_nsec
   local hs = now.tv_sec - 15778476
   local recent = (hs < ms or (hs == ms and now.tv_nsec < mn)) and
     (ms < now.tv_sec or (ms == now.tv_sec and mn < now.tv_nsec))
-  util.write(string.format(fmt, util.modestr(st.st_mode), (@integer)(st.st_nlink),
-    u, g, size,
-    util.timefmt(st.st_mtim.tv_sec, recent and '%b %e %H:%M' or '%b %e  %Y'), shown))
+  util.write(util.timefmt(ms, recent and '%b %e %H:%M' or '%b %e  %Y'))
+  util.writebyte(32)
+  util.write(e.name)
   if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then
-    local buf: [4096]byte
-    local n = sys.readlink(path, &buf[0], #buf)
-    if n > 0 then util.write(' -> '); util.writebytes(&buf[0], (@usize)(n)) end
+    util.write(' -> '); util.write(e.link)
+    if self.indicator == IND_CLASSIFY and e.linkmode ~= 0 then
+      local c = self:indicatorof(e.linkmode)
+      if c ~= 0 then util.writebyte(c) end
+    end
+  else
+    local c = self:indicatorof(st.st_mode)
+    if c ~= 0 then util.writebyte(c) end
   end
   util.writebyte(10)
 end
 
-local Ls = @record{longfmt: boolean, all: boolean, classify: boolean, slash: boolean, recursive: boolean, rc: integer,
-  reverse: boolean, bytime: boolean, bysize: boolean, human: boolean, inode: boolean, numeric: boolean, almost: boolean}
-
-function Ls:show(path: string, shown: string, st: *sys.Stat, w: LsWidths)
-  if self.inode then util.writef('%d ', st.st_ino) end
-  if self.longfmt then ls_long(path, shown, st, w, self.human, self.numeric) return end
-  util.write(shown)
-  local kind = st.st_mode & sys.S_IFMT
-  if (self.classify or self.slash) and kind == sys.S_IFDIR then util.writebyte(47)
-  elseif self.classify and kind == sys.S_IFLNK then util.writebyte(64)
-  elseif self.classify and (st.st_mode & 0x49) ~= 0 and kind == sys.S_IFREG then util.writebyte(42) end
-  util.writebyte(10)
+-- GNU sort functions; ties go to the name, and -r reverses the whole order.
+function Ls:cmp(a: *LsEnt, b: *LsEnt): integer
+  if self.reverse then a, b = b, a end
+  local r: integer = 0
+  if self.sortby == SORT_TIME then
+    local ta, tb = self:time(&a.st), self:time(&b.st)
+    if ta.tv_sec ~= tb.tv_sec then r = ta.tv_sec > tb.tv_sec and -1 or 1
+    elseif ta.tv_nsec ~= tb.tv_nsec then r = ta.tv_nsec > tb.tv_nsec and -1 or 1 end
+  elseif self.sortby == SORT_SIZE then
+    if a.st.st_size ~= b.st.st_size then r = a.st.st_size > b.st.st_size and -1 or 1 end
+  elseif self.sortby == SORT_EXT then
+    local ea, eb: string = '', ''
+    for i = (@isize)(a.key.size), 1, -1 do if a.key:byte(i) == 46 then ea = a.key:sub(i) break end end
+    for i = (@isize)(b.key.size), 1, -1 do if b.key:byte(i) == 46 then eb = b.key:sub(i) break end end
+    if ea < eb then r = -1 elseif eb < ea then r = 1 end
+  elseif self.sortby == SORT_VER then
+    r = filevercmp(a.key, b.key)
+  end
+  if r == 0 then
+    if a.key < b.key then r = -1 elseif b.key < a.key then r = 1 end
+  end
+  return r
 end
 
--- Print a group of entries (operand files, or one directory's contents).
-function Ls:group(paths: sequence(string), shown: sequence(string), total: boolean)
-  local stats: sequence(sys.Stat)
-  local okpaths: sequence(string)
-  local okshown: sequence(string)
-  local blocks: integer = 0
-  for i, p in ipairs(paths) do
-    local st: sys.Stat
-    if sys.lstat(p, &st) ~= 0 then
-      if total and not (self.longfmt or self.inode or self.classify or self.slash or self.bytime or self.bysize) then
-        -- a directory entry that vanished (or cannot be stat'ed) after it was
-        -- read: plain listings need only its name, as coreutils ls prints it
-        st = (@sys.Stat)()
-        stats:push(st); okpaths:push(p); okshown:push(shown[i])
-      else
-        util.err("cannot access '" .. p .. "': " .. sys.errstr()); self.rc = 2
+-- Stable merge sort of entry indexes.
+function Ls:order(ents: sequence(LsEnt)): sequence(integer)
+  local idx: sequence(integer)
+  local tmp: sequence(integer)
+  local n = #ents
+  for i = 1, n do idx:push(i); tmp:push(i) end
+  local width: integer = 1
+  while width < n do
+    local lo: integer = 1
+    while lo <= n do
+      local mid = lo + width
+      local hi = lo + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local i, j, k = lo, mid, lo
+      while i < mid and j < hi do
+        if self:cmp(&ents[idx[j]], &ents[idx[i]]) < 0 then tmp[k] = idx[j]; j = j + 1
+        else tmp[k] = idx[i]; i = i + 1 end
+        k = k + 1
       end
-    else
-      stats:push(st); okpaths:push(p); okshown:push(shown[i])
-      blocks = blocks + (@integer)(st.st_blocks)
+      while i < mid do tmp[k] = idx[i]; i = i + 1; k = k + 1 end
+      while j < hi do tmp[k] = idx[j]; j = j + 1; k = k + 1 end
+      lo = hi
+    end
+    idx, tmp = tmp, idx
+    width = width * 2
+  end
+  return idx
+end
+
+-- GNU calculate_columns, print_many_per_line and print_horizontal.
+function Ls:columns(ents: sequence(LsEnt), order: sequence(integer), w: *LsW, bycols: boolean)
+  local n = #order
+  if n == 0 then return end
+  local lens: sequence(integer)
+  for k = 1, n do lens:push(self:frills(&ents[order[k]], w)) end
+  local maxidx = self.linelen // 3 + (self.linelen % 3 ~= 0 and 1 or 0)
+  local maxcols = (maxidx > 0 and maxidx < n) and maxidx or n
+  local valid: sequence(boolean)
+  local linelen: sequence(integer)
+  local base: sequence(integer)
+  local arr: sequence(integer)
+  for i = 0, maxcols - 1 do
+    valid:push(true); linelen:push((i + 1) * 3); base:push(#arr)
+    for _ = 0, i do arr:push(3) end
+  end
+  for f = 0, n - 1 do
+    local len = lens[f + 1]
+    for i = 0, maxcols - 1 do
+      if valid[i + 1] then
+        local idx: integer
+        if bycols then idx = f // ((n + i) // (i + 1)) else idx = f % (i + 1) end
+        local real = len + (idx == i and 0 or 2)
+        local slot = base[i + 1] + idx + 1
+        if arr[slot] < real then
+          linelen[i + 1] = linelen[i + 1] + real - arr[slot]
+          arr[slot] = real
+          valid[i + 1] = linelen[i + 1] < self.linelen
+        end
+      end
     end
   end
-  local w = widths_of(stats, self.human, self.numeric)
-  if self.longfmt and total then
-    if self.human then util.line('total ' .. util.human(blocks * 512)) else util.writef('total %d\n', (blocks + 1) // 2) end
+  local cols = maxcols
+  while cols > 1 and not valid[cols] do cols = cols - 1 end
+  local b = base[cols]
+  if bycols then
+    local rows = n // cols + (n % cols ~= 0 and 1 or 0)
+    for row = 0, rows - 1 do
+      local col: integer = 0
+      local f = row
+      local pos: integer = 0
+      while true do
+        local maxw = arr[b + col + 1]
+        col = col + 1
+        self:printname(&ents[order[f + 1]], w)
+        local len = lens[f + 1]
+        f = f + rows
+        if f >= n then break end
+        self:indent(pos + len, pos + maxw)
+        pos = pos + maxw
+      end
+      util.writebyte(10)
+    end
+  else
+    local pos: integer = 0
+    self:printname(&ents[order[1]], w)
+    local len = lens[1]
+    local maxw = arr[b + 1]
+    for f = 1, n - 1 do
+      local col = f % cols
+      if col == 0 then util.writebyte(10); pos = 0
+      else self:indent(pos + len, pos + maxw); pos = pos + maxw end
+      self:printname(&ents[order[f + 1]], w)
+      len = lens[f + 1]
+      maxw = arr[b + col + 1]
+    end
+    util.writebyte(10)
   end
-  local order = ls_order(stats, okshown, self.bytime, self.bysize, self.reverse)
-  for _, i in ipairs(order) do self:show(okpaths[i], okshown[i], &stats[i], w) end
+end
+
+function Ls:print(ents: sequence(LsEnt), order: sequence(integer), w: *LsW)
+  if self.format == LS_LONG then
+    for _, i in ipairs(order) do self:long(&ents[i], w) end
+  elseif self.format == LS_ONE then
+    for _, i in ipairs(order) do self:printname(&ents[i], w); util.writebyte(10) end
+  elseif self.format == LS_COMMAS then
+    if #order == 0 then return end
+    local pos: integer = 0
+    for k, i in ipairs(order) do
+      local len = self:frills(&ents[i], w)
+      if k > 1 then
+        util.writebyte(44)
+        if pos + len + 2 < self.linelen then pos = pos + 2; util.writebyte(32)
+        else pos = 0; util.writebyte(10) end
+      end
+      self:printname(&ents[i], w)
+      pos = pos + len
+    end
+    util.writebyte(10)
+  else
+    self:columns(ents, order, w, self.format == LS_VERT)
+  end
+end
+
+-- Symlink target text (long format) and, for -lF, the target's mode.
+function Ls:linkinfo(e: *LsEnt)
+  if self.format ~= LS_LONG or (e.st.st_mode & sys.S_IFMT) ~= sys.S_IFLNK then return end
+  local buf: [4096]byte
+  local n = sys.readlink(e.path, &buf[0], #buf)
+  if n < 0 then return end
+  local target = string.copy((@string){data=&buf[0], size=(@usize)(n)})
+  e.link = self.qmark and ls_qmark(target) or target
+  if self.indicator == IND_CLASSIFY then
+    local full = target
+    if target.size == 0 or target:byte(1) ~= 47 then
+      local slash: isize = 0
+      for i = (@isize)(e.path.size), 1, -1 do if e.path:byte(i) == 47 then slash = i break end end
+      if slash > 0 then full = e.path:sub(1, slash) .. target end
+    end
+    local ts: sys.Stat
+    if sys.stat(full, &ts) == 0 then e.linkmode = ts.st_mode end
+  end
+end
+
+function Ls:ignored(name: string): boolean
+  if name:byte(1) == 46 then
+    if not self.all then return true end
+    if self.almost and (name == '.' or name == '..') then return true end
+  end
+  if self.nobackups and name:byte(name.size) == 126 then return true end
+  for _, p in ipairs(self.ignores) do
+    -- fnmatch with FNM_PERIOD: a leading '.' must be matched literally
+    if name:byte(1) == 46 and p:byte(1) ~= 46 then continue end
+    if util.glob(p, name, false) then return true end
+  end
+  return false
+end
+
+function Ls:needstat(): boolean
+  return self.format == LS_LONG or self.inode or self.blocks or self.indicator ~= IND_NONE or
+    self.sortby == SORT_TIME or self.sortby == SORT_SIZE or self.recursive
 end
 
 function Ls:listdir(dir: string, label: boolean)
-  local names, ok = util.readnames(dir, self.all)
+  local names, ok = util.readnames(dir, true)
   if not ok then util.err("cannot open directory '" .. dir .. "': " .. sys.errstr()); self.rc = 2; return end
-  if self.almost then
-    local kept: sequence(string)
-    for _, n in ipairs(names) do if n ~= '.' and n ~= '..' then kept:push(n) end end
-    names = kept
+  if label then
+    if not self.first then util.writebyte(10) end
+    self.first = false
+    util.write(dir); util.line(':')
   end
-  if label then util.write(dir); util.line(':') end
-  local paths: sequence(string)
-  for _, n in ipairs(names) do paths:push(util.join(dir, n)) end
-  self:group(paths, names, true)
+  local ents: sequence(LsEnt)
+  local need = self:needstat()
+  for _, n in ipairs(names) do
+    if self:ignored(n) then continue end
+    local e: LsEnt = {name = self.qmark and ls_qmark(n) or n, key = n, path = util.join(dir, n), ok = true}
+    if sys.lstat(e.path, &e.st) ~= 0 then
+      if need then
+        util.err("cannot access '" .. e.path .. "': " .. sys.errstr()); if self.rc == 0 then self.rc = 1 end
+        continue
+      end
+      -- a plain listing needs only the name of an entry that vanished
+      -- after it was read, as coreutils ls (which does not stat) prints it
+      e.st = (@sys.Stat)(); e.ok = false
+    end
+    self:linkinfo(&e)
+    ents:push(e)
+  end
+  if self.format == LS_LONG or self.blocks then
+    local total: integer = 0
+    for _, e in ipairs(ents) do if e.ok then total = total + (@integer)(e.st.st_blocks) end end
+    util.write('total '); util.line(self:blockstr(total))
+  end
+  local w = self:widths(ents)
+  local order = self:order(ents)
+  self:print(ents, order, &w)
   if self.recursive then
-    for _, n in ipairs(names) do
-      if n == '.' or n == '..' then continue end
-      local p = util.join(dir, n)
-      local st: sys.Stat
-      if sys.lstat(p, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
-        util.writebyte(10)
-        self:listdir(p, true)
+    for _, i in ipairs(order) do
+      local e = &ents[i]
+      if e.ok and (e.st.st_mode & sys.S_IFMT) == sys.S_IFDIR and e.key ~= '.' and e.key ~= '..' then
+        self:listdir(e.path, true)
       end
     end
   end
 end
 
-global function applet_ls(args: sequence(string)): integer
-  local o = util.parse(args, 'al1dFRprtShinAgo')
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then o.operands:push('.') end
-  local ls: Ls = {longfmt = o:has('l') or o:has('n') or o:has('g') or o:has('o'), all = o:has('a') or o:has('A'), classify = o:has('F'), slash = o:has('p'), recursive = o:has('R'),
-    reverse = o:has('r'), bytime = o:has('t'), bysize = o:has('S'), human = o:has('h'), inode = o:has('i'), numeric = o:has('n'),
-    almost = o:has('A') and not o:has('a')}
-  local dironly = o:has('d')
-  local files: sequence(string)
-  local dirs: sequence(string)
-  for _, p in ipairs(o.operands) do
-    if not dironly and util.isdir(p) then dirs:push(p) else files:push(p) end
+-- strtoumax with base 0 and no trailing characters, as GNU xstrtoumax;
+-- returns value, ok, overflowed.
+local function ls_number(s: string): (integer, boolean, boolean)
+  local i: usize = 1
+  while i <= s.size and (s:byte(i) == 32 or (s:byte(i) >= 9 and s:byte(i) <= 13)) do i = i + 1 end
+  if i <= s.size and s:byte(i) == 45 then return 0, false, false end
+  if i <= s.size and s:byte(i) == 43 then i = i + 1 end
+  local base: integer = 10
+  if i + 1 <= s.size and s:byte(i) == 48 and (s:byte(i + 1) == 120 or s:byte(i + 1) == 88) and i + 2 <= s.size then
+    local c = s:byte(i + 2)
+    if (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70) then base = 16; i = i + 2 end
   end
-  util.sort(files, util.name_less)
-  util.sort(dirs, util.name_less)
-  if #files > 0 then ls:group(files, files, false) end
-  for i, d in ipairs(dirs) do
-    if #files > 0 or i > 1 then util.writebyte(10) end
-    ls:listdir(d, #o.operands > 1 or ls.recursive)
+  if base == 10 and i <= s.size and s:byte(i) == 48 then base = 8 end
+  local v: integer = 0
+  local any, over = false, false
+  while i <= s.size do
+    local c = s:byte(i)
+    local d: integer = 99
+    if c >= 48 and c <= 57 then d = c - 48 elseif c >= 97 and c <= 102 then d = c - 87 elseif c >= 65 and c <= 70 then d = c - 55 end
+    if d >= base then break end
+    if v > (0x7fffffffffffffff - d) // base then over = true else v = v * base + d end
+    any = true
+    i = i + 1
+  end
+  if not any or i <= s.size then return 0, false, false end
+  return v, true, over
+end
+
+local WinSize = @record{row: cushort, col: cushort, xpixel: cushort, ypixel: cushort}
+
+global function applet_ls(args: sequence(string)): integer
+  local ls: Ls = {format = LS_ONE, linelen = -1, tabsize = 8, first = true, showowner = true, showgroup = true}
+  if sys.isatty(1) == 1 then ls.format = LS_VERT end
+  local operands: sequence(string)
+  local sortset = false
+  local haveW, haveT = false, false
+  local nomore = false
+  local i: integer = 1
+  while i <= #args do
+    local a = args[i]
+    if nomore or a.size < 2 or a:byte(1) ~= 45 then
+      operands:push(a)
+    elseif a == '--' then
+      nomore = true
+    elseif a:byte(2) == 45 then
+      util.err("unrecognized option '" .. a .. "'"); util.err("Try 'ls --help' for more information."); return 2
+    else
+      local j: usize = 2
+      while j <= a.size do
+        local c = a:byte(j)
+        if c == 119 or c == 84 or c == 73 then -- w T I take a value
+          local v: string
+          if j < a.size then v = a:sub(j + 1)
+          elseif i < #args then i = i + 1; v = args[i]
+          else
+            util.err("option requires an argument -- '" .. string.char(c) .. "'")
+            util.err("Try 'ls --help' for more information."); return 2
+          end
+          if c == 119 then
+            local n, ok, over = ls_number(v)
+            if not ok then util.err("invalid line width: '" .. v .. "'"); return 2 end
+            ls.linelen = (over or n == 0) and LS_UNLIMITED or n; haveW = true
+          elseif c == 84 then
+            local n, ok, over = ls_number(v)
+            if not ok or over then util.err("invalid tab size: '" .. v .. "'"); return 2 end
+            haveT = true; ls.tabsize = n
+          else
+            ls.ignores:push(v)
+          end
+          break
+        end
+        if c == 97 then ls.all = true; ls.almost = false            -- a
+        elseif c == 65 then ls.all = true; ls.almost = true          -- A
+        elseif c == 66 then ls.nobackups = true                       -- B
+        elseif c == 99 then ls.timekind = 1                          -- c
+        elseif c == 117 then ls.timekind = 2                         -- u
+        elseif c == 67 then ls.format = LS_VERT                      -- C
+        elseif c == 120 then ls.format = LS_HORIZ                    -- x
+        elseif c == 109 then ls.format = LS_COMMAS                   -- m
+        elseif c == 108 then ls.format = LS_LONG                     -- l
+        elseif c == 49 then if ls.format ~= LS_LONG then ls.format = LS_ONE end -- 1 (no effect after -l)
+        elseif c == 110 then ls.format = LS_LONG; ls.numeric = true  -- n
+        elseif c == 103 then ls.format = LS_LONG; ls.showowner = false -- g
+        elseif c == 111 then ls.format = LS_LONG; ls.showgroup = false -- o
+        elseif c == 71 then ls.showgroup = false                     -- G
+        elseif c == 100 then ls.dironly = true                        -- d
+        elseif c == 70 then ls.indicator = IND_CLASSIFY              -- F
+        elseif c == 112 then ls.indicator = IND_SLASH                -- p
+        elseif c == 82 then ls.recursive = true                      -- R
+        elseif c == 114 then ls.reverse = true                       -- r
+        elseif c == 116 then ls.sortby = SORT_TIME; sortset = true   -- t
+        elseif c == 83 then ls.sortby = SORT_SIZE; sortset = true    -- S
+        elseif c == 88 then ls.sortby = SORT_EXT; sortset = true     -- X
+        elseif c == 118 then ls.sortby = SORT_VER; sortset = true    -- v
+        elseif c == 104 then ls.human = true                         -- h
+        elseif c == 107 then                                         -- k: 1024-byte blocks, the default here
+        elseif c == 105 then ls.inode = true                         -- i
+        elseif c == 115 then ls.blocks = true                        -- s
+        elseif c == 113 then ls.qmark = true                         -- q
+        elseif c == 78 then                                          -- N: literal names, the default here
+        else
+          util.err("invalid option -- '" .. string.char(c) .. "'")
+          util.err("Try 'ls --help' for more information."); return 2
+        end
+        j = j + 1
+      end
+    end
+    i = i + 1
+  end
+  if ls.timekind ~= 0 and not sortset and ls.format ~= LS_LONG then ls.sortby = SORT_TIME end
+  if ls.format == LS_VERT or ls.format == LS_HORIZ or ls.format == LS_COMMAS then
+    if not haveW then
+      local p = sys.getenv('COLUMNS')
+      if p ~= nilptr then
+        local s = string.copy(p)
+        if s.size > 0 then
+          local n, ok, over = ls_number(s)
+          if ok then ls.linelen = (over or n == 0) and LS_UNLIMITED or n
+          else util.err("ignoring invalid width in environment variable COLUMNS: '" .. s .. "'") end
+        end
+      end
+      if ls.linelen < 0 then
+        local ws: WinSize
+        if sys.ioctl(1, 0x5413, &ws) == 0 and ws.col > 0 then ls.linelen = ws.col end
+      end
+      if ls.linelen < 0 then ls.linelen = 80 end
+    end
+    -- TABSIZE is read for -C, -x and -m, and only without -T
+    if not haveT then
+      local p = sys.getenv('TABSIZE')
+      if p ~= nilptr then
+        local s = string.copy(p)
+        local n, ok, over = ls_number(s)
+        if ok and not over then
+          ls.tabsize = n
+        else
+          util.err("ignoring invalid tab size in environment variable TABSIZE: '" .. s .. "'")
+        end
+      end
+    end
+  end
+  if #operands == 0 then operands:push('.') end
+  -- Command-line symlinks to directories are followed unless -d, -F or -l.
+  local deref = not (ls.dironly or ls.indicator == IND_CLASSIFY or ls.format == LS_LONG)
+  local ents: sequence(LsEnt)
+  for _, p in ipairs(operands) do
+    local e: LsEnt = {name = ls.qmark and ls_qmark(p) or p, key = p, path = p, ok = true}
+    local found = false
+    if deref and sys.stat(p, &e.st) == 0 and (e.st.st_mode & sys.S_IFMT) == sys.S_IFDIR then found = true end
+    if not found and sys.lstat(p, &e.st) ~= 0 then
+      util.err("cannot access '" .. p .. "': " .. sys.errstr()); ls.rc = 2
+      continue
+    end
+    ls:linkinfo(&e)
+    ents:push(e)
+  end
+  -- widths cover every operand, directories included, as in GNU ls
+  local w = ls:widths(ents)
+  local order = ls:order(ents)
+  local files: sequence(integer)
+  local dirs: sequence(integer)
+  for _, k in ipairs(order) do
+    if not ls.dironly and (ents[k].st.st_mode & sys.S_IFMT) == sys.S_IFDIR then dirs:push(k) else files:push(k) end
+  end
+  if #files > 0 then
+    ls:print(ents, files, &w)
+    if #dirs > 0 then util.writebyte(10) end
+  end
+  for _, k in ipairs(dirs) do
+    ls:listdir(ents[k].path, #operands > 1 or ls.recursive)
   end
   return ls.rc
 end

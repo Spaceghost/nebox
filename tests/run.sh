@@ -726,6 +726,38 @@ same ls-i 'ls -i words.txt | wc -w; ls -i words.txt | cut -d" " -f2'
 same ls-n 'ls -n words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
 same ls-A 'ls -A'
 same ls-lS 'ls -lS | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+# ls output formats and column layout (GNU ls 9.1 calculate_columns). Block
+# counts and inode numbers come from /usr/share/zoneinfo, which is identical
+# for both runs; the fixture copies differ in both.
+LSC='unset COLUMNS TABSIZE; mkdir c; cd c; touch a bb ccc dddd eeeee ffffff ggggggg hhhhhhhhh iiiiiiiiiiii j k lmnopqrstuv;'
+Z=/usr/share/zoneinfo
+same ls-C-default "$LSC ls -C; ls -x; ls -m"
+same ls-C-widths "$LSC for w in 1 2 3 4 5 9 10 11 12 13 20 30 31 40 79 80 200; do echo w=\$w; ls -C -w \$w; ls -x -w \$w; ls -m -w\$w; done"
+same ls-C-w0 "$LSC ls -C -w 0; ls -x -w0; ls -m -w 0; ls -C -w 99999999999999999999999; ls -C -w 0x10; ls -C -w 010"
+same ls-C-columns-env "$LSC COLUMNS=30 ls -C; COLUMNS=0 ls -x; COLUMNS=' +25' ls -m; COLUMNS= ls -C; COLUMNS=abc ls -C 2>&1; COLUMNS='30 ' ls -x 2>&1; COLUMNS=abc ls -1 2>&1 | head -2; COLUMNS=abc ls -C -w 40 2>&1"
+same ls-C-tabs "$LSC ls -C -T 0 -w 40; ls -C -T 3 -w 40; ls -x -T 4 -w 50; TABSIZE=4 ls -C -w 40; TABSIZE=0x2 ls -x -w 40; TABSIZE=abc ls -C 2>&1; TABSIZE= ls -C -T 0 2>&1; TABSIZE=abc ls -m 2>&1 | head -1"
+same ls-C-bad "ls -w x; echo \$?; ls -w; echo \$?; ls -w -1; echo \$?; ls -T x; echo \$?; ls -w ''; echo \$?; ls -j; echo \$?; ls --nope; echo \$?"
+same ls-C-last-wins "$LSC ls -l -C -w 30; ls -C -l | head -1; ls -C -1 | head -2; ls -1 -C -w 30; ls -m -1 | head -1; ls -m -l | head -1; ls -l -m -w 30; ls -l -1 a | cut -c1-10; ls -x -C -w 30; ls -C -x -w 30"
+same ls-C-empty 'ls -C empty; ls -x empty; ls -m empty; ls -sm empty; ls -sC empty; echo end'
+same ls-C-zoneinfo "unset COLUMNS; ls -C $Z/America; ls -x -w 120 $Z/Europe; ls -m $Z/Asia; ls -C -w 50 $Z/Australia $Z/Pacific"
+same ls-C-classify 'mkfifo p; chmod +x nums.txt; ls -CF; ls -xp -w 40; ls -mF; ls -F; ls -CF -w 30 sub link nums.txt p; rm p'
+same ls-C-operands 'unset COLUMNS; ls -C words.txt nums.txt sub empty case.txt; ls -x -w 30 sub empty words.txt fields.txt spaces.txt; ls -m nope words.txt sub; ls -Cd sub empty words.txt'
+same ls-C-R 'unset COLUMNS; ls -RC -w 40; ls -R; ls -Rm sub'
+same ls-s "ls -s $Z/Europe | head -8; ls -sC -w 70 $Z/Europe; ls -sx $Z/Asia | head -5; ls -sm $Z/Australia; ls -sh $Z/America | head -5; ls -shC $Z/Australia; ls -sk $Z/Australia | head -3; ls -sd $Z/UTC $Z/Australia"
+same ls-s-empty "mkdir e; touch e/a e/bb e/ccc; ls -s e; ls -sC e; ls -sm e; ls -s1 e"
+same ls-i-columns "ls -i $Z/Australia | head -4; ls -iC -w 100 $Z/Australia; ls -ix -w 90 $Z/Australia; ls -im $Z/Australia; ls -is $Z/Australia | head -3; ls -isC -w 80 $Z/Australia"
+same ls-l-s-i "ls -lsi $Z/Australia | head -5 | sed 's/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//'; ls -ls $Z/Europe/London $Z/Europe | sed 's/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//' | head -4"
+same ls-l-operand-widths 'mkdir -p d; for i in 1 2 3 4 5 6 7 8 9 10 11; do mkdir d/s$i; done; ls -l words.txt d | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -ld words.txt d | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same ls-g-o-G 'ls -g words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -o words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -lG words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -go sub | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -gn words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same ls-l-dev 'ls -l /dev/null /dev/zero /dev/full | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -l /dev/null words.txt | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same ls-lF 'mkfifo p; chmod +x nums.txt; ln -s sub dl; ln -s nope dangling; ln -s ../words.txt sub/up; ls -lF | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -lp | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -lF sub | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; rm p'
+same ls-symlink-operand 'ln -s sub dl; ls dl; ls -p dl; ls -F dl; ls -d dl; ls -l dl | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; ls -C dl link'
+same ls-sort-X-v 'touch a.c b.a c.b d noext.z .h.a x.1.10 x.1.9 x.1.2 v10 v9 v1.1; ls -X; ls -Xr; ls -v; ls -vr; ls -aX; ls -lvX | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"'
+same ls-u-c 'touch -a -d @1000 words.txt; touch -a -d @2000 nums.txt; touch -a -d @3000 case.txt; ls -u | tail -3; ls -ur | head -3; ls -lu words.txt | cut -d" " -f6-; ls -lu | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//" | head -3; ls -ltu | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//" | tail -3; ls -l -u -t -r | head -3 | sed "s/[A-Z][a-z][a-z] *[0-9]* [0-9:]*//"; chmod 600 fields.txt; ls -c | head -1; ls -tc | head -1; ls -ct -r | tail -1'
+same ls-I-B 'touch a~ .b~ c.txt~; ls -B; ls -aB; ls -I "*.txt"; ls -a -I "*"; ls -A -I "[a-f]*" -I "*.bin"; ls -I "*~" -B -1; ls -d -I words.txt words.txt'
+same ls-q 'unset COLUMNS; touch "$(printf "a\tb")" "$(printf "c\200d")" eeeeeeeeeeee ffffffffff gg hhh; ls -C -w 30; ls -m -w 16; ls -q; ls -qC -w 30; ls -qN'
+same ls-r-operands 'ls -r sub empty words.txt nums.txt; ls -S big.bin words.txt sub; ls -t words.txt nums.txt > /dev/null; echo $?'
+same ls-permute 'ls sub -d; ls words.txt -i -- -x 2>/dev/null | wc -l'
 # dd / diff
 same dd-copy 'dd if=words.txt of=out status=none; cmp words.txt out; echo $?'
 same dd-bs-count 'dd if=big.bin of=out bs=1000 count=3 status=none; wc -c out'
