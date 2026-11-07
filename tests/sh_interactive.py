@@ -352,5 +352,75 @@ def _():
     sh.close()
 
 
+@case('job control: ^Z stops a job, jobs lists it, bg resumes it, kill %1 ends it')
+def _():
+    sh = Shell()
+    sh.send('sleep 30\r')
+    time.sleep(0.5)
+    sh.send('\x1a')
+    sh.expect('[1]+  Stopped                 sleep 30')
+    sh.prompt()
+    sh.run('echo $?', '148\r\n')
+    sh.prompt()
+    sh.run('jobs', '[1]+  Stopped                 sleep 30\r\n')
+    sh.prompt()
+    sh.run('bg', '[1]+ sleep 30 &\r\n')
+    sh.prompt()
+    sh.run('jobs', '[1]+  Running                 sleep 30 &\r\n')
+    sh.prompt()
+    sh.run('kill %1', '\x1b[?2004l')
+    time.sleep(0.3)
+    sh.send('\r')
+    sh.expect('[1]+  Terminated              sleep 30')
+    sh.close()
+
+
+@case('job control: a background job reports Done before the next prompt')
+def _():
+    sh = Shell()
+    sh.run('sleep 0.2 &', '[1] ')
+    sh.prompt()
+    time.sleep(0.6)
+    sh.send('\r')
+    sh.expect('[1]+  Done                    sleep 0.2')
+    sh.close()
+
+
+@case('job control: fg brings a stopped job back with the terminal')
+def _():
+    sh = Shell()
+    sh.send("sh -c 'read x; echo got $x'\r")
+    time.sleep(0.5)
+    sh.send('\x1a')
+    sh.expect('Stopped')
+    sh.prompt()
+    sh.run('fg', "sh -c 'read x; echo got $x'\r\n")
+    sh.send('hello\r')
+    sh.expect('got hello\r\n')
+    sh.prompt()
+    sh.run('jobs; echo n=$?', 'n=0\r\n')
+    sh.close()
+
+
+@case('job control: ^C ends a loop of external commands; exit warns about stopped jobs')
+def _():
+    sh = Shell()
+    sh.send('while :; do sleep 1; done; echo never\r')
+    time.sleep(0.5)
+    sh.send('\x03')
+    seen = sh.prompt(3)
+    assert 'never' not in seen.replace('echo never', ''), seen
+    sh.send('sleep 30\r')
+    time.sleep(0.4)
+    sh.send('\x1a')
+    sh.expect('Stopped')
+    sh.prompt()
+    sh.run('exit', 'There are stopped jobs.')
+    sh.prompt()
+    sh.send('exit\r')
+    _, status = os.waitpid(sh.pid, 0)
+    assert os.WIFEXITED(status), status
+
+
 print('%d failed' % len(failures))
 sys.exit(1 if failures else 0)

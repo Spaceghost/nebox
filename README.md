@@ -128,8 +128,19 @@ Stated here rather than worked around:
   (built-ins, functions, aliases, reserved words, `PATH`), file names and
   `$NAME`s, bracketed paste and lines wrapping past the terminal width.
   Character width is one column per code point (no wide or combining
-  characters). Unimplemented: `fc`, vi mode, `set -o emacs/vi`; job control (`-m`/`set -o monitor`, `%job`
-  operands, `jobs`, `bg`, `fg` report an error with status 2); `ulimit`;
+  characters). Job control (`-m`, `set -o monitor`; on by default in an
+  interactive shell with a terminal): each pipeline, subshell or external
+  command the shell forks is a job in its own process group, and the
+  foreground one owns the terminal; ^Z stops it (status 148) and the shell
+  takes the terminal back with its own modes, restoring the job's modes on
+  `fg`; `jobs [-l|-p]`, `fg`, `bg`, `kill %job` and `wait %job` take `%N`,
+  `%+`/`%%`, `%-`, `%PREFIX` and `%?TEXT`; background jobs are reported
+  (`[1]+  Done ...`, bash's layout) before the next prompt; ^C on a
+  foreground job also ends the rest of the command line; `exit` or ^D with
+  stopped jobs warns once, and leaving sends them SIGHUP and SIGCONT. A
+  job's text is its command line. Without a terminal `-m` changes nothing;
+  `fg`/`bg` with no job say `No current job`, status 2, as dash does.
+  Unimplemented: `fc`, vi mode; `ulimit`;
   locales and multibyte characters (bytes only, C-locale classes and byte
   order for globbing). Not POSIX and refused: `local`, `;&` in `case`,
   `${!name}` and other bash expansions (an invalid `${...}` is reported

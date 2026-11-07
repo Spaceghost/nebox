@@ -240,3 +240,9 @@ function sys.dup(fd: cint): cint <cimport 'dup', cinclude '<unistd.h>'> end
 function sys.times(buf: *sys.Tms): clong <cimport 'times', cinclude '<sys/times.h>'> end
 function sys.sysconf(name: cint): clong <cimport 'sysconf', cinclude '<unistd.h>'> end
 function sys.getpgrp(): cint <cimport 'getpgrp', cinclude '<unistd.h>'> end
+function sys.setpgid(pid: cint, pgid: cint): cint <cimport 'setpgid', cinclude '<unistd.h>'> end
+function sys.tcgetpgrp(fd: cint): cint <cimport 'tcgetpgrp', cinclude '<unistd.h>'> end
+function sys.tcsetpgrp(fd: cint, pgrp: cint): cint <cimport 'tcsetpgrp', cinclude '<unistd.h>'> end
+global sys.WUNTRACED: cint <comptime> = 2
+global sys.SIGCONT: cint <comptime> = 18
+global sys.SIGHUP: cint <comptime> = 1

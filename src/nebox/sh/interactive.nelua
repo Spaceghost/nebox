@@ -4,8 +4,9 @@
 -- $HISTFILE (default ~/.sh_history, $HISTSIZE entries, default 1000) and
 -- completion, the $ENV file, POSIX 2.11 signal dispositions (SIGINT caught
 -- and ending the command being run, SIGTERM and SIGQUIT ignored), and
--- recovery from errors back to the prompt (POSIX 2.8.1).
--- Not implemented: job control (`set -m`, fg, bg, jobs, ^Z).
+-- recovery from errors back to the prompt (POSIX 2.8.1), and job control
+-- (set -m, on by default with a terminal): each job in its own process group,
+-- ^Z, fg, bg, jobs, %job operands, and reports before the prompt.
 ## pragmas.nogc = true
 
 require 'string'
@@ -68,6 +69,7 @@ end
 
 local function read_line(first: boolean): (string, boolean)
   shexec.run_traps()
+  if first and shst.o_monitor then shexec.notify_jobs() end
   local prompt: string
   if first then prompt = expand_prompt(getvar_or('PS1', '$ '), true)
   else prompt = expand_prompt(getvar_or('PS2', '> '), false) end
@@ -308,8 +310,32 @@ local function recover(lx: *shlex.Lexer)
   lx:discard()
 end
 
+-- Job control: wait until the shell is in the foreground of its terminal,
+-- lead its own process group, and take the terminal (as bash and dash do).
+local function take_terminal()
+  local fd = sys.fcntl(0, sys.F_DUPFD_CLOEXEC, 100)
+  if fd < 0 then return end
+  while true do
+    local fg = sys.tcgetpgrp(fd)
+    if fg < 0 then sys.close(fd); return end
+    if fg == sys.getpgrp() then break end
+    sys.kill(-sys.getpgrp(), sys.SIGTTIN)
+  end
+  shexec.set_handler(sys.SIGTSTP, 1)
+  shexec.set_handler(sys.SIGTTIN, 1)
+  shexec.set_handler(sys.SIGTTOU, 1)
+  local pid = sys.getpid()
+  if sys.getpgrp() ~= pid then sys.setpgid(0, 0) end
+  shst.shell_pgid = sys.getpgrp()
+  sys.tcsetpgrp(fd, shst.shell_pgid)
+  shst.have_tmodes = sys.tcgetattr(fd, &shst.shell_tmodes) == 0
+  shst.tty = fd
+  shst.o_monitor = true
+end
+
 function shint.run(lx: *shlex.Lexer)
   shst.interactive = true
+  if sys.isatty(0) == 1 then take_terminal() end
   -- POSIX 2.11: an interactive shell ignores SIGTERM and SIGQUIT, and catches
   -- SIGINT so that it can end the current command instead of exiting.
   if not shst.trap_set[15] then shexec.set_handler(15, 1) end
@@ -348,7 +374,14 @@ function shint.run(lx: *shlex.Lexer)
     shlex.cmd_start = -1
     local s0: usize = #lx.srcs > 0 and lx.srcs[1].pos or 0
     local node = shparse.next_command(lx)
-    if node < 0 then break end
+    if node < 0 then
+      -- end of input with stopped jobs: warn once, then leave on the next one
+      if shexec.stopped_jobs_warn() then
+        lx:init_reader()
+        continue
+      end
+      break
+    end
     -- the text of the command, for the history
     if #lx.srcs > 0 then
       local src = &lx.srcs[1]
@@ -360,6 +393,7 @@ function shint.run(lx: *shlex.Lexer)
         local t = sb:promote()
         while t.size > 0 and (t.data[t.size - 1] == 10 or t.data[t.size - 1] == 32) do t.size = t.size - 1 end
         editor:add_history(t)
+        shst.cmd_text = t
       end
     end
     if shst.o_noexec then continue end

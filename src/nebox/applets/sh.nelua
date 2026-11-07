@@ -74,7 +74,7 @@ local function run_sh(args: sequence(string), nsh: boolean): integer
       if c == 99 then cmode = true            -- c
       elseif c == 115 then smode = true       -- s
       elseif c == 105 then imode = on              -- i
-      elseif c == 109 then return usage_error('-m: job control is not supported')
+      elseif c == 109 then shbi.set_option(c, on)   -- m: job control (needs a terminal)
       elseif c == 111 then                    -- o
         if i + 1 > #args then return usage_error('-o requires an argument') end
         local err = shbi.set_option_name(args[i + 1], on)

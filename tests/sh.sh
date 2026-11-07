@@ -595,10 +595,11 @@ shf sh-wait-twice 'sleep 0.1 & p=$!; wait $p; echo $?; wait $p; echo $?'
 shf sh-echo-builtin 'echo -n a; echo; echo -e x; echo "a\tb\\nc"; echo "\0101\0102"; echo a\\cb c; echo -n; echo -- x; echo -E y; echo - z; echo "\x41"; echo "\c"; echo x; echo -n -n y; echo'
 shf sh-printf-builtin 'printf "%s %d %5.2f|%-3s|%03d|%x|%o|%c|%b|%%\n" a 42 3.14159 b 7 255 8 hi "x\ty"; printf "%s\n" a b c; printf "%d\n" "" 0x1f 010; printf "\101\102\n"; printf "%5s|%-5s|\n" ab cd; printf "a\n" extra; echo st=$?; printf "%.3s\n" abcdef; printf "%d\n" abc 2>/dev/null; echo st=$?'
 shf sh-test-builtin '[ -t 1 ]; echo $?; test -n ""; echo $?; [ 1 -eq 1 ] && echo eq; [ ]; echo $?; [ a = a -a b = b ]; echo $?; [ ! x ]; echo $?; [ -e /tmp ]; echo $?; test 1 -lt 2 -o 3 -lt 2; echo $?; [ -z "" -a -n a ]; echo $?; [ "(" = "(" ]; echo $?; [ 1 ]; echo $?; [ -f words.txt -a -d sub -a ! -d words.txt ]; echo $?; [ x 2>/dev/null; echo $?; test; echo $?'
-# jobs, bg, fg and ulimit are unimplemented and local is not POSIX: each
-# reports an error with status 2 and the script continues (dash implements
-# jobs and ulimit, and exits on local outside a function)
-shx sh-unsupported-builtins 'st=2
+# jobs lists nothing and bg/fg find no current job (status 2, as dash);
+# ulimit is unimplemented and local is not POSIX: each reports an error with
+# status 2 and the script continues (dash implements ulimit, and exits on
+# local outside a function)
+shx sh-unsupported-builtins 'st=0
 st=2
 st=2
 st=2
@@ -694,14 +695,14 @@ st=127
 exit=0' "sh -c 'exec nosuch' 2>&1; echo st=\$?"
 expect sh-i-with-c 'i
 exit=0' "sh -i -c 'echo i' 2>&1"
-expect sh-error-m-unsupported 'sh: -m: job control is not supported
-exit=2' "sh -m -c 'echo m' 2>&1"
-expect sh-error-set-m 'sh: line 1: set: -m: job control is not supported
-exit=2' "sh -c 'set -m; echo after' 2>&1"
+# -m is accepted; without a terminal there is no job control to do
+expect sh-m-no-tty 'm
+exit=0' "sh -m -c 'echo m' 2>&1"
+expect sh-set-m-no-tty 'after m
+exit=0' "sh -c 'set -m; case \$- in *m*) echo after m;; esac' 2>&1"
 expect sh-error-fallthrough-msg 'sh: line 1: Syntax error: "&" unexpected
 exit=2' "sh -c 'case a in a) echo 1;& esac' 2>&1"
-expect sh-error-jobs-msg 'sh: line 1: jobs: job control is not supported
-after 2
+expect sh-jobs-no-jobs 'after 0
 exit=0' "sh -c 'jobs; echo after \$?' 2>&1"
 
 # recorded choices where POSIX and dash disagree
