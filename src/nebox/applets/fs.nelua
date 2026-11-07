@@ -104,7 +104,14 @@ function Ls:group(paths: sequence(string), shown: sequence(string), total: boole
   for i, p in ipairs(paths) do
     local st: sys.Stat
     if sys.lstat(p, &st) ~= 0 then
-      util.err("cannot access '" .. p .. "': " .. sys.errstr()); self.rc = 2
+      if total and not (self.longfmt or self.inode or self.classify or self.slash or self.bytime or self.bysize) then
+        -- a directory entry that vanished (or cannot be stat'ed) after it was
+        -- read: plain listings need only its name, as coreutils ls prints it
+        st = (@sys.Stat)()
+        stats:push(st); okpaths:push(p); okshown:push(shown[i])
+      else
+        util.err("cannot access '" .. p .. "': " .. sys.errstr()); self.rc = 2
+      end
     else
       stats:push(st); okpaths:push(p); okshown:push(shown[i])
       blocks = blocks + (@integer)(st.st_blocks)
