@@ -266,6 +266,16 @@ Stated here rather than worked around:
   `--all`), sleep.c (C-locale strtod numbers including inf and hex floats,
   one s/m/h/d suffix, endless sleep for infinity) and printenv.c (-0, "a=b"
   operands skipped). `tests/smallcore_compare.py`: 68 cases, 0 mismatches.
+- `tac` ports tac.c: -b, -r, -s, tac_seekable's backward scan with the
+  separator kept in front of the buffer as a sentinel and the buffer
+  doubling for long records, non-seekable input and terminals copied to a
+  temporary file in $TMPDIR first. -r searches backward the way glibc
+  re_search does with re_syntax_options 0 (Emacs syntax, translated for
+  nebox's engine: \( \) \| groups, + and ? operators, no intervals or
+  character classes, context-dependent anchors, glibc's wording for a
+  pattern ending in "[" ); one difference remains: [^...] does not match a
+  newline. `tests/tac_compare.py`: 55 fixed cases plus 300 random inputs
+  from files and pipes, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

@@ -53,24 +53,6 @@ end
 
 -- comm: three-column compare of sorted files; -1 -2 -3 suppress columns
 
-global function applet_tac(args: sequence(string)): integer
-  if #args == 0 then args:push('-') end
-  local rc: integer = 0
-  for _, path in ipairs(args) do
-    local data, ok = util.readfile(path)
-    if not ok then rc = 1; continue end
-    -- records end with \n; a final partial record is printed first, as is.
-    local stop: usize = data.size
-    while stop > 0 do
-      local start: usize = stop
-      if data.data[stop - 1] == 10 then start = stop - 1 end
-      while start > 0 and data.data[start - 1] ~= 10 do start = start - 1 end
-      util.writebytes((@*[0]byte)(&data.data[start]), stop - start)
-      stop = start
-    end
-  end
-  return rc
-end
 
 -- fold: -w WIDTH (default 80), -s break at spaces, -b count bytes (always)
 -- fold: GNU coreutils 9.1 fold.c. -b counts bytes, -s breaks after the last

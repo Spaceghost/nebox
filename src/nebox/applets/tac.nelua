@@ -1,0 +1,354 @@
+-- tac: a port of GNU coreutils 9.1 src/tac.c. -b, -r, -s; tac_seekable's
+-- backward scan over a buffer that doubles when a record outgrows it (the
+-- separator itself kept in front as the sentinel), non-seekable input and
+-- terminals copied to a temporary file in $TMPDIR first. -r searches
+-- backward as glibc re_search does with re_syntax_options 0 (Emacs syntax:
+-- \( \) \| groups and alternation, + and ? operators, no intervals, ^ and $
+-- anchors only in context, newline anchors), translated for nebox's engine.
+-- One difference: in that syntax [^...] matches a newline; here it does not.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_mkstemp(t: cstring): cint <cimport 'mkstemp', cinclude '<stdlib.h>'> end
+local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
+
+local separator = '\n'
+local sentinel_length = 1
+local match_length = 1
+local separator_ends_record = true
+local prog: regex.Prog
+local mem: sequence(byte)   -- [sentinel][G_buffer...]
+local base = 0              -- index in mem (0-based) of G_buffer[0]
+local read_size = 8192
+local G_buffer_size = 0
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function die(msg: string) util.err(msg); util.flush(); c_exit(1) end
+
+local function G(i: integer): byte return mem[base + i + 1] end
+local function Gptr(i: integer): *[0]byte return (@*[0]byte)(&mem[base + i + 1]) end
+
+local function output(a: integer, b: integer)
+  if b > a then util.writebytes(Gptr(a), (@usize)(b - a)) end
+end
+
+local function safe_read(fd: cint, at: integer, n: integer): integer
+  while true do
+    local r = sys.read(fd, Gptr(at), (@csize)(n))
+    if r < 0 and sys.errno() == sys.EINTR then continue end
+    return r
+  end
+  return -1
+end
+
+-- Emacs regex syntax (re_syntax_options 0) to ERE.
+local function translate(p: string): (string, boolean)
+  local early_end = false
+  local sb: stringbuilder
+  local i = 1
+  local at_start = true   -- start of pattern or after \( or \|
+  while i <= #p do
+    local c = p:byte(i)
+    local next_start = false
+    if c == 92 and i < #p then
+      local d = p:byte(i + 1)
+      if d == 40 then sb:writebyte(40); next_start = true
+      elseif d == 41 then sb:writebyte(41)
+      elseif d == 124 then sb:writebyte(124); next_start = true
+      elseif d == 123 or d == 125 or d == 43 or d == 63 then sb:writebyte(92); sb:writebyte(d)
+      else sb:writebyte(92); sb:writebyte(d) end
+      i = i + 2
+    elseif c == 40 or c == 41 or c == 124 or c == 123 or c == 125 then
+      sb:writebyte(92); sb:writebyte(c); i = i + 1
+    elseif c == 91 then
+      local j = i + 1
+      if j <= #p and p:byte(j) == 94 then j = j + 1 end
+      if j > #p then early_end = true end
+      if j <= #p and p:byte(j) == 93 then j = j + 1 end
+      while j <= #p and p:byte(j) ~= 93 do j = j + 1 end
+      -- syntax 0 has no [: :] [. .] [= =]: a '[' inside is just a character,
+      -- so move lone '[' characters to the end where ERE reads them as such
+      local open = (i + 1 <= #p and p:byte(i + 1) == 94) and 2 or 1
+      local body = p:sub(i + open, j - 1)
+      local lead = ''
+      if #body > 0 and body:byte(1) == 93 then lead = ']'; body = body:sub(2) end
+      local plain: stringbuilder
+      local brackets = 0
+      local k = 1
+      while k <= #body do
+        local ch = body:byte(k)
+        if ch == 91 and not (k + 1 <= #body and body:byte(k + 1) == 45) and not (k > 1 and body:byte(k - 1) == 45) then
+          brackets = brackets + 1
+        else
+          plain:writebyte(ch)
+        end
+        k = k + 1
+      end
+      sb:write(p:sub(i, i + open - 1)); sb:write(lead); sb:write(plain:promote())
+      for _ = 1, brackets do sb:writebyte(91) end
+      if j <= #p then sb:writebyte(93) end
+      i = j + 1
+    elseif c == 94 then
+      if at_start then sb:writebyte(94); next_start = true else sb:write('\\^') end
+      i = i + 1
+    elseif c == 36 then
+      local nx = p:sub(i + 1, i + 2)
+      if i == #p or nx == '\\)' or nx == '\\|' then sb:writebyte(36) else sb:write('\\$') end
+      i = i + 1
+    elseif c == 42 or c == 43 or c == 63 then
+      if at_start then sb:writebyte(92) end
+      sb:writebyte(c); i = i + 1
+    else
+      sb:writebyte(c); i = i + 1
+    end
+    at_start = next_start
+  end
+  return sb:promote(), early_end
+end
+
+local function search_back(i: integer): (integer, integer)
+  -- re_search (buf, size i, start i-1, range 1-i): the first start, from
+  -- the right, where a match exists; longest there.
+  local text = (@string){data = Gptr(0), size = (@usize)(i)}
+  local caps: regex.Caps
+  local s = i - 1
+  while s >= 0 do
+    if prog:matchat(text, s, &caps) then return s, caps.at[1] - caps.at[0] end
+    s = s - 1
+  end
+  return -1, 0
+end
+
+local function grow()
+  local offset = sentinel_length > 0 and sentinel_length or 1
+  read_size = read_size * 2
+  G_buffer_size = read_size * 2 + sentinel_length + 2
+  mem:resize(offset + G_buffer_size + 1)
+end
+
+local function tac_seekable(fd: cint, file: string, file_pos: int64): boolean
+  local first_time = true
+  local remainder = file_pos % read_size
+  if remainder ~= 0 then
+    file_pos = file_pos - remainder
+    if sys.lseek(fd, file_pos, sys.SEEK_SET) < 0 then util.err(errno_msg(util.quotef(file) .. ': seek failed', sys.errno())) end
+  end
+  local saved_record_size = safe_read(fd, 0, read_size)
+  while saved_record_size == 0 and file_pos ~= 0 do
+    if sys.lseek(fd, -read_size, sys.SEEK_CUR) < 0 then util.err(errno_msg(util.quotef(file) .. ': seek failed', sys.errno())) end
+    file_pos = file_pos - read_size
+    saved_record_size = safe_read(fd, 0, read_size)
+  end
+  while saved_record_size == read_size do
+    local nread = safe_read(fd, 0, read_size)
+    if nread == 0 then break end
+    saved_record_size = nread
+    if nread < 0 then break end
+    file_pos = file_pos + nread
+  end
+  if saved_record_size < 0 then
+    util.err(errno_msg(util.quotef(file) .. ': read error', sys.errno()))
+    return false
+  end
+  local past_end = saved_record_size
+  local match_start = past_end
+  local first_char: byte = separator:byte(1)
+  local match_length1 = match_length - 1
+  if sentinel_length > 0 then match_start = match_start - match_length1 end
+  while true do
+    if sentinel_length == 0 then
+      local i = match_start
+      local range = 1 - i
+      if 1 < range then die('record too large') end
+      local ms, ml: integer = -1, 0
+      if range ~= 1 then ms, ml = search_back(i) end
+      if ms < 0 then match_start = -1
+      else match_start = ms; match_length = ml end
+    else
+      while true do
+        match_start = match_start - 1
+        if G(match_start) == first_char then
+          local same = true
+          for k = 1, match_length1 do
+            if G(match_start + k) ~= separator:byte(k + 1) then same = false; break end
+          end
+          if same then break end
+        end
+      end
+    end
+    if match_start < 0 then
+      if file_pos == 0 then
+        output(0, past_end)
+        return true
+      end
+      saved_record_size = past_end
+      if saved_record_size > read_size then grow() end
+      if file_pos >= read_size then file_pos = file_pos - read_size
+      else read_size = (@integer)(file_pos); file_pos = 0 end
+      if sys.lseek(fd, file_pos, sys.SEEK_SET) < 0 then util.err(errno_msg(util.quotef(file) .. ': seek failed', sys.errno())) end
+      -- shift the pending record right to make room
+      for k = saved_record_size - 1, 0, -1 do mem[base + read_size + k + 1] = mem[base + k + 1] end
+      past_end = read_size + saved_record_size
+      if sentinel_length > 0 then match_start = read_size else match_start = past_end end
+      if safe_read(fd, 0, read_size) ~= read_size then
+        util.err(errno_msg(util.quotef(file) .. ': read error', sys.errno()))
+        return false
+      end
+    else
+      if separator_ends_record then
+        local match_end = match_start + match_length
+        if not first_time or match_end ~= past_end then output(match_end, past_end) end
+        past_end = match_end
+        first_time = false
+      else
+        output(match_start, past_end)
+        past_end = match_start
+      end
+      if sentinel_length > 0 then match_start = match_start - (match_length - 1) end
+    end
+  end
+  return true
+end
+
+local tmp_fd: cint = -1
+local tmp_name = ''
+
+local function temp_stream(): boolean
+  if tmp_fd < 0 then
+    local t = sys.getenv('TMPDIR')
+    local tempdir: string = t ~= nilptr and (@string)(t) or '/tmp'
+    local tmpl = tempdir:sub(-1) == '/' and tempdir .. 'tacXXXXXX' or tempdir .. '/tacXXXXXX'
+    local buf: sequence(byte)
+    for k = 1, #tmpl do buf:push(tmpl:byte(k)) end
+    buf:push(0)
+    local fd = c_mkstemp((@cstring)(&buf[1]))
+    if fd < 0 then
+      util.err(errno_msg('failed to create temporary file in ' .. util.quoteaf(tempdir), sys.errno()))
+      return false
+    end
+    tmp_name = string.copy((@cstring)(&buf[1]))
+    sys.unlink(tmp_name)
+    tmp_fd = fd
+  else
+    if sys.lseek(tmp_fd, 0, sys.SEEK_SET) < 0 or c_ftruncate(tmp_fd, 0) < 0 then
+      util.err(errno_msg('failed to rewind stream for ' .. util.quoteaf(tmp_name), sys.errno()))
+      return false
+    end
+  end
+  return true
+end
+
+local function tac_nonseekable(fd: cint, file: string): boolean
+  if not temp_stream() then return false end
+  local copied: int64 = 0
+  while true do
+    local n = safe_read(fd, 0, read_size)
+    if n == 0 then break end
+    if n < 0 then
+      util.err(errno_msg(util.quotef(file) .. ': read error', sys.errno()))
+      return false
+    end
+    local off = 0
+    while off < n do
+      local w = sys.write(tmp_fd, Gptr(off), (@csize)(n - off))
+      if w < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        util.err(errno_msg(util.quotef(tmp_name) .. ': write error', sys.errno()))
+        return false
+      end
+      off = off + w
+    end
+    copied = copied + n
+  end
+  return tac_seekable(tmp_fd, tmp_name, copied)
+end
+
+local have_read_stdin = false
+
+local function tac_file(filename: string): boolean
+  local fd: cint
+  local is_stdin = filename == '-'
+  if is_stdin then
+    have_read_stdin = true
+    fd = 0
+    filename = 'standard input'
+  else
+    fd = sys.open(filename, sys.O_RDONLY, 0)
+    if fd < 0 then
+      util.err(errno_msg('failed to open ' .. util.quoteaf(filename) .. ' for reading', sys.errno()))
+      return false
+    end
+  end
+  local file_size = sys.lseek(fd, 0, 2)
+  local ok: boolean
+  if file_size < 0 or sys.isatty(fd) == 1 then ok = tac_nonseekable(fd, filename)
+  else ok = tac_seekable(fd, filename, file_size) end
+  if not is_stdin and sys.close(fd) ~= 0 then
+    util.err(errno_msg(util.quotef(filename) .. ': read error', sys.errno()))
+    ok = false
+  end
+  return ok
+end
+
+global function applet_tac(args: sequence(string)): integer
+  local longs: []util.LongOpt = {
+    {'before', 0, 98}, {'regex', 0, 114}, {'separator', 1, 115},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'brs:', &longs, #longs)
+  g.quiet = true
+  local regex_mode = false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 or c == util.UNSUPPORTED then
+      if c == 63 then util.err(g.errmsg) else util.err("option '--" .. g.longname .. "' is not supported") end
+      util.flush()
+      local m = "Try 'tac --help' for more information.\n"
+      sys.write(2, m.data, m.size)
+      return 1
+    end
+    if c == 98 then separator_ends_record = false
+    elseif c == 114 then regex_mode = true
+    elseif c == 115 then separator = g.optarg end
+  end
+  if regex_mode then
+    sentinel_length = 0
+    if #separator == 0 then die('separator cannot be empty') end
+    local e: string
+    -- glibc reports a pattern that ends right after "[" or "[^" as REG_BADPAT
+    local tr, early_end = translate(separator)
+    if early_end then die('Invalid regular expression') end
+    prog, e = regex.compile_nl(tr, true, false, true, true)
+    if #e > 0 then die(e) end
+  else
+    sentinel_length = #separator > 0 and #separator or 1
+    match_length = sentinel_length
+  end
+  read_size = 8192
+  while sentinel_length >= read_size // 2 do read_size = read_size * 2 end
+  G_buffer_size = 2 * (read_size + sentinel_length + 1)
+  local offset = sentinel_length > 0 and sentinel_length or 1
+  mem:resize(offset + G_buffer_size + 1)
+  if sentinel_length > 0 then
+    for k = 1, sentinel_length do mem[k] = #separator > 0 and separator:byte(k) or 0 end
+  end
+  base = offset
+  if #separator == 0 then separator = '\0' end
+  local files = g:operands()
+  if #files == 0 then files:push('-') end
+  local ok = true
+  for _, f in ipairs(files) do ok = tac_file(f) and ok end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  if have_read_stdin and sys.close(0) < 0 then util.err(errno_msg('-', sys.errno())); ok = false end
+  return ok and 0 or 1
+end
