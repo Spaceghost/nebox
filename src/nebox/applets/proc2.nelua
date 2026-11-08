@@ -193,29 +193,3 @@ global function applet_xargs(args: sequence(string)): integer
 end
 
 
-global function applet_factor(args: sequence(string)): integer
-  local nums: sequence(string)
-  if #args == 0 then
-    local data, ok = util.readfd(0)
-    if not ok then return 1 end
-    for _, line in ipairs(util.lines(data)) do
-      for w in line:gmatch('%S+') do nums:push(w) end
-    end
-  else
-    for _, a in ipairs(args) do nums:push(a) end
-  end
-  for _, s in ipairs(nums) do
-    local v, ok = util.toint(s)
-    if not ok or v < 0 then return util.die("'" .. s .. "' is not a valid positive integer") end
-    local n: uint64 = (@uint64)(v)
-    util.writef('%d:', n)
-    local p: uint64 = 2
-    while p * p <= n do
-      while n % p == 0 do util.writef(' %d', p); n = n // p end
-      p = p + (p == 2 and 1 or 2)
-    end
-    if n > 1 then util.writef(' %d', n) end
-    util.writebyte(10)
-  end
-  return 0
-end

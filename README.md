@@ -308,6 +308,17 @@ Stated here rather than worked around:
   statuses 0-3 (a match over nebox's thread bound fails with status 3 where
   GNU backtracks for hours). `tests/expr_compare.py`: 175 fixed and 3000 random
   expressions, 0 mismatches.
+- `factor` keeps factor.c's interface and output over its own factoring:
+  operands of any length (digits after spaces and one '+'), standard input
+  read token by token as it arrives, GNU's lbuf (numbers below 2^127 are
+  written in 512-byte line batches, larger ones at once, so the output
+  order through a pipe is GNU's). Below 2^64: trial division,
+  deterministic Miller-Rabin, Pollard-Brent with mulq/divq; up to 2^128:
+  Montgomery arithmetic; beyond: a base-2^32 bignum. Primality above 2^64
+  is Miller-Rabin over 25 prime bases, not GNU's Lucas proof, and the
+  bignum path is slower than GMP. `tests/factor_compare.py`: 72 fixed and
+  600 random numbers up to about 2^200 plus pipe and write-error cases,
+  0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
