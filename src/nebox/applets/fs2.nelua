@@ -103,42 +103,6 @@ function Chown:apply(path: string)
   end
 end
 
-local function chown_main(args: sequence(string), groupmode: boolean): integer
-  local o = util.parsel(args, 'RhvfcH', &longopts.chown, #longopts.chown)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands < 2 then
-    if #o.operands == 0 then return util.die('missing operand') end
-    return util.die("missing operand after '" .. o.operands[1] .. "'")
-  end
-  local c: Chown = {uid = -1, gid = -1, recursive = o:has('R'), nofollow = o:has('h'), verbose = o:has('v')}
-  local spec = o.operands[1]
-  local user, group: string = '', ''
-  if groupmode then group = spec
-  else
-    local colon = spec:find(':', 1, true)
-    if colon <= 0 then colon = spec:find('.', 1, true) end
-    if colon > 0 then user = spec:sub(1, colon - 1); group = spec:sub(colon + 1) else user = spec end
-  end
-  if user.size > 0 then
-    local v, ok = util.toint(user)
-    if ok then c.uid = v else
-      c.uid = util.userid(user)
-      if c.uid < 0 then return util.die("invalid user: '" .. spec .. "'") end
-    end
-  end
-  if group.size > 0 then
-    local v, ok = util.toint(group)
-    if ok then c.gid = v else
-      c.gid = util.groupid(group)
-      if c.gid < 0 then return util.die("invalid group: '" .. spec .. "'") end
-    end
-  end
-  for i = 2, #o.operands do c:apply(o.operands[i]) end
-  return c.rc
-end
-
-global function applet_chown(args: sequence(string)): integer return chown_main(args, false) end
-global function applet_chgrp(args: sequence(string)): integer return chown_main(args, true) end
 
 -- mktemp: replace the trailing XXXXXX run with random letters/digits
 local function fill_template(t: string): (string, boolean)

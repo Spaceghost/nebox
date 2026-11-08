@@ -1,0 +1,488 @@
+-- chown and chgrp: ports of GNU coreutils 9.1 src/chown.c, src/chgrp.c
+-- and src/chown-core.c over src/nebox/fts.nelua, with gnulib userspec.c
+-- (USER[:GROUP], the login group after a bare ':', numeric fallbacks, the
+-- "'.' should be ':'" warning). -c -f -h -v -R with -H/-L/-P, --dereference,
+-- --from, --reference, --preserve-root; restricted_chown's open/fstat/fchown
+-- path when --from is given, and every describe_change message.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.fts'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwnam(name: cstring): *Passwd <cimport 'getpwnam', cinclude '<pwd.h>'> end
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrnam(name: cstring): *Group <cimport 'getgrnam', cinclude '<grp.h>'> end
+local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
+local function c_fchown(fd: cint, uid: cuint, gid: cuint): cint <cimport 'fchown', cinclude '<unistd.h>'> end
+local function c_chown(path: cstring, uid: cuint, gid: cuint): cint <cimport 'chown', cinclude '<unistd.h>'> end
+local function c_lchown(path: cstring, uid: cuint, gid: cuint): cint <cimport 'lchown', cinclude '<unistd.h>'> end
+
+local NOID: cuint <comptime> = 0xffffffff
+local EOPNOTSUPP: cint <comptime> = 95
+local EACCES: cint <comptime> = 13
+
+local V_OFF <comptime> = 0
+local V_CHANGES <comptime> = 1
+local V_HIGH <comptime> = 2
+
+local CH_NOT_APPLIED <comptime> = 1
+local CH_SUCCEEDED <comptime> = 2
+local CH_FAILED <comptime> = 3
+local CH_NO_CHANGE_REQUESTED <comptime> = 4
+
+local RC_ok <comptime> = 2
+local RC_excluded <comptime> = 3
+local RC_inode_changed <comptime> = 4
+local RC_do_ordinary_chown <comptime> = 5
+local RC_error <comptime> = 6
+
+local Chopt = @record{
+  verbosity: integer,
+  have_root: boolean, root_dev: uint64, root_ino: uint64,
+  affect_symlink_referent: boolean,
+  recurse: boolean,
+  force_silent: boolean,
+  user_name: string, have_user_name: boolean,
+  group_name: string, have_group_name: boolean,
+}
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try '" .. util.applet .. " --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function uid_to_name(uid: cuint): string
+  local p = c_getpwuid(uid)
+  if p ~= nilptr then return string.copy((@string)(p.pw_name)) end
+  return tostring(uid)
+end
+local function gid_to_name(gid: cuint): string
+  local g = c_getgrgid(gid)
+  if g ~= nilptr then return string.copy((@string)(g.gr_name)) end
+  return tostring(gid)
+end
+
+-- xstrtoul (base 10, no suffixes) for ids.
+local function id_number(s: string): (boolean, uint64)
+  local st, v = util.xstrtoumax(s, '')
+  return st == 0, v
+end
+
+-- userspec.c parse_with_separator: SEP is the 1-based index of the
+-- separator in SPEC, or 0.
+local function parse_with_separator(spec: string, sep: integer, uid: *cuint, gid: *cuint, have_gid: boolean,
+    uname: *string, have_uname: *boolean, gname_out: *string, have_gname: *boolean): string
+  local error_msg = ''
+  local unum = $uid
+  local gnum: cuint = have_gid and $gid or NOID
+  $have_uname = false
+  $have_gname = false
+  local u = ''
+  local have_u = false
+  if sep == 0 then
+    if #spec > 0 then u = spec; have_u = true end
+  elseif sep > 1 then
+    u = spec:sub(1, sep - 1); have_u = true
+  end
+  local g = ''
+  local have_g = sep ~= 0 and sep < #spec
+  if have_g then g = spec:sub(sep + 1) end
+  local want_uname = true
+  local want_gname = true
+  local gname = ''
+  local have_gn = false
+  if have_u then
+    local pwd: *Passwd = nilptr
+    if u:byte(1) ~= 43 then pwd = c_getpwnam(u) end
+    if pwd == nilptr then
+      want_uname = false
+      if sep ~= 0 and not have_g then
+        error_msg = 'invalid spec'
+      else
+        local ok, tmp = id_number(u)
+        if ok and tmp <= 0xfffffffe then unum = (@cuint)(tmp)
+        else error_msg = 'invalid user' end
+      end
+    else
+      unum = pwd.pw_uid
+      if not have_g and sep ~= 0 then
+        gnum = pwd.pw_gid
+        local grp = c_getgrgid(gnum)
+        gname = grp ~= nilptr and string.copy((@string)(grp.gr_name)) or tostring(gnum)
+        have_gn = true
+      end
+    end
+  end
+  if have_g and #error_msg == 0 then
+    local grp: *Group = nilptr
+    if g:byte(1) ~= 43 then grp = c_getgrnam(g) end
+    if grp == nilptr then
+      want_gname = false
+      local ok, tmp = id_number(g)
+      if ok and tmp <= 0xfffffffe then gnum = (@cuint)(tmp)
+      else error_msg = 'invalid group' end
+    else
+      gnum = grp.gr_gid
+    end
+    gname = g; have_gn = true
+  end
+  if #error_msg == 0 then
+    $uid = unum
+    if have_gid then $gid = gnum end
+    if want_uname and have_u then $uname = u; $have_uname = true end
+    if want_gname and have_gn then $gname_out = gname; $have_gname = true end
+  end
+  return error_msg
+end
+
+-- parse_user_spec_warn: (message, is it a warning).
+local function parse_user_spec_warn(spec: string, uid: *cuint, gid: *cuint, have_gid: boolean,
+    uname: *string, have_uname: *boolean, gname: *string, have_gname: *boolean): (string, boolean)
+  local colon = have_gid and spec:find(':', 1, true) or 0
+  local msg = parse_with_separator(spec, colon, uid, gid, have_gid, uname, have_uname, gname, have_gname)
+  local warn = false
+  if have_gid and colon == 0 and #msg > 0 then
+    local dot = spec:find('.', 1, true)
+    if dot > 0 and #parse_with_separator(spec, dot, uid, gid, have_gid, uname, have_uname, gname, have_gname) == 0 then
+      warn = true
+      msg = "warning: '.' should be ':'"
+    end
+  end
+  return msg, warn
+end
+
+local function user_group_str(user: string, have_user: boolean, group: string, have_group: boolean): (string, boolean)
+  if have_user then
+    if have_group then return user .. ':' .. group, true end
+    return user, true
+  elseif have_group then
+    return group, true
+  end
+  return '', false
+end
+
+local function describe_change(file: string, changed: integer, old_user: string, old_group: string, have_old: boolean,
+    user: string, have_user: boolean, group: string, have_group: boolean)
+  if changed == CH_NOT_APPLIED then
+    util.write('neither symbolic link ' .. util.quoteaf(file) .. ' nor referent has been changed\n')
+    return
+  end
+  local spec, have_spec = user_group_str(user, have_user, group, have_group)
+  local old_spec, have_old_spec = user_group_str(old_user, have_user and have_old, old_group, have_group and have_old)
+  local q = util.quoteaf(file)
+  local out: string
+  if changed == CH_SUCCEEDED then
+    if have_user then out = 'changed ownership of ' .. q .. ' from ' .. old_spec .. ' to ' .. spec
+    elseif have_group then out = 'changed group of ' .. q .. ' from ' .. old_spec .. ' to ' .. spec
+    else out = 'no change to ownership of ' .. q end
+  elseif changed == CH_FAILED then
+    if have_old_spec then
+      if have_user then out = 'failed to change ownership of ' .. q .. ' from ' .. old_spec .. ' to ' .. spec
+      elseif have_group then out = 'failed to change group of ' .. q .. ' from ' .. old_spec .. ' to ' .. spec
+      else out = 'failed to change ownership of ' .. q end
+    else
+      if have_user then out = 'failed to change ownership of ' .. q .. ' to ' .. spec
+      elseif have_group then out = 'failed to change group of ' .. q .. ' to ' .. spec
+      else out = 'failed to change ownership of ' .. q end
+    end
+  else
+    -- printf (fmt, file, old_spec, spec): "retained as %s" shows OLD_SPEC
+    if have_user then out = 'ownership of ' .. q .. ' retained as ' .. (have_old_spec and old_spec or '(null)')
+    elseif have_group then out = 'group of ' .. q .. ' retained as ' .. (have_old_spec and old_spec or '(null)')
+    else out = 'ownership of ' .. q .. ' retained' end
+  end
+  util.write(out .. '\n')
+end
+
+local function restricted_chown(file: string, orig: *sys.Stat, uid: cuint, gid: cuint, ruid: cuint, rgid: cuint): integer
+  if ruid == NOID and rgid == NOID then return RC_do_ordinary_chown end
+  local flags: cint = 0x800 | 0x100
+  local f = orig.st_mode & sys.S_IFMT
+  if f ~= 0x8000 then
+    if f == sys.S_IFDIR then flags = flags | sys.O_DIRECTORY
+    else return RC_do_ordinary_chown end
+  end
+  local fd = sys.open(file, sys.O_RDONLY | flags, 0)
+  if fd < 0 then
+    local e = sys.errno()
+    if e == EACCES and f == 0x8000 then fd = sys.open(file, sys.O_WRONLY | flags, 0) end
+    if fd < 0 then return sys.errno() == EACCES and RC_do_ordinary_chown or RC_error end
+  end
+  local st: sys.Stat
+  local status = RC_ok
+  if sys.fstat(fd, &st) ~= 0 then status = RC_error
+  elseif orig.st_dev ~= st.st_dev or orig.st_ino ~= st.st_ino then status = RC_inode_changed
+  elseif (ruid == NOID or ruid == st.st_uid) and (rgid == NOID or rgid == st.st_gid) then
+    if c_fchown(fd, uid, gid) == 0 then
+      return sys.close(fd) == 0 and RC_ok or RC_error
+    end
+    status = RC_error
+  end
+  local saved = sys.errno()
+  sys.close(fd)
+  sys.seterrno(saved)
+  return status
+end
+
+local function root_warn(name: string)
+  if name == '/' then util.err('it is dangerous to operate recursively on ' .. util.quoteaf('/'))
+  else util.err('it is dangerous to operate recursively on ' .. util.quoteaf(name) .. ' (same as ' .. util.quoteaf('/') .. ')') end
+  util.err('use --no-preserve-root to override this failsafe')
+end
+
+local function change_file_owner(sp: *fts.FTS, ent: *fts.Ent, uid: cuint, gid: cuint, ruid: cuint, rgid: cuint, c: *Chopt): boolean
+  local file = ent.path
+  local ok = true
+  local do_chown = false
+  local symlink_changed = true
+  local file_stats: *sys.Stat = nilptr
+  local stat_buf: sys.Stat
+  local info = ent.info
+  if info == fts.D then
+    if c.recurse then
+      if c.have_root and ent.st.st_dev == c.root_dev and ent.st.st_ino == c.root_ino then
+        root_warn(file)
+        fts.set(ent, fts.SKIP)
+        fts.read(sp)
+        return false
+      end
+      return true
+    end
+  elseif info == fts.DP then
+    if not c.recurse then return true end
+  elseif info == fts.NS then
+    if ent.level == 0 and ent.number == 0 then
+      ent.number = 1
+      fts.set(ent, fts.AGAIN)
+      return true
+    end
+    if not c.force_silent then util.err(errno_msg('cannot access ' .. util.quoteaf(file), ent.err)) end
+    ok = false
+  elseif info == fts.ERR then
+    if not c.force_silent then util.err(errno_msg(util.quotef(file), ent.err)) end
+    ok = false
+  elseif info == fts.DNR then
+    if not c.force_silent then util.err(errno_msg('cannot read directory ' .. util.quoteaf(file), ent.err)) end
+    ok = false
+  elseif info == fts.DC then
+    local phys = (sp.options & fts.PHYSICAL) ~= 0
+    local com = (sp.options & fts.COMFOLLOW) ~= 0
+    if (phys and not com) or (phys and com and ent.level ~= 0) then
+      util.err('WARNING: Circular directory structure.\nThis almost certainly means that you have a corrupted file system.\nNOTIFY YOUR SYSTEM MANAGER.\nThe following directory is part of the cycle:\n  ' .. util.quotef(file) .. '\n')
+      return false
+    end
+  end
+  if not ok then
+    do_chown = false
+    file_stats = nilptr
+  elseif ruid == NOID and rgid == NOID and c.verbosity == V_OFF and not c.have_root and not c.affect_symlink_referent then
+    do_chown = true
+    file_stats = &ent.st
+  else
+    file_stats = &ent.st
+    if c.affect_symlink_referent and (file_stats.st_mode & sys.S_IFMT) == sys.S_IFLNK then
+      if sys.stat(file, &stat_buf) ~= 0 then
+        if not c.force_silent then util.err(errno_msg('cannot dereference ' .. util.quoteaf(file), sys.errno())) end
+        ok = false
+        -- GNU goes on to describe the change from an uninitialized stat
+        -- buffer (undefined); the link's own owner is shown instead.
+        stat_buf = ent.st
+      end
+      file_stats = &stat_buf
+    end
+    do_chown = ok and (ruid == NOID or ruid == file_stats.st_uid) and (rgid == NOID or rgid == file_stats.st_gid)
+  end
+  local isdir = info == fts.D or info == fts.DC or info == fts.DP or info == fts.DNR
+  if ok and isdir and c.have_root and file_stats.st_dev == c.root_dev and file_stats.st_ino == c.root_ino then
+    root_warn(file)
+    return false
+  end
+  if do_chown then
+    if not c.affect_symlink_referent then
+      ok = c_lchown(file, uid, gid) == 0
+      if not ok and sys.errno() == EOPNOTSUPP then ok = true; symlink_changed = false end
+    else
+      local err = restricted_chown(file, file_stats, uid, gid, ruid, rgid)
+      if err == RC_ok then
+      elseif err == RC_do_ordinary_chown then ok = c_chown(file, uid, gid) == 0
+      elseif err == RC_error then ok = false
+      else do_chown = false; ok = false end
+    end
+    if do_chown and not ok and not c.force_silent then
+      util.err(errno_msg((uid ~= NOID and 'changing ownership of ' or 'changing group of ') .. util.quoteaf(file), sys.errno()))
+    end
+  end
+  if c.verbosity ~= V_OFF then
+    local changed = (do_chown and ok and symlink_changed)
+      and not ((uid == NOID or uid == file_stats.st_uid) and (gid == NOID or gid == file_stats.st_gid))
+    if changed or c.verbosity == V_HIGH then
+      local ch: integer
+      if not ok then ch = CH_FAILED
+      elseif not symlink_changed then ch = CH_NOT_APPLIED
+      elseif not changed then ch = CH_NO_CHANGE_REQUESTED
+      else ch = CH_SUCCEEDED end
+      local have_old = file_stats ~= nilptr
+      local old_usr = have_old and uid_to_name(file_stats.st_uid) or ''
+      local old_grp = have_old and gid_to_name(file_stats.st_gid) or ''
+      local new_usr, have_nu = c.user_name, c.have_user_name
+      if not have_nu and uid ~= NOID then new_usr = tostring(uid); have_nu = true end
+      local new_grp, have_ng = c.group_name, c.have_group_name
+      if not have_ng and gid ~= NOID then new_grp = tostring(gid); have_ng = true end
+      describe_change(file, ch, old_usr, old_grp, have_old, new_usr, have_nu, new_grp, have_ng)
+    end
+  end
+  if not c.recurse then fts.set(ent, fts.SKIP) end
+  return ok
+end
+
+local function chown_files(files: sequence(string), bit_flags: integer, uid: cuint, gid: cuint, ruid: cuint, rgid: cuint, c: *Chopt): boolean
+  local ok = true
+  local stat_flags = (ruid ~= NOID or rgid ~= NOID or c.affect_symlink_referent or c.verbosity ~= V_OFF) and 0 or fts.NOSTAT
+  local sp = fts.open(files, bit_flags | stat_flags)
+  while true do
+    local ent = fts.read(&sp)
+    if ent == nilptr then break end
+    ok = change_file_owner(&sp, ent, uid, gid, ruid, rgid, c) and ok
+  end
+  return ok
+end
+
+local function chown_main(args: sequence(string), is_chgrp: boolean): integer
+  local preserve_root = false
+  local uid: cuint = NOID
+  local gid: cuint = NOID
+  local ruid: cuint = NOID
+  local rgid: cuint = NOID
+  local bit_flags = fts.PHYSICAL
+  local dereference = -1
+  local c: Chopt
+  c.affect_symlink_referent = true
+  local reference_file = ''
+  local have_ref = false
+  local longs: []util.LongOpt = {
+    {'recursive', 0, 82}, {'changes', 0, 99}, {'dereference', 0, 256}, {'from', 1, 257},
+    {'no-dereference', 0, 104}, {'no-preserve-root', 0, 258}, {'preserve-root', 0, 259},
+    {'quiet', 0, 102}, {'silent', 0, 102}, {'reference', 1, 260}, {'verbose', 0, 118},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local glongs: []util.LongOpt = {
+    {'recursive', 0, 82}, {'changes', 0, 99}, {'dereference', 0, 256},
+    {'no-dereference', 0, 104}, {'no-preserve-root', 0, 258}, {'preserve-root', 0, 259},
+    {'quiet', 0, 102}, {'silent', 0, 102}, {'reference', 1, 260}, {'verbose', 0, 118},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = is_chgrp and util.getopt(args, 'HLPRcfhv', &glongs, #glongs) or util.getopt(args, 'HLPRcfhv', &longs, #longs)
+  g.quiet = true
+  while true do
+    local o = g:next()
+    if o == -1 then break end
+    if o == 63 then usage_fail(g.errmsg) end
+    if o == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if o == 72 then bit_flags = fts.COMFOLLOW | fts.PHYSICAL
+    elseif o == 76 then bit_flags = fts.LOGICAL
+    elseif o == 80 then bit_flags = fts.PHYSICAL
+    elseif o == 104 then dereference = 0
+    elseif o == 256 then dereference = 1
+    elseif o == 258 then preserve_root = false
+    elseif o == 259 then preserve_root = true
+    elseif o == 260 then reference_file = g.optarg; have_ref = true
+    elseif o == 257 and not is_chgrp then
+      local un, hu, gn, hg = '', false, '', false
+      local e, warn = parse_user_spec_warn(g.optarg, &ruid, &rgid, true, &un, &hu, &gn, &hg)
+      if #e > 0 then
+        util.err(e .. ': ' .. util.quote(g.optarg))
+        if not warn then util.flush(); c_exit(1) end
+      end
+    elseif o == 82 then c.recurse = true
+    elseif o == 99 then c.verbosity = V_CHANGES
+    elseif o == 102 then c.force_silent = true
+    elseif o == 118 then c.verbosity = V_HIGH
+    end
+  end
+  if c.recurse then
+    if bit_flags == fts.PHYSICAL then
+      if dereference == 1 then die('-R --dereference requires either -H or -L') end
+      dereference = 0
+    end
+  else
+    bit_flags = fts.PHYSICAL
+  end
+  c.affect_symlink_referent = dereference ~= 0
+  local ops = g:operands()
+  if #ops < (have_ref and 1 or 2) then
+    if #ops == 0 then usage_fail('missing operand') end
+    usage_fail('missing operand after ' .. util.quote(ops[#ops]))
+  end
+  local files: sequence(string)
+  if have_ref then
+    local rs: sys.Stat
+    if sys.stat(reference_file, &rs) ~= 0 then
+      die(errno_msg('failed to get attributes of ' .. util.quoteaf(reference_file), sys.errno()))
+    end
+    if not is_chgrp then
+      uid = rs.st_uid
+      c.user_name = uid_to_name(rs.st_uid); c.have_user_name = true
+    end
+    gid = rs.st_gid
+    c.group_name = gid_to_name(rs.st_gid); c.have_group_name = true
+    for i = 1, #ops do files:push(ops[i]) end
+  else
+    if is_chgrp then
+      local name = ops[1]
+      if #name > 0 then
+        c.group_name = name; c.have_group_name = true
+        local grp = c_getgrnam(name)
+        if grp ~= nilptr then gid = grp.gr_gid
+        else
+          local ok, tmp = id_number(name)
+          if not (ok and tmp <= 0xffffffff) then die('invalid group: ' .. util.quote(name)) end
+          gid = (@cuint)(tmp)
+        end
+      end
+    else
+      local e, warn = parse_user_spec_warn(ops[1], &uid, &gid, true, &c.user_name, &c.have_user_name, &c.group_name, &c.have_group_name)
+      if #e > 0 then
+        util.err(e .. ': ' .. util.quote(ops[1]))
+        if not warn then util.flush(); c_exit(1) end
+      end
+      if not c.have_user_name and c.have_group_name then c.user_name = ''; c.have_user_name = true end
+    end
+    for i = 2, #ops do files:push(ops[i]) end
+  end
+  if c.recurse and preserve_root then
+    local rs: sys.Stat
+    if sys.lstat('/', &rs) ~= 0 then die(errno_msg('failed to get attributes of ' .. util.quoteaf('/'), sys.errno())) end
+    c.have_root = true; c.root_dev = rs.st_dev; c.root_ino = rs.st_ino
+  end
+  bit_flags = bit_flags | fts.DEFER_STAT
+  local ok = chown_files(files, bit_flags, uid, gid, ruid, rgid, &c)
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end
+
+global function applet_chown(args: sequence(string)): integer return chown_main(args, false) end
+global function applet_chgrp(args: sequence(string)): integer return chown_main(args, true) end

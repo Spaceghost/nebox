@@ -201,6 +201,18 @@ Stated here rather than worked around:
   `tests/du_compare.py`: 238 cases, 0 mismatches. Not exercised: the inode
   sort past 10000 entries and the cycle warning, which needs a bind-mount
   loop.
+- `chown` and `chgrp` port chown.c, chgrp.c and chown-core.c with gnulib
+  userspec.c over `src/nebox/fts.nelua`, a shared iterator modeled on
+  gnulib fts_read/fts_build/fts_stat (PHYSICAL, LOGICAL, COMFOLLOW, NOSTAT,
+  XDEV, DEFER_STAT, cycle detection for LOGICAL and TIGHT_CYCLE_CHECK,
+  SKIP/AGAIN, DNR/ERR). -c -f -h -v -R -H -L -P, `--dereference`, `--from`,
+  `--reference`, `--preserve-root`, restricted_chown's fchown path under
+  `--from`, every describe_change message (including "retained as" showing
+  the old owner, as GNU's printf arguments do). One deliberate difference:
+  when a symlink can't be dereferenced GNU describes the failed change from
+  an uninitialized stat buffer; nebox shows the link's own owner.
+  `tests/chown_compare.py`: 273 cases, 0 mismatches, run both as an
+  ordinary user and as root.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

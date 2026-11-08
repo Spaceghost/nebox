@@ -64,6 +64,7 @@ test: $(OUT)/nebox
 	python3 tests/ln_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/df_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/du_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/chown_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400

@@ -1,0 +1,332 @@
+-- gnulib fts as coreutils uses it, as an iterator: fts.open / fts.read /
+-- fts.set. Modeled on fts_read, fts_build and fts_stat: FTS_PHYSICAL,
+-- FTS_LOGICAL, FTS_COMFOLLOW (roots followed), FTS_NOSTAT (d_type spares
+-- the stat of non-directories, stats deferred to the visit otherwise
+-- done while reading the directory), FTS_XDEV, FTS_DEFER_STAT (roots
+-- after the first stat'ed when reached), FTS_TIGHT_CYCLE_CHECK and
+-- FTS_LOGICAL cycle detection (FTS_DC) through the set of active
+-- directories, FTS_SKIP (the directory comes back once more as FTS_DP),
+-- FTS_AGAIN, FTS_DNR/FTS_ERR from opendir/readdir failures, trailing
+-- slashes on roots trimmed to one, and gnulib's inode-order sort past
+-- 10000 entries off tmpfs/NFS/CIFS. Paths are whole (no FTS_CWDFD
+-- descriptor ring), so names past PATH_MAX fail. The approximate cycle
+-- check gnulib uses for plain physical walks is not done.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+
+global fts = @record{}
+global fts.COMFOLLOW: integer <comptime> = 0x0001
+global fts.LOGICAL: integer <comptime> = 0x0002
+global fts.NOCHDIR: integer <comptime> = 0x0004
+global fts.NOSTAT: integer <comptime> = 0x0008
+global fts.PHYSICAL: integer <comptime> = 0x0010
+global fts.SEEDOT: integer <comptime> = 0x0020
+global fts.XDEV: integer <comptime> = 0x0040
+global fts.TIGHT_CYCLE_CHECK: integer <comptime> = 0x0100
+global fts.CWDFD: integer <comptime> = 0x0200
+global fts.DEFER_STAT: integer <comptime> = 0x0400
+
+global fts.D: integer <comptime> = 1
+global fts.DC: integer <comptime> = 2
+global fts.DEFAULT: integer <comptime> = 3
+global fts.DNR: integer <comptime> = 4
+global fts.DOT: integer <comptime> = 5
+global fts.DP: integer <comptime> = 6
+global fts.ERR: integer <comptime> = 7
+global fts.F: integer <comptime> = 8
+global fts.INIT: integer <comptime> = 9
+global fts.NS: integer <comptime> = 10
+global fts.NSOK: integer <comptime> = 11
+global fts.SL: integer <comptime> = 12
+global fts.SLNONE: integer <comptime> = 13
+
+global fts.AGAIN: integer <comptime> = 1
+global fts.FOLLOW: integer <comptime> = 2
+global fts.NOINSTR: integer <comptime> = 3
+global fts.SKIP: integer <comptime> = 4
+
+global fts.Ent = @record{
+  path: string,
+  name: string,
+  level: integer,
+  info: integer,
+  err: cint,
+  number: integer,        -- free for the caller (fts_number)
+  instr: integer,
+  st: sys.Stat,
+  stat_required: boolean,
+  dtype: byte,
+  parent: *fts.Ent,
+}
+
+local Frame = @record{ dir: *fts.Ent, kids: sequence(fts.Ent), idx: integer }
+local Active = @record{ dev: uint64, ino: uint64 }
+
+global fts.FTS = @record{
+  options: integer,
+  roots: sequence(fts.Ent),
+  ri: integer,
+  cur: *fts.Ent,
+  dev: uint64,
+  started: boolean,
+  frames: sequence(Frame),
+  active: sequence(Active),
+  last_errno: cint,
+}
+
+local function isdot(n: string): boolean return n == '.' or n == '..' end
+
+local function fts_stat(sp: *fts.FTS, p: *fts.Ent, follow: boolean): integer
+  if (sp.options & fts.LOGICAL) ~= 0 or ((sp.options & fts.COMFOLLOW) ~= 0 and p.level == 0) then follow = true end
+  local r: cint
+  if follow then r = sys.stat(p.path, &p.st) else r = sys.lstat(p.path, &p.st) end
+  if r < 0 then
+    local e = sys.errno()
+    if follow and e == 2 and sys.lstat(p.path, &p.st) == 0 then
+      sys.seterrno(0)
+      return fts.SLNONE
+    end
+    p.err = e
+    p.st = {}
+    return fts.NS
+  end
+  local f = p.st.st_mode & sys.S_IFMT
+  if f == sys.S_IFDIR then
+    if isdot(p.name) then return p.level == 0 and fts.D or fts.DOT end
+    return fts.D
+  end
+  if f == sys.S_IFLNK then return fts.SL end
+  if f == 0x8000 then return fts.F end
+  return fts.DEFAULT
+end
+
+function fts.open(paths: sequence(string), options: integer): fts.FTS
+  local sp: fts.FTS
+  sp.options = options
+  if (options & fts.LOGICAL) ~= 0 then sp.options = sp.options | fts.NOCHDIR end
+  for i = 1, #paths do
+    local v = paths[i]
+    local len = #v
+    if 2 < len and v:byte(len) == 47 then
+      while 1 < len and v:byte(len - 1) == 47 do len = len - 1 end
+    end
+    local e: fts.Ent
+    e.path = v:sub(1, len)
+    e.name = e.path
+    e.level = 0
+    e.instr = fts.NOINSTR
+    sp.roots:push(e)
+  end
+  for i = 1, #sp.roots do
+    local p = &sp.roots[i]
+    if i > 1 then
+      p.info = fts.NSOK
+      p.stat_required = true
+    else
+      p.info = fts_stat(&sp, p, (options & fts.COMFOLLOW) ~= 0)
+    end
+  end
+  return sp
+end
+
+function fts.set(p: *fts.Ent, instr: integer) p.instr = instr end
+
+local function enter_dir(sp: *fts.FTS, p: *fts.Ent)
+  if (sp.options & (fts.LOGICAL | fts.TIGHT_CYCLE_CHECK)) == 0 then return end
+  for i = 1, #sp.active do
+    if sp.active[i].dev == p.st.st_dev and sp.active[i].ino == p.st.st_ino then
+      p.info = fts.DC
+      return
+    end
+  end
+  sp.active:push({dev = p.st.st_dev, ino = p.st.st_ino})
+end
+
+local function leave_dir(sp: *fts.FTS, p: *fts.Ent)
+  if (sp.options & (fts.LOGICAL | fts.TIGHT_CYCLE_CHECK)) == 0 then return end
+  for i = #sp.active, 1, -1 do
+    if sp.active[i].dev == p.st.st_dev and sp.active[i].ino == p.st.st_ino then
+      sp.active:remove(i)
+      return
+    end
+  end
+end
+
+local function child_less(a: *fts.Ent, b: *fts.Ent): boolean return a.st.st_ino < b.st.st_ino end
+
+local function sort_kids(v: *sequence(fts.Ent))
+  local n = #v
+  if n < 2 then return end
+  local tmp: sequence(fts.Ent)
+  tmp:resize(n)
+  local width = 1
+  while width < n do
+    local i = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local a, b, k = i, mid, i
+      while a < mid and b < hi do
+        if child_less(&v[b], &v[a]) then tmp[k] = v[b]; b = b + 1 else tmp[k] = v[a]; a = a + 1 end
+        k = k + 1
+      end
+      while a < mid do tmp[k] = v[a]; a = a + 1; k = k + 1 end
+      while b < hi do tmp[k] = v[b]; b = b + 1; k = k + 1 end
+      i = hi
+    end
+    for j = 1, n do v[j] = tmp[j] end
+    width = width * 2
+  end
+  tmp:destroy()
+end
+
+-- fts_build (BREAD): true with a frame pushed, false when CUR comes back
+-- by itself (FTS_DNR, FTS_ERR or, when empty, FTS_DP).
+local function build(sp: *fts.FTS, cur: *fts.Ent): boolean
+  local nofollow = (sp.options & fts.PHYSICAL) ~= 0 and not ((sp.options & fts.COMFOLLOW) ~= 0 and cur.level == 0)
+  local fd = sys.open(cur.path, sys.O_RDONLY | sys.O_DIRECTORY | 0x100 | 0x800 | 0x80000 | (nofollow and sys.O_NOFOLLOW or 0), 0)
+  local d: *sys.DIR = nilptr
+  if fd >= 0 then
+    d = c_fdopendir(fd)
+    if d == nilptr then sys.close(fd) end
+  end
+  if d == nilptr then
+    cur.info = fts.DNR
+    cur.err = sys.errno()
+    return false
+  end
+  if cur.info == fts.NSOK then
+    cur.info = fts_stat(sp, cur, false)
+  elseif (sp.options & fts.TIGHT_CYCLE_CHECK) ~= 0 then
+    leave_dir(sp, cur)
+    fts_stat(sp, cur, false)
+    enter_dir(sp, cur)
+  end
+  local fr: Frame
+  fr.dir = cur
+  fr.idx = 1
+  local base = cur.path:sub(-1) == '/' and cur.path:sub(1, #cur.path - 1) or cur.path
+  local nostat = (sp.options & fts.NOSTAT) ~= 0
+  local physical = (sp.options & fts.PHYSICAL) ~= 0
+  while true do
+    sys.seterrno(0)
+    local de = sys.readdir(d)
+    if de == nilptr then
+      local e = sys.errno()
+      if e ~= 0 then
+        cur.err = e
+        cur.info = #fr.kids > 0 and fts.ERR or fts.DNR
+      end
+      break
+    end
+    local n = sys.cstr(&de.d_name)
+    if (sp.options & fts.SEEDOT) == 0 and isdot(n) then continue end
+    local p: fts.Ent
+    p.name = string.copy(n)
+    p.path = base .. '/' .. p.name
+    p.level = cur.level + 1
+    p.parent = cur
+    p.instr = fts.NOINSTR
+    p.dtype = de.d_type
+    fr.kids:push(p)
+    local q = &fr.kids[#fr.kids]
+    if nostat then
+      local skip_stat = de.d_type ~= 0 and de.d_type ~= 4 and (physical or de.d_type ~= 10)
+      q.info = fts.NSOK
+      q.st.st_ino = de.d_ino
+      q.stat_required = not skip_stat
+    else
+      q.info = fts_stat(sp, q, false)
+    end
+  end
+  sys.closedir(d)
+  if #fr.kids == 0 then
+    if cur.info ~= fts.DNR and cur.info ~= fts.ERR then cur.info = fts.DP end
+    return false
+  end
+  if #fr.kids > 10000 then
+    local fs: sys.Statfs
+    local ft: int64 = 0
+    if sys.statfs(cur.path, &fs) == 0 then ft = fs.f_type end
+    if ft ~= 0xFF534D42 and ft ~= 0x6969 and ft ~= 0x01021994 then sort_kids(&fr.kids) end
+  end
+  sp.frames:push(fr)
+  return true
+end
+
+local function check_for_dir(sp: *fts.FTS, p: *fts.Ent): *fts.Ent
+  sp.cur = p
+  if p.info == fts.NSOK and p.stat_required then p.info = fts_stat(sp, p, false) end
+  if p.info == fts.D then
+    if p.level == 0 then sp.dev = p.st.st_dev end
+    enter_dir(sp, p)
+  end
+  return p
+end
+
+-- The next entry, or nilptr when the walk is over.
+function fts.read(sp: *fts.FTS): *fts.Ent
+  if not sp.started then
+    sp.started = true
+    if #sp.roots == 0 then sp.cur = nilptr; return nilptr end
+    sp.ri = 1
+    return check_for_dir(sp, &sp.roots[1])
+  end
+  local p = sp.cur
+  if p == nilptr then return nilptr end
+  local instr = p.instr
+  p.instr = fts.NOINSTR
+  if instr == fts.AGAIN then
+    p.info = fts_stat(sp, p, false)
+    return p
+  end
+  if p.info == fts.D then
+    if instr == fts.SKIP or ((sp.options & fts.XDEV) ~= 0 and p.st.st_dev ~= sp.dev) then
+      p.info = fts.DP
+      leave_dir(sp, p)
+      return p
+    end
+    if not build(sp, p) then
+      if p.err ~= 0 and p.info ~= fts.DNR then p.info = fts.ERR end
+      leave_dir(sp, p)
+      return p
+    end
+    local fr = &sp.frames[#sp.frames]
+    return check_for_dir(sp, &fr.kids[1])
+  end
+  while true do
+    if #sp.frames == 0 then
+      sp.ri = sp.ri + 1
+      if sp.ri > #sp.roots then sp.cur = nilptr; return nilptr end
+      return check_for_dir(sp, &sp.roots[sp.ri])
+    end
+    local fr = &sp.frames[#sp.frames]
+    fr.idx = fr.idx + 1
+    if fr.idx <= #fr.kids then
+      local q = &fr.kids[fr.idx]
+      if q.instr == fts.SKIP then continue end
+      return check_for_dir(sp, q)
+    end
+    local dir = fr.dir
+    for i = 1, #fr.kids do
+      fr.kids[i].path:destroy()
+      fr.kids[i].name:destroy()
+    end
+    fr.kids:destroy()
+    sp.frames:pop()
+    sp.cur = dir
+    if dir.info ~= fts.DC then
+      dir.info = dir.err ~= 0 and fts.ERR or fts.DP
+      if dir.err == 0 then leave_dir(sp, dir) end
+    end
+    return dir
+  end
+  return nilptr
+end

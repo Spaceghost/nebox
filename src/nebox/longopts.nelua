@@ -97,10 +97,3 @@ global longopts.pwd: []util.LongOpt = {
   {'logical', 0, 76}, {'physical', 0, 80}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.chown: []util.LongOpt = {
-  {'recursive', 0, 82}, {'changes', 0, 99}, {'dereference', 0, util.UNSUPPORTED},
-  {'from', 1, util.UNSUPPORTED}, {'no-dereference', 0, 104},
-  {'no-preserve-root', 0, util.UNSUPPORTED}, {'preserve-root', 0, util.UNSUPPORTED},
-  {'quiet', 0, 102}, {'silent', 0, 102}, {'reference', 1, util.UNSUPPORTED}, {'verbose', 0, 118},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
