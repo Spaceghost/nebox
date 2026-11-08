@@ -1,0 +1,210 @@
+-- tsort: a port of GNU coreutils 9.1 src/tsort.c. Knuth's algorithm T over
+-- the items in strcmp order (the in-order walk of GNU's balanced tree),
+-- successor lists newest first, and detect_loop's printing of each cycle
+-- on standard error before breaking it.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'hashmap'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local Succ = @record{ suc: integer, next: integer }
+local Item = @record{ str: string, count: integer, printed: boolean, top: integer, qlink: integer }
+
+local items: sequence(Item)      -- 1-based; 0 is NULL
+local succs: sequence(Succ)
+local order: sequence(integer)   -- items in strcmp order
+local head = 0
+local zeros = 0
+local loop = 0
+local n_strings = 0
+
+local function less(a: string, b: string): boolean
+  local n = #a < #b and #a or #b
+  for i = 1, n do
+    local x, y = a:byte(i), b:byte(i)
+    if x ~= y then return x < y end
+  end
+  return #a < #b
+end
+
+local function sort_order()
+  local n = #order
+  local tmp: sequence(integer)
+  tmp:resize(n)
+  local width = 1
+  while width < n do
+    local i = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local a, b, k = i, mid, i
+      while a < mid and b < hi do
+        if less(items[order[b]].str, items[order[a]].str) then tmp[k] = order[b]; b = b + 1 else tmp[k] = order[a]; a = a + 1 end
+        k = k + 1
+      end
+      while a < mid do tmp[k] = order[a]; a = a + 1; k = k + 1 end
+      while b < hi do tmp[k] = order[b]; b = b + 1; k = k + 1 end
+      i = hi
+    end
+    for j = 1, n do order[j] = tmp[j] end
+    width = width * 2
+  end
+end
+
+local function scan_zeros(k: integer): boolean
+  local it = &items[k]
+  if it.count == 0 and not it.printed then
+    if head == 0 then head = k else items[zeros].qlink = k end
+    zeros = k
+  end
+  return false
+end
+
+local function detect_loop(k: integer): boolean
+  local it = &items[k]
+  if it.count > 0 then
+    if loop == 0 then
+      loop = k
+    else
+      local prev = 0      -- successor before p in k's list (0: the head)
+      local p = it.top
+      while p ~= 0 do
+        if succs[p].suc == loop then
+          if items[k].qlink ~= 0 then
+            while loop ~= 0 do
+              local tmp = items[loop].qlink
+              util.err(items[loop].str)
+              if loop == k then
+                items[succs[p].suc].count = items[succs[p].suc].count - 1
+                if prev == 0 then items[k].top = succs[p].next else succs[prev].next = succs[p].next end
+                break
+              end
+              items[loop].qlink = 0
+              loop = tmp
+            end
+            while loop ~= 0 do
+              local tmp = items[loop].qlink
+              items[loop].qlink = 0
+              loop = tmp
+            end
+            return true
+          else
+            items[k].qlink = loop
+            loop = k
+            break
+          end
+        end
+        prev = p
+        p = succs[p].next
+      end
+    end
+  end
+  return false
+end
+
+global function applet_tsort(args: sequence(string)): integer
+  local longs: []util.LongOpt = {{'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED}}
+  local g = util.getopt(args, '+', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == util.UNSUPPORTED then util.err("option '--" .. g.longname .. "' is not supported") else util.err(g.errmsg) end
+    util.flush()
+    local m = "Try 'tsort --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  local ops = g:operands()
+  if #ops > 1 then
+    util.err('extra operand ' .. util.quote(ops[2]))
+    util.flush()
+    local m = "Try 'tsort --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  local file = #ops == 1 and ops[1] or '-'
+  local fd: cint = 0
+  if file ~= '-' then
+    fd = sys.open(file, sys.O_RDONLY, 0)
+    if fd < 0 then util.err(util.quotef(file) .. ': ' .. sys.errstr()); util.flush(); return 1 end
+  end
+  -- readtoken treats a read error as the end of the input, silently
+  local data = util.readfd(fd)
+  local index: hashmap(string, integer)
+  local j = 0
+  local k = 0
+  local p = 1
+  local n = #data
+  while true do
+    while p <= n and (data:byte(p) == 32 or data:byte(p) == 9 or data:byte(p) == 10) do p = p + 1 end
+    if p > n then break end
+    local s = p
+    while p <= n and not (data:byte(p) == 32 or data:byte(p) == 9 or data:byte(p) == 10) do p = p + 1 end
+    local tok = data:sub(s, p - 1)
+    local found = index:peek(tok)
+    if found ~= nilptr then
+      k = $found
+    else
+      items:push({str = tok})
+      k = #items
+      index[tok] = k
+      order:push(k)
+    end
+    if j ~= 0 then
+      if items[j].str ~= items[k].str then
+        items[k].count = items[k].count + 1
+        succs:push({suc = k, next = items[j].top})
+        items[j].top = #succs
+      end
+      k = 0
+    end
+    j = k
+  end
+  if k ~= 0 then
+    util.err(util.quotef(file) .. ': input contains an odd number of tokens')
+    util.flush()
+    return 1
+  end
+  sort_order()
+  n_strings = #items
+  local ok = true
+  while n_strings > 0 do
+    for i = 1, #order do scan_zeros(order[i]) end
+    while head ~= 0 do
+      local q = items[head].top
+      util.write(items[head].str); util.writebyte(10)
+      items[head].printed = true
+      n_strings = n_strings - 1
+      while q ~= 0 do
+        local s = succs[q].suc
+        items[s].count = items[s].count - 1
+        if items[s].count == 0 then
+          items[zeros].qlink = s
+          zeros = s
+        end
+        q = succs[q].next
+      end
+      head = items[head].qlink
+    end
+    if n_strings > 0 then
+      util.err(util.quotef(file) .. ': input contains a loop:')
+      ok = false
+      repeat
+        for i = 1, #order do
+          if detect_loop(order[i]) then break end
+        end
+      until loop == 0
+    end
+  end
+  if fd ~= 0 then sys.close(fd) end
+  if not util.flush() then util.err('write error: ' .. sys.errstr()); return 1 end
+  return ok and 0 or 1
+end

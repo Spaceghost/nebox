@@ -276,6 +276,11 @@ Stated here rather than worked around:
   pattern ending in "[" ); one difference remains: [^...] does not match a
   newline. `tests/tac_compare.py`: 55 fixed cases plus 300 random inputs
   from files and pipes, 0 mismatches.
+- `tsort` ports tsort.c: Knuth's algorithm over the items in strcmp order
+  (the in-order walk of GNU's balanced tree), successor lists newest first,
+  each cycle listed on standard error before a relation is dropped to break
+  it, read errors taken as end of input. `tests/tsort_compare.py`: 19 fixed
+  cases plus 400 random graphs, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
