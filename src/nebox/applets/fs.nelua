@@ -998,72 +998,8 @@ global function copy_file(src: string, dst: string, mode: cuint): boolean
   return ok
 end
 
-local function copy_tree(src: string, dst: string, recursive: boolean, preserve: boolean): boolean
-  local st: sys.Stat
-  if sys.lstat(src, &st) ~= 0 then util.err("cannot stat '" .. src .. "': " .. sys.errstr()); return false end
-  local kind = st.st_mode & sys.S_IFMT
-  local ok = true
-  if kind == sys.S_IFDIR then
-    if not recursive then util.err("-r not specified; omitting directory '" .. src .. "'"); return false end
-    if not util.isdir(dst) and sys.mkdir(dst, st.st_mode & 0x1FF) ~= 0 then
-      util.err("cannot create directory '" .. dst .. "': " .. sys.errstr()); return false
-    end
-    local names, rok = util.readnames(src, true)
-    if not rok then util.perror(src); return false end
-    for _, n in ipairs(names) do
-      if n ~= '.' and n ~= '..' then
-        if not copy_tree(util.join(src, n), util.join(dst, n), recursive, preserve) then ok = false end
-      end
-    end
-  elseif kind == sys.S_IFLNK and recursive then
-    local buf: [4096]byte
-    local n = sys.readlink(src, &buf[0], #buf)
-    if n < 0 then util.perror(src); return false end
-    sys.unlink(dst)
-    local target = string.copy((@string){data=&buf[0], size=(@usize)(n)})
-    if sys.symlink(target, dst) ~= 0 then util.err("cannot create symbolic link '" .. dst .. "': " .. sys.errstr()); return false end
-    return true
-  else
-    ok = copy_file(src, dst, st.st_mode)
-  end
-  if ok and preserve then
-    sys.chmod(dst, st.st_mode & 0xFFF)
-    local times: [2]sys.Timespec = {st.st_atim, st.st_mtim}
-    sys.utimensat(sys.AT_FDCWD, dst, &times, 0)
-  end
-  return ok
-end
 
 
-global function applet_mv(args: sequence(string)): integer
-  local o = util.parsel(args, 'fivn', &longopts.mv, #longopts.mv)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands < 2 then return util.die(#o.operands == 0 and 'missing file operand' or "missing destination file operand after '" .. o.operands[1] .. "'") end
-  local dst = o.operands[#o.operands]
-  local nsrc = #o.operands - 1
-  local dstdir = util.isdir(dst)
-  if nsrc > 1 and not dstdir then return util.die("target '" .. dst .. "' is not a directory") end
-  local rc: integer = 0
-  for i: integer = 1, nsrc do
-    local src = o.operands[i]
-    local target = dstdir and util.join(dst, util.basename(src)) or dst
-    if o:has('n') and util.exists(target) then continue end
-    if sys.rename(src, target) ~= 0 then
-      if sys.errno() == sys.EXDEV then
-        if copy_tree(src, target, true, true) and rm_tree(src, false, false) then
-          if o:has('v') then util.line("renamed '" .. src .. "' -> '" .. target .. "'") end
-          continue
-        end
-      else
-        util.err("cannot move '" .. src .. "' to '" .. target .. "': " .. sys.errstr())
-      end
-      rc = 1
-    elseif o:has('v') then
-      util.line("renamed '" .. src .. "' -> '" .. target .. "'")
-    end
-  end
-  return rc
-end
 
 
 

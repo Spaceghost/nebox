@@ -1,0 +1,162 @@
+-- mv: a port of GNU coreutils 9.1 src/mv.c over src/nebox/copy.nelua, with
+-- remove.c's rm () (nebox_rm_for_mv) removing the source after a
+-- cross-device copy. -b -f -i -n -S -t -T -u -v, --strip-trailing-slashes,
+-- -Z (ignored without SELinux), the initial RENAME_NOREPLACE attempt for
+-- two operands, and the copy-into-self handling.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.backup'
+require 'nebox.copy'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local AT_FDCWD: cint <comptime> = -100
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function die(msg: string) util.err(msg); util.flush(); c_exit(1) end
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'mv --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function do_move(source: string, dest: string, dest_dirfd: cint, dest_relname: string, x: *copy.Options): boolean
+  local copy_into_self = false
+  local rename_succeeded = false
+  local ok = copy.copy(source, dest, dest_dirfd, dest_relname, 0, x, &copy_into_self, &rename_succeeded)
+  if ok then
+    local remove = false
+    if copy_into_self then
+      ok = false
+    elseif rename_succeeded then
+    else
+      remove = true
+    end
+    if remove then
+      if not nebox_rm_for_mv(source, x.verbose) then ok = false end
+    end
+  end
+  return ok
+end
+
+global function applet_mv(args: sequence(string)): integer
+  local make_backups = false
+  local backup_suffix = ''
+  local have_suffix = false
+  local version_control = ''
+  local have_vc = false
+  local remove_trailing_slashes = false
+  local target_directory = ''
+  local have_target = false
+  local no_target_directory = false
+  local x: copy.Options
+  copy.default_options(&x)
+  x.copy_as_regular = false
+  x.reflink_mode = copy.REFLINK_AUTO
+  x.dereference = copy.DEREF_NEVER
+  x.interactive = copy.I_UNSPECIFIED
+  x.move_mode = true
+  x.preserve_ownership = true
+  x.preserve_links = true
+  x.preserve_mode = true
+  x.preserve_timestamps = true
+  x.data_copy_required = true
+  x.preserve_xattr = true
+  x.recursive = true
+  x.sparse_mode = copy.SPARSE_AUTO
+  x.stdin_tty = sys.isatty(0) == 1
+  local longs: []util.LongOpt = {
+    {'backup', 2, 98}, {'context', 0, 90}, {'force', 0, 102}, {'interactive', 0, 105},
+    {'no-clobber', 0, 110}, {'no-target-directory', 0, 84}, {'strip-trailing-slashes', 0, 256},
+    {'suffix', 1, 83}, {'target-directory', 1, 116}, {'update', 0, 117}, {'verbose', 0, 118},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'bfint:uvS:TZ', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 98 then
+      make_backups = true
+      if g.has_optarg then version_control = g.optarg; have_vc = true end
+    elseif c == 102 then x.interactive = copy.I_ALWAYS_YES
+    elseif c == 105 then x.interactive = copy.I_ASK_USER
+    elseif c == 110 then x.interactive = copy.I_ALWAYS_NO
+    elseif c == 256 then remove_trailing_slashes = true
+    elseif c == 116 then
+      if have_target then die('multiple target directories specified') end
+      target_directory = g.optarg; have_target = true
+    elseif c == 84 then no_target_directory = true
+    elseif c == 117 then x.update = true
+    elseif c == 118 then x.verbose = true
+    elseif c == 83 then make_backups = true; backup_suffix = g.optarg; have_suffix = true
+    elseif c == 90 then
+    end
+  end
+  local file = g:operands()
+  local n_files = #file
+  if n_files <= (have_target and 0 or 1) then
+    if n_files <= 0 then usage_fail('missing file operand') end
+    usage_fail('missing destination file operand after ' .. util.quoteaf(file[1]))
+  end
+  local target_dirfd: cint = AT_FDCWD
+  if no_target_directory then
+    if have_target then die('cannot combine --target-directory (-t) and --no-target-directory (-T)') end
+    if 2 < n_files then usage_fail('extra operand ' .. util.quoteaf(file[3])) end
+  elseif have_target then
+    target_dirfd = copy.target_directory_operand(target_directory)
+    if target_dirfd == -1 then die(errno_msg('target directory ' .. util.quoteaf(target_directory), sys.errno())) end
+  else
+    local lastfile = file[n_files]
+    if n_files == 2 then
+      x.rename_errno = sys.renameat2(AT_FDCWD, file[1], AT_FDCWD, lastfile, 1) ~= 0 and sys.errno() or 0
+    end
+    if x.rename_errno ~= 0 then
+      local fd = copy.target_directory_operand(lastfile)
+      if fd ~= -1 then
+        x.rename_errno = -1
+        target_dirfd = fd
+        target_directory = lastfile; have_target = true
+        n_files = n_files - 1
+      else
+        local e = sys.errno()
+        if 2 < n_files then die(errno_msg('target ' .. util.quoteaf(lastfile), e)) end
+      end
+    end
+  end
+  if remove_trailing_slashes then
+    for i = 1, n_files do file[i] = copy.strip_trailing_slashes(file[i]) end
+  end
+  if x.interactive == copy.I_ALWAYS_NO then x.update = false end
+  if make_backups and x.interactive == copy.I_ALWAYS_NO then usage_fail('options --backup and --no-clobber are mutually exclusive') end
+  x.backup_type = make_backups and backup.xget_version('backup type', version_control, have_vc) or backup.NONE
+  backup.set_simple_suffix(backup_suffix, have_suffix)
+  local ok = true
+  if have_target then
+    if 2 <= n_files then x.dest_info = true end
+    for i = 1, n_files do
+      x.last_file = i == n_files
+      local source = file[i]
+      local dest, off = copy.file_name_concat(target_directory, copy.last_component(source))
+      dest = dest:sub(1, off - 1) .. copy.strip_trailing_slashes(dest:sub(off))
+      ok = do_move(source, dest, target_dirfd, dest:sub(off), &x) and ok
+    end
+  else
+    x.last_file = true
+    ok = do_move(file[1], file[2], AT_FDCWD, file[2], &x)
+  end
+  copy.close_stdin()
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end

@@ -477,6 +477,40 @@ local function visit(ent: *Ent, depth: integer)
   update(rm_fts(ent, depth))
 end
 
+local function rm_roots(ops: sequence(string))
+  status = RM_OK
+  stack:clear()
+  for _, f in ipairs(ops) do
+    local len = #f
+    if 2 < len and f:byte(len) == 47 then
+      while 1 < len and f:byte(len - 1) == 47 do len = len - 1 end
+    end
+    local ent: Ent
+    ent.path = f:sub(1, len)
+    ent.level = 0
+    fts_stat(&ent)
+    if #stack < 1 then stack:push(&ent) end
+    visit(&ent, 1)
+  end
+end
+
+-- mv.c's rm_option_init and rm (): remove PATH recursively, without
+-- prompting, as a cross-device move does after copying. False on RM_ERROR.
+global function nebox_rm_for_mv(path: string, verbose: boolean): boolean
+  x = {interactive = RMI_NEVER, remove_empty_directories = true, recursive = true, verbose = verbose}
+  local st: sys.Stat
+  if sys.lstat('/', &st) ~= 0 then
+    util.err(errno_msg('failed to get attributes of ' .. util.quoteaf('/'), sys.errno()))
+    util.flush()
+    c_exit(1)
+  end
+  x.have_root = true; x.root_dev = st.st_dev; x.root_ino = st.st_ino
+  local ops: sequence(string)
+  ops:push(path)
+  rm_roots(ops)
+  return status ~= RM_ERROR
+end
+
 local function usage_fail(msg: string)
   if #msg > 0 then util.err(msg) end
   util.flush()
@@ -580,20 +614,7 @@ global function applet_rm(args: sequence(string)): integer
     end
     if not yesno() then close_stdin(); util.flush(); return 0 end
   end
-  status = RM_OK
-  stack:clear()
-  for _, f in ipairs(ops) do
-    local len = #f
-    if 2 < len and f:byte(len) == 47 then
-      while 1 < len and f:byte(len - 1) == 47 do len = len - 1 end
-    end
-    local ent: Ent
-    ent.path = f:sub(1, len)
-    ent.level = 0
-    fts_stat(&ent)
-    if #stack < 1 then stack:push(&ent) end
-    visit(&ent, 1)
-  end
+  rm_roots(ops)
   close_stdin()
   if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
   return status == RM_ERROR and 1 or 0

@@ -231,6 +231,12 @@ Stated here rather than worked around:
   probing. renameat2 comes from a raw syscall until nelibc has a wrapper.
   `tests/cp_compare.py`: 175 cases on tmpfs, 0 mismatches as an ordinary
   user and as root.
+- `mv` ports mv.c over copy.nelua, with remove.c's rm () (exported from the
+  rm port as `nebox_rm_for_mv`) removing the source after a cross-device
+  copy: -b -f -i -n -S -t -T -u -v, `--strip-trailing-slashes`, the initial
+  RENAME_NOREPLACE attempt for two operands, copy-into-self handling.
+  `tests/mv_compare.py`: 116 cases, 22 of them across file systems (tmpfs to
+  ZFS), 0 mismatches as an ordinary user and as root.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
