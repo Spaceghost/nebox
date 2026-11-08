@@ -1,6 +1,6 @@
 -- touch: a port of GNU coreutils 9.1 src/touch.c with gnulib posixtm.c
--- (-t and the obsolete MMDDhhmm[YY] operand under _POSIX2_VERSION < 200112)
--- and parse_datetime (util.getdate) for -d, relative to the -r file's times
+-- (util.posixtime: -t and the obsolete MMDDhhmm[YY] operand under
+-- _POSIX2_VERSION < 200112) and parse_datetime (util.getdate) for -d, relative to the -r file's times
 -- when both are given. -a -c -d -f -h -m -r -t --time, "-" as standard
 -- output, "-d now" treated as no date, and GNU's choice between "cannot
 -- touch" and "setting times of".
@@ -15,7 +15,6 @@ require 'nebox.getdate'
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
 local function c_futimens(fd: cint, ts: *[2]sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
-local function c_time(t: *clong): clong <cimport 'time', cinclude '<time.h>'> end
 
 local AT_FDCWD: cint <comptime> = -100
 local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
@@ -24,10 +23,10 @@ local UTIME_OMIT: clong <comptime> = 0x3ffffffe
 local CH_ATIME <comptime> = 1
 local CH_MTIME <comptime> = 2
 
-local PDS_TRAILING_YEAR <comptime> = 1
-local PDS_CENTURY <comptime> = 2
-local PDS_SECONDS <comptime> = 4
-local PDS_PRE_2000 <comptime> = 8
+local PDS_TRAILING_YEAR <comptime> = util.PDS_TRAILING_YEAR
+local PDS_CENTURY <comptime> = util.PDS_CENTURY
+local PDS_SECONDS <comptime> = util.PDS_SECONDS
+local PDS_PRE_2000 <comptime> = util.PDS_PRE_2000
 
 local change_times = 0
 local no_create = false
@@ -46,90 +45,6 @@ local function usage_fail(msg: string)
   local m = "Try 'touch --help' for more information.\n"
   sys.write(2, m.data, m.size)
   c_exit(1)
-end
-
-local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
-
--- posixtm.c year (): N digit pairs of year.
-local function year(tm: *sys.Tm, pair: *[6]integer, at: integer, n: integer, bits: integer): boolean
-  if n == 1 then
-    tm.tm_year = pair[at]
-    if pair[at] <= 68 then
-      if (bits & PDS_PRE_2000) ~= 0 then return false end
-      tm.tm_year = tm.tm_year + 100
-    end
-  elseif n == 2 then
-    if (bits & PDS_CENTURY) == 0 then return false end
-    tm.tm_year = pair[at] * 100 + pair[at + 1] - 1900
-  else
-    local now: clong = c_time(nilptr)
-    local t: sys.Tm
-    if sys.localtime_r(&now, &t) == nilptr then return false end
-    tm.tm_year = t.tm_year
-  end
-  return true
-end
-
-local function posix_time_parse(tm: *sys.Tm, s: string, bits: integer): boolean
-  local s_len = #s
-  local len = s_len
-  local dot = 0
-  if (bits & PDS_SECONDS) ~= 0 then
-    dot = s:find('.', 1, true)
-    if dot > 0 then
-      len = dot - 1
-      if s_len - len ~= 3 then return false end
-    end
-  end
-  if not (8 <= len and len <= 12 and len % 2 == 0) then return false end
-  for i = 1, len do if not isdigit(s:byte(i)) then return false end end
-  len = len // 2
-  local pair: [6]integer
-  for i = 0, len - 1 do pair[i] = 10 * (s:byte(2 * i + 1) - 48) + s:byte(2 * i + 2) - 48 end
-  local p = 0
-  if (bits & PDS_TRAILING_YEAR) == 0 then
-    if not year(tm, &pair, p, len - 4, bits) then return false end
-    p = p + len - 4
-    len = 4
-  end
-  tm.tm_mon = pair[p] - 1
-  tm.tm_mday = pair[p + 1]
-  tm.tm_hour = pair[p + 2]
-  tm.tm_min = pair[p + 3]
-  p = p + 4
-  len = len - 4
-  if (bits & PDS_TRAILING_YEAR) ~= 0 then
-    if not year(tm, &pair, p, len, bits) then return false end
-  end
-  if dot == 0 then tm.tm_sec = 0
-  elseif isdigit(s:byte(dot + 1)) and isdigit(s:byte(dot + 2)) then
-    tm.tm_sec = 10 * (s:byte(dot + 1) - 48) + s:byte(dot + 2) - 48
-  else
-    return false
-  end
-  return true
-end
-
-local function posixtime(s: string, bits: integer): (boolean, int64)
-  local tm0: sys.Tm
-  local leapsec = 0
-  if not posix_time_parse(&tm0, s, bits) then return false, 0 end
-  while true do
-    local tm1: sys.Tm = {}
-    tm1.tm_sec = tm0.tm_sec; tm1.tm_min = tm0.tm_min; tm1.tm_hour = tm0.tm_hour
-    tm1.tm_mday = tm0.tm_mday; tm1.tm_mon = tm0.tm_mon; tm1.tm_year = tm0.tm_year
-    tm1.tm_wday = -1; tm1.tm_isdst = -1
-    local t = sys.mktime(&tm1)
-    if tm1.tm_wday < 0 then return false, 0 end
-    if tm0.tm_year == tm1.tm_year and tm0.tm_mon == tm1.tm_mon and tm0.tm_mday == tm1.tm_mday
-        and tm0.tm_hour == tm1.tm_hour and tm0.tm_min == tm1.tm_min and tm0.tm_sec == tm1.tm_sec then
-      return true, t + leapsec
-    end
-    if tm0.tm_sec ~= 60 then return false, 0 end
-    tm0.tm_sec = 59
-    leapsec = 1
-  end
-  return false, 0
 end
 
 local function get_reldate(result: *sys.Timespec, flex_date: string, now: *sys.Timespec)
@@ -208,7 +123,7 @@ global function applet_touch(args: sequence(string)): integer
     elseif c == 109 then change_times = change_times | CH_MTIME
     elseif c == 114 then use_ref = true; ref_file = g.optarg
     elseif c == 116 then
-      local okp, t = posixtime(g.optarg, PDS_CENTURY | PDS_SECONDS)
+      local okp, t = util.posixtime(g.optarg, PDS_CENTURY | PDS_SECONDS)
       if not okp then die('invalid date format ' .. util.quote(g.optarg)) end
       newtime[0].tv_sec = t; newtime[0].tv_nsec = 0
       newtime[1] = newtime[0]
@@ -266,7 +181,7 @@ global function applet_touch(args: sequence(string)): integer
       if okn then pv = neg and -v or v end
     end
     if pv < 200112 then
-      local okp, t = posixtime(ops[1], PDS_TRAILING_YEAR | PDS_PRE_2000)
+      local okp, t = util.posixtime(ops[1], PDS_TRAILING_YEAR | PDS_PRE_2000)
       if okp then
         newtime[0].tv_sec = t; newtime[0].tv_nsec = 0
         newtime[1] = newtime[0]

@@ -60,17 +60,6 @@ function util.localsecs(y: integer, mo: integer, d: integer, hh: integer, mm: in
   return (@integer)(t), true
 end
 
--- mktime with an explicit tm_isdst, normalizing out-of-range fields; no
--- round trip check (parse-datetime keeps the current DST flag when a date
--- string has no date, time or weekday in it).
-function util.mktime_dst(y: integer, mo: integer, d: integer, hh: integer, mm: integer, ss: integer, isdst: integer): integer
-  local tm: sys.Tm
-  tm.tm_year = (@cint)(y - 1900); tm.tm_mon = (@cint)(mo - 1); tm.tm_mday = (@cint)(d)
-  tm.tm_hour = (@cint)(hh); tm.tm_min = (@cint)(mm); tm.tm_sec = (@cint)(ss)
-  tm.tm_isdst = (@cint)(isdst)
-  return (@integer)(sys.mktime(&tm))
-end
-
 local DAYS: [7]string = {'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'}
 local MONTHS: [12]string = {'January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'}
@@ -142,6 +131,12 @@ local function tf_year(sb: *stringbuilder, digits: integer, neg: boolean, v: int
   tf_number(sb, digits, neg, v, width, pad, sign, 0)
 end
 
+-- gnulib DO_NUMBER: a negative value prints with a '-' (parse-datetime's
+-- --debug output formats unnormalized fields such as a day of -5)
+local function tf_signed(sb: *stringbuilder, digits: integer, v: integer, width: integer, pad: byte)
+  tf_number(sb, digits, v < 0, iabs(v), width, pad, false, 0)
+end
+
 local function iso_week_days(yday: integer, wday: integer): integer
   local big: integer = (366 /// 7 + 2) * 7
   return yday - (yday - wday + 4 + big) %%% 7 + 4 - 1
@@ -206,7 +201,7 @@ local function tf_format(sb: *stringbuilder, fmt: string, f: *util.Time, upcase:
     end
     if modifier == 'E'_b and E_BAD:find(string.char(conv), 1, true) > 0 then bad = true end
     if modifier == 'O'_b and O_BAD:find(string.char(conv), 1, true) > 0 then bad = true end
-    local year: integer = tm.tm_year + 1900
+    local year: integer = (@integer)(tm.tm_year) + 1900
     if bad then
       tf_text(sb, fmt:sub(start, j), width, pad, up, low)
     elseif conv == '%'_b then
@@ -261,6 +256,7 @@ local function tf_format(sb: *stringbuilder, fmt: string, f: *util.Time, upcase:
       inner:write(tail)
       local s = inner:promote()
       tf_text(sb, s, width, pad, false, false)
+      s:destroy()
     elseif conv == 'C'_b then
       local negy = tm.tm_year < -1900
       local early = not negy and tm.tm_year < 0
@@ -291,19 +287,19 @@ local function tf_format(sb: *stringbuilder, fmt: string, f: *util.Time, upcase:
       else
         tf_number(sb, 2, false, days /// 7 + 1, width, pad, false, 0)
       end
-    elseif conv == 'd'_b then tf_number(sb, 2, false, tm.tm_mday, width, pad, false, 0)
-    elseif conv == 'e'_b then tf_number(sb, 2, false, tm.tm_mday, width, pad == 0 and '_'_b or pad, false, 0)
-    elseif conv == 'H'_b then tf_number(sb, 2, false, tm.tm_hour, width, pad, false, 0)
-    elseif conv == 'k'_b then tf_number(sb, 2, false, tm.tm_hour, width, pad == 0 and '_'_b or pad, false, 0)
+    elseif conv == 'd'_b then tf_signed(sb, 2, tm.tm_mday, width, pad)
+    elseif conv == 'e'_b then tf_signed(sb, 2, tm.tm_mday, width, pad == 0 and '_'_b or pad)
+    elseif conv == 'H'_b then tf_signed(sb, 2, tm.tm_hour, width, pad)
+    elseif conv == 'k'_b then tf_signed(sb, 2, tm.tm_hour, width, pad == 0 and '_'_b or pad)
     elseif conv == 'I'_b or conv == 'l'_b then
       local h12: integer = tm.tm_hour %%% 12
       if h12 == 0 then h12 = 12 end
       if conv == 'l'_b and pad == 0 then pad = '_'_b end
       tf_number(sb, 2, false, h12, width, pad, false, 0)
     elseif conv == 'j'_b then tf_number(sb, 3, false, tm.tm_yday + 1, width, pad, false, 0)
-    elseif conv == 'm'_b then tf_number(sb, 2, false, tm.tm_mon + 1, width, pad, false, 0)
-    elseif conv == 'M'_b then tf_number(sb, 2, false, tm.tm_min, width, pad, false, 0)
-    elseif conv == 'S'_b then tf_number(sb, 2, false, tm.tm_sec, width, pad, false, 0)
+    elseif conv == 'm'_b then tf_signed(sb, 2, (@integer)(tm.tm_mon) + 1, width, pad)
+    elseif conv == 'M'_b then tf_signed(sb, 2, tm.tm_min, width, pad)
+    elseif conv == 'S'_b then tf_signed(sb, 2, tm.tm_sec, width, pad)
     elseif conv == 'q'_b then tf_number(sb, 1, false, tm.tm_mon /// 3 + 1, width, pad, false, 0)
     elseif conv == 'u'_b then tf_number(sb, 1, false, (tm.tm_wday + 6) %%% 7 + 1, width, pad, false, 0)
     elseif conv == 'w'_b then tf_number(sb, 1, false, tm.tm_wday, width, pad, false, 0)

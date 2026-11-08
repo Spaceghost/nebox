@@ -77,8 +77,11 @@ end
 -- Diagnostics go straight to fd 2, after stdout is flushed so ordering is sane.
 function util.err(s: string)
   util.flush()
-  local msg = util.applet .. ': ' .. s .. '\n'
+  local sb: stringbuilder
+  sb:write(util.applet, ': ', s, '\n')
+  local msg = sb:view()
   write_all(2, msg.data, msg.size)
+  sb:destroy()
 end
 
 function util.errf(fmt: string, ...: varargs)

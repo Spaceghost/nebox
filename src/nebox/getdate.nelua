@@ -1,476 +1,2030 @@
--- Date strings for `date -d` (and `touch -d`), a subset of gnulib's
--- parse-datetime as GNU date 9.1 reads it. Items, in any order, separated by
--- blanks; case does not matter:
---   @SECONDS[.FRACTION]                     (alone)
---   YYYY-MM-DD, MM/DD/YYYY, MM/DD            calendar date
---   HH:MM[:SS[.FRACTION]] [am|pm] [ZONE]     time of day; also YYYY-MM-DDTHH:MM...
---   ZONE: Z, UTC, UT, GMT, +HH, +HHMM, +HH:MM (and -), after a time or alone
---   now, today, yesterday, tomorrow
---   a weekday (monday or mon; "next"/"last" before it move by a week)
---   [+|-]N UNIT[s] [ago], next/last/this UNIT; UNIT is year, month,
---   fortnight, week, day, hour, minute (min), second (sec)
--- Semantics follow parse-datetime: a date without a time means midnight; a
--- time without a date means today; with neither, the current time
--- (nanoseconds included), and the current DST flag is kept, so "14 days ago"
--- across a DST change is 14 x 86400 seconds as in GNU. Years, months and days are added to the broken-down
--- time and normalized like mktime; hours, minutes and seconds are added to
--- the resulting count of seconds. A zone makes the date and time UTC plus
--- that offset; otherwise they are local wall time.
--- Not understood: month names, ordinal words ("third"), "week" numbers,
--- named time zones other than UTC/UT/GMT/Z, and "DST".
+-- parse-datetime: a port of gnulib's lib/parse-datetime.y as GNU coreutils
+-- 9.1 builds it (parse_datetime2 with --debug output; struct tm with
+-- tm_zone and tm_gmtoff). The bison grammar is a hand-written parser with
+-- the same productions, the same shift preference in the grammar's 31
+-- shift/reduce conflicts and bison's default reductions, so items are
+-- reduced (and their --debug lines printed) and lookahead tokens read
+-- (and "unknown word" reported) in the order the generated parser does
+-- them. yylex, lookup_word and its tables (local zone abbreviations from
+-- the current and the next three quarters' localtime, military zones, the
+-- 19-character word buffer, the period-dropping retry), the TZ="..."
+-- prefix, digits_to_date_time, time_zone_hhmm, to_hour, to_tm_year,
+-- apply_relative_time and every intmax_t/int overflow check
+-- (__builtin_*_overflow, as gnulib's intprops does it) are ported as
+-- written, as are parse_datetime_body's steps and messages.
+--
+-- Time zones work as gnulib's time_rz does: a zone is a TZ value (or none,
+-- for unset TZ) that localtime_rz/mktime_z switch the environment to and
+-- back, with nelibc's localtime_r doing the conversion. mktime is a port of
+-- the glibc/gnulib mktime.c that GNU date runs (__mktime_internal with its
+-- process-wide offset guess, spring-forward gap handling and tm_isdst
+-- search), so out-of-range fields, skipped and repeated wall times and a
+-- requested DST flag resolve as they do in glibc.
 ## pragmas.nogc = true
 
 require 'string'
+require 'stringbuilder'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.clock'
 
-local function days_from_civil(y: integer, m: integer, d: integer): integer
-  if m <= 2 then y = y - 1 end
-  local era = (y >= 0 and y or y - 399) // 400
-  local yoe = y - era * 400
-  local mp = (m + 9) % 12
-  local doy = (153 * mp + 2) // 5 + d - 1
-  local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
-  return era * 146097 + doe - 719468
+##[==[
+cemitdecl[[
+#include <stdint.h>
+#include <stdbool.h>
+static inline bool nebox_pd_add(int64_t *r, int64_t a, int64_t b) { return __builtin_add_overflow(a, b, r); }
+static inline bool nebox_pd_sub(int64_t *r, int64_t a, int64_t b) { return __builtin_sub_overflow(a, b, r); }
+static inline bool nebox_pd_mul(int64_t *r, int64_t a, int64_t b) { return __builtin_mul_overflow(a, b, r); }
+static inline bool nebox_pd_add32(int *r, int64_t a, int64_t b) { return __builtin_add_overflow(a, b, r); }
+static inline bool nebox_pd_sub32(int *r, int64_t a, int64_t b) { return __builtin_sub_overflow(a, b, r); }
+]]
+]==]
+local function ckd_add(r: *int64, a: int64, b: int64): boolean <cimport 'nebox_pd_add', nodecl> end
+local function ckd_sub(r: *int64, a: int64, b: int64): boolean <cimport 'nebox_pd_sub', nodecl> end
+local function ckd_mul(r: *int64, a: int64, b: int64): boolean <cimport 'nebox_pd_mul', nodecl> end
+local function ckd_add32(r: *cint, a: int64, b: int64): boolean <cimport 'nebox_pd_add32', nodecl> end
+local function ckd_sub32(r: *cint, a: int64, b: int64): boolean <cimport 'nebox_pd_sub32', nodecl> end
+local function c_tzset() <cimport 'tzset', cinclude '<time.h>'> end
+
+local EOVERFLOW: cint <comptime> = 75
+
+local function b2i(b: boolean): int32
+  if b then return 1 end
+  return 0
 end
 
-local function civil_from_days(z: integer): (integer, integer, integer)
-  z = z + 719468
-  local era = (z >= 0 and z or z - 146096) // 146097
-  local doe = z - era * 146097
-  local yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
-  local y = yoe + era * 400
-  local doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
-  local mp = (5 * doy + 2) // 153
-  local d = doy - (153 * mp + 2) // 5 + 1
-  local m = mp < 10 and mp + 3 or mp - 9
-  if m <= 2 then y = y + 1 end
-  return y, m, d
-end
+----------------------------------------------------------------------------
+-- time_rz: timezone_t as a TZ setting
 
-local function valid_date(y: integer, m: integer, d: integer): boolean
-  if m < 1 or m > 12 or d < 1 then return false end
-  local mdays: []integer = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
-  local n = mdays[m - 1]
-  if m == 2 and (y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0)) then n = 29 end
-  return d <= n
-end
+global util.Tz = @record{set: boolean, name: string}
 
-local function lower(s: string): string
-  local sb: stringbuilder
-  for i: usize = 0, < s.size do
-    local c = s.data[i]
-    if c >= 65 and c <= 90 then c = c + 32 end
-    sb:writebyte(c)
+-- tzalloc: NAME nil means TZ unset.
+function util.tzalloc(name: cstring): util.Tz
+  local tz: util.Tz
+  if name ~= nilptr then
+    local s: string = name
+    tz.set = true
+    tz.name = string.copy(s)
   end
-  return sb:promote()
+  return tz
 end
 
-local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+local function change_env(set: boolean, name: string)
+  if set then sys.setenv('TZ', name, 1) else sys.unsetenv('TZ') end
+  c_tzset()
+end
 
-local function all_digits(s: string): boolean
-  if s.size == 0 then return false end
-  for i: usize = 0, < s.size do if not isdigit(s.data[i]) then return false end end
+-- set_tz: switch to TZ unless it is already in effect; OLD gets the
+-- previous setting. True when the environment changed.
+local function set_tz(tz: *util.Tz, old: *util.Tz): boolean
+  local env = sys.getenv('TZ')
+  if env ~= nilptr then
+    local es: string = env
+    if tz.set and tz.name == es then return false end
+    old.set = true
+    old.name = string.copy(es)
+  else
+    if not tz.set then return false end
+    old.set = false
+    old.name = ''
+  end
+  change_env(tz.set, tz.name)
   return true
 end
 
-local function num(s: string): integer
-  local v = 0
-  for i: usize = 0, < s.size do v = v * 10 + (s.data[i] - 48) end
-  return v
+local function revert_tz(changed: boolean, old: *util.Tz)
+  if not changed then return end
+  change_env(old.set, old.name)
+  if old.set then old.name:destroy() end
 end
 
--- digits of a fraction as nanoseconds (truncated to nine digits)
-local function frac_ns(s: string): integer
-  local ns = 0
-  local n = 0
-  for i: usize = 0, < s.size do
-    if n < 9 then ns = ns * 10 + (s.data[i] - 48); n = n + 1 end
+-- save_abbr: zone names outlive the TZ setting they came from
+local zone_pool: sequence(string)
+local function save_abbr(tm: *sys.Tm)
+  if tm.tm_zone == nilptr then return end
+  local z: string = tm.tm_zone
+  for i = 1, #zone_pool do
+    if zone_pool[i] == z then tm.tm_zone = (@cstring)(zone_pool[i].data); return end
   end
-  while n < 9 do ns = ns * 10; n = n + 1 end
-  return ns
+  local c = string.copy(z)
+  zone_pool:push(c)
+  tm.tm_zone = (@cstring)(c.data)
 end
 
-local WEEKDAYS: []string = {'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'}
+function util.localtime_rz(tz: *util.Tz, t: int64, tm: *sys.Tm): boolean
+  local old: util.Tz
+  local ch = set_tz(tz, &old)
+  local tt: clong = t
+  local ok = sys.localtime_r(&tt, tm) ~= nilptr
+  if ok then save_abbr(tm) end
+  revert_tz(ch, &old)
+  return ok
+end
 
-local function weekday_of(w: string): integer
-  for i = 0, < 7 do
-    local full = WEEKDAYS[i]
-    if w == full or w == full:sub(1, 3) or (w.size == 4 and w == full:sub(1, 4) and (i == 2 or i == 3 or i == 4)) then
-      return i
+----------------------------------------------------------------------------
+-- mktime.c (__mktime_internal, as glibc 2.36 and gnulib have it)
+
+local mon_yday: [2][13]int32 = {
+  {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365},
+  {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366},
+}
+
+local function leapyear(year: int64): boolean
+  return (year & 3) == 0 and (year %%% 100 ~= 0 or ((year /// 100) & 3) == ((-19) & 3))
+end
+
+local function isdst_differ(a: int32, b: int32): boolean
+  return ((a == 0) ~= (b == 0)) and 0 <= a and 0 <= b
+end
+
+local function ydhms_diff(year1: int64, yday1: int64, hour1: int32, min1: int32, sec1: int32,
+    year0: int32, yday0: int32, hour0: int32, min0: int32, sec0: int32): int64
+  local a4: int32 = (@int32)((year1 // 4) + 475 - b2i((year1 & 3) == 0))
+  local b4: int32 = (@int32)((year0 // 4) + 475 - b2i((year0 & 3) == 0))
+  local a100: int32 = (a4 + b2i(a4 < 0)) /// 25 - b2i(a4 < 0)
+  local b100: int32 = (b4 + b2i(b4 < 0)) /// 25 - b2i(b4 < 0)
+  local a400: int32 = a100 // 4
+  local b400: int32 = b100 // 4
+  local leaps: int32 = (a4 - b4) - (a100 - b100) + (a400 - b400)
+  local years: int64 = year1 - year0
+  local days: int64 = 365 * years + yday1 - yday0 + leaps
+  local hours: int64 = 24 * days + hour1 - hour0
+  local minutes: int64 = 60 * hours + min1 - min0
+  return 60 * minutes + sec1 - sec0
+end
+
+local function tm_diff(year: int64, yday: int64, hour: int32, min: int32, sec: int32, tp: *sys.Tm): int64
+  return ydhms_diff(year, yday, hour, min, sec, tp.tm_year, tp.tm_yday, tp.tm_hour, tp.tm_min, tp.tm_sec)
+end
+
+local function convert_time(t: int64, tm: *sys.Tm): boolean
+  local x: clong = t
+  return sys.localtime_r(&x, tm) ~= nilptr
+end
+
+local function ranged_convert(t: *int64, tp: *sys.Tm): boolean
+  local t1: int64 = $t
+  if convert_time(t1, tp) then return true end
+  local bad: int64 = t1
+  local ok: int64 = 0
+  local oktm: sys.Tm
+  oktm.tm_sec = -1
+  while true do
+    local mid: int64 = (ok // 2) + (bad // 2) + ((ok | bad) & 1)
+    if mid == ok or mid == bad then break end
+    if convert_time(mid, tp) then ok = mid; oktm = $tp else bad = mid end
+  end
+  if oktm.tm_sec < 0 then return false end
+  $t = ok
+  $tp = oktm
+  return true
+end
+
+local localtime_offset: int64 = 0
+
+local function mktime_internal(tp: *sys.Tm, offset: *int64): int64
+  local tm: sys.Tm
+  local remaining_probes = 6
+  local sec: int32 = tp.tm_sec
+  local min: int32 = tp.tm_min
+  local hour: int32 = tp.tm_hour
+  local mday: int32 = tp.tm_mday
+  local mon: int32 = tp.tm_mon
+  local year_requested: int32 = tp.tm_year
+  local isdst: int32 = tp.tm_isdst
+  local dst2: int32 = 0
+  local mon_remainder: int32 = mon %%% 12
+  local negative_mon_remainder: int32 = b2i(mon_remainder < 0)
+  local mon_years: int32 = mon /// 12 - negative_mon_remainder
+  local year: int64 = (@int64)(year_requested) + mon_years
+  local myd: int32 = mon_yday[leapyear(year) and 1 or 0][mon_remainder + 12 * negative_mon_remainder] - 1
+  local yday: int64 = (@int64)(myd) + mday
+  local off: int64 = $offset
+  local sec_requested: int32 = sec
+  if sec < 0 then sec = 0 end
+  if 59 < sec then sec = 59 end
+  local negative_offset_guess: int32 = (@int32)((@int64)(0) - off)
+  local t0: int64 = ydhms_diff(year, yday, hour, min, sec, 70, 0, 0, 0, negative_offset_guess)
+  local t: int64 = t0
+  local t1: int64 = t0
+  local t2: int64 = t0
+  local found = false
+  while true do
+    if not ranged_convert(&t, &tm) then return -1 end
+    local dt = tm_diff(year, yday, hour, min, sec, &tm)
+    if dt == 0 then break end
+    if t == t1 and t ~= t2 and (tm.tm_isdst < 0 or
+        (isdst < 0 and dst2 <= b2i(tm.tm_isdst ~= 0)) or
+        (isdst >= 0 and ((isdst ~= 0) ~= (tm.tm_isdst ~= 0)))) then
+      -- oscillating around a spring-forward gap
+      found = true
+      break
+    end
+    remaining_probes = remaining_probes - 1
+    if remaining_probes == 0 then sys.seterrno(EOVERFLOW); return -1 end
+    t1 = t2; t2 = t; t = t + dt; dst2 = b2i(tm.tm_isdst ~= 0)
+  end
+  if not found and isdst_differ(isdst, tm.tm_isdst) then
+    local dst_difference: int32 = b2i(isdst == 0) - b2i(tm.tm_isdst == 0)
+    local stride: int32 = 601200
+    local duration_max: int32 = 457243209
+    local delta_bound: int32 = duration_max // 2 + stride
+    local delta: int32 = stride
+    while delta < delta_bound and not found do
+      local direction: int32 = -1
+      while direction <= 1 do
+        local ot: int64
+        if not ckd_add(&ot, t, (@int64)(delta) * direction) then
+          local otm: sys.Tm
+          if not ranged_convert(&ot, &otm) then return -1 end
+          if not isdst_differ(isdst, otm.tm_isdst) then
+            local gt: int64 = ot + tm_diff(year, yday, hour, min, sec, &otm)
+            if convert_time(gt, &tm) then
+              t = gt
+              found = true
+              break
+            end
+          end
+        end
+        direction = direction + 2
+      end
+      delta = delta + stride
+    end
+    if not found then
+      t = t + 3600 * dst_difference
+      if not convert_time(t, &tm) then sys.seterrno(EOVERFLOW); return -1 end
     end
   end
-  if w == 'wednes' or w == 'thur' or w == 'thurs' or w == 'tues' then
-    if w == 'wednes' then return 3 elseif w == 'tues' then return 2 else return 4 end
+  $offset = (t - t0) - negative_offset_guess
+  if sec_requested ~= tm.tm_sec then
+    local sec_adjustment: int64 = b2i(sec == 0 and tm.tm_sec == 60)
+    sec_adjustment = sec_adjustment - sec
+    sec_adjustment = sec_adjustment + sec_requested
+    if ckd_add(&t, t, sec_adjustment) then sys.seterrno(EOVERFLOW); return -1 end
+    if not convert_time(t, &tm) then return -1 end
+  end
+  $tp = tm
+  return t
+end
+
+-- glibc mktime: tzset, then __mktime_internal over localtime_r
+function util.mktime(tp: *sys.Tm): int64
+  c_tzset()
+  return mktime_internal(tp, &localtime_offset)
+end
+
+function util.mktime_z(tz: *util.Tz, tm: *sys.Tm): int64
+  local old: util.Tz
+  local ch = set_tz(tz, &old)
+  local tm1: sys.Tm
+  tm1.tm_sec = tm.tm_sec; tm1.tm_min = tm.tm_min; tm1.tm_hour = tm.tm_hour
+  tm1.tm_mday = tm.tm_mday; tm1.tm_mon = tm.tm_mon; tm1.tm_year = tm.tm_year
+  tm1.tm_yday = -1
+  tm1.tm_isdst = tm.tm_isdst
+  local t = util.mktime(&tm1)
+  local ok = 0 <= tm1.tm_yday
+  if ok then save_abbr(&tm1) end
+  revert_tz(ch, &old)
+  if ok then
+    $tm = tm1
+    return t
   end
   return -1
 end
 
-local function unit_of(w: string): integer
-  if w:sub(-1) == 's' and w.size > 3 and w ~= 'secs' and w ~= 'mins' then w = w:sub(1, -2) end
-  if w == 'year' then return 1 elseif w == 'month' then return 2 elseif w == 'fortnight' then return 3
-  elseif w == 'week' then return 4 elseif w == 'day' then return 5 elseif w == 'hour' then return 6
-  elseif w == 'minute' or w == 'min' or w == 'mins' then return 7
-  elseif w == 'second' or w == 'sec' or w == 'secs' then return 8 end
-  return 0
-end
+----------------------------------------------------------------------------
+-- posixtm.c: [[CC]YY]MMDDhhmm[.ss] and MMDDhhmm[[CC]YY][.ss]
 
--- parse-datetime month names: full, three-letter, "sept", a trailing '.'.
--- lookup_word: a three-letter word (or three letters and a period) is an
--- abbreviation; anything else must be a whole name.
-local function month_of(w: string): integer
-  local names: []string = {'january', 'february', 'march', 'april', 'may', 'june', 'july',
-    'august', 'september', 'october', 'november', 'december'}
-  local abbrev = w.size == 3 or (w.size == 4 and w.data[3] == 46)
-  for k = 0, 11 do
-    if (abbrev and names[k]:sub(1, 3) == w:sub(1, 3)) or (not abbrev and w == names[k]) then return k + 1 end
-  end
-  if w == 'sept' then return 9 end
-  return 0
-end
+global util.PDS_TRAILING_YEAR: integer <comptime> = 1
+global util.PDS_CENTURY: integer <comptime> = 2
+global util.PDS_SECONDS: integer <comptime> = 4
+global util.PDS_PRE_2000: integer <comptime> = 8
 
--- A meridian word: 0 for am, 12 for pm, -1 for neither.
-local function meridian_of(w: string): integer
-  if w == 'am' or w == 'a.m.' then return 0 end
-  if w == 'pm' or w == 'p.m.' then return 12 end
-  return -1
-end
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+local function isspace(c: byte): boolean return c == 32 or (c >= 9 and c <= 13) end
+local function isalpha(c: byte): boolean return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) end
 
--- to_year: two-digit years map to 1969-2068.
-local function to_year(v: integer, digits: integer): integer
-  if digits == 2 then return v < 69 and v + 2000 or v + 1900 end
-  return v
-end
-
--- Items are separated by blanks and commas; "YYYY-MM-DDTHH:MM..." splits at
--- the T. Signs stay with their number ("+2", "-0500").
-local function tokens(s: string): sequence(string)
-  local out: sequence(string)
-  local i: usize = 0
-  while i < s.size do
-    local c = s.data[i]
-    if c == 32 or c == 9 or c == 44 then
-      i = i + 1
-    else
-      -- a comma between digits is a decimal point ("05,5"), not a separator
-      local j = i
-      while j < s.size and s.data[j] ~= 32 and s.data[j] ~= 9 and
-          not (s.data[j] == 44 and not (j > i and isdigit(s.data[j - 1]) and j + 1 < s.size and isdigit(s.data[j + 1]))) do
-        j = j + 1
-      end
-      local w = s:sub((@isize)(i) + 1, (@isize)(j))
-      -- the lexer separates a number from a following word ("3pm")
-      local k: usize = w.size
-      while k > 0 and not isdigit(w.data[k - 1]) do k = k - 1 end
-      if k > 0 and k < w.size and meridian_of(w:sub((@isize)(k) + 1)) >= 0 then
-        out:push(w:sub(1, (@isize)(k)))
-        out:push(w:sub((@isize)(k) + 1))
-        i = j
-        continue
-      end
-      local t = w:find('t', 1, true)
-      if t > 1 and isdigit(w.data[t - 2]) and t < (@isize)(w.size) and isdigit(w.data[t]) then
-        out:push(w:sub(1, t - 1))
-        out:push(w:sub(t + 1))
-      else
-        out:push(w)
-      end
-      i = j
+local function pds_year(tm: *sys.Tm, pair: *[6]integer, at: integer, n: integer, bits: integer): boolean
+  if n == 1 then
+    tm.tm_year = pair[at]
+    if pair[at] <= 68 then
+      if (bits & util.PDS_PRE_2000) ~= 0 then return false end
+      tm.tm_year = tm.tm_year + 100
     end
-  end
-  return out
-end
-
--- A zone item: offset in seconds east of UTC.
-local function parse_zone(w: string): (integer, boolean)
-  if w == 'z' or w == 'utc' or w == 'ut' or w == 'gmt' then return 0, true end
-  if w.size < 2 or (w.data[0] ~= 43 and w.data[0] ~= 45) then return 0, false end
-  local sign = w.data[0] == 45 and -1 or 1
-  local body = w:sub(2)
-  local hh, mm = 0, 0
-  local colon = body:find(':', 1, true)
-  if colon > 0 then
-    local a, b = body:sub(1, colon - 1), body:sub(colon + 1)
-    if not all_digits(a) or not all_digits(b) or a.size > 2 or b.size ~= 2 then return 0, false end
-    hh, mm = num(a), num(b)
-  elseif all_digits(body) and body.size <= 2 then
-    hh = num(body)
-  elseif all_digits(body) and body.size == 4 then
-    hh, mm = num(body:sub(1, 2)), num(body:sub(3, 4))
+  elseif n == 2 then
+    if (bits & util.PDS_CENTURY) == 0 then return false end
+    tm.tm_year = pair[at] * 100 + pair[at + 1] - 1900
   else
-    return 0, false
+    local ts: sys.Timespec
+    sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
+    local now: clong = ts.tv_sec
+    local t: sys.Tm
+    if sys.localtime_r(&now, &t) == nilptr then return false end
+    tm.tm_year = t.tm_year
   end
-  if hh > 24 or mm > 59 then return 0, false end
-  return sign * (hh * 3600 + mm * 60), true
+  return true
 end
 
--- Parse `s` relative to now (now_t, now_ns). Returns seconds, nanoseconds, ok.
+local function posix_time_parse(tm: *sys.Tm, s: string, bits: integer): boolean
+  local s_len = #s
+  local len = s_len
+  local dot = 0
+  if (bits & util.PDS_SECONDS) ~= 0 then
+    dot = s:find('.', 1, true)
+    if dot > 0 then
+      len = dot - 1
+      if s_len - len ~= 3 then return false end
+    end
+  end
+  if not (8 <= len and len <= 12 and len % 2 == 0) then return false end
+  for i = 1, len do if not isdigit(s:byte(i)) then return false end end
+  len = len // 2
+  local pair: [6]integer
+  for i = 0, len - 1 do pair[i] = 10 * (s:byte(2 * i + 1) - 48) + s:byte(2 * i + 2) - 48 end
+  local p = 0
+  if (bits & util.PDS_TRAILING_YEAR) == 0 then
+    if not pds_year(tm, &pair, p, len - 4, bits) then return false end
+    p = p + len - 4
+    len = 4
+  end
+  tm.tm_mon = pair[p] - 1
+  tm.tm_mday = pair[p + 1]
+  tm.tm_hour = pair[p + 2]
+  tm.tm_min = pair[p + 3]
+  p = p + 4
+  len = len - 4
+  if (bits & util.PDS_TRAILING_YEAR) ~= 0 then
+    if not pds_year(tm, &pair, p, len, bits) then return false end
+  end
+  if dot == 0 then tm.tm_sec = 0
+  elseif isdigit(s:byte(dot + 1)) and isdigit(s:byte(dot + 2)) then
+    tm.tm_sec = 10 * (s:byte(dot + 1) - 48) + s:byte(dot + 2) - 48
+  else
+    return false
+  end
+  return true
+end
+
+-- posixtime: the time, or false for an invalid one (a seconds field of 60
+-- is the next second)
+function util.posixtime(s: string, bits: integer): (boolean, int64)
+  local tm0: sys.Tm
+  local leapsec: int64 = 0
+  if not posix_time_parse(&tm0, s, bits) then return false, 0 end
+  while true do
+    local tm1: sys.Tm
+    tm1.tm_sec = tm0.tm_sec; tm1.tm_min = tm0.tm_min; tm1.tm_hour = tm0.tm_hour
+    tm1.tm_mday = tm0.tm_mday; tm1.tm_mon = tm0.tm_mon; tm1.tm_year = tm0.tm_year
+    tm1.tm_wday = -1; tm1.tm_isdst = -1
+    local t = util.mktime(&tm1)
+    if tm1.tm_wday < 0 then return false, 0 end
+    if tm0.tm_year == tm1.tm_year and tm0.tm_mon == tm1.tm_mon and tm0.tm_mday == tm1.tm_mday
+        and tm0.tm_hour == tm1.tm_hour and tm0.tm_min == tm1.tm_min and tm0.tm_sec == tm1.tm_sec then
+      return true, t + leapsec
+    end
+    if tm0.tm_sec ~= 60 then return false, 0 end
+    tm0.tm_sec = 59
+    leapsec = 1
+  end
+  return false, 0
+end
+
+----------------------------------------------------------------------------
+-- parse-datetime.y
+
+local tAGO <comptime> = 258
+local tDST <comptime> = 259
+local tYEAR_UNIT <comptime> = 260
+local tMONTH_UNIT <comptime> = 261
+local tHOUR_UNIT <comptime> = 262
+local tMINUTE_UNIT <comptime> = 263
+local tSEC_UNIT <comptime> = 264
+local tDAY_UNIT <comptime> = 265
+local tDAY_SHIFT <comptime> = 266
+local tDAY <comptime> = 267
+local tDAYZONE <comptime> = 268
+local tLOCAL_ZONE <comptime> = 269
+local tMERIDIAN <comptime> = 270
+local tMONTH <comptime> = 271
+local tORDINAL <comptime> = 272
+local tZONE <comptime> = 273
+local tSNUMBER <comptime> = 274
+local tUNUMBER <comptime> = 275
+local tSDECIMAL_NUMBER <comptime> = 276
+local tUDECIMAL_NUMBER <comptime> = 277
+
+local MERam <comptime> = 0
+local MERpm <comptime> = 1
+local MER24 <comptime> = 2
+
+local BILLION: int64 <comptime> = 1000000000
+
+local TextInt = @record{negative: boolean, value: int64, digits: int64}
+local RelTime = @record{year: int64, month: int64, day: int64, hour: int64, minutes: int64, seconds: int64, ns: cint}
+local Tok = @record{kind: integer, ival: int64, ti: TextInt, sec: int64, nsec: int64}
+local Ent = @record{name: string, type: integer, value: integer}
+local LocalZone = @record{name: string, value: integer}
+
+local PC = @record{
+  s: string,
+  pos: int64,
+  has_la: boolean,
+  la: Tok,
+  day_ordinal: int64,
+  day_number: cint,
+  local_isdst: cint,
+  time_zone: cint,
+  meridian: cint,
+  year: TextInt,
+  month: int64,
+  day: int64,
+  hour: int64,
+  minutes: int64,
+  sec: int64,
+  nsec: int64,
+  rel: RelTime,
+  timespec_seen: boolean,
+  rels_seen: boolean,
+  dates_seen: int64,
+  days_seen: int64,
+  local_zones_seen: int64,
+  dsts_seen: int64,
+  times_seen: int64,
+  zones_seen: int64,
+  year_seen: boolean,
+  debug: boolean,
+  debug_dates_seen: boolean,
+  debug_days_seen: boolean,
+  debug_local_zones_seen: boolean,
+  debug_times_seen: boolean,
+  debug_zones_seen: boolean,
+  debug_year_seen: boolean,
+  debug_ordinal_day_seen: boolean,
+  lz: [2]LocalZone,
+  nlz: integer,
+}
+
+local function HOUR(x: integer): integer return 3600 * x end
+
+local meridian_table: []Ent = {
+  {'AM', tMERIDIAN, MERam}, {'A.M.', tMERIDIAN, MERam}, {'PM', tMERIDIAN, MERpm}, {'P.M.', tMERIDIAN, MERpm},
+}
+
+local month_and_day_table: []Ent = {
+  {'JANUARY', tMONTH, 1}, {'FEBRUARY', tMONTH, 2}, {'MARCH', tMONTH, 3}, {'APRIL', tMONTH, 4},
+  {'MAY', tMONTH, 5}, {'JUNE', tMONTH, 6}, {'JULY', tMONTH, 7}, {'AUGUST', tMONTH, 8},
+  {'SEPTEMBER', tMONTH, 9}, {'SEPT', tMONTH, 9}, {'OCTOBER', tMONTH, 10}, {'NOVEMBER', tMONTH, 11},
+  {'DECEMBER', tMONTH, 12}, {'SUNDAY', tDAY, 0}, {'MONDAY', tDAY, 1}, {'TUESDAY', tDAY, 2},
+  {'TUES', tDAY, 2}, {'WEDNESDAY', tDAY, 3}, {'WEDNES', tDAY, 3}, {'THURSDAY', tDAY, 4},
+  {'THUR', tDAY, 4}, {'THURS', tDAY, 4}, {'FRIDAY', tDAY, 5}, {'SATURDAY', tDAY, 6},
+}
+
+local time_units_table: []Ent = {
+  {'YEAR', tYEAR_UNIT, 1}, {'MONTH', tMONTH_UNIT, 1}, {'FORTNIGHT', tDAY_UNIT, 14}, {'WEEK', tDAY_UNIT, 7},
+  {'DAY', tDAY_UNIT, 1}, {'HOUR', tHOUR_UNIT, 1}, {'MINUTE', tMINUTE_UNIT, 1}, {'MIN', tMINUTE_UNIT, 1},
+  {'SECOND', tSEC_UNIT, 1}, {'SEC', tSEC_UNIT, 1},
+}
+
+local relative_time_table: []Ent = {
+  {'TOMORROW', tDAY_SHIFT, 1}, {'YESTERDAY', tDAY_SHIFT, -1}, {'TODAY', tDAY_SHIFT, 0}, {'NOW', tDAY_SHIFT, 0},
+  {'LAST', tORDINAL, -1}, {'THIS', tORDINAL, 0}, {'NEXT', tORDINAL, 1}, {'FIRST', tORDINAL, 1},
+  {'THIRD', tORDINAL, 3}, {'FOURTH', tORDINAL, 4}, {'FIFTH', tORDINAL, 5}, {'SIXTH', tORDINAL, 6},
+  {'SEVENTH', tORDINAL, 7}, {'EIGHTH', tORDINAL, 8}, {'NINTH', tORDINAL, 9}, {'TENTH', tORDINAL, 10},
+  {'ELEVENTH', tORDINAL, 11}, {'TWELFTH', tORDINAL, 12}, {'AGO', tAGO, -1}, {'HENCE', tAGO, 1},
+}
+
+local universal_time_zone_table: []Ent = {
+  {'GMT', tZONE, 0}, {'UT', tZONE, 0}, {'UTC', tZONE, 0},
+}
+
+local time_zone_table: []Ent = {
+  {'WET', tZONE, 0}, {'WEST', tDAYZONE, 0}, {'BST', tDAYZONE, 0},
+  {'ART', tZONE, -3 * 3600}, {'BRT', tZONE, -3 * 3600}, {'BRST', tDAYZONE, -3 * 3600},
+  {'NST', tZONE, -(3 * 3600 + 30 * 60)}, {'NDT', tDAYZONE, -(3 * 3600 + 30 * 60)},
+  {'AST', tZONE, -4 * 3600}, {'ADT', tDAYZONE, -4 * 3600}, {'CLT', tZONE, -4 * 3600}, {'CLST', tDAYZONE, -4 * 3600},
+  {'EST', tZONE, -5 * 3600}, {'EDT', tDAYZONE, -5 * 3600}, {'CST', tZONE, -6 * 3600}, {'CDT', tDAYZONE, -6 * 3600},
+  {'MST', tZONE, -7 * 3600}, {'MDT', tDAYZONE, -7 * 3600}, {'PST', tZONE, -8 * 3600}, {'PDT', tDAYZONE, -8 * 3600},
+  {'AKST', tZONE, -9 * 3600}, {'AKDT', tDAYZONE, -9 * 3600}, {'HST', tZONE, -10 * 3600},
+  {'HAST', tZONE, -10 * 3600}, {'HADT', tDAYZONE, -10 * 3600}, {'SST', tZONE, -12 * 3600},
+  {'WAT', tZONE, 3600}, {'CET', tZONE, 3600}, {'CEST', tDAYZONE, 3600}, {'MET', tZONE, 3600},
+  {'MEZ', tZONE, 3600}, {'MEST', tDAYZONE, 3600}, {'MESZ', tDAYZONE, 3600},
+  {'EET', tZONE, 2 * 3600}, {'EEST', tDAYZONE, 2 * 3600}, {'CAT', tZONE, 2 * 3600}, {'SAST', tZONE, 2 * 3600},
+  {'EAT', tZONE, 3 * 3600}, {'MSK', tZONE, 3 * 3600}, {'MSD', tDAYZONE, 3 * 3600},
+  {'IST', tZONE, 5 * 3600 + 30 * 60}, {'SGT', tZONE, 8 * 3600}, {'KST', tZONE, 9 * 3600},
+  {'JST', tZONE, 9 * 3600}, {'GST', tZONE, 10 * 3600}, {'NZST', tZONE, 12 * 3600}, {'NZDT', tDAYZONE, 12 * 3600},
+}
+
+-- A to Z without J; 'T' is the ISO 8601 separator token
+local military_table: []Ent = {
+  {'A', tZONE, 1 * 3600}, {'B', tZONE, 2 * 3600}, {'C', tZONE, 3 * 3600}, {'D', tZONE, 4 * 3600},
+  {'E', tZONE, 5 * 3600}, {'F', tZONE, 6 * 3600}, {'G', tZONE, 7 * 3600}, {'H', tZONE, 8 * 3600},
+  {'I', tZONE, 9 * 3600}, {'K', tZONE, 10 * 3600}, {'L', tZONE, 11 * 3600}, {'M', tZONE, 12 * 3600},
+  {'N', tZONE, -1 * 3600}, {'O', tZONE, -2 * 3600}, {'P', tZONE, -3 * 3600}, {'Q', tZONE, -4 * 3600},
+  {'R', tZONE, -5 * 3600}, {'S', tZONE, -6 * 3600}, {'T', 84, 0}, {'U', tZONE, -8 * 3600},
+  {'V', tZONE, -9 * 3600}, {'W', tZONE, -10 * 3600}, {'X', tZONE, -11 * 3600}, {'Y', tZONE, -12 * 3600},
+  {'Z', tZONE, 0},
+}
+
+----------------------------------------------------------------------------
+-- --debug output: dbg_printf writes "date: " and the message to stderr
+
+local function dbg_emit(sb: *stringbuilder)
+  local pre: string = 'date: '
+  local v = sb:view()
+  sys.write(2, pre.data, pre.size)
+  sys.write(2, v.data, v.size)
+  sb:destroy()
+end
+
+local function dbg_line(s: string)
+  local sb: stringbuilder
+  sb:write(s)
+  dbg_emit(&sb)
+end
+
+-- printf %[+][0]Nd
+local function putd(sb: *stringbuilder, v: int64, width: integer, zero: boolean, plus: boolean)
+  local neg = v < 0
+  local u: uint64 = neg and ((@uint64)(0) - (@uint64)(v)) or (@uint64)(v)
+  local digs: [24]byte
+  local nd = 0
+  repeat
+    digs[nd] = (@byte)(48 + u % 10)
+    u = u // 10
+    nd = nd + 1
+  until u == 0
+  local signc: byte = 0
+  if neg then signc = '-'_b elseif plus then signc = '+'_b end
+  local len = nd + (signc ~= 0 and 1 or 0)
+  if not zero then for _ = len + 1, width do sb:writebyte(32) end end
+  if signc ~= 0 then sb:writebyte(signc) end
+  if zero then for _ = len + 1, width do sb:writebyte(48) end end
+  for k = nd - 1, 0, -1 do sb:writebyte(digs[k]) end
+end
+
+local function time_zone_str(sb: *stringbuilder, time_zone: integer)
+  local sign: byte = time_zone < 0 and '-'_b or '+'_b
+  local hour = time_zone /// 3600
+  if hour < 0 then hour = -hour end
+  sb:writebyte(sign)
+  putd(sb, hour, 2, true, false)
+  local off = time_zone %%% 3600
+  if off < 0 then off = -off end
+  if off ~= 0 then
+    local mm, ss = off // 60, off % 60
+    sb:writebyte(':'_b)
+    sb:writebyte((@byte)(48 + mm // 10)); sb:writebyte((@byte)(48 + mm % 10))
+    if ss ~= 0 then
+      sb:writebyte(':'_b)
+      sb:writebyte((@byte)(48 + ss // 10)); sb:writebyte((@byte)(48 + ss % 10))
+    end
+  end
+end
+
+local ordinal_values: []string = {
+  'last', 'this', 'next/first', '(SECOND)', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eight',
+  'ninth', 'tenth', 'eleventh', 'twelfth',
+}
+local days_values: []string = {'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'}
+
+local function str_days(sb: *stringbuilder, pc: *PC)
+  local len = 0
+  if pc.debug_ordinal_day_seen then
+    if -1 <= pc.day_ordinal and pc.day_ordinal <= 12 then
+      local w = ordinal_values[pc.day_ordinal + 1]
+      sb:write(w)
+      len = #w
+    else
+      local before = #sb
+      putd(sb, pc.day_ordinal, 0, false, false)
+      len = #sb - before
+    end
+  end
+  if 0 <= pc.day_number and pc.day_number <= 6 then
+    if len ~= 0 then sb:writebyte(32) end
+    sb:write(days_values[pc.day_number])
+  end
+end
+
+local function debug_print_current_time(item: string, pc: *PC)
+  if not pc.debug then return end
+  local space = false
+  local sb: stringbuilder
+  sb:write('parsed ', item, ' part: ')
+  if pc.dates_seen ~= 0 and not pc.debug_dates_seen then
+    sb:write('(Y-M-D) ')
+    putd(&sb, pc.year.value, 4, true, false); sb:writebyte('-'_b)
+    putd(&sb, pc.month, 2, true, false); sb:writebyte('-'_b)
+    putd(&sb, pc.day, 2, true, false)
+    pc.debug_dates_seen = true
+    space = true
+  end
+  if pc.year_seen ~= pc.debug_year_seen then
+    if space then sb:writebyte(32) end
+    sb:write('year: ')
+    putd(&sb, pc.year.value, 4, true, false)
+    pc.debug_year_seen = pc.year_seen
+    space = true
+  end
+  if pc.times_seen ~= 0 and not pc.debug_times_seen then
+    if space then sb:writebyte(32) end
+    putd(&sb, pc.hour, 2, true, false); sb:writebyte(':'_b)
+    putd(&sb, pc.minutes, 2, true, false); sb:writebyte(':'_b)
+    putd(&sb, pc.sec, 2, true, false)
+    if pc.nsec ~= 0 then
+      sb:writebyte('.'_b)
+      putd(&sb, (@cint)(pc.nsec), 9, true, false)
+    end
+    if pc.meridian == MERpm then sb:write('pm') end
+    pc.debug_times_seen = true
+    space = true
+  end
+  if pc.days_seen ~= 0 and not pc.debug_days_seen then
+    if space then sb:writebyte(32) end
+    str_days(&sb, pc)
+    sb:write(' (day ordinal=')
+    putd(&sb, pc.day_ordinal, 0, false, false)
+    sb:write(' number=')
+    putd(&sb, pc.day_number, 0, false, false)
+    sb:writebyte(')'_b)
+    pc.debug_days_seen = true
+    space = true
+  end
+  if pc.local_zones_seen ~= 0 and not pc.debug_local_zones_seen then
+    if space then sb:writebyte(32) end
+    sb:write('isdst=')
+    putd(&sb, pc.local_isdst, 0, false, false)
+    if pc.dsts_seen ~= 0 then sb:write(' DST') end
+    pc.debug_local_zones_seen = true
+    space = true
+  end
+  if pc.zones_seen ~= 0 and not pc.debug_zones_seen then
+    if space then sb:writebyte(32) end
+    sb:write('UTC')
+    time_zone_str(&sb, pc.time_zone)
+    pc.debug_zones_seen = true
+    space = true
+  end
+  if pc.timespec_seen then
+    if space then sb:writebyte(32) end
+    sb:write('number of seconds: ')
+    putd(&sb, pc.sec, 0, false, false)
+  end
+  sb:writebyte(10)
+  dbg_emit(&sb)
+end
+
+local function print_rel_part(sb: *stringbuilder, space: boolean, val: int64, name: string): boolean
+  if val == 0 then return space end
+  if space then sb:writebyte(32) end
+  putd(sb, val, 0, false, true)
+  sb:writebyte(32)
+  sb:write(name)
+  return true
+end
+
+local function debug_print_relative_time(item: string, pc: *PC)
+  if not pc.debug then return end
+  local sb: stringbuilder
+  sb:write('parsed ', item, ' part: ')
+  local r = &pc.rel
+  if r.year == 0 and r.month == 0 and r.day == 0 and r.hour == 0 and r.minutes == 0 and r.seconds == 0 and r.ns == 0 then
+    sb:write('today/this/now\n')
+    dbg_emit(&sb)
+    return
+  end
+  local space = false
+  space = print_rel_part(&sb, space, r.year, 'year(s)')
+  space = print_rel_part(&sb, space, r.month, 'month(s)')
+  space = print_rel_part(&sb, space, r.day, 'day(s)')
+  space = print_rel_part(&sb, space, r.hour, 'hour(s)')
+  space = print_rel_part(&sb, space, r.minutes, 'minutes')
+  space = print_rel_part(&sb, space, r.seconds, 'seconds')
+  print_rel_part(&sb, space, r.ns, 'nanoseconds')
+  sb:writebyte(10)
+  dbg_emit(&sb)
+end
+
+----------------------------------------------------------------------------
+-- semantic helpers
+
+local function digits_to_date_time(pc: *PC, text_int: TextInt)
+  if pc.dates_seen ~= 0 and pc.year.digits == 0 and not pc.rels_seen and (pc.times_seen ~= 0 or 2 < text_int.digits) then
+    pc.year_seen = true
+    pc.year = text_int
+  else
+    if 4 < text_int.digits then
+      pc.dates_seen = pc.dates_seen + 1
+      pc.day = text_int.value %%% 100
+      pc.month = (text_int.value /// 100) %%% 100
+      pc.year.value = text_int.value /// 10000
+      pc.year.digits = text_int.digits - 4
+    else
+      pc.times_seen = pc.times_seen + 1
+      if text_int.digits <= 2 then
+        pc.hour = text_int.value
+        pc.minutes = 0
+      else
+        pc.hour = text_int.value /// 100
+        pc.minutes = text_int.value %%% 100
+      end
+      pc.sec = 0
+      pc.nsec = 0
+      pc.meridian = MER24
+    end
+  end
+end
+
+local function apply_relative_time(pc: *PC, rel: RelTime, factor: int64): boolean
+  local r = &pc.rel
+  local bad = false
+  if factor < 0 then
+    if ckd_sub32(&r.ns, r.ns, rel.ns) then bad = true end
+    if ckd_sub(&r.seconds, r.seconds, rel.seconds) then bad = true end
+    if ckd_sub(&r.minutes, r.minutes, rel.minutes) then bad = true end
+    if ckd_sub(&r.hour, r.hour, rel.hour) then bad = true end
+    if ckd_sub(&r.day, r.day, rel.day) then bad = true end
+    if ckd_sub(&r.month, r.month, rel.month) then bad = true end
+    if ckd_sub(&r.year, r.year, rel.year) then bad = true end
+  else
+    if ckd_add32(&r.ns, r.ns, rel.ns) then bad = true end
+    if ckd_add(&r.seconds, r.seconds, rel.seconds) then bad = true end
+    if ckd_add(&r.minutes, r.minutes, rel.minutes) then bad = true end
+    if ckd_add(&r.hour, r.hour, rel.hour) then bad = true end
+    if ckd_add(&r.day, r.day, rel.day) then bad = true end
+    if ckd_add(&r.month, r.month, rel.month) then bad = true end
+    if ckd_add(&r.year, r.year, rel.year) then bad = true end
+  end
+  if bad then return false end
+  pc.rels_seen = true
+  return true
+end
+
+local function set_hhmmss(pc: *PC, hour: int64, minutes: int64, sec: int64, nsec: int64)
+  pc.hour = hour
+  pc.minutes = minutes
+  pc.sec = sec
+  pc.nsec = nsec
+end
+
+local function time_zone_hhmm(pc: *PC, s: TextInt, mm: int64): boolean
+  local n_minutes: int64
+  local overflow = false
+  if s.digits <= 2 and mm < 0 then s.value = s.value * 100 end
+  if mm < 0 then
+    n_minutes = (s.value /// 100) * 60 + s.value %%% 100
+  else
+    if ckd_mul(&n_minutes, s.value, 60) then overflow = true end
+    if s.negative then
+      if ckd_sub(&n_minutes, n_minutes, mm) then overflow = true end
+    else
+      if ckd_add(&n_minutes, n_minutes, mm) then overflow = true end
+    end
+  end
+  if overflow or not (-24 * 60 <= n_minutes and n_minutes <= 24 * 60) then return false end
+  pc.time_zone = (@cint)(n_minutes * 60)
+  return true
+end
+
+local function to_hour(hours: int64, meridian: integer): cint
+  if meridian == MERam then
+    if 0 < hours and hours < 12 then return (@cint)(hours) end
+    if hours == 12 then return 0 end
+    return -1
+  elseif meridian == MERpm then
+    if 0 < hours and hours < 12 then return (@cint)(hours + 12) end
+    if hours == 12 then return 12 end
+    return -1
+  end
+  if 0 <= hours and hours < 24 then return (@cint)(hours) end
+  return -1
+end
+
+local function tm_year_str(sb: *stringbuilder, tm_year: cint)
+  if not (-1900 <= tm_year) then sb:writebyte('-'_b) end
+  local a: integer = tm_year /// 100 + 19
+  local b: integer = tm_year %%% 100
+  if a < 0 then a = -a end
+  if b < 0 then b = -b end
+  putd(sb, a, 2, true, false)
+  putd(sb, b, 2, true, false)
+end
+
+local function to_tm_year(textyear: TextInt, debug: boolean, tm_year: *cint): boolean
+  local year: int64 = textyear.value
+  if 0 <= year and textyear.digits == 2 then
+    year = year + (year < 69 and 2000 or 1900)
+    if debug then
+      local sb: stringbuilder
+      sb:write('warning: adjusting year value ')
+      putd(&sb, textyear.value, 0, false, false)
+      sb:write(' to ')
+      putd(&sb, year, 0, false, false)
+      sb:writebyte(10)
+      dbg_emit(&sb)
+    end
+  end
+  local bad: boolean
+  if year < 0 then bad = ckd_sub32(tm_year, -1900, year) else bad = ckd_sub32(tm_year, year, 1900) end
+  if bad then
+    if debug then
+      local sb: stringbuilder
+      sb:write('error: out-of-range year ')
+      putd(&sb, year, 0, false, false)
+      sb:writebyte(10)
+      dbg_emit(&sb)
+    end
+    return false
+  end
+  return true
+end
+
+----------------------------------------------------------------------------
+-- yylex
+
+local function at(pc: *PC, i: int64): byte
+  if i >= 0 and i < (@int64)(pc.s.size) then return pc.s.data[i] end
+  return 0
+end
+
+local function ent_eq(w: *[20]byte, n: integer, name: string): boolean
+  if n ~= #name then return false end
+  for i = 0, < n do if w[i] ~= name.data[i] then return false end end
+  return true
+end
+
+local function lookup_zone(pc: *PC, w: *[20]byte, n: integer, typ: *integer, val: *int64): boolean
+  for i = 0, < #universal_time_zone_table do
+    local e = universal_time_zone_table[i]
+    if ent_eq(w, n, e.name) then $typ = e.type; $val = e.value; return true end
+  end
+  for i = 0, < pc.nlz do
+    if ent_eq(w, n, pc.lz[i].name) then $typ = tLOCAL_ZONE; $val = pc.lz[i].value; return true end
+  end
+  for i = 0, < #time_zone_table do
+    local e = time_zone_table[i]
+    if ent_eq(w, n, e.name) then $typ = e.type; $val = e.value; return true end
+  end
+  return false
+end
+
+local function lookup_word(pc: *PC, w: *[20]byte, np: *integer, typ: *integer, val: *int64): boolean
+  local n = $np
+  for i = 0, < n do
+    if w[i] >= 97 and w[i] <= 122 then w[i] = w[i] - 32 end
+  end
+  for i = 0, < #meridian_table do
+    local e = meridian_table[i]
+    if ent_eq(w, n, e.name) then $typ = e.type; $val = e.value; return true end
+  end
+  local abbrev = n == 3 or (n == 4 and w[3] == '.'_b)
+  for i = 0, < #month_and_day_table do
+    local e = month_and_day_table[i]
+    local hit: boolean
+    if abbrev then
+      hit = w[0] == e.name.data[0] and w[1] == e.name.data[1] and w[2] == e.name.data[2]
+    else
+      hit = ent_eq(w, n, e.name)
+    end
+    if hit then $typ = e.type; $val = e.value; return true end
+  end
+  if lookup_zone(pc, w, n, typ, val) then return true end
+  if ent_eq(w, n, 'DST') then $typ = tDST; $val = 0; return true end
+  for i = 0, < #time_units_table do
+    local e = time_units_table[i]
+    if ent_eq(w, n, e.name) then $typ = e.type; $val = e.value; return true end
+  end
+  if n > 0 and w[n - 1] == 'S'_b then
+    for i = 0, < #time_units_table do
+      local e = time_units_table[i]
+      if ent_eq(w, n - 1, e.name) then $typ = e.type; $val = e.value; return true end
+    end
+  end
+  for i = 0, < #relative_time_table do
+    local e = relative_time_table[i]
+    if ent_eq(w, n, e.name) then $typ = e.type; $val = e.value; return true end
+  end
+  if n == 1 then
+    for i = 0, < #military_table do
+      local e = military_table[i]
+      if w[0] == e.name.data[0] then $typ = e.type; $val = e.value; return true end
+    end
+  end
+  -- drop the periods and try the zones again
+  local period_found = false
+  local k = 0
+  for i = 0, < n do
+    if w[i] == '.'_b then period_found = true
+    else w[k] = w[i]; k = k + 1 end
+  end
+  $np = k
+  if period_found and lookup_zone(pc, w, k, typ, val) then return true end
+  return false
+end
+
+local function yylex(pc: *PC, tok: *Tok): integer
+  while true do
+    local c = at(pc, pc.pos)
+    while isspace(c) do pc.pos = pc.pos + 1; c = at(pc, pc.pos) end
+    if isdigit(c) or c == '-'_b or c == '+'_b then
+      local p: int64 = pc.pos
+      local sign: integer = 0
+      local skip = false
+      if c == '-'_b or c == '+'_b then
+        sign = c == '-'_b and -1 or 1
+        repeat
+          p = p + 1
+          pc.pos = p
+          c = at(pc, p)
+        until not isspace(c)
+        if not isdigit(c) then skip = true end
+      end
+      if not skip then
+        local value: int64 = 0
+        repeat
+          if ckd_mul(&value, value, 10) then return '?'_b end
+          local dv: int64 = (@int64)(c) - 48
+          if sign < 0 then dv = -dv end
+          if ckd_add(&value, value, dv) then return '?'_b end
+          p = p + 1
+          c = at(pc, p)
+        until not isdigit(c)
+        if (c == '.'_b or c == ','_b) and isdigit(at(pc, p + 1)) then
+          local s: int64 = value
+          p = p + 1
+          local ns: int64 = (@int64)(at(pc, p)) - 48
+          p = p + 1
+          for _ = 2, 9 do
+            ns = ns * 10
+            if isdigit(at(pc, p)) then ns = ns + ((@int64)(at(pc, p)) - 48); p = p + 1 end
+          end
+          if sign < 0 then
+            while isdigit(at(pc, p)) do
+              if at(pc, p) ~= '0'_b then ns = ns + 1; break end
+              p = p + 1
+            end
+          end
+          while isdigit(at(pc, p)) do p = p + 1 end
+          if sign < 0 and ns ~= 0 then
+            if ckd_sub(&s, s, 1) then return '?'_b end
+            ns = BILLION - ns
+          end
+          tok.sec = s
+          tok.nsec = ns
+          pc.pos = p
+          return sign ~= 0 and tSDECIMAL_NUMBER or tUDECIMAL_NUMBER
+        end
+        tok.ti.negative = sign < 0
+        tok.ti.value = value
+        tok.ti.digits = p - pc.pos
+        pc.pos = p
+        return sign ~= 0 and tSNUMBER or tUNUMBER
+      end
+    elseif isalpha(c) then
+      local buf: [20]byte
+      local n = 0
+      repeat
+        if n < 19 then buf[n] = c; n = n + 1 end
+        pc.pos = pc.pos + 1
+        c = at(pc, pc.pos)
+      until not (isalpha(c) or c == '.'_b)
+      local typ: integer = 0
+      local val: int64 = 0
+      if not lookup_word(pc, &buf, &n, &typ, &val) then
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write("error: unknown word '")
+          sb:write((@string){data = (@*[0]byte)(&buf[0]), size = (@usize)(n)})
+          sb:write("'\n")
+          dbg_emit(&sb)
+        end
+        return '?'_b
+      end
+      tok.ival = val
+      return typ
+    elseif c ~= '('_b then
+      pc.pos = pc.pos + 1
+      return c
+    else
+      local count = 0
+      repeat
+        c = at(pc, pc.pos)
+        pc.pos = pc.pos + 1
+        if c == 0 then return 0 end
+        if c == '('_b then count = count + 1 elseif c == ')'_b then count = count - 1 end
+      until count == 0
+    end
+  end
+  return 0
+end
+
+----------------------------------------------------------------------------
+-- the grammar
+
+local function peek(pc: *PC): integer
+  if not pc.has_la then
+    local t: Tok
+    t.kind = yylex(pc, &t)
+    pc.la = t
+    pc.has_la = true
+  end
+  return pc.la.kind
+end
+
+local function take(pc: *PC): Tok
+  peek(pc)
+  pc.has_la = false
+  return pc.la
+end
+
+local function is_unit(k: integer): boolean
+  return k == tYEAR_UNIT or k == tMONTH_UNIT or k == tDAY_UNIT or k == tHOUR_UNIT or
+    k == tMINUTE_UNIT or k == tSEC_UNIT
+end
+
+-- relunit: N UNIT (DAY units multiply N by their value)
+local function mkrel(r: *RelTime, n: int64, u: Tok): boolean
+  if u.kind == tYEAR_UNIT then r.year = n
+  elseif u.kind == tMONTH_UNIT then r.month = n
+  elseif u.kind == tDAY_UNIT then
+    if ckd_mul(&r.day, n, u.ival) then return false end
+  elseif u.kind == tHOUR_UNIT then r.hour = n
+  elseif u.kind == tMINUTE_UNIT then r.minutes = n
+  else r.seconds = n end
+  return true
+end
+
+-- rel: relunit [tAGO]
+local function rel_tail(pc: *PC, rel: RelTime): boolean
+  local factor: int64 = 1
+  if peek(pc) == tAGO then factor = take(pc).ival end
+  if not apply_relative_time(pc, rel, factor) then return false end
+  debug_print_relative_time('relative', pc)
+  return true
+end
+
+-- zone_offset: tSNUMBER o_colon_minutes, the tSNUMBER already shifted
+local function zone_offset(pc: *PC, s: TextInt): boolean
+  local mm: int64 = -1
+  if peek(pc) == ':'_b then
+    take(pc)
+    if peek(pc) ~= tUNUMBER then return false end
+    mm = take(pc).ti.value
+  end
+  pc.zones_seen = pc.zones_seen + 1
+  return time_zone_hhmm(pc, s, mm)
+end
+
+-- unsigned_seconds
+local function unsigned_seconds(pc: *PC, sec: *int64, nsec: *int64): boolean
+  local k = peek(pc)
+  if k == tUDECIMAL_NUMBER then
+    local t = take(pc)
+    $sec = t.sec; $nsec = t.nsec
+    return true
+  elseif k == tUNUMBER then
+    local t = take(pc)
+    $sec = t.ti.value; $nsec = 0
+    return true
+  end
+  return false
+end
+
+local function time_item(pc: *PC)
+  pc.times_seen = pc.times_seen + 1
+  debug_print_current_time('time', pc)
+end
+
+local function date_item(pc: *PC)
+  pc.dates_seen = pc.dates_seen + 1
+  debug_print_current_time('date', pc)
+end
+
+local function zone_item(pc: *PC)
+  pc.zones_seen = pc.zones_seen + 1
+  debug_print_current_time('zone', pc)
+end
+
+local function day_item(pc: *PC)
+  pc.days_seen = pc.days_seen + 1
+  debug_print_current_time('day', pc)
+end
+
+-- iso_8601_time after iso_8601_date 'T', then the datetime item
+local function iso_datetime_tail(pc: *PC): boolean
+  if peek(pc) ~= tUNUMBER then return false end
+  local h = take(pc).ti
+  local k = peek(pc)
+  if k == tSNUMBER then
+    local s = take(pc).ti
+    if not zone_offset(pc, s) then return false end
+    set_hhmmss(pc, h.value, 0, 0, 0)
+  elseif k == ':'_b then
+    take(pc)
+    if peek(pc) ~= tUNUMBER then return false end
+    local m = take(pc).ti
+    if peek(pc) == ':'_b then
+      take(pc)
+      local sec: int64, nsec: int64 = 0, 0
+      if not unsigned_seconds(pc, &sec, &nsec) then return false end
+      if peek(pc) == tSNUMBER then
+        local s = take(pc).ti
+        if not zone_offset(pc, s) then return false end
+      end
+      set_hhmmss(pc, h.value, m.value, sec, nsec)
+    else
+      if peek(pc) == tSNUMBER then
+        local s = take(pc).ti
+        if not zone_offset(pc, s) then return false end
+      end
+      set_hhmmss(pc, h.value, m.value, 0, 0)
+    end
+  else
+    return false
+  end
+  pc.meridian = MER24
+  pc.times_seen = pc.times_seen + 1
+  pc.dates_seen = pc.dates_seen + 1
+  debug_print_current_time('datetime', pc)
+  return true
+end
+
+-- items starting with tUNUMBER
+local function item_unumber(pc: *PC): boolean
+  local n1 = take(pc).ti
+  local k = peek(pc)
+  if k == tMERIDIAN then
+    local m = take(pc).ival
+    set_hhmmss(pc, n1.value, 0, 0, 0)
+    pc.meridian = (@cint)(m)
+    time_item(pc)
+  elseif k == ':'_b then
+    take(pc)
+    if peek(pc) ~= tUNUMBER then return false end
+    local n2 = take(pc).ti
+    k = peek(pc)
+    if k == tMERIDIAN then
+      local m = take(pc).ival
+      set_hhmmss(pc, n1.value, n2.value, 0, 0)
+      pc.meridian = (@cint)(m)
+    elseif k == ':'_b then
+      take(pc)
+      local sec: int64, nsec: int64 = 0, 0
+      if not unsigned_seconds(pc, &sec, &nsec) then return false end
+      k = peek(pc)
+      if k == tMERIDIAN then
+        local m = take(pc).ival
+        set_hhmmss(pc, n1.value, n2.value, sec, nsec)
+        pc.meridian = (@cint)(m)
+      else
+        if k == tSNUMBER then
+          local s = take(pc).ti
+          if not zone_offset(pc, s) then return false end
+        end
+        set_hhmmss(pc, n1.value, n2.value, sec, nsec)
+        pc.meridian = MER24
+      end
+    else
+      if k == tSNUMBER then
+        local s = take(pc).ti
+        if not zone_offset(pc, s) then return false end
+      end
+      set_hhmmss(pc, n1.value, n2.value, 0, 0)
+      pc.meridian = MER24
+    end
+    time_item(pc)
+  elseif k == tSNUMBER then
+    local s1 = take(pc).ti
+    k = peek(pc)
+    if k == tSNUMBER then
+      -- iso_8601_date: YYYY-MM-DD
+      local s2 = take(pc).ti
+      pc.year = n1
+      if ckd_sub(&pc.month, 0, s1.value) then return false end
+      if ckd_sub(&pc.day, 0, s2.value) then return false end
+      if peek(pc) == 'T'_b then
+        take(pc)
+        return iso_datetime_tail(pc)
+      end
+      date_item(pc)
+    elseif is_unit(k) then
+      -- hybrid: YYYYMMDD +N UNIT
+      local u = take(pc)
+      local rel: RelTime
+      if not mkrel(&rel, s1.value, u) then return false end
+      digits_to_date_time(pc, n1)
+      if not apply_relative_time(pc, rel, 1) then return false end
+      debug_print_relative_time('hybrid', pc)
+    else
+      if not zone_offset(pc, s1) then return false end
+      set_hhmmss(pc, n1.value, 0, 0, 0)
+      pc.meridian = MER24
+      time_item(pc)
+    end
+  elseif k == '/'_b then
+    take(pc)
+    if peek(pc) ~= tUNUMBER then return false end
+    local n2 = take(pc).ti
+    if peek(pc) == '/'_b then
+      take(pc)
+      if peek(pc) ~= tUNUMBER then return false end
+      local n3 = take(pc).ti
+      if 4 <= n1.digits then
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write('warning: value ')
+          putd(&sb, n1.value, 0, false, false)
+          sb:write(' has ')
+          putd(&sb, n1.digits, 0, false, false)
+          sb:write(' digits. Assuming YYYY/MM/DD\n')
+          dbg_emit(&sb)
+        end
+        pc.year = n1
+        pc.month = n2.value
+        pc.day = n3.value
+      else
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write('warning: value ')
+          putd(&sb, n1.value, 0, false, false)
+          sb:write(' has less than 4 digits. Assuming MM/DD/YY[YY]\n')
+          dbg_emit(&sb)
+        end
+        pc.month = n1.value
+        pc.day = n2.value
+        pc.year = n3
+      end
+    else
+      pc.month = n1.value
+      pc.day = n2.value
+    end
+    date_item(pc)
+  elseif k == tMONTH then
+    local m = take(pc).ival
+    k = peek(pc)
+    if k == tSNUMBER then
+      -- 17-JUN-1992
+      local s = take(pc).ti
+      pc.day = n1.value
+      pc.month = m
+      if ckd_sub(&pc.year.value, 0, s.value) then return false end
+      pc.year.digits = s.digits
+    elseif k == tUNUMBER then
+      local y = take(pc).ti
+      pc.day = n1.value
+      pc.month = m
+      pc.year = y
+    else
+      pc.day = n1.value
+      pc.month = m
+    end
+    date_item(pc)
+  elseif k == tDAY then
+    local d = take(pc).ival
+    pc.day_ordinal = n1.value
+    pc.day_number = (@cint)(d)
+    pc.debug_ordinal_day_seen = true
+    day_item(pc)
+  elseif is_unit(k) then
+    local u = take(pc)
+    local rel: RelTime
+    if not mkrel(&rel, n1.value, u) then return false end
+    return rel_tail(pc, rel)
+  else
+    digits_to_date_time(pc, n1)
+    debug_print_current_time('number', pc)
+  end
+  return true
+end
+
+local function parse_item(pc: *PC): boolean
+  local k = peek(pc)
+  if k == tUNUMBER then
+    return item_unumber(pc)
+  elseif k == 'T'_b then
+    take(pc)
+    if peek(pc) == tSNUMBER then
+      local s = take(pc).ti
+      if not is_unit(peek(pc)) then return false end
+      local u = take(pc)
+      local rel: RelTime
+      if not mkrel(&rel, s.value, u) then return false end
+      pc.time_zone = -HOUR(7)
+      if not apply_relative_time(pc, rel, 1) then return false end
+      debug_print_relative_time('relative', pc)
+    else
+      pc.time_zone = -HOUR(7)
+    end
+    zone_item(pc)
+  elseif k == tZONE then
+    local z = take(pc).ival
+    k = peek(pc)
+    if k == tSNUMBER then
+      local s = take(pc).ti
+      k = peek(pc)
+      if is_unit(k) then
+        local u = take(pc)
+        local rel: RelTime
+        if not mkrel(&rel, s.value, u) then return false end
+        pc.time_zone = (@cint)(z)
+        if not apply_relative_time(pc, rel, 1) then return false end
+        debug_print_relative_time('relative', pc)
+      else
+        local mm: int64 = -1
+        if k == ':'_b then
+          take(pc)
+          if peek(pc) ~= tUNUMBER then return false end
+          mm = take(pc).ti.value
+        end
+        if not time_zone_hhmm(pc, s, mm) then return false end
+        if ckd_add32(&pc.time_zone, pc.time_zone, z) then return false end
+      end
+    elseif k == tDST then
+      take(pc)
+      pc.time_zone = (@cint)(z + 3600)
+    else
+      pc.time_zone = (@cint)(z)
+    end
+    zone_item(pc)
+  elseif k == tDAYZONE then
+    pc.time_zone = (@cint)(take(pc).ival + 3600)
+    zone_item(pc)
+  elseif k == tLOCAL_ZONE then
+    local v = take(pc).ival
+    if peek(pc) == tDST then
+      take(pc)
+      pc.local_isdst = 1
+      pc.dsts_seen = pc.dsts_seen + 1
+    else
+      pc.local_isdst = (@cint)(v)
+    end
+    pc.local_zones_seen = pc.local_zones_seen + 1
+    debug_print_current_time('local_zone', pc)
+  elseif k == tDAY then
+    local d = take(pc).ival
+    if peek(pc) == ','_b then take(pc) end
+    pc.day_ordinal = 0
+    pc.day_number = (@cint)(d)
+    day_item(pc)
+  elseif k == tORDINAL then
+    local o = take(pc).ival
+    k = peek(pc)
+    if k == tDAY then
+      local d = take(pc).ival
+      pc.day_ordinal = o
+      pc.day_number = (@cint)(d)
+      pc.debug_ordinal_day_seen = true
+      day_item(pc)
+    elseif is_unit(k) then
+      local u = take(pc)
+      local rel: RelTime
+      if not mkrel(&rel, o, u) then return false end
+      return rel_tail(pc, rel)
+    else
+      return false
+    end
+  elseif k == tMONTH then
+    local m = take(pc).ival
+    k = peek(pc)
+    if k == tSNUMBER then
+      -- JUN-17-1992
+      local s1 = take(pc).ti
+      if peek(pc) ~= tSNUMBER then return false end
+      local s2 = take(pc).ti
+      pc.month = m
+      if ckd_sub(&pc.day, 0, s1.value) then return false end
+      if ckd_sub(&pc.year.value, 0, s2.value) then return false end
+      pc.year.digits = s2.digits
+    elseif k == tUNUMBER then
+      local d = take(pc).ti
+      if peek(pc) == ','_b then
+        take(pc)
+        if peek(pc) ~= tUNUMBER then return false end
+        local y = take(pc).ti
+        pc.month = m
+        pc.day = d.value
+        pc.year = y
+      else
+        pc.month = m
+        pc.day = d.value
+      end
+    else
+      return false
+    end
+    date_item(pc)
+  elseif k == tSNUMBER then
+    local s = take(pc).ti
+    if not is_unit(peek(pc)) then return false end
+    local u = take(pc)
+    local rel: RelTime
+    if not mkrel(&rel, s.value, u) then return false end
+    return rel_tail(pc, rel)
+  elseif k == tSDECIMAL_NUMBER or k == tUDECIMAL_NUMBER then
+    local t = take(pc)
+    if peek(pc) ~= tSEC_UNIT then return false end
+    take(pc)
+    local rel: RelTime
+    rel.seconds = t.sec
+    rel.ns = (@cint)(t.nsec)
+    return rel_tail(pc, rel)
+  elseif is_unit(k) then
+    local u = take(pc)
+    local rel: RelTime
+    if not mkrel(&rel, 1, u) then return false end
+    return rel_tail(pc, rel)
+  elseif k == tDAY_SHIFT then
+    local rel: RelTime
+    rel.day = take(pc).ival
+    if not apply_relative_time(pc, rel, 1) then return false end
+    debug_print_relative_time('relative', pc)
+  else
+    return false
+  end
+  return true
+end
+
+local function yyparse(pc: *PC): boolean
+  if peek(pc) == '@'_b then
+    take(pc)
+    local k = peek(pc)
+    if k == tSDECIMAL_NUMBER or k == tUDECIMAL_NUMBER then
+      local t = take(pc)
+      pc.sec = t.sec; pc.nsec = t.nsec
+    elseif k == tSNUMBER or k == tUNUMBER then
+      local t = take(pc)
+      pc.sec = t.ti.value; pc.nsec = 0
+    else
+      return false
+    end
+    pc.timespec_seen = true
+    debug_print_current_time('number of seconds', pc)
+    return peek(pc) == 0
+  end
+  while true do
+    if peek(pc) == 0 then return true end
+    if not parse_item(pc) then return false end
+  end
+  return false
+end
+
+----------------------------------------------------------------------------
+-- parse_datetime_body
+
+local function mktime_ok(tm0: *sys.Tm, tm1: *sys.Tm): boolean
+  if tm1.tm_wday < 0 then return false end
+  return tm0.tm_sec == tm1.tm_sec and tm0.tm_min == tm1.tm_min and tm0.tm_hour == tm1.tm_hour and
+    tm0.tm_mday == tm1.tm_mday and tm0.tm_mon == tm1.tm_mon and tm0.tm_year == tm1.tm_year
+end
+
+-- "(Y-M-D) %Y-%m-%d %H:%M:%S" through nstrftime, plus " TZ=..." for a
+-- parsed zone
+local function debug_strfdatetime(sb: *stringbuilder, tm: *sys.Tm, pc: *PC)
+  local f: util.Time
+  f.tm = $tm
+  local s = util.timestr('(Y-M-D) %Y-%m-%d %H:%M:%S', &f)
+  sb:write(s)
+  s:destroy()
+  if pc ~= nilptr and pc.zones_seen ~= 0 then
+    local tz: integer = pc.time_zone
+    sb:write(' TZ=')
+    time_zone_str(sb, tz)
+  end
+end
+
+local function debug_strfdate(sb: *stringbuilder, tm: *sys.Tm)
+  sb:write('(Y-M-D) ')
+  tm_year_str(sb, tm.tm_year)
+  sb:writebyte('-'_b)
+  putd(sb, (@integer)(tm.tm_mon) + 1, 2, true, false)
+  sb:writebyte('-'_b)
+  putd(sb, tm.tm_mday, 2, true, false)
+end
+
+local function debug_strftime(sb: *stringbuilder, tm: *sys.Tm)
+  putd(sb, tm.tm_hour, 2, true, false); sb:writebyte(':'_b)
+  putd(sb, tm.tm_min, 2, true, false); sb:writebyte(':'_b)
+  putd(sb, tm.tm_sec, 2, true, false)
+end
+
+local function debug_mktime_not_ok(tm0: *sys.Tm, tm1: *sys.Tm, pc: *PC, time_zone_seen: boolean)
+  local eq_sec = tm0.tm_sec == tm1.tm_sec
+  local eq_min = tm0.tm_min == tm1.tm_min
+  local eq_hour = tm0.tm_hour == tm1.tm_hour
+  local eq_mday = tm0.tm_mday == tm1.tm_mday
+  local eq_month = tm0.tm_mon == tm1.tm_mon
+  local eq_year = tm0.tm_year == tm1.tm_year
+  local dst_shift = eq_sec and eq_min and not eq_hour and eq_mday and eq_month and eq_year
+  if not pc.debug then return end
+  dbg_line('error: invalid date/time value:\n')
+  local sb: stringbuilder
+  sb:write("    user provided time: '")
+  debug_strfdatetime(&sb, tm0, pc)
+  sb:write("'\n")
+  dbg_emit(&sb)
+  sb:write("       normalized time: '")
+  debug_strfdatetime(&sb, tm1, pc)
+  sb:write("'\n")
+  dbg_emit(&sb)
+  sb:write('                                 ')
+  sb:write(eq_year and '    ' or '----')
+  sb:write(eq_month and '   ' or ' --')
+  sb:write(eq_mday and '   ' or ' --')
+  sb:write(eq_hour and '   ' or ' --')
+  sb:write(eq_min and '   ' or ' --')
+  sb:write(eq_sec and '   ' or ' --')
+  local v = sb:promote()
+  local i = #v
+  while 0 < i and v:byte(i) == 32 do i = i - 1 end
+  local line = v:sub(1, i)
+  v:destroy()
+  sb:write(line, '\n')
+  line:destroy()
+  dbg_emit(&sb)
+  dbg_line('     possible reasons:\n')
+  if dst_shift then dbg_line('       non-existing due to daylight-saving time;\n') end
+  if not eq_mday and not eq_month then dbg_line('       invalid day/month combination;\n') end
+  dbg_line('       numeric values overflow;\n')
+  dbg_line(time_zone_seen and '       incorrect timezone\n' or '       missing timezone\n')
+end
+
+local function parse_body(result: *sys.Timespec, input0: string, Start: int64, Start_ns: int64, debug: boolean,
+    tz: *util.Tz, tz_from_string: boolean, tzstr_set: boolean, tzstr: string): boolean
+  local tm: sys.Tm
+  local tm0: sys.Tm
+  local tmp: sys.Tm
+  local pc: PC
+  local input = input0
+  if not util.localtime_rz(tz, Start, &tmp) then return false end
+  if input.size == 0 then input = '0' end
+  pc.s = input
+  pc.pos = 0
+  pc.debug = debug
+  pc.year.value = (@int64)(tmp.tm_year) + 1900
+  pc.year.digits = 0
+  pc.month = (@int64)(tmp.tm_mon) + 1
+  pc.day = tmp.tm_mday
+  pc.hour = tmp.tm_hour
+  pc.minutes = tmp.tm_min
+  pc.sec = tmp.tm_sec
+  pc.nsec = Start_ns
+  tm.tm_isdst = tmp.tm_isdst
+  pc.meridian = MER24
+  pc.nlz = 0
+  if tmp.tm_zone ~= nilptr then
+    local zs: string = tmp.tm_zone
+    pc.lz[0].name = zs
+    pc.lz[0].value = tmp.tm_isdst
+    pc.nlz = 1
+    for quarter = 1, 3 do
+      local probe: int64
+      if ckd_add(&probe, Start, quarter * (90 * 24 * 60 * 60)) then break end
+      local probe_tm: sys.Tm
+      if util.localtime_rz(tz, probe, &probe_tm) and probe_tm.tm_zone ~= nilptr and
+          probe_tm.tm_isdst ~= pc.lz[0].value then
+        local ps: string = probe_tm.tm_zone
+        pc.lz[1].name = ps
+        pc.lz[1].value = probe_tm.tm_isdst
+        pc.nlz = 2
+        break
+      end
+    end
+    if pc.nlz == 2 and pc.lz[0].name == pc.lz[1].name then
+      pc.lz[0].value = -1
+      pc.nlz = 1
+    end
+  end
+
+  if not yyparse(&pc) then
+    if pc.debug then
+      if pc.pos >= (@int64)(pc.s.size) then
+        dbg_line('error: parsing failed\n')
+      else
+        local sb: stringbuilder
+        sb:write("error: parsing failed, stopped at '", pc.s:subview(pc.pos + 1), "'\n")
+        dbg_emit(&sb)
+      end
+    end
+    return false
+  end
+
+  if pc.debug then
+    local sb: stringbuilder
+    sb:write('input timezone: ')
+    if pc.timespec_seen then
+      sb:write("'@timespec' - always UTC")
+    elseif pc.zones_seen ~= 0 then
+      sb:write('parsed date/time string')
+    elseif tzstr_set then
+      if tz_from_string then sb:write('TZ="', tzstr, '" in date string')
+      elseif tzstr == 'UTC0' then sb:write('TZ="UTC0" environment value or -u')
+      else sb:write('TZ="', tzstr, '" environment value') end
+    else
+      sb:write('system default')
+    end
+    if pc.local_zones_seen ~= 0 and pc.zones_seen == 0 and 0 < pc.local_isdst then sb:write(', dst') end
+    if pc.zones_seen ~= 0 then
+      sb:write(' (')
+      time_zone_str(&sb, pc.time_zone)
+      sb:writebyte(')'_b)
+    end
+    sb:writebyte(10)
+    dbg_emit(&sb)
+  end
+
+  if pc.timespec_seen then
+    result.tv_sec = pc.sec
+    result.tv_nsec = pc.nsec
+  else
+    if 1 < (pc.times_seen | pc.dates_seen | pc.days_seen | pc.dsts_seen | (pc.local_zones_seen + pc.zones_seen)) then
+      if pc.debug then
+        if pc.times_seen > 1 then dbg_line('error: seen multiple time parts\n') end
+        if pc.dates_seen > 1 then dbg_line('error: seen multiple date parts\n') end
+        if pc.days_seen > 1 then dbg_line('error: seen multiple days parts\n') end
+        if pc.dsts_seen > 1 then dbg_line('error: seen multiple daylight-saving parts\n') end
+        if (pc.local_zones_seen + pc.zones_seen) > 1 then dbg_line('error: seen multiple time-zone parts\n') end
+      end
+      return false
+    end
+    if not to_tm_year(pc.year, pc.debug, &tm.tm_year) or ckd_add32(&tm.tm_mon, pc.month, -1) or
+        ckd_add32(&tm.tm_mday, pc.day, 0) then
+      if pc.debug then dbg_line('error: year, month, or day overflow\n') end
+      return false
+    end
+    if pc.times_seen ~= 0 or (pc.rels_seen and pc.dates_seen == 0 and pc.days_seen == 0) then
+      tm.tm_hour = to_hour(pc.hour, pc.meridian)
+      if tm.tm_hour < 0 then
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write('error: invalid hour ')
+          putd(&sb, pc.hour, 0, false, false)
+          if pc.meridian == MERam then sb:write('am') elseif pc.meridian == MERpm then sb:write('pm') end
+          sb:writebyte(10)
+          dbg_emit(&sb)
+        end
+        return false
+      end
+      tm.tm_min = (@cint)(pc.minutes)
+      tm.tm_sec = (@cint)(pc.sec)
+      if pc.debug then
+        local sb: stringbuilder
+        sb:write(pc.times_seen ~= 0 and "using specified time as starting value: '" or
+          "using current time as starting value: '")
+        debug_strftime(&sb, &tm)
+        sb:write("'\n")
+        dbg_emit(&sb)
+      end
+    else
+      tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0
+      pc.nsec = 0
+      if pc.debug then dbg_line('warning: using midnight as starting time: 00:00:00\n') end
+    end
+
+    if (pc.dates_seen | pc.days_seen | pc.times_seen) ~= 0 then tm.tm_isdst = -1 end
+    if pc.local_zones_seen ~= 0 then tm.tm_isdst = pc.local_isdst end
+
+    tm0.tm_sec = tm.tm_sec; tm0.tm_min = tm.tm_min; tm0.tm_hour = tm.tm_hour
+    tm0.tm_mday = tm.tm_mday; tm0.tm_mon = tm.tm_mon; tm0.tm_year = tm.tm_year
+    tm0.tm_isdst = tm.tm_isdst
+    tm.tm_wday = -1
+
+    Start = util.mktime_z(tz, &tm)
+
+    if not mktime_ok(&tm0, &tm) then
+      local repaired = false
+      local time_zone_seen = pc.zones_seen ~= 0
+      if time_zone_seen then
+        -- retry in a fixed zone "XXX<offset>" near the time_t limits
+        local zsb: stringbuilder
+        zsb:write('XXX')
+        time_zone_str(&zsb, pc.time_zone)
+        local tz2: util.Tz
+        tz2.set = true
+        tz2.name = zsb:promote()
+        tm.tm_sec = tm0.tm_sec; tm.tm_min = tm0.tm_min; tm.tm_hour = tm0.tm_hour
+        tm.tm_mday = tm0.tm_mday; tm.tm_mon = tm0.tm_mon; tm.tm_year = tm0.tm_year
+        tm.tm_isdst = tm0.tm_isdst
+        tm.tm_wday = -1
+        Start = util.mktime_z(&tz2, &tm)
+        repaired = mktime_ok(&tm0, &tm)
+        tz2.name:destroy()
+      end
+      if not repaired then
+        debug_mktime_not_ok(&tm0, &tm, &pc, time_zone_seen)
+        return false
+      end
+    end
+
+    if pc.days_seen ~= 0 and pc.dates_seen == 0 then
+      tm.tm_yday = -1
+      local dayincr: int64
+      local adj: int64 = (0 < pc.day_ordinal and tm.tm_wday ~= pc.day_number) and 1 or 0
+      if not (ckd_mul(&dayincr, pc.day_ordinal - adj, 7) or
+          ckd_add(&dayincr, ((@int64)(pc.day_number) - tm.tm_wday + 7) %%% 7, dayincr) or
+          ckd_add32(&tm.tm_mday, dayincr, tm.tm_mday)) then
+        tm.tm_isdst = -1
+        Start = util.mktime_z(tz, &tm)
+      end
+      if tm.tm_yday < 0 then
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write("error: day '")
+          str_days(&sb, &pc)
+          sb:write("' (day ordinal=")
+          putd(&sb, pc.day_ordinal, 0, false, false)
+          sb:write(' number=')
+          putd(&sb, pc.day_number, 0, false, false)
+          sb:write(") resulted in an invalid date: '")
+          debug_strfdatetime(&sb, &tm, &pc)
+          sb:write("'\n")
+          dbg_emit(&sb)
+        end
+        return false
+      end
+      if pc.debug then
+        local sb: stringbuilder
+        sb:write("new start date: '")
+        str_days(&sb, &pc)
+        sb:write("' is '")
+        debug_strfdatetime(&sb, &tm, &pc)
+        sb:write("'\n")
+        dbg_emit(&sb)
+      end
+    end
+
+    if pc.debug then
+      if pc.dates_seen == 0 and pc.days_seen == 0 then
+        local sb: stringbuilder
+        sb:write("using current date as starting value: '")
+        debug_strfdate(&sb, &tm)
+        sb:write("'\n")
+        dbg_emit(&sb)
+      end
+      if pc.days_seen ~= 0 and pc.dates_seen ~= 0 then
+        local sb: stringbuilder
+        sb:write('warning: day (')
+        str_days(&sb, &pc)
+        sb:write(') ignored when explicit dates are given\n')
+        dbg_emit(&sb)
+      end
+      local sb: stringbuilder
+      sb:write("starting date/time: '")
+      debug_strfdatetime(&sb, &tm, &pc)
+      sb:write("'\n")
+      dbg_emit(&sb)
+    end
+
+    -- relative date
+    if (pc.rel.year | pc.rel.month | pc.rel.day) ~= 0 then
+      if pc.debug then
+        if (pc.rel.year ~= 0 or pc.rel.month ~= 0) and tm.tm_mday ~= 15 then
+          dbg_line('warning: when adding relative months/years, it is recommended to specify the 15th of the months\n')
+        end
+        if pc.rel.day ~= 0 and tm.tm_hour ~= 12 then
+          dbg_line('warning: when adding relative days, it is recommended to specify noon\n')
+        end
+      end
+      local year: cint, month: cint, day: cint = 0, 0, 0
+      if ckd_add32(&year, tm.tm_year, pc.rel.year) or ckd_add32(&month, tm.tm_mon, pc.rel.month) or
+          ckd_add32(&day, tm.tm_mday, pc.rel.day) then
+        if pc.debug then dbg_line('error: parse-datetime.y:2148\n') end
+        return false
+      end
+      tm.tm_year = year
+      tm.tm_mon = month
+      tm.tm_mday = day
+      tm.tm_hour = tm0.tm_hour
+      tm.tm_min = tm0.tm_min
+      tm.tm_sec = tm0.tm_sec
+      tm.tm_isdst = tm0.tm_isdst
+      tm.tm_wday = -1
+      Start = util.mktime_z(tz, &tm)
+      if tm.tm_wday < 0 then
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write("error: adding relative date resulted in an invalid date: '")
+          debug_strfdatetime(&sb, &tm, &pc)
+          sb:write("'\n")
+          dbg_emit(&sb)
+        end
+        return false
+      end
+      if pc.debug then
+        local sb: stringbuilder
+        sb:write('after date adjustment (')
+        putd(&sb, pc.rel.year, 0, false, true)
+        sb:write(' years, ')
+        putd(&sb, pc.rel.month, 0, false, true)
+        sb:write(' months, ')
+        putd(&sb, pc.rel.day, 0, false, true)
+        sb:write(' days),\n')
+        dbg_emit(&sb)
+        sb:write("    new date/time = '")
+        debug_strfdatetime(&sb, &tm, &pc)
+        sb:write("'\n")
+        dbg_emit(&sb)
+        if tm0.tm_isdst ~= -1 and tm.tm_isdst ~= tm0.tm_isdst then
+          dbg_line('warning: daylight saving time changed after date adjustment\n')
+        end
+        if pc.rel.day == 0 and (tm.tm_mday ~= day or (pc.rel.month == 0 and tm.tm_mon ~= month)) then
+          dbg_line('warning: month/year adjustment resulted in shifted dates:\n')
+          sb:write('     adjusted Y M D: ')
+          tm_year_str(&sb, year)
+          sb:writebyte(32)
+          putd(&sb, (@integer)(month) + 1, 2, true, false)
+          sb:writebyte(32)
+          putd(&sb, day, 2, true, false)
+          sb:writebyte(10)
+          dbg_emit(&sb)
+          sb:write('   normalized Y M D: ')
+          tm_year_str(&sb, tm.tm_year)
+          sb:writebyte(32)
+          putd(&sb, (@integer)(tm.tm_mon) + 1, 2, true, false)
+          sb:writebyte(32)
+          putd(&sb, tm.tm_mday, 2, true, false)
+          sb:writebyte(10)
+          dbg_emit(&sb)
+        end
+      end
+    end
+
+    if pc.zones_seen ~= 0 then
+      local overflow = false
+      local utcoff: int64 = tm.tm_gmtoff
+      local delta: int64
+      local t1: int64
+      if ckd_sub(&delta, pc.time_zone, utcoff) then overflow = true end
+      if ckd_sub(&t1, Start, delta) then overflow = true end
+      if overflow then
+        if pc.debug then
+          local sb: stringbuilder
+          sb:write('error: timezone ')
+          putd(&sb, pc.time_zone, 0, false, false)
+          sb:write(' caused time_t overflow\n')
+          dbg_emit(&sb)
+        end
+        return false
+      end
+      Start = t1
+    end
+
+    if pc.debug then
+      local sb: stringbuilder
+      sb:write("'")
+      debug_strfdatetime(&sb, &tm, &pc)
+      sb:write("' = ")
+      putd(&sb, Start, 0, false, false)
+      sb:write(' epoch-seconds\n')
+      dbg_emit(&sb)
+    end
+
+    -- relative hours, minutes and seconds
+    do
+      local orig_ns: int64 = pc.nsec
+      local sum_ns: int64 = orig_ns + pc.rel.ns
+      local normalized_ns: int64 = (sum_ns %%% BILLION + BILLION) %%% BILLION
+      local d4: int64 = (sum_ns - normalized_ns) /// BILLION
+      local d1: int64, t1: int64, d2: int64, t2: int64, t3: int64, t4: int64 = 0, 0, 0, 0, 0, 0
+      if ckd_mul(&d1, pc.rel.hour, 3600) or ckd_add(&t1, Start, d1) or ckd_mul(&d2, pc.rel.minutes, 60) or
+          ckd_add(&t2, t1, d2) or ckd_add(&t3, t2, pc.rel.seconds) or ckd_add(&t4, t3, d4) then
+        if pc.debug then dbg_line('error: adding relative time caused an overflow\n') end
+        return false
+      end
+      result.tv_sec = t4
+      result.tv_nsec = normalized_ns
+      if pc.debug and (pc.rel.hour | pc.rel.minutes | pc.rel.seconds | pc.rel.ns) ~= 0 then
+        local sb: stringbuilder
+        sb:write('after time adjustment (')
+        putd(&sb, pc.rel.hour, 0, false, true)
+        sb:write(' hours, ')
+        putd(&sb, pc.rel.minutes, 0, false, true)
+        sb:write(' minutes, ')
+        putd(&sb, pc.rel.seconds, 0, false, true)
+        sb:write(' seconds, ')
+        putd(&sb, pc.rel.ns, 0, false, true)
+        sb:write(' ns),\n')
+        dbg_emit(&sb)
+        sb:write('    new time = ')
+        putd(&sb, t4, 0, false, false)
+        sb:write(' epoch-seconds\n')
+        dbg_emit(&sb)
+        local lmt: sys.Tm
+        if tm.tm_isdst ~= -1 and util.localtime_rz(tz, result.tv_sec, &lmt) and tm.tm_isdst ~= lmt.tm_isdst then
+          dbg_line('warning: daylight saving time changed after time adjustment\n')
+        end
+      end
+    end
+  end
+
+  if pc.debug then
+    if not tzstr_set then
+      dbg_line('timezone: system default\n')
+    elseif tzstr == 'UTC0' then
+      dbg_line('timezone: Universal Time\n')
+    else
+      local sb: stringbuilder
+      sb:write('timezone: TZ="', tzstr, '" environment value\n')
+      dbg_emit(&sb)
+    end
+    local sb: stringbuilder
+    sb:write('final: ')
+    putd(&sb, result.tv_sec, 0, false, false)
+    sb:writebyte('.'_b)
+    putd(&sb, (@cint)(result.tv_nsec), 9, true, false)
+    sb:write(' (epoch-seconds)\n')
+    dbg_emit(&sb)
+    local gmt: sys.Tm
+    local lmt: sys.Tm
+    local tt: clong = result.tv_sec
+    if sys.gmtime_r(&tt, &gmt) ~= nilptr then
+      sb:write('final: ')
+      debug_strfdatetime(&sb, &gmt, nilptr)
+      sb:write(' (UTC)\n')
+      dbg_emit(&sb)
+    end
+    if util.localtime_rz(tz, result.tv_sec, &lmt) then
+      sb:write('final: ')
+      debug_strfdatetime(&sb, &lmt, nilptr)
+      sb:write(' (UTC')
+      time_zone_str(&sb, (@cint)(lmt.tm_gmtoff))
+      sb:write(')\n')
+      dbg_emit(&sb)
+    end
+  end
+
+  return true
+end
+
+-- Parse P into RESULT, relative to NOW (nil: the current time), in the
+-- zone TZDEFAULT (the TZ value it was made from is tzstring in GNU's
+-- terms). DEBUG prints parse-datetime's --debug report.
+function util.parse_datetime2(result: *sys.Timespec, p0: string, now: *sys.Timespec, debug: boolean,
+    tzdefault: *util.Tz): boolean
+  -- a C string ends at its first NUL
+  local p = p0
+  for i: usize = 0, < p.size do
+    if p.data[i] == 0 then p = p:subview(1, (@isize)(i)); break end
+  end
+  local gettime_buffer: sys.Timespec
+  if now == nilptr then
+    sys.clock_gettime(sys.CLOCK_REALTIME, &gettime_buffer)
+    now = &gettime_buffer
+  end
+  local Start: int64 = now.tv_sec
+  local Start_ns: int64 = now.tv_nsec
+  local pos: usize = 0
+  while pos < p.size and isspace(p.data[pos]) do pos = pos + 1 end
+  local tz: *util.Tz = tzdefault
+  local tz1: util.Tz
+  local tz_from_string = false
+  local tzstr_set = tzdefault.set
+  local tzstr: string = tzdefault.name
+  if p.size - pos >= 4 and p.data[pos] == 'T'_b and p.data[pos + 1] == 'Z'_b and p.data[pos + 2] == '='_b and
+      p.data[pos + 3] == '"'_b then
+    local base = pos + 4
+    local s = base
+    while s < p.size do
+      local c = p.data[s]
+      if c == '\\'_b then
+        s = s + 1
+        local c2: byte = s < p.size and p.data[s] or 0
+        if not (c2 == '\\'_b or c2 == '"'_b) then break end
+      elseif c == '"'_b then
+        local sb: stringbuilder
+        local q = base
+        while p.data[q] ~= '"'_b do
+          if p.data[q] == '\\'_b then q = q + 1 end
+          sb:writebyte(p.data[q])
+          q = q + 1
+        end
+        tz1.set = true
+        tz1.name = sb:promote()
+        tz = &tz1
+        tz_from_string = true
+        tzstr_set = true
+        tzstr = tz1.name
+        pos = s + 1
+        while pos < p.size and isspace(p.data[pos]) do pos = pos + 1 end
+        break
+      end
+      s = s + 1
+    end
+  end
+  local ok = parse_body(result, p:subview((@isize)(pos) + 1), Start, Start_ns, debug, tz, tz_from_string,
+    tzstr_set, tzstr)
+  if tz_from_string then tz1.name:destroy() end
+  return ok
+end
+
+-- parse_datetime: the plain interface, without --debug, in the zone that
+-- TZ names (touch -d). Returns seconds, nanoseconds, ok.
 function util.getdate(s: string, now_t: integer, now_ns: integer): (integer, integer, boolean)
-  local ls = lower(s)
-  -- @SECONDS[.FRACTION]
-  if ls.size > 1 and ls.data[0] == 64 then
-    local body = ls:sub(2)
-    local neg = false
-    if body.size > 0 and (body.data[0] == 45 or body.data[0] == 43) then neg = body.data[0] == 45; body = body:sub(2) end
-    local dot = body:find('.', 1, true)
-    local ip, fp = body, ''
-    if dot > 0 then ip = body:sub(1, dot - 1); fp = body:sub(dot + 1) end
-    if not all_digits(ip) or (dot > 0 and fp.size > 0 and not all_digits(fp)) then return 0, 0, false end
-    local t, ns = num(ip), frac_ns(fp)
-    if neg then
-      t = -t
-      if ns > 0 then t = t - 1; ns = 1000000000 - ns end
-    end
-    return t, ns, true
-  end
-  local now, okn = util.breaktime(now_t, now_ns, false)
-  if not okn then return 0, 0, false end
-  local y, mo, d = (@integer)(now.tm.tm_year) + 1900, (@integer)(now.tm.tm_mon) + 1, (@integer)(now.tm.tm_mday)
-  local hh, mi, ss, ns = (@integer)(now.tm.tm_hour), (@integer)(now.tm.tm_min), (@integer)(now.tm.tm_sec), now_ns
-  local have_date, have_time, have_zone, have_wday = false, false, false, false
-  local zone = 0
-  local wday, wday_ord = -1, 0
-  local rel: [9]integer
-  local toks = tokens(ls)
-  local i = 1
-  local last_rel_unit = 0
-  local last_rel_val = 0
-  local prev_time = false
-  local year_given = false
-  local rels_seen = false
-  while i <= #toks do
-    local w = toks[i]
-    local after_time = prev_time
-    prev_time = false
-    local colon = w:find(':', 1, true)
-    local slash = w:find('/', 1, true)
-    local dash = w:find('-', 2, true)
-    if w == 'now' or w == 'today' then
-      -- no change
-    elseif w == 'yesterday' then rel[5] = rel[5] - 1
-    elseif w == 'tomorrow' then rel[5] = rel[5] + 1
-    elseif w == 'ago' then
-      if last_rel_unit == 0 then return 0, 0, false end
-      rel[last_rel_unit] = rel[last_rel_unit] - 2 * last_rel_val
-      last_rel_unit = 0
-    elseif colon > 0 and isdigit(w.data[0]) then
-      -- HH:MM[:SS[.FRAC]] with an optional zone glued on (+0100, Z)
-      local body = w
-      if body:sub(-1) == 'z' then body = body:sub(1, -2); zone = 0; have_zone = true end
-      local zpos = 0
-      for k: usize = 1, < body.size do
-        local c = body.data[k]
-        if (c == 43 or c == 45) and zpos == 0 then zpos = (@integer)(k) end
-      end
-      if zpos > 0 then
-        local z, okz = parse_zone(body:sub(zpos + 1))
-        if not okz then return 0, 0, false end
-        zone = z; have_zone = true
-        body = body:sub(1, zpos)
-      end
-      local parts: sequence(string)
-      local st: usize = 0
-      for k: usize = 0, < body.size do
-        if body.data[k] == 58 then parts:push(body:sub((@isize)(st) + 1, (@isize)(k))); st = k + 1 end
-      end
-      parts:push(body:sub((@isize)(st) + 1))
-      if #parts < 2 or #parts > 3 then return 0, 0, false end
-      local secpart = #parts == 3 and parts[3] or '0'
-      secpart = secpart:gsub(',', '.')
-      local dot = secpart:find('.', 1, true)
-      local fp = ''
-      if dot <= 0 then dot = secpart:find(',', 1, true) end
-      if dot > 0 then fp = secpart:sub(dot + 1); secpart = secpart:sub(1, dot - 1) end
-      if not all_digits(parts[1]) or not all_digits(parts[2]) or not all_digits(secpart) or
-         (fp.size > 0 and not all_digits(fp)) or parts[1].size > 2 or parts[2].size ~= 2 then
-        return 0, 0, false
-      end
-      hh, mi, ss, ns = num(parts[1]), num(parts[2]), num(secpart), frac_ns(fp)
-      if hh > 23 or mi > 59 or ss > 60 then return 0, 0, false end
-      have_time = true
-      -- am/pm
-      if i < #toks and (toks[i + 1] == 'am' or toks[i + 1] == 'pm' or toks[i + 1] == 'a.m.' or toks[i + 1] == 'p.m.') then
-        if hh < 1 or hh > 12 then return 0, 0, false end
-        local pm = toks[i + 1]:byte(1) == 112
-        if hh == 12 then hh = 0 end
-        if pm then hh = hh + 12 end
-        i = i + 1
-      end
-      prev_time = not have_zone
-    elseif slash > 0 then
-      -- MM/DD[/YYYY]
-      local a = w:sub(1, slash - 1)
-      local rest = w:sub(slash + 1)
-      local s2 = rest:find('/', 1, true)
-      local b, c = rest, ''
-      if s2 > 0 then b = rest:sub(1, s2 - 1); c = rest:sub(s2 + 1) end
-      if not all_digits(a) or not all_digits(b) or (s2 > 0 and not all_digits(c)) then return 0, 0, false end
-      mo, d = num(a), num(b)
-      if s2 > 0 then
-        y = num(c)
-        if c.size <= 2 then y = y < 69 and y + 2000 or y + 1900 end
-        year_given = true
-      end
-      if not valid_date(y, mo, d) then return 0, 0, false end
-      have_date = true
-      if not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-    elseif dash > 0 and (month_of(w:sub(1, dash - 1)) > 0 or (isdigit(w.data[0]) and month_of(w:sub(dash + 1, (w:find('-', dash + 1, true) > 0 and w:find('-', dash + 1, true) or w.size + 1) - 1)) > 0)) then
-      -- MON-D-Y ("jun-17-1992") or D-MON-Y ("17-jun-1992")
-      local p1 = dash
-      local p2 = w:find('-', p1 + 1, true)
-      local a = w:sub(1, p1 - 1)
-      local b = p2 > 0 and w:sub(p1 + 1, p2 - 1) or w:sub(p1 + 1)
-      local c = p2 > 0 and w:sub(p2 + 1) or ''
-      if month_of(a) > 0 then
-        mo = month_of(a)
-        if not all_digits(b) then return 0, 0, false end
-        d = num(b)
-      else
-        if not all_digits(a) then return 0, 0, false end
-        d = num(a); mo = month_of(b)
-      end
-      if p2 > 0 then
-        if not all_digits(c) then return 0, 0, false end
-        y = to_year(num(c), c.size); year_given = true
-      end
-      if not valid_date(y, mo, d) then return 0, 0, false end
-      have_date = true
-      if not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-    elseif month_of(w) > 0 then
-      -- MON D (a year may follow as a bare number)
-      if i == #toks or not all_digits(toks[i + 1]) then return 0, 0, false end
-      mo = month_of(w); d = num(toks[i + 1])
-      i = i + 1
-      if not valid_date(y, mo, d) then return 0, 0, false end
-      have_date = true
-      if not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-    elseif dash > 0 and isdigit(w.data[0]) then
-      -- YYYY-MM-DD
-      local p1 = w:find('-', 1, true)
-      local rest = w:sub(p1 + 1)
-      local p2 = rest:find('-', 1, true)
-      if p2 <= 0 then return 0, 0, false end
-      local a, b, c = w:sub(1, p1 - 1), rest:sub(1, p2 - 1), rest:sub(p2 + 1)
-      if not all_digits(a) or not all_digits(b) or not all_digits(c) then return 0, 0, false end
-      y, mo, d = num(a), num(b), num(c)
-      year_given = true
-      if not valid_date(y, mo, d) then return 0, 0, false end
-      have_date = true
-      if not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-    elseif (w.data[0] == 43 or w.data[0] == 45) and after_time then
-      -- parse-datetime reads a signed number right after a time as its zone,
-      -- even when a unit follows ("01:30 +1 hour" is 01:30 UTC+1, plus an hour)
-      local z, okz = parse_zone(w)
-      if not okz then return 0, 0, false end
-      zone = z; have_zone = true
-    elseif w == 'z' or w == 'utc' or w == 'ut' or w == 'gmt' then
-      zone = 0; have_zone = true
-    elseif w == 'next' or w == 'last' or w == 'this' or all_digits(w) or
-           ((w.data[0] == 43 or w.data[0] == 45) and w.size > 1 and all_digits(w:sub(2))) then
-      local n: integer
-      if w == 'next' then n = 1 elseif w == 'last' then n = -1 elseif w == 'this' then n = 0
-      elseif w.data[0] == 45 then n = -num(w:sub(2))
-      elseif w.data[0] == 43 then n = num(w:sub(2))
-      else n = num(w) end
-      local nxt = i < #toks and toks[i + 1] or ''
-      local u = i < #toks and unit_of(nxt) or 0
-      local wd = i < #toks and weekday_of(nxt) or -1
-      if all_digits(w) and meridian_of(nxt) >= 0 then
-        -- tUNUMBER tMERIDIAN: an hour from 1 to 12
-        local v = num(w)
-        if have_time or v < 1 or v > 12 then return 0, 0, false end
-        hh = v % 12 + meridian_of(nxt); mi = 0; ss = 0; ns = 0
-        have_time = true
-        i = i + 1
-      elseif all_digits(w) and month_of(nxt) > 0 then
-        -- D MON [YEAR]
-        d = num(w); mo = month_of(nxt)
-        i = i + 1
-        if i < #toks and all_digits(toks[i + 1]) and unit_of(i + 1 < #toks and toks[i + 2] or '') == 0 then
-          y = to_year(num(toks[i + 1]), toks[i + 1].size); year_given = true
-          i = i + 1
-        end
-        if not valid_date(y, mo, d) then return 0, 0, false end
-        have_date = true
-        if not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-      elseif all_digits(w) and u == 0 and not (wd >= 0) then
-        -- parse-datetime's bare number: a year after a date, a YYYYMMDD
-        -- date when longer than four digits, else HH or HHMM
-        local v = num(w)
-        if have_date and not year_given and not rels_seen and (have_time or w.size > 2) then
-          y = to_year(v, w.size); year_given = true
-          if not valid_date(y, mo, d) then return 0, 0, false end
-        elseif 4 < w.size and not have_date then
-          d = v % 100; mo = (v // 100) % 100; y = to_year(v // 10000, w.size - 4); year_given = true
-          if not valid_date(y, mo, d) then return 0, 0, false end
-          have_date = true
-          if not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-        else
-          if have_time or 4 < w.size then return 0, 0, false end
-          if w.size <= 2 then hh = v; mi = 0 else hh = v // 100; mi = v % 100 end
-          ss = 0; ns = 0
-          if hh > 23 or mi > 59 then return 0, 0, false end
-          have_time = true
-        end
-      elseif u > 0 then
-        rels_seen = true
-        rel[u] = rel[u] + n
-        last_rel_unit = u; last_rel_val = n
-        i = i + 1
-      elseif wd >= 0 and (w == 'next' or w == 'last' or w == 'this') then
-        wday = wd; wday_ord = n; have_wday = true
-        i = i + 1
-      else
-        return 0, 0, false
-      end
-    elseif unit_of(w) > 0 then
-      local u = unit_of(w)
-      rels_seen = true
-      rel[u] = rel[u] + 1
-      last_rel_unit = u; last_rel_val = 1
-    elseif weekday_of(w) >= 0 then
-      wday = weekday_of(w); wday_ord = 0; have_wday = true
-    else
-      return 0, 0, false
-    end
-    i = i + 1
-  end
-  if have_wday and not have_time then hh = 0; mi = 0; ss = 0; ns = 0 end
-  if (have_date or have_wday) and not have_time then ns = 0 end
-  -- parse-datetime's order: the day of the week first (only without an
-  -- explicit date), then years, months and days on the broken-down time
-  -- (normalized like mktime), then hours, minutes and seconds as a count
-  local days = days_from_civil(y, mo, 1) + (d - 1)
-  if have_wday and not have_date then
-    local cur = (days + 4) % 7   -- 1970-01-01 was a Thursday
-    local delta = (wday - cur + 7) % 7
-    local adj = (wday_ord > 0 and cur ~= wday) and 1 or 0
-    days = days + delta + 7 * (wday_ord - adj)
-  end
-  y, mo, d = civil_from_days(days)
-  y = y + rel[1]
-  mo = mo + rel[2]
-  local my = (mo - 1) // 12
-  y = y + my
-  mo = mo - my * 12
-  days = days_from_civil(y, mo, 1) + (d - 1) + rel[5] + 7 * rel[4] + 14 * rel[3]
-  y, mo, d = civil_from_days(days)
-  local t: integer
-  if have_zone then
-    t = days * 86400 + hh * 3600 + mi * 60 + ss - zone
-  else
-    if not have_date and not have_time and not have_wday then
-      -- only relative items: keep the current DST flag, as parse-datetime does,
-      -- so days across a DST change keep their length in seconds
-      t = util.mktime_dst(y, mo, d, hh, mi, ss, now.tm.tm_isdst)
-    else
-      local okl: boolean
-      t, okl = util.localsecs(y, mo, d, hh, mi, ss)
-      if not okl then return 0, 0, false end
-    end
-  end
-  t = t + rel[6] * 3600 + rel[7] * 60 + rel[8]
-  return t, ns, true
+  local tz = util.tzalloc(sys.getenv('TZ'))
+  local now: sys.Timespec
+  now.tv_sec = now_t
+  now.tv_nsec = now_ns
+  local r: sys.Timespec
+  local ok = util.parse_datetime2(&r, s, &now, false, &tz)
+  if tz.set then tz.name:destroy() end
+  return r.tv_sec, r.tv_nsec, ok
 end

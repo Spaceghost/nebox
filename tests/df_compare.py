@@ -5,7 +5,7 @@ Both read the same live mount table; a case whose output differs is rerun
 up to four times, since busy file systems (the root's usage) change between
 runs, and counts as a mismatch only if it never matches. Output,
 diagnostics (minus "Try --help") and exit status must match."""
-import os, subprocess, sys, tempfile
+import os, re, subprocess, sys, tempfile
 
 NEBOX = os.path.abspath(sys.argv[1])
 d = tempfile.mkdtemp(prefix='df-compare-', dir='/dev/shm' if os.access('/dev/shm', os.W_OK) else None)
@@ -54,7 +54,11 @@ def run(cmd, which):
     p = subprocess.run(['bash', '-c', c], cwd=d, env=env, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
     err = p.stderr.replace(NEBOX.encode() + b' ', b'')
     err = b'\n'.join(l for l in err.split(b'\n') if not l.startswith(b"Try '"))
-    return p.returncode, p.stdout, err
+    # /dev/shm is shared with other test writers, so its used/available/inode
+    # counts (and Use%) move between the two runs: mask the digits of its rows
+    out = b'\n'.join(re.sub(rb'\d', b'#', l) if l.rstrip().endswith(b'/dev/shm') else l
+                      for l in p.stdout.split(b'\n'))
+    return p.returncode, out, err
 
 
 bad = 0

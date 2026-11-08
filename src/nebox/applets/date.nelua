@@ -1,0 +1,503 @@
+-- date: a port of GNU coreutils 9.1 src/date.c in the C locale. Options
+-- through util.getopt (glibc getopt_long, every long option and alias),
+-- --iso-8601 and --rfc-3339 through argmatch, the "multiple output
+-- formats", mutually-exclusive and lacks-a-leading-'+' errors, -d and -s
+-- through the parse-datetime port (src/nebox/getdate.nelua) with --debug,
+-- -f FILE (or -) line by line with "invalid date" per bad line, -r FILE's
+-- mtime, --resolution and "%-N" from gettime_res (clock_getres and
+-- clock_gettime samples), -u as TZ=UTC0, the MMDDhhmm[[CC]YY][.ss] operand
+-- through posixtm, setting the clock with clock_settime (and printing the
+-- date whatever the outcome), show_date's "time ... is out of range", and
+-- close_stdout's write error. Formatting is the nstrftime port in
+-- clock.nelua.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.clock'
+require 'nebox.getdate'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_clock_getres(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_getres', cinclude '<time.h>'> end
+local function c_clock_settime(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_settime', cinclude '<time.h>'> end
+local function c_tzset() <cimport 'tzset', cinclude '<time.h>'> end
+local function c_read(fd: cint, buf: pointer, n: csize): clong <cimport 'read', cinclude '<unistd.h>'> end
+
+local DEBUG_DATE_PARSING_OPTION <comptime> = 256
+local RESOLUTION_OPTION <comptime> = 257
+local RFC_3339_OPTION <comptime> = 258
+local HELP_OPTION <comptime> = 259
+local VERSION_OPTION <comptime> = 260
+
+local TIME_SPEC_DATE <comptime> = 0
+local TIME_SPEC_SECONDS <comptime> = 1
+local TIME_SPEC_NS <comptime> = 2
+local TIME_SPEC_HOURS <comptime> = 3
+local TIME_SPEC_MINUTES <comptime> = 4
+
+local rfc_email_format: string = '%a, %d %b %Y %H:%M:%S %z'
+local debug_flag = false
+
+-- stdout errors stick, as a stdio stream's error flag does
+local stdout_failed = false
+
+local function oflush()
+  if not util.flush() then stdout_failed = true end
+end
+
+-- error (0, 0, ...): stdout is flushed first
+local function err(msg: string)
+  oflush()
+  util.err(msg)
+end
+
+-- the same for a message built per line, which is freed
+local function err_free(prefix: string, quoted: string, suffix: string)
+  local m = prefix .. quoted .. suffix
+  err(m)
+  m:destroy()
+  quoted:destroy()
+end
+
+-- close_stdout (gnulib close_stream): an earlier failure with nothing left
+-- to write is "write error" without an errno
+local function finish(status: integer): integer
+  local prev_fail = stdout_failed
+  local fclose_fail = not util.flush()
+  local e: cint = sys.errno()
+  if prev_fail or fclose_fail then
+    util.err(fclose_fail and ('write error: ' .. sys.strerror(e)) or 'write error')
+    c_exit(1)
+  end
+  c_exit((@cint)(status))
+  return status
+end
+
+local function die(msg: string)
+  err(msg)
+  finish(1)
+end
+
+local function usage(status: integer)
+  if status ~= 0 then
+    oflush()
+    local m = "Try '" .. util.applet .. " --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+  else
+    util.write('Usage: ' .. util.applet .. ' [OPTION]... [+FORMAT]\n')
+    util.write('  or:  ' .. util.applet .. ' [-u|--utc|--universal] [MMDDhhmm[[CC]YY][.ss]]\n')
+    util.write([==[
+Display date and time in the given FORMAT.
+With -s, or with [MMDDhhmm[[CC]YY][.ss]], set the date and time.
+
+Mandatory arguments to long options are mandatory for short options too.
+  -d, --date=STRING          display time described by STRING, not 'now'
+      --debug                annotate the parsed date,
+                              and warn about questionable usage to stderr
+  -f, --file=DATEFILE        like --date; once for each line of DATEFILE
+  -I[FMT], --iso-8601[=FMT]  output date/time in ISO 8601 format.
+                               FMT='date' for date only (the default),
+                               'hours', 'minutes', 'seconds', or 'ns'
+                               for date and time to the indicated precision.
+                               Example: 2006-08-14T02:34:56-06:00
+  --resolution               output the available resolution of timestamps
+                               Example: 0.000000001
+  -R, --rfc-email            output date and time in RFC 5322 format.
+                               Example: Mon, 14 Aug 2006 02:34:56 -0600
+      --rfc-3339=FMT         output date/time in RFC 3339 format.
+                               FMT='date', 'seconds', or 'ns'
+                               for date and time to the indicated precision.
+                               Example: 2006-08-14 02:34:56-06:00
+  -r, --reference=FILE       display the last modification time of FILE
+  -s, --set=STRING           set time described by STRING
+  -u, --utc, --universal     print or set Coordinated Universal Time (UTC)
+      --help        display this help and exit
+      --version     output version information and exit
+
+FORMAT controls the output.  Interpreted sequences are:
+
+  %%   a literal %
+  %a   locale's abbreviated weekday name (e.g., Sun)
+  %A   locale's full weekday name (e.g., Sunday)
+  %b   locale's abbreviated month name (e.g., Jan)
+  %B   locale's full month name (e.g., January)
+  %c   locale's date and time (e.g., Thu Mar  3 23:05:25 2005)
+  %C   century; like %Y, except omit last two digits (e.g., 20)
+  %d   day of month (e.g., 01)
+  %D   date; same as %m/%d/%y
+  %e   day of month, space padded; same as %_d
+  %F   full date; like %+4Y-%m-%d
+  %g   last two digits of year of ISO week number (see %G)
+  %G   year of ISO week number (see %V); normally useful only with %V
+  %h   same as %b
+  %H   hour (00..23)
+  %I   hour (01..12)
+  %j   day of year (001..366)
+  %k   hour, space padded ( 0..23); same as %_H
+  %l   hour, space padded ( 1..12); same as %_I
+  %m   month (01..12)
+  %M   minute (00..59)
+  %n   a newline
+  %N   nanoseconds (000000000..999999999)
+  %p   locale's equivalent of either AM or PM; blank if not known
+  %P   like %p, but lower case
+  %q   quarter of year (1..4)
+  %r   locale's 12-hour clock time (e.g., 11:11:04 PM)
+  %R   24-hour hour and minute; same as %H:%M
+  %s   seconds since the Epoch (1970-01-01 00:00 UTC)
+  %S   second (00..60)
+  %t   a tab
+  %T   time; same as %H:%M:%S
+  %u   day of week (1..7); 1 is Monday
+  %U   week number of year, with Sunday as first day of week (00..53)
+  %V   ISO week number, with Monday as first day of week (01..53)
+  %w   day of week (0..6); 0 is Sunday
+  %W   week number of year, with Monday as first day of week (00..53)
+  %x   locale's date representation (e.g., 12/31/99)
+  %X   locale's time representation (e.g., 23:13:48)
+  %y   last two digits of year (00..99)
+  %Y   year
+  %z   +hhmm numeric time zone (e.g., -0400)
+  %:z  +hh:mm numeric time zone (e.g., -04:00)
+  %::z  +hh:mm:ss numeric time zone (e.g., -04:00:00)
+  %:::z  numeric time zone with : to necessary precision (e.g., -04, +05:30)
+  %Z   alphabetic time zone abbreviation (e.g., EDT)
+
+By default, date pads numeric fields with zeroes.
+The following optional flags may follow '%':
+
+  -  (hyphen) do not pad the field
+  _  (underscore) pad with spaces
+  0  (zero) pad with zeros
+  +  pad with zeros, and put '+' before future years with >4 digits
+  ^  use upper case if possible
+  #  use opposite case if possible
+
+After any flags comes an optional field width, as a decimal number;
+then an optional modifier, which is either
+E to use the locale's alternate representations if available, or
+O to use the locale's alternate numeric symbols if available.
+
+Examples:
+Convert seconds since the Epoch (1970-01-01 UTC) to a date
+  $ date --date='@2147483647'
+
+Show the time on the west coast of the US (use tzselect(1) to find TZ)
+  $ TZ='America/Los_Angeles' date
+
+Show the local time for 9AM next Friday on the west coast of the US
+  $ date --date='TZ="America/Los_Angeles" 09:00 next Fri'
+]==])
+  end
+  finish(status)
+end
+
+-- gnulib gettime_res: clock_getres, narrowed by clock_gettime samples
+local function gcd(a: int64, b: int64): int64
+  while b ~= 0 do
+    local r = a % b
+    a = b
+    b = r
+  end
+  return a
+end
+
+local function gettime_res(): int64
+  local res: sys.Timespec
+  c_clock_getres(sys.CLOCK_REALTIME, &res)
+  local hz: int64 = 1000000000
+  local r: int64 = hz * res.tv_sec + res.tv_nsec
+  local i = 0
+  while 1 < r and i < 32 do
+    local now: sys.Timespec
+    sys.clock_gettime(sys.CLOCK_REALTIME, &now)
+    r = gcd(r, now.tv_nsec ~= 0 and now.tv_nsec or hz)
+    i = i + 1
+  end
+  return r
+end
+
+local function res_width(res: int64): integer
+  local i = 9
+  local r: int64 = 1
+  while true do
+    r = r * 10
+    if r > res then break end
+    i = i - 1
+  end
+  return i
+end
+
+-- each "%-N" becomes "%9N" (the digits the clock resolution needs)
+local function adjust_resolution(format: string): string
+  local copy: stringbuilder
+  local changed = false
+  local f: usize = 0
+  local n = format.size
+  local function at(s: string, i: usize): byte
+    if i < s.size then return s.data[i] end
+    return 0
+  end
+  local res_digit: byte = 0
+  while f < n do
+    if format.data[f] == '%'_b then
+      if at(format, f + 1) == '-'_b and at(format, f + 2) == 'N'_b then
+        if not changed then
+          changed = true
+          copy:write(format)
+          res_digit = (@byte)(48 + res_width(gettime_res()))
+        end
+        copy:view().data[f + 1] = res_digit
+        f = f + 2
+      elseif at(format, f + 1) == '%'_b then
+        f = f + 1
+      end
+    end
+    f = f + 1
+  end
+  if not changed then return format end
+  return copy:promote()
+end
+
+local function show_date(format: string, when: sys.Timespec, tz: *util.Tz): boolean
+  if debug_flag then err_free('output format: ', util.quote(format), '') end
+  local tm: sys.Tm
+  if util.localtime_rz(tz, when.tv_sec, &tm) then
+    local f: util.Time
+    f.t = when.tv_sec
+    f.ns = when.tv_nsec
+    f.tm = tm
+    if tm.tm_zone ~= nilptr then
+      local z: string = tm.tm_zone
+      f.zone = z
+    end
+    local s = util.timestr(format, &f)
+    util.write(s)
+    util.writebyte(10)
+    s:destroy()
+    return true
+  end
+  local ts = tostring(when.tv_sec)
+  err_free('time ', util.quote(ts), ' is out of range')
+  ts:destroy()
+  return false
+end
+
+-- batch_convert: each line of FILE as a --date string
+local function batch_convert(input_filename: string, format: string, tz: *util.Tz): boolean
+  local fd: cint = 0
+  if input_filename == '-' then
+    input_filename = 'standard input'
+  else
+    fd = sys.open(input_filename, 0, 0)
+    if fd < 0 then die(util.quotef(input_filename) .. ': ' .. sys.errstr()) end
+  end
+  local ok = true
+  local buf: [4096]byte
+  local line: stringbuilder
+  local eof = false
+  local pending: sequence(byte)
+  local start = 1
+  while true do
+    -- find a complete line in pending
+    local nl = -1
+    for i = start, #pending do
+      if pending[i] == 10 then nl = i; break end
+    end
+    if nl < 0 and not eof then
+      -- compact, then read more
+      if start > 1 then
+        local k = 1
+        for i = start, #pending do pending[k] = pending[i]; k = k + 1 end
+        while #pending >= k do pending:pop() end
+        start = 1
+      end
+      local r = c_read(fd, &buf[0], 4096)
+      if r < 0 and sys.errno() == sys.EINTR then continue end
+      if r <= 0 then
+        eof = true
+      else
+        for i = 0, < r do pending:push(buf[i]) end
+      end
+      continue
+    end
+    local stop = nl >= 0 and nl or #pending
+    if stop < start then break end
+    line:clear()
+    for i = start, stop do line:writebyte(pending[i]) end
+    start = stop + 1
+    local when: sys.Timespec
+    local l = line:view()
+    if not util.parse_datetime2(&when, l, nilptr, debug_flag, tz) then
+      local shown = l
+      if shown.size > 0 and shown.data[shown.size - 1] == 10 then shown = shown:subview(1, -2) end
+      for i: usize = 0, < shown.size do
+        if shown.data[i] == 0 then shown = shown:subview(1, (@isize)(i)); break end
+      end
+      err_free('invalid date ', util.quote(shown), '')
+      ok = false
+    else
+      if not show_date(format, when, tz) then ok = false end
+    end
+  end
+  line:destroy()
+  if fd ~= 0 and sys.close(fd) ~= 0 then die(util.quotef(input_filename) .. ': ' .. sys.errstr()) end
+  return ok
+end
+
+global function applet_date(args: sequence(string)): integer
+  local datestr: string
+  local have_datestr = false
+  local set_datestr: string
+  local have_set_datestr = false
+  local set_date = false
+  local format: string
+  local have_format = false
+  local get_resolution = false
+  local batch_file: string
+  local have_batch = false
+  local reference: string
+  local have_reference = false
+  local longs: []util.LongOpt = {
+    {'date', 1, 100}, {'debug', 0, DEBUG_DATE_PARSING_OPTION}, {'file', 1, 102}, {'iso-8601', 2, 73},
+    {'reference', 1, 114}, {'resolution', 0, RESOLUTION_OPTION}, {'rfc-email', 0, 82}, {'rfc-822', 0, 82},
+    {'rfc-2822', 0, 82}, {'rfc-3339', 1, RFC_3339_OPTION}, {'set', 1, 115}, {'uct', 0, 117}, {'utc', 0, 117},
+    {'universal', 0, 117}, {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+  }
+  local rfc_3339_format: []string = {'%Y-%m-%d', '%Y-%m-%d %H:%M:%S%:z', '%Y-%m-%d %H:%M:%S.%N%:z'}
+  local iso_8601_format: []string = {'%Y-%m-%d', '%Y-%m-%dT%H:%M:%S%:z', '%Y-%m-%dT%H:%M:%S,%N%:z',
+    '%Y-%m-%dT%H%:z', '%Y-%m-%dT%H:%M%:z'}
+  local time_spec_string: []string = {'hours', 'minutes', 'date', 'seconds', 'ns'}
+  local time_spec: []integer = {TIME_SPEC_HOURS, TIME_SPEC_MINUTES, TIME_SPEC_DATE, TIME_SPEC_SECONDS, TIME_SPEC_NS}
+  local rfc_names: []string = {'date', 'seconds', 'ns'}
+  local rfc_specs: []integer = {TIME_SPEC_DATE, TIME_SPEC_SECONDS, TIME_SPEC_NS}
+  local g = util.getopt(args, 'd:f:I::r:Rs:u', &longs, #longs)
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    local new_format: string
+    local has_new = false
+    if c == 100 then
+      datestr = g.optarg; have_datestr = true
+    elseif c == DEBUG_DATE_PARSING_OPTION then
+      debug_flag = true
+    elseif c == 102 then
+      batch_file = g.optarg; have_batch = true
+    elseif c == RESOLUTION_OPTION then
+      get_resolution = true
+    elseif c == RFC_3339_OPTION then
+      local i = util.argmatch('--rfc-3339', g.optarg, &rfc_names, &rfc_specs, #rfc_names)
+      if i < 0 then usage(1) end
+      new_format = rfc_3339_format[i]; has_new = true
+    elseif c == 73 then
+      local i: integer = TIME_SPEC_DATE
+      if g.has_optarg then
+        i = util.argmatch('--iso-8601', g.optarg, &time_spec_string, &time_spec, #time_spec_string)
+        if i < 0 then usage(1) end
+      end
+      new_format = iso_8601_format[i]; has_new = true
+    elseif c == 114 then
+      reference = g.optarg; have_reference = true
+    elseif c == 82 then
+      new_format = rfc_email_format; has_new = true
+    elseif c == 115 then
+      set_datestr = g.optarg; have_set_datestr = true
+      set_date = true
+    elseif c == 117 then
+      sys.setenv('TZ', 'UTC0', 1)
+      c_tzset()
+    elseif c == HELP_OPTION then
+      usage(0)
+    elseif c == VERSION_OPTION then
+      util.write('date (nebox) after GNU coreutils 9.1\n')
+      finish(0)
+    else
+      usage(1)
+    end
+    if has_new then
+      if have_format then die('multiple output formats specified') end
+      format = new_format; have_format = true
+    end
+  end
+
+  local option_specified_date = (have_datestr and 1 or 0) + (have_batch and 1 or 0) + (have_reference and 1 or 0) +
+    (get_resolution and 1 or 0)
+  if option_specified_date > 1 then
+    err('the options to specify dates for printing are mutually exclusive')
+    usage(1)
+  end
+  if set_date and option_specified_date ~= 0 then
+    err('the options to print and set the time may not be used together')
+    usage(1)
+  end
+  local ops = g:operands()
+  local optind = 1
+  if #ops >= 1 then
+    if #ops >= 2 then
+      err('extra operand ' .. util.quote(ops[2]))
+      usage(1)
+    end
+    if #ops[1] > 0 and ops[1]:byte(1) == '+'_b then
+      if have_format then die('multiple output formats specified') end
+      format = ops[1]:sub(2); have_format = true
+      optind = 2
+    elseif set_date or option_specified_date ~= 0 then
+      err('the argument ' .. util.quote(ops[1]) .. " lacks a leading '+';\n" ..
+        'when using an option to specify date(s), any non-option\n' ..
+        "argument must be a format string beginning with '+'")
+      usage(1)
+    end
+  end
+
+  if not have_format then
+    if get_resolution then format = '%s.%N' else format = '%a %b %e %H:%M:%S %Z %Y' end
+  end
+  local format_res = adjust_resolution(format)
+  local tz = util.tzalloc(sys.getenv('TZ'))
+  local ok: boolean
+  if have_batch then
+    ok = batch_convert(batch_file, format_res, &tz)
+  else
+    local valid_date = true
+    local when: sys.Timespec
+    ok = true
+    if option_specified_date == 0 and not set_date then
+      if optind <= #ops then
+        set_date = true
+        datestr = ops[optind]
+        local t: int64
+        valid_date, t = util.posixtime(datestr, util.PDS_TRAILING_YEAR | util.PDS_CENTURY | util.PDS_SECONDS)
+        when.tv_sec = t
+        when.tv_nsec = 0
+      else
+        sys.clock_gettime(sys.CLOCK_REALTIME, &when)
+      end
+    else
+      if have_reference then
+        local st: sys.Stat
+        if sys.stat(reference, &st) ~= 0 then die(util.quotef(reference) .. ': ' .. sys.errstr()) end
+        when.tv_sec = st.st_mtim.tv_sec
+        when.tv_nsec = st.st_mtim.tv_nsec
+      elseif get_resolution then
+        local res = gettime_res()
+        when.tv_sec = res // 1000000000
+        when.tv_nsec = res % 1000000000
+      else
+        if have_set_datestr then datestr = set_datestr end
+        valid_date = util.parse_datetime2(&when, datestr, nilptr, debug_flag, &tz)
+      end
+    end
+    if not valid_date then die('invalid date ' .. util.quote(datestr)) end
+    if set_date then
+      if c_clock_settime(sys.CLOCK_REALTIME, &when) ~= 0 then
+        err('cannot set date: ' .. sys.errstr())
+        ok = false
+      end
+    end
+    if not show_date(format_res, when, &tz) then ok = false end
+  end
+  return finish(ok and 0 or 1)
+end

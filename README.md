@@ -248,11 +248,9 @@ Stated here rather than worked around:
   MMDDhhmm[YY] operand when `_POSIX2_VERSION` is below 200112) and
   parse_datetime (`util.getdate`) for -d, relative to the -r file's times
   when both are given: -a -c -d -f -h -m -r -t `--time`, "-" for standard
-  output, "-d now" treated as no date. `util.getdate` gained parse-datetime's
-  month names (three-letter or "abc." abbreviations, "sept"), MON D, D MON
-  [Y], D-MON-Y and MON-D-Y, the bare-number rule (a year after a date,
-  YYYYMMDD, else HH or HHMM), am/pm after a bare hour or glued to a time,
-  and a comma as the decimal point in seconds. `tests/touch_compare.py`: 113
+  output, "-d now" treated as no date. -d is the parse-datetime port
+  described under `date`, -t and the operand use its glibc mktime port.
+  `tests/touch_compare.py`: 113
   cases, 0 mismatches.
 - `truncate` ports truncate.c: -c -o -r -s with the < > / % + - modifiers,
   sizes through the new `util.xdectoimax` (gnulib's signed xdectoimax),
@@ -691,7 +689,8 @@ Stated here rather than worked around:
 - `groups`/`whoami` know only the
   current process.
 - Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)
-  comes from nelibc's `localtime_r`/`mktime`: TZif zone files, POSIX TZ
+  comes from nelibc's `localtime_r` (and `mktime`, except in `date` and
+  `touch`, which use a port of glibc's mktime over localtime_r): TZif zone files, POSIX TZ
   strings (`EST5EDT`, `<+0530>-5:30`, `NZST-12NZDT,M9.5.0,M4.1.0/3`), and
   `/etc/localtime` when TZ is unset. A relative zone name is looked up
   under `$TZDIR` or `/usr/share/zoneinfo` first, as glibc does (`TZ=Japan`
@@ -705,21 +704,56 @@ Stated here rather than worked around:
   string, both as in glibc (`date-tz-unknown-name`,
   `date-tz-tzdir-missing`). `touch` rejects a wall time that a
   DST change skips and takes the first of a repeated hour, as GNU does.
-- `date` formats with GNU's nstrftime rules in the C locale: every
-  conversion, the `_ - 0 + ^ #` flags, widths, `E`/`O`, `%N` (and `%-N`),
-  `%q`, `%P`, `%s`, `%:z %::z %:::z` (`date-fmt-*`). `-u`, `-R`, `-r FILE`;
-  `-d` reads a subset of gnulib's parse-datetime (`src/nebox/getdate.nelua`):
-  `@SECONDS[.FRAC]`, `YYYY-MM-DD`, `MM/DD[/YY[YY]]`, `HH:MM[:SS[.FRAC]]`
-  with `am`/`pm`, the ISO `T` form, zones `Z`/`UTC`/`UT`/`GMT`/`+HH[:MM]`
-  (a signed number right after a time is its zone, as in GNU, so
-  `01:30 +1 hour` means UTC+1 plus one hour), `now`/`today`/`yesterday`/
-  `tomorrow`, weekdays with `next`/`last`/`this`, and relative
-  `[+-]N unit [ago]` for years, months, fortnights, weeks, days, hours,
-  minutes and seconds, applied in parse-datetime's order (calendar units on
-  the broken-down time, then seconds; relative-only strings keep the current
-  DST flag), and month names (`D MON Y`, `MON D`, `D-MON-Y`). Against GNU
-  date 9.1 (`date-d-*`). Not understood: ordinal words, `week` numbers, named zones other than UTC/GMT, `DST`. No
-  `-I`, `--rfc-3339`, `-f`, long options, or setting the date.
+- `date` ports GNU coreutils 9.1 date.c in the C locale
+  (`src/nebox/applets/date.nelua`) over a port of gnulib's
+  parse-datetime.y (`src/nebox/getdate.nelua`, which `touch -d` also uses):
+  every option and long option (-d -f -I[FMT] `--rfc-3339` -R and its
+  aliases -r `--resolution` -s -u and its aliases `--debug`), argmatch's
+  messages for -I and `--rfc-3339`, the "multiple output formats",
+  mutually-exclusive, print-and-set, extra-operand and missing-'+' errors,
+  -f FILE or - read line by line with "invalid date" for each bad line (a
+  line ends at a NUL for the parser, as in C), the MMDDhhmm[[CC]YY][.ss]
+  operand through posixtm, clock_settime for -s and the operand with the
+  date printed whatever the outcome, `%-N` and `--resolution` from
+  gettime_res, show_date's "time ... is out of range", and close_stdout's
+  write error (with or without an errno, as close_stream decides).
+  Formatting is the nstrftime port (`date-fmt-*`). The parser is
+  hand-written from the bison grammar: the same productions, bison's shift
+  in the grammar's 31 conflicts and its default reductions, so `--debug`
+  reports items, unknown words and the "stopped at" text in GNU's order.
+  yylex, lookup_word and its tables (local zone abbreviations from the zone
+  now and in the next three quarters, military letters with no J and T as
+  the ISO separator, the 19-character word buffer, the period-dropping
+  retry), the `TZ="..."` prefix with its escapes, relative items with
+  ago/hence, this/next/last and ordinal words, decimal seconds, `@N`,
+  digits_to_date_time, time_zone_hhmm, to_hour, to_tm_year, every
+  overflow check and parse_datetime_body's steps and `--debug` lines are
+  ported as written. mktime is a port of the glibc 2.36 / gnulib mktime.c
+  that GNU date calls (its process-wide offset guess, spring-forward gaps,
+  a requested tm_isdst) over nelibc's localtime_r, and zones switch TZ as
+  gnulib's time_rz does. `tests/date_compare.py`: 3512 fixed cases (every
+  option and error, about 600 grammar strings plain and with `--debug`
+  under several TZ values, DST edges in New York, a POSIX-rule zone and
+  Lord Howe, far years and the time_t limits) and 3000 random strings
+  built from grammar pieces and character fuzz, 0 mismatches; four more
+  seeds with 12000 random strings each also gave 0. -f with 100000 lines
+  (30000 with `--debug` or invalid lines) stayed near 8 MB resident.
+  Differences:
+  - nelibc's localtime_r fails for the last year time_t can show (tm_year
+    INT_MAX) in a zone west of UTC, where the UTC year has already
+    overflowed: `TZ=America/New_York date -d @67768036191676800` is "out of
+    range" where GNU prints year 2147485547. The test runs the two such
+    cases and reports them as known differences.
+  - glibc applies a POSIX TZ rule (a TZ string such as
+    `EST5EDT,M3.2.0,M11.1.0`, or a zone file's footer after its last
+    transition) only from 1970, so earlier times are standard time there,
+    and its rule arithmetic overflows int past year 5885487; nelibc applies
+    the rule in every year. The test reruns such cases (about 1% of the
+    random strings) in Asia/Tokyo.
+  - `--help` omits GNU's closing links; `--version` prints nebox's line.
+  - -s and the operand were compared as an unprivileged user only ("cannot
+    set date: Operation not permitted", the date still printed, status
+    1); actually setting the clock is untested.
 - `ls`, `dir` and `vdir` port GNU coreutils 9.1 `src/ls.c` in the C locale
   (`src/nebox/applets/ls.nelua`): every option and long option with
   getopt_long's abbreviation rules and ls's XARGMATCH/argmatch messages

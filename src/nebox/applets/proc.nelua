@@ -1,5 +1,5 @@
 -- Process and system applets: true false sleep env printenv uname hostname id
--- kill which sync date nproc
+-- kill which sync nproc
 ## pragmas.nogc = true
 
 require 'string'
@@ -8,8 +8,6 @@ require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.longopts'
-require 'nebox.getdate'
-require 'nebox.clock'
 
 global function applet_true(args: sequence(string)): integer
   return 0
@@ -162,58 +160,6 @@ end
 
 global function applet_sync(args: sequence(string)): integer
   sys.sync()
-  return 0
-end
-
--- date: local time from nelibc's zone handling (TZ, /etc/localtime), -u for
--- UTC; formats go through util.timestr (GNU nstrftime semantics).
-global function applet_date(args: sequence(string)): integer
-  local o = util.parse(args, 'ud:r:R')
-  if not o:ok() then return util.optfail(o) end
-  local t: integer
-  local ns: integer = 0
-  if o:has('r') then
-    local st: sys.Stat
-    if sys.stat(o:get('r'), &st) ~= 0 then return util.die(o:get('r') .. ': ' .. sys.errstr()) end
-    t = st.st_mtim.tv_sec; ns = st.st_mtim.tv_nsec
-  elseif o:has('d') then
-    local d = o:get('d')
-    local ts: sys.Timespec
-    sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
-    local v, vns, ok = util.getdate(d, ts.tv_sec, ts.tv_nsec)
-    if not ok then return util.die("invalid date '" .. d .. "'") end
-    t = v; ns = vns
-  else
-    local ts: sys.Timespec
-    sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
-    t = ts.tv_sec; ns = ts.tv_nsec
-  end
-  local fmt: string = '%a %b %e %H:%M:%S %Z %Y'
-  if o:has('R') then fmt = '%a, %d %b %Y %H:%M:%S %z' end
-  if #o.operands > 1 then return util.die("extra operand '" .. o.operands[2] .. "'") end
-  if #o.operands > 0 then
-    local f = o.operands[1]
-    if f.size == 0 or f:byte(1) ~= 43 then return util.die('setting the date is not supported') end
-    if o:has('R') then return util.die('multiple output formats specified') end
-    -- "%-N" means as many digits as the clock resolution: 9 here, as in
-    -- coreutils' adjust_resolution
-    local sb: stringbuilder
-    local i: usize = 2
-    while i <= f.size do
-      local c = f:byte(i)
-      if c == 37 and i + 2 <= f.size and f:byte(i + 1) == 45 and f:byte(i + 2) == 78 then
-        sb:write('%9N'); i = i + 3
-      elseif c == 37 and i + 1 <= f.size and f:byte(i + 1) == 37 then
-        sb:write('%%'); i = i + 2
-      else
-        sb:writebyte(c); i = i + 1
-      end
-    end
-    fmt = sb:promote()
-  end
-  local tm, ok = util.breaktime(t, ns, o:has('u'))
-  if not ok then return util.die(string.format("time '%d' is out of range", t)) end
-  util.line(util.timestr(fmt, &tm))
   return 0
 end
 

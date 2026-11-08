@@ -66,6 +66,7 @@ require 'nebox.applets.sh'
 require 'nebox.applets.diff'
 require 'nebox.applets.patch'
 require 'nebox.applets.ls'
+require 'nebox.applets.date'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
