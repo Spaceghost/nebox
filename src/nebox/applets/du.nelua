@@ -1,0 +1,624 @@
+-- du: a port of GNU coreutils 9.1 src/du.c. The traversal hands
+-- process_file what gnulib fts gives du (FTS_NOSTAT with FTS_AGAIN
+-- re-stats, FTS_PHYSICAL, FTS_LOGICAL with cycle detection, FTS_COMFOLLOW
+-- for -D/-H, FTS_XDEV): lazily stat'ed roots with trailing slashes trimmed,
+-- readdir order (inode order past 10000 entries off tmpfs/NFS/CIFS), FTS_DNR
+-- after the preorder visit of an unreadable directory. Hard links are
+-- counted once through a dev/ino set (all files with several operands or
+-- -L), --exclude/-X follow gnulib exclude.c (literal patterns matched as
+-- strings, wildcard ones through fnmatch, at any '/' boundary), sizes go
+-- through src/nebox/human.nelua, --time through the nstrftime port.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'hashmap'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.human'
+require 'nebox.clock'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_fnmatch(pat: cstring, s: cstring, flags: cint): cint <cimport 'fnmatch', cinclude '<fnmatch.h>'> end
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+local TIME_MIN: int64 <comptime> = -0x7fffffffffffffff - 1
+
+local FTS_D <comptime> = 1
+local FTS_DC <comptime> = 2
+local FTS_DEFAULT <comptime> = 3
+local FTS_DNR <comptime> = 4
+local FTS_DP <comptime> = 6
+local FTS_F <comptime> = 8
+local FTS_NS <comptime> = 10
+local FTS_NSOK <comptime> = 11
+local FTS_SL <comptime> = 12
+local FTS_SLNONE <comptime> = 13
+
+local PHYSICAL <comptime> = 0
+local LOGICAL <comptime> = 1
+local COMFOLLOW <comptime> = 2
+
+local DuInfo = @record{ size: uint64, inodes: uint64, tsec: int64, tnsec: int64 }
+local DuLevel = @record{ ent: DuInfo, subdir: DuInfo }
+
+local function duinfo_init(a: *DuInfo) a.size = 0; a.inodes = 0; a.tsec = TIME_MIN; a.tnsec = -1 end
+local function duinfo_add(a: *DuInfo, b: *DuInfo)
+  local sum = a.size + b.size
+  a.size = a.size <= sum and sum or UMAX
+  a.inodes = a.inodes + b.inodes
+  if a.tsec < b.tsec or (a.tsec == b.tsec and a.tnsec < b.tnsec) then a.tsec = b.tsec; a.tnsec = b.tnsec end
+end
+
+local opt_all = false
+local apparent_size = false
+local opt_count_all = false
+local hash_all = false
+local opt_nul = false
+local print_grand_total = false
+local opt_separate_dirs = false
+local max_depth: uint64 = UMAX
+local opt_threshold: int64 = 0
+local human_output_opts: integer = 0
+local opt_inodes = false
+local opt_time = false
+local time_type = 0 -- 0 mtime, 1 ctime, 2 atime
+local time_format = ''
+local output_block_size: uint64 = 0
+local symlink_mode = PHYSICAL
+local xdev = false
+local tot_dui: DuInfo
+local prev_level: integer = 0
+local dulvl: sequence(DuLevel)
+local di_files: hashmap(string, boolean)
+local fts_dev: uint64 = 0
+local write_failed = false
+
+-- exclude.c: literal (hashed) and wildcard patterns.
+local Pattern = @record{ text: string, wild: boolean }
+local excludes: sequence(Pattern)
+
+local function has_wildcards(s: string): boolean
+  local i = 1
+  while i <= #s do
+    local c = s:byte(i)
+    if c == 92 then
+      if i + 1 <= #s then i = i + 1 end
+    elseif c == 63 or c == 42 or c == 91 or c == 93 then
+      return true
+    end
+    i = i + 1
+  end
+  return false
+end
+
+local function unescape_pattern(s: string): string
+  local sb: stringbuilder
+  local i = 1
+  while i <= #s do
+    local c = s:byte(i)
+    if c == 92 and i + 1 <= #s then i = i + 1; c = s:byte(i) end
+    sb:writebyte(c)
+    i = i + 1
+  end
+  return sb:promote()
+end
+
+local function add_exclude(p: string)
+  if has_wildcards(p) then excludes:push({text = p, wild = true})
+  else excludes:push({text = unescape_pattern(p), wild = false}) end
+end
+
+local function excluded_file_name(f: string): boolean
+  for i = 1, #excludes do
+    local pat = &excludes[i]
+    if pat.wild then
+      if c_fnmatch(pat.text, f, 0) == 0 then return true end
+      local k = 1
+      while k <= #f do
+        if f:byte(k) == 47 and not (k + 1 <= #f and f:byte(k + 1) == 47) then
+          if c_fnmatch(pat.text, f:sub(k + 1), 0) == 0 then return true end
+        end
+        k = k + 1
+      end
+    else
+      local s = f
+      while true do
+        if s == pat.text then return true end
+        local sl = s:find('/', 1, true)
+        if sl == 0 then break end
+        s = s:sub(sl + 1)
+      end
+    end
+  end
+  return false
+end
+
+-- add_exclude_file with '\n' separators: trailing white space trimmed,
+-- blank lines skipped.
+local function add_exclude_file(name: string): boolean
+  local fd: cint = 0
+  if name ~= '-' then
+    fd = sys.open(name, sys.O_RDONLY, 0)
+    if fd < 0 then return false end
+  end
+  local data, ok = util.readfd(fd)
+  if name ~= '-' then sys.close(fd) end
+  if not ok then return false end
+  local start = 1
+  local n = #data
+  local i = 1
+  while i <= n + 1 do
+    if i == n + 1 or data:byte(i) == 10 then
+      if i == n + 1 and start > n then break end
+      local e = i - 1
+      while e >= start and (data:byte(e) == 32 or (data:byte(e) >= 9 and data:byte(e) <= 13)) do e = e - 1 end
+      if e >= start then add_exclude(data:sub(start, e)) end
+      start = i + 1
+    end
+    i = i + 1
+  end
+  return true
+end
+
+local function hash_ins(ino: uint64, dev: uint64): boolean
+  local key = tostring(dev) .. ':' .. tostring(ino)
+  if di_files:peek(key) ~= nilptr then return false end
+  di_files[key] = true
+  return true
+end
+
+local function print_only_size(n: uint64)
+  if n == UMAX then util.write('Infinity')
+  else util.write(human.readable(n, human_output_opts, 1, output_block_size)) end
+end
+
+local function print_size(d: *DuInfo, s: string)
+  print_only_size(opt_inodes and d.inodes or d.size)
+  if opt_time then
+    util.writebyte(9)
+    local f, ok = util.breaktime(d.tsec, d.tnsec, false)
+    if ok then util.write(util.timestr(time_format, &f))
+    else util.err('time ' .. util.quote(tostring(d.tsec)) .. ' is out of range') end
+  end
+  util.writebyte(9)
+  util.write(s)
+  util.writebyte(opt_nul and 0 or 10)
+  -- du flushes after every line; close_stdout then reports a bare
+  -- "write error" (errno 0) because the stream's error flag is already set.
+  if not util.flush() then write_failed = true end
+end
+
+local Ent = @record{
+  path: string, level: integer, info: integer, err: cint,
+  st: sys.Stat, dtype: byte, skip: boolean,
+}
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+-- fts_stat.
+local function fts_stat(e: *Ent, follow: boolean)
+  if symlink_mode == LOGICAL or follow then
+    if sys.stat(e.path, &e.st) ~= 0 then
+      local er = sys.errno()
+      if er == 2 and sys.lstat(e.path, &e.st) == 0 then e.err = 0; e.info = FTS_SLNONE; return end
+      e.err = er
+      e.info = FTS_NS
+      return
+    end
+  elseif sys.lstat(e.path, &e.st) ~= 0 then
+    e.err = sys.errno()
+    e.info = FTS_NS
+    return
+  end
+  local f = e.st.st_mode & sys.S_IFMT
+  if f == sys.S_IFDIR then e.info = FTS_D
+  elseif f == sys.S_IFLNK then e.info = FTS_SL
+  elseif f == 0x8000 then e.info = FTS_F
+  else e.info = FTS_DEFAULT end
+end
+
+local function process_file(ent: *Ent): boolean
+  local ok = true
+  local file = ent.path
+  local info = ent.info
+  if info == FTS_DNR then
+    util.err(errno_msg('cannot read directory ' .. util.quoteaf(file), ent.err))
+    ok = false
+  elseif info ~= FTS_DP then
+    local excluded = excluded_file_name(file)
+    if not excluded then
+      if info == FTS_NSOK then
+        fts_stat(ent, false)
+        info = ent.info
+      end
+      if info == FTS_NS or info == FTS_SLNONE then
+        util.err(errno_msg('cannot access ' .. util.quoteaf(file), ent.err))
+        return false
+      end
+      if xdev and ent.level > 0 and fts_dev ~= ent.st.st_dev then excluded = true end
+    end
+    if excluded or (not opt_count_all and (hash_all or ((ent.st.st_mode & sys.S_IFMT) ~= sys.S_IFDIR and 1 < ent.st.st_nlink))
+        and not hash_ins(ent.st.st_ino, ent.st.st_dev)) then
+      if info == FTS_D then ent.skip = true end
+      return true
+    end
+    if info == FTS_D then return true end
+    if info == FTS_DC then
+      if symlink_mode ~= LOGICAL and not (symlink_mode == COMFOLLOW and ent.level == 0) then
+        util.err('WARNING: Circular directory structure.\nThis almost certainly means that you have a corrupted file system.\nNOTIFY YOUR SYSTEM MANAGER.\nThe following directory is part of the cycle:\n  ' .. util.quotef(file) .. '\n')
+        return false
+      end
+      return true
+    end
+  end
+  local dui: DuInfo
+  if apparent_size then dui.size = ent.st.st_size > 0 and (@uint64)(ent.st.st_size) or 0
+  else dui.size = (@uint64)(ent.st.st_blocks) * 512 end
+  dui.inodes = 1
+  if time_type == 0 then dui.tsec = ent.st.st_mtim.tv_sec; dui.tnsec = ent.st.st_mtim.tv_nsec
+  elseif time_type == 2 then dui.tsec = ent.st.st_atim.tv_sec; dui.tnsec = ent.st.st_atim.tv_nsec
+  else dui.tsec = ent.st.st_ctim.tv_sec; dui.tnsec = ent.st.st_ctim.tv_nsec end
+  local level = ent.level
+  local dui_to_print = dui
+  while #dulvl < level + 2 do
+    local z: DuLevel
+    dulvl:push(z)
+  end
+  if level == prev_level then
+  elseif level > prev_level then
+    for i = prev_level + 1, level do
+      duinfo_init(&dulvl[i + 1].ent)
+      duinfo_init(&dulvl[i + 1].subdir)
+    end
+  else
+    duinfo_add(&dui_to_print, &dulvl[prev_level + 1].ent)
+    if not opt_separate_dirs then duinfo_add(&dui_to_print, &dulvl[prev_level + 1].subdir) end
+    duinfo_add(&dulvl[level + 1].subdir, &dulvl[prev_level + 1].ent)
+    duinfo_add(&dulvl[level + 1].subdir, &dulvl[prev_level + 1].subdir)
+  end
+  prev_level = level
+  local is_dir_type = info == FTS_DP or info == FTS_DNR
+  if not (opt_separate_dirs and is_dir_type) then duinfo_add(&dulvl[level + 1].ent, &dui) end
+  duinfo_add(&tot_dui, &dui)
+  local lv: uint64 = (@uint64)(level)
+  if (is_dir_type and lv <= max_depth) or (opt_all and lv <= max_depth) or level == 0 then
+    local v = opt_inodes and dui_to_print.inodes or dui_to_print.size
+    local show: boolean
+    if opt_threshold < 0 then show = v <= (@uint64)(-opt_threshold)
+    else show = v >= (@uint64)(opt_threshold) end
+    if show then print_size(&dui_to_print, file) end
+  end
+  return ok
+end
+
+local Child = @record{ name: string, dtype: byte, ino: uint64 }
+local function sort_by_inode(v: *sequence(Child))
+  local n = #v
+  if n < 2 then return end
+  local tmp: sequence(Child)
+  tmp:resize(n)
+  local width = 1
+  while width < n do
+    local i = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local a, b, k = i, mid, i
+      while a < mid and b < hi do
+        if v[b].ino < v[a].ino then tmp[k] = v[b]; b = b + 1 else tmp[k] = v[a]; a = a + 1 end
+        k = k + 1
+      end
+      while a < mid do tmp[k] = v[a]; a = a + 1; k = k + 1 end
+      while b < hi do tmp[k] = v[b]; b = b + 1; k = k + 1 end
+      i = hi
+    end
+    for j = 1, n do v[j] = tmp[j] end
+    width = width * 2
+  end
+end
+
+local Active = @record{ dev: uint64, ino: uint64 }
+local active: sequence(Active)
+
+local function walk(ent: *Ent): boolean
+  local ok = true
+  if ent.info == FTS_D then
+    if ent.level == 0 then fts_dev = ent.st.st_dev end
+    -- enter_dir: a directory that is one of its own ancestors
+    if symlink_mode == LOGICAL then
+      for i = 1, #active do
+        if active[i].dev == ent.st.st_dev and active[i].ino == ent.st.st_ino then ent.info = FTS_DC; break end
+      end
+      if ent.info == FTS_DC then return process_file(ent) end
+    end
+    ok = process_file(ent) and ok
+    if ent.skip then return ok end
+    if xdev and ent.st.st_dev ~= fts_dev then
+      ent.info = FTS_DP
+      return process_file(ent) and ok
+    end
+    local fd = sys.open(ent.path, sys.O_RDONLY | sys.O_DIRECTORY | 0x100 | 0x800 | ((symlink_mode == LOGICAL or (symlink_mode == COMFOLLOW and ent.level == 0)) and 0 or sys.O_NOFOLLOW), 0)
+    local d: *sys.DIR = nilptr
+    if fd >= 0 then
+      d = c_fdopendir(fd)
+      if d == nilptr then sys.close(fd) end
+    end
+    if d == nilptr then
+      ent.err = sys.errno()
+      ent.info = FTS_DNR
+      return process_file(ent) and ok
+    end
+    local kids: sequence(Child)
+    while true do
+      local de = sys.readdir(d)
+      if de == nilptr then break end
+      local n = sys.cstr(&de.d_name)
+      if n ~= '.' and n ~= '..' then kids:push({name = string.copy(n), dtype = de.d_type, ino = de.d_ino}) end
+    end
+    sys.closedir(d)
+    if #kids > 10000 then
+      local fs: sys.Statfs
+      local ft: int64 = 0
+      if sys.statfs(ent.path, &fs) == 0 then ft = fs.f_type end
+      if ft ~= 0xFF534D42 and ft ~= 0x6969 and ft ~= 0x01021994 then sort_by_inode(&kids) end
+    end
+    active:push({dev = ent.st.st_dev, ino = ent.st.st_ino})
+    local base = ent.path:sub(-1) == '/' and ent.path:sub(1, #ent.path - 1) or ent.path
+    for i = 1, #kids do
+      local k = &kids[i]
+      local ce: Ent
+      ce.path = base .. '/' .. k.name
+      ce.level = ent.level + 1
+      local known_nondir = k.dtype ~= 0 and k.dtype ~= 4 and (symlink_mode ~= LOGICAL or k.dtype ~= 10)
+      if known_nondir then ce.info = FTS_NSOK else fts_stat(&ce, false) end
+      ok = walk(&ce) and ok
+    end
+    active:pop()
+    ent.info = FTS_DP
+    return process_file(ent) and ok
+  end
+  return process_file(ent) and ok
+end
+
+local function du_file(name: string): boolean
+  local len = #name
+  if 2 < len and name:byte(len) == 47 then
+    while 1 < len and name:byte(len - 1) == 47 do len = len - 1 end
+  end
+  local ent: Ent
+  ent.path = name:sub(1, len)
+  ent.level = 0
+  fts_stat(&ent, symlink_mode == COMFOLLOW)
+  local ok = walk(&ent)
+  prev_level = 0
+  return ok
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'du --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+global function applet_du(args: sequence(string)): integer
+  local max_depth_specified = false
+  local ok = true
+  local files_from = ''
+  local have_files_from = false
+  local opt_summarize_only = false
+  local time_style = ''
+  local have_time_style = false
+  do
+    local e = sys.getenv('DU_BLOCK_SIZE')
+    local _, o, bs = human.options(e ~= nilptr and (@string)(e) or '', e ~= nilptr, output_block_size)
+    human_output_opts = o; output_block_size = bs
+  end
+  local longs: []util.LongOpt = {
+    {'all', 0, 97}, {'apparent-size', 0, 256}, {'block-size', 1, 66}, {'bytes', 0, 98},
+    {'count-links', 0, 108}, {'dereference', 0, 76}, {'dereference-args', 0, 68},
+    {'exclude', 1, 257}, {'exclude-from', 1, 88}, {'files0-from', 1, 258},
+    {'human-readable', 0, 104}, {'inodes', 0, 262}, {'si', 0, 259}, {'max-depth', 1, 100},
+    {'null', 0, 48}, {'no-dereference', 0, 80}, {'one-file-system', 0, 120},
+    {'separate-dirs', 0, 83}, {'summarize', 0, 115}, {'total', 0, 99}, {'threshold', 1, 116},
+    {'time', 2, 260}, {'time-style', 1, 261},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, '0abd:chHklmst:xB:DLPSX:', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then
+      if #g.errmsg > 0 then util.err(g.errmsg) end
+      ok = false
+    elseif c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported")
+    elseif c == 48 then opt_nul = true
+    elseif c == 97 then opt_all = true
+    elseif c == 256 then apparent_size = true
+    elseif c == 98 then apparent_size = true; human_output_opts = 0; output_block_size = 1
+    elseif c == 99 then print_grand_total = true
+    elseif c == 104 then human_output_opts = human.autoscale | human.SI | human.base_1024; output_block_size = 1
+    elseif c == 259 then human_output_opts = human.autoscale | human.SI; output_block_size = 1
+    elseif c == 107 then human_output_opts = 0; output_block_size = 1024
+    elseif c == 100 then
+      local st, v = util.xstrtoumax_base(g.optarg, 0, '')
+      if st == 0 then max_depth_specified = true; max_depth = v
+      else util.err('invalid maximum depth ' .. util.quote(g.optarg)); ok = false end
+    elseif c == 109 then human_output_opts = 0; output_block_size = 1024 * 1024
+    elseif c == 108 then opt_count_all = true
+    elseif c == 115 then opt_summarize_only = true
+    elseif c == 116 then
+      -- xstrtoimax: a leading '-' is allowed
+      local a = g.optarg
+      local p = 1
+      while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+      local neg = p <= #a and a:byte(p) == 45
+      local st, v = util.xstrtoumax_base(neg and a:sub(p + 1) or a, 0, 'kKmMGTPEZY0')
+      if neg and #a >= p + 1 and (a:byte(p + 1) == 45 or a:byte(p + 1) == 43) then st = 2 end
+      if st == 0 or st == 1 then
+        if neg then
+          if v > 0x8000000000000000 then st = 1 else opt_threshold = -(@int64)(v) end
+        else
+          if v > 0x7fffffffffffffff then st = 1 else opt_threshold = (@int64)(v) end
+        end
+      end
+      if st ~= 0 then
+        util.err(util.xstrtol_msg(st, g.was_long and '--threshold' or '-t', a))
+        util.flush()
+        local m = "Try 'du --help' for more information.\n"
+        sys.write(2, m.data, m.size)
+        c_exit(1)
+      end
+      if opt_threshold == 0 and a:byte(1) == 45 then die("invalid --threshold argument '-0'") end
+    elseif c == 120 then xdev = true
+    elseif c == 66 then
+      local st, o, bs = human.options(g.optarg, true, output_block_size)
+      human_output_opts = o; output_block_size = bs
+      if st ~= 0 then
+        util.err(util.xstrtol_msg(st, g.was_long and '--block-size' or '-B', g.optarg))
+        util.flush()
+        local m = "Try 'du --help' for more information.\n"
+        sys.write(2, m.data, m.size)
+        c_exit(1)
+      end
+    elseif c == 72 or c == 68 then symlink_mode = COMFOLLOW
+    elseif c == 76 then symlink_mode = LOGICAL
+    elseif c == 80 then symlink_mode = PHYSICAL
+    elseif c == 83 then opt_separate_dirs = true
+    elseif c == 88 then
+      if not add_exclude_file(g.optarg) then
+        util.err(errno_msg(util.quotef(g.optarg), sys.errno()))
+        ok = false
+      end
+    elseif c == 258 then files_from = g.optarg; have_files_from = true
+    elseif c == 257 then add_exclude(g.optarg)
+    elseif c == 262 then opt_inodes = true
+    elseif c == 260 then
+      opt_time = true
+      time_type = 0
+      if g.has_optarg then
+        local names: []string = {'atime', 'access', 'use', 'ctime', 'status'}
+        local values: []integer = {2, 2, 2, 1, 1}
+        local v = util.argmatch('--time', g.optarg, &names, &values, 5)
+        if v < 0 then usage_fail('') end
+        time_type = v
+      end
+    elseif c == 261 then time_style = g.optarg; have_time_style = true
+    end
+  end
+  if not ok then usage_fail('') end
+  if opt_all and opt_summarize_only then usage_fail('cannot both summarize and show all entries') end
+  if opt_summarize_only and max_depth_specified and max_depth == 0 then
+    util.err('warning: summarizing is the same as using --max-depth=0')
+  end
+  if opt_summarize_only and max_depth_specified and max_depth ~= 0 then
+    usage_fail('warning: summarizing conflicts with --max-depth=' .. tostring(max_depth))
+  end
+  if opt_summarize_only then max_depth = 0 end
+  if opt_inodes then
+    if apparent_size then util.err('warning: options --apparent-size and -b are ineffective with --inodes') end
+    output_block_size = 1
+  end
+  if opt_time then
+    if not have_time_style then
+      local e = sys.getenv('TIME_STYLE')
+      if e == nilptr or (@string)(e) == 'locale' then time_style = 'long-iso'
+      else
+        time_style = (@string)(e)
+        if time_style:byte(1) == 43 then
+          local nl = time_style:find('\n', 1, true)
+          if nl > 0 then time_style = time_style:sub(1, nl - 1) end
+        else
+          while time_style:sub(1, 6) == 'posix-' do time_style = time_style:sub(7) end
+        end
+      end
+    end
+    if #time_style > 0 and time_style:byte(1) == 43 then
+      time_format = time_style:sub(2)
+    else
+      local names: []string = {'full-iso', 'long-iso', 'iso'}
+      local values: []integer = {0, 1, 2}
+      local v = util.argmatch('time style', time_style, &names, &values, 3)
+      if v < 0 then usage_fail('') end
+      if v == 0 then time_format = '%Y-%m-%d %H:%M:%S.%N %z'
+      elseif v == 1 then time_format = '%Y-%m-%d %H:%M'
+      else time_format = '%Y-%m-%d' end
+    end
+  end
+  duinfo_init(&tot_dui)
+  local ops = g:operands()
+  local names: sequence(string)
+  local from_names = false
+  if have_files_from then
+    if #ops > 0 then
+      util.err('extra operand ' .. util.quote(ops[1]))
+      util.flush()
+      local m = 'file operands cannot be combined with --files0-from\n'
+      sys.write(2, m.data, m.size)
+      usage_fail('')
+    end
+    local fd: cint = 0
+    if files_from ~= '-' then
+      fd = sys.open(files_from, sys.O_RDONLY, 0)
+      if fd < 0 then die(errno_msg('cannot open ' .. util.quoteaf(files_from) .. ' for reading', sys.errno())) end
+      if fd ~= 0 then sys.dup2(fd, 0); sys.close(fd) end
+    end
+    local data, rok = util.readfd(0)
+    local start = 1
+    for i = 1, #data + 1 do
+      if i > #data or data:byte(i) == 0 then
+        if i > #data and start > #data then break end
+        names:push(data:sub(start, i - 1))
+        start = i + 1
+      end
+    end
+    if not rok then
+      -- names read before the error are still processed by GNU, one at a time
+      names:push('\0read-error')
+    end
+    from_names = true
+    hash_all = true
+  else
+    if #ops == 0 then names:push('.') else for _, o in ipairs(ops) do names:push(o) end end
+    hash_all = #ops > 1 or symlink_mode == LOGICAL
+  end
+  for i = 1, #names do
+    local fname = names[i]
+    if fname == '\0read-error' then
+      util.err(errno_msg(util.quotef(files_from) .. ': read error', sys.errno()))
+      ok = false
+      break
+    end
+    local skip = false
+    if from_names and files_from == '-' and fname == '-' then
+      util.err('when reading file names from stdin, no file name of ' .. util.quoteaf(fname) .. ' allowed')
+      skip = true
+    end
+    if #fname == 0 then
+      if not from_names then util.err('invalid zero-length file name')
+      else util.err(util.quotef(files_from) .. ':' .. tostring(i) .. ': invalid zero-length file name') end
+      skip = true
+    end
+    if skip then ok = false
+    else ok = du_file(fname) and ok end
+  end
+  if print_grand_total then print_size(&tot_dui, 'total') end
+  if write_failed then util.err('write error'); return 1 end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end

@@ -64,18 +64,6 @@ function Du:walk(path: string, top: boolean): integer
   return total
 end
 
-global function applet_du(args: sequence(string)): integer
-  local o = util.parsel(args, 'sabhkcLxd:', &longopts.du, #longopts.du)
-  if not o:ok() then return util.optfail(o) end
-  local d: Du = {summarize = o:has('s'), all = o:has('a'), apparent = o:has('b'), human = o:has('h'),
-    bytes = o:has('b'), deref = o:has('L')}
-  if o:has('d') and o:get('d') == '0' then d.summarize = true end
-  if #o.operands == 0 then o.operands:push('.') end
-  local grand: integer = 0
-  for _, p in ipairs(o.operands) do grand = grand + d:walk(p, true) end
-  if o:has('c') then util.line(d:fmt(grand) .. '\ttotal') end
-  return d.rc
-end
 
 -- stat
 local function filetype(mode: cuint, size: integer): string

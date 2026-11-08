@@ -56,19 +56,6 @@ global longopts.sort: []util.LongOpt = {
   {'parallel', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.du: []util.LongOpt = {
-  {'all', 0, 97}, {'apparent-size', 0, util.UNSUPPORTED}, {'block-size', 1, util.UNSUPPORTED},
-  {'bytes', 0, 98}, {'count-links', 0, util.UNSUPPORTED}, {'-debug', 0, util.UNSUPPORTED},
-  {'dereference', 0, 76}, {'dereference-args', 0, util.UNSUPPORTED},
-  {'exclude', 1, util.UNSUPPORTED}, {'exclude-from', 1, util.UNSUPPORTED},
-  {'files0-from', 1, util.UNSUPPORTED}, {'human-readable', 0, 104},
-  {'inodes', 0, util.UNSUPPORTED}, {'si', 0, util.UNSUPPORTED}, {'max-depth', 1, 100},
-  {'null', 0, util.UNSUPPORTED}, {'no-dereference', 0, util.UNSUPPORTED},
-  {'one-file-system', 0, 120}, {'separate-dirs', 0, util.UNSUPPORTED}, {'summarize', 0, 115},
-  {'total', 0, 99}, {'threshold', 1, util.UNSUPPORTED}, {'time', 2, util.UNSUPPORTED},
-  {'time-style', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
-}
 global longopts.basename: []util.LongOpt = {
   {'multiple', 0, 97}, {'suffix', 1, 115}, {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},

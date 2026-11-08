@@ -190,6 +190,17 @@ Stated here rather than worked around:
   shared number parser and its xstrtol_fatal messages. `tests/df_compare.py`:
   357 cases against the container's live mount table (rerun when a busy file
   system's usage moves between the two runs), 0 mismatches.
+- `du` ports du.c over a traversal that gives process_file what gnulib fts
+  gives it (FTS_NOSTAT entries re-stat'ed as with FTS_AGAIN, -P/-L/-D/-H,
+  -x, cycle detection under -L, FTS_DNR after the preorder visit), with
+  hard links counted once, `--exclude`/-X as gnulib exclude.c matches
+  (literal patterns as strings, wildcard ones through nelibc fnmatch, at
+  every '/' boundary), `--files0-from`, `--threshold`, `--inodes`, `--time`
+  and `--time-style`/`TIME_STYLE` through the nstrftime port, sizes through
+  human.nelua, and GNU's bare "write error" after a failed per-line flush.
+  `tests/du_compare.py`: 238 cases, 0 mismatches. Not exercised: the inode
+  sort past 10000 entries and the cycle warning, which needs a bind-mount
+  loop.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
