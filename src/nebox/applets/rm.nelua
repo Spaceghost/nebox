@@ -1,0 +1,600 @@
+-- rm: a port of GNU coreutils 9.1 src/rm.c and src/remove.c. The traversal
+-- reproduces what remove.c sees from gnulib fts with FTS_CWDFD|FTS_NOSTAT|
+-- FTS_PHYSICAL (and FTS_XDEV for --one-file-system): lazily stat'ed roots
+-- with trailing slashes trimmed to one, readdir order (inode order past
+-- 10000 entries off tmpfs/NFS/CIFS), d_type to skip stats of non-directories,
+-- FTS_DNR for unreadable directories, ancestors marked so their removal is
+-- declined silently. Prompts (-i, -I, --interactive=WHEN, write-protected
+-- files on a terminal or with ---presume-input-tty) read replies as gnulib
+-- yesno does, and unread input on a seekable stdin is given back at exit.
+-- Paths are used whole, so names past PATH_MAX fail where fts would not.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.quotearg'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
+local function c_faccessat(fd: cint, path: cstring, mode: cint, flags: cint): cint <cimport 'faccessat', cinclude '<unistd.h>'> end
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_REMOVEDIR: cint <comptime> = 0x200
+local AT_EACCESS: cint <comptime> = 0x200
+local W_OK: cint <comptime> = 2
+local EACCES: cint <comptime> = 13
+local EPERM: cint <comptime> = 1
+local EISDIR: cint <comptime> = 21
+local ENOTDIR: cint <comptime> = 20
+local ENOTEMPTY: cint <comptime> = 39
+local EEXIST: cint <comptime> = 17
+local EROFS: cint <comptime> = 30
+local ENOENT: cint <comptime> = 2
+local EINVAL: cint <comptime> = 22
+local EILSEQ: cint <comptime> = 84
+local O_NOCTTY: cint <comptime> = 0x100
+local O_NONBLOCK: cint <comptime> = 0x800
+local DT_UNKNOWN: byte <comptime> = 0
+local DT_DIR: byte <comptime> = 4
+
+local RMI_ALWAYS <comptime> = 3
+local RMI_SOMETIMES <comptime> = 4
+local RMI_NEVER <comptime> = 5
+
+local RM_OK <comptime> = 2
+local RM_USER_DECLINED <comptime> = 3
+local RM_ERROR <comptime> = 4
+
+-- fts_info values
+local FTS_D <comptime> = 1
+local FTS_DNR <comptime> = 4
+local FTS_DP <comptime> = 6
+local FTS_F <comptime> = 8
+local FTS_NS <comptime> = 10
+local FTS_NSOK <comptime> = 11
+local FTS_SL <comptime> = 12
+local FTS_DEFAULT <comptime> = 3
+
+local T_UNKNOWN <comptime> = 2
+local T_NO <comptime> = 3
+local T_YES <comptime> = 4
+
+local PA_DESCEND_INTO_DIR <comptime> = 2
+local PA_REMOVE_DIR <comptime> = 3
+
+local Opts = @record{
+  ignore_missing_files: boolean,
+  interactive: integer,
+  one_file_system: boolean,
+  recursive: boolean,
+  remove_empty_directories: boolean,
+  have_root: boolean,
+  root_dev: uint64,
+  root_ino: uint64,
+  preserve_all_root: boolean,
+  stdin_tty: boolean,
+  verbose: boolean,
+}
+
+local Ent = @record{
+  path: string,
+  level: integer,
+  info: integer,
+  err: cint,
+  number: boolean,
+  skip: boolean,
+  dev: uint64,
+  ino: uint64,
+  mode: cuint,
+}
+
+local x: Opts
+local fts_dev: uint64 = 0
+local stack: sequence(*Ent)
+
+-- stdin, buffered as stdio would, for yesno.
+local inbuf: [4096]byte
+local inlen: integer = 0
+local inpos: integer = 0
+local ineof = false
+
+local function yesno(): boolean
+  local first: integer = -1
+  local got = false
+  while true do
+    if inpos == inlen then
+      if ineof then break end
+      local r = sys.read(0, &inbuf[0], #inbuf)
+      if r < 0 and sys.errno() == sys.EINTR then continue end
+      if r <= 0 then ineof = true; break end
+      inlen = r; inpos = 0
+    end
+    local c = inbuf[inpos]
+    inpos = inpos + 1
+    if not got then first = c; got = true end
+    if c == 10 then break end
+  end
+  return first == 121 or first == 89
+end
+
+local function close_stdin()
+  if inpos < inlen then sys.lseek(0, -(inlen - inpos), sys.SEEK_CUR) end
+end
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function prompt_out(s: string)
+  util.flush()
+  local m = util.applet .. ': ' .. s
+  sys.write(2, m.data, m.size)
+end
+
+local function file_type(mode: cuint, size: int64): string
+  local f = mode & sys.S_IFMT
+  if f == 0x8000 then return size == 0 and 'regular empty file' or 'regular file' end
+  if f == sys.S_IFDIR then return 'directory' end
+  if f == sys.S_IFLNK then return 'symbolic link' end
+  if f == 0x6000 then return 'block special file' end
+  if f == 0x2000 then return 'character special file' end
+  if f == 0x1000 then return 'fifo' end
+  if f == 0xC000 then return 'socket' end
+  return 'weird file'
+end
+
+-- cache_fstatat over a per-prompt record.
+local StatCache = @record{ state: integer, err: cint, st: sys.Stat }
+local function cache_lstat(c: *StatCache, path: string): boolean
+  if c.state == 0 then
+    if sys.lstat(path, &c.st) ~= 0 then c.state = 2; c.err = sys.errno() else c.state = 1 end
+  end
+  if c.state == 1 then return true end
+  sys.seterrno(c.err)
+  return false
+end
+
+local function is_empty_dir(path: string): boolean
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_DIRECTORY | O_NOCTTY | sys.O_NOFOLLOW | O_NONBLOCK, 0)
+  if fd < 0 then return false end
+  local d = c_fdopendir(fd)
+  if d == nilptr then sys.close(fd); return false end
+  local empty = true
+  sys.seterrno(0)
+  while true do
+    local e = sys.readdir(d)
+    if e == nilptr then break end
+    local n = sys.cstr(&e.d_name)
+    if n ~= '.' and n ~= '..' then empty = false; break end
+  end
+  local saved = sys.errno()
+  sys.closedir(d)
+  if not empty then return false end
+  return saved == 0
+end
+
+local function write_protected_non_symlink(path: string, c: *StatCache): integer
+  if sys.geteuid() == 0 then return 0 end
+  if not cache_lstat(c, path) then return -1 end
+  if (c.st.st_mode & sys.S_IFMT) == sys.S_IFLNK then return 0 end
+  if c_faccessat(AT_FDCWD, path, W_OK, AT_EACCESS) == 0 then return 0 end
+  return sys.errno() == EACCES and 1 or -1
+end
+
+local function prompt(ent: *Ent, is_dir: boolean, mode: integer, want_empty: boolean): (integer, integer)
+  local is_empty_p = T_UNKNOWN
+  local c: StatCache
+  local dirent_type: byte = is_dir and DT_DIR or DT_UNKNOWN
+  local DTLNK: byte = 10
+  local write_protected = 0
+  local is_empty = false
+  if want_empty then
+    is_empty = is_empty_dir(ent.path)
+    is_empty_p = is_empty and T_YES or T_NO
+  end
+  if ent.number then return RM_USER_DECLINED, is_empty_p end
+  if x.interactive == RMI_NEVER then return RM_OK, is_empty_p end
+  local wp_errno: cint = 0
+  if not x.ignore_missing_files and (x.interactive == RMI_ALWAYS or x.stdin_tty) and dirent_type ~= DTLNK then
+    write_protected = write_protected_non_symlink(ent.path, &c)
+    wp_errno = sys.errno()
+  end
+  if write_protected ~= 0 or x.interactive == RMI_ALWAYS then
+    if write_protected >= 0 and dirent_type == DT_UNKNOWN then
+      if cache_lstat(&c, ent.path) then
+        local f = c.st.st_mode & sys.S_IFMT
+        if f == sys.S_IFLNK then dirent_type = DTLNK
+        elseif f == sys.S_IFDIR then dirent_type = DT_DIR end
+      else
+        write_protected = -1
+        wp_errno = sys.errno()
+      end
+    end
+    if write_protected >= 0 then
+      if dirent_type == DTLNK then
+        if x.interactive ~= RMI_ALWAYS then return RM_OK, is_empty_p end
+      elseif dirent_type == DT_DIR then
+        if not (x.recursive or (x.remove_empty_directories and is_empty)) then
+          write_protected = -1
+          wp_errno = EISDIR
+        end
+      end
+    end
+    local quoted = util.quoteaf(ent.path)
+    if write_protected < 0 then
+      util.err(errno_msg('cannot remove ' .. quoted, wp_errno))
+      return RM_ERROR, is_empty_p
+    end
+    if dirent_type == DT_DIR and mode == PA_DESCEND_INTO_DIR and not is_empty then
+      prompt_out((write_protected ~= 0 and 'descend into write-protected directory ' or 'descend into directory ')
+        .. quoted .. '? ')
+    else
+      if not cache_lstat(&c, ent.path) then
+        util.err(errno_msg('cannot remove ' .. quoted, sys.errno()))
+        return RM_ERROR, is_empty_p
+      end
+      prompt_out((write_protected ~= 0 and 'remove write-protected ' or 'remove ')
+        .. file_type(c.st.st_mode, c.st.st_size) .. ' ' .. quoted .. '? ')
+    end
+    if not yesno() then return RM_USER_DECLINED, is_empty_p end
+  end
+  return RM_OK, is_empty_p
+end
+
+local function nonexistent_file_errno(e: cint): boolean
+  return e == EILSEQ or e == EINVAL or e == ENOENT or e == ENOTDIR
+end
+
+local function mark_ancestor_dirs(depth: integer)
+  -- stack[depth] is ENT; its parents are below it.
+  local i = depth - 1
+  while i >= 1 do
+    local p = stack[i]
+    if p.number then break end
+    p.number = true
+    i = i - 1
+  end
+end
+
+local function excise(ent: *Ent, depth: integer, is_dir: boolean): integer
+  if c_unlinkat(AT_FDCWD, ent.path, is_dir and AT_REMOVEDIR or 0) == 0 then
+    if x.verbose then
+      util.write((is_dir and 'removed directory ' or 'removed ') .. util.quoteaf(ent.path) .. '\n')
+    end
+    return RM_OK
+  end
+  local e = sys.errno()
+  if e == EROFS then
+    local st: sys.Stat
+    if sys.lstat(ent.path, &st) ~= 0 and sys.errno() == ENOENT then e = ENOENT end
+  end
+  if x.ignore_missing_files and nonexistent_file_errno(e) then return RM_OK end
+  if ent.info == FTS_DNR and (e == ENOTEMPTY or e == EISDIR or e == ENOTDIR or e == EEXIST)
+      and (ent.err == EPERM or ent.err == EACCES) then
+    e = ent.err
+  end
+  util.err(errno_msg('cannot remove ' .. util.quoteaf(ent.path), e))
+  mark_ancestor_dirs(depth)
+  return RM_ERROR
+end
+
+-- coreutils system.h dot_or_dotdot: "." or "..", alone or before a slash.
+local function dot_or_dotdot(s: string): boolean
+  if #s == 0 or s:byte(1) ~= 46 then return false end
+  local k = (#s >= 2 and s:byte(2) == 46) and 3 or 2
+  return k > #s or s:byte(k) == 47
+end
+
+-- gnulib last_component.
+local function last_component(s: string): string
+  local i = 1
+  while i <= #s and s:byte(i) == 47 do i = i + 1 end
+  local base = i
+  local saw_slash = false
+  while i <= #s do
+    if s:byte(i) == 47 then saw_slash = true
+    elseif saw_slash then base = i; saw_slash = false end
+    i = i + 1
+  end
+  return s:sub(base)
+end
+
+local function rm_fts(ent: *Ent, depth: integer): integer
+  if ent.info == FTS_D then
+    if not x.recursive and not (x.remove_empty_directories and is_empty_dir(ent.path)) then
+      local err = x.remove_empty_directories and ENOTEMPTY or EISDIR
+      util.err(errno_msg('cannot remove ' .. util.quoteaf(ent.path), err))
+      mark_ancestor_dirs(depth)
+      ent.skip = true
+      return RM_ERROR
+    end
+    if ent.level == 0 then
+      if dot_or_dotdot(last_component(ent.path)) then
+        util.err("refusing to remove '.' or '..' directory: skipping " .. util.quoteaf(ent.path))
+        ent.skip = true
+        return RM_ERROR
+      end
+      if x.have_root and ent.dev == x.root_dev and ent.ino == x.root_ino then
+        if ent.path == '/' then
+          util.err('it is dangerous to operate recursively on ' .. util.quoteaf('/'))
+        else
+          util.err('it is dangerous to operate recursively on ' .. util.quoteaf(ent.path) .. ' (same as ' .. util.quoteaf('/') .. ')')
+        end
+        util.err('use --no-preserve-root to override this failsafe')
+        ent.skip = true
+        return RM_ERROR
+      end
+      if x.preserve_all_root then
+        local parent = ent.path:sub(-1) == '/' and ent.path .. '..' or ent.path .. '/..'
+        local st: sys.Stat
+        local failed = false
+        if sys.lstat(parent, &st) ~= 0 then
+          util.err('failed to stat ' .. util.quoteaf(parent) .. ': skipping ' .. util.quoteaf(ent.path))
+          failed = true
+        end
+        if failed or fts_dev ~= st.st_dev then
+          if not failed then
+            util.err('skipping ' .. util.quoteaf(ent.path) .. ", since it's on a different device")
+            util.err('and --preserve-root=all is in effect')
+          end
+          ent.skip = true
+          return RM_ERROR
+        end
+      end
+    end
+    local s, is_empty_directory = prompt(ent, true, PA_DESCEND_INTO_DIR, true)
+    if s == RM_OK and is_empty_directory == T_YES then
+      s = excise(ent, depth, true)
+      if s == RM_OK then ent.skip = true end
+    end
+    if s ~= RM_OK then
+      mark_ancestor_dirs(depth)
+      ent.skip = true
+    end
+    return s
+  end
+  if ent.info == FTS_DP and x.one_file_system and ent.level > 0 and ent.dev ~= fts_dev then
+    mark_ancestor_dirs(depth)
+    util.err('skipping ' .. util.quoteaf(ent.path) .. ", since it's on a different device")
+    return RM_ERROR
+  end
+  local is_dir = ent.info == FTS_DP or ent.info == FTS_DNR
+  local s = prompt(ent, is_dir, PA_REMOVE_DIR, false)
+  if s ~= RM_OK then return s end
+  return excise(ent, depth, is_dir)
+end
+
+local status = RM_OK
+local function update(s: integer)
+  if s == RM_ERROR or (s == RM_USER_DECLINED and status == RM_OK) then status = s end
+end
+
+-- fts_stat with FTS_PHYSICAL.
+local function fts_stat(ent: *Ent)
+  local st: sys.Stat
+  if sys.lstat(ent.path, &st) ~= 0 then
+    ent.err = sys.errno()
+    ent.info = FTS_NS
+    return
+  end
+  ent.dev = st.st_dev; ent.ino = st.st_ino; ent.mode = st.st_mode
+  local f = st.st_mode & sys.S_IFMT
+  if f == sys.S_IFDIR then ent.info = FTS_D
+  elseif f == sys.S_IFLNK then ent.info = FTS_SL
+  elseif f == 0x8000 then ent.info = FTS_F
+  else ent.info = FTS_DEFAULT end
+end
+
+local Child = @record{ name: string, dtype: byte, ino: uint64 }
+
+local function child_less(a: Child, b: Child): boolean return a.ino < b.ino end
+
+local function sort_by_inode(v: *sequence(Child))
+  -- insertion into a binary-merge would do; a simple merge sort keeps it O(n log n)
+  local n = #v
+  if n < 2 then return end
+  local tmp: sequence(Child)
+  tmp:resize(n)
+  local width = 1
+  while width < n do
+    local i = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local a, b, k = i, mid, i
+      while a < mid and b < hi do
+        if child_less(v[b], v[a]) then tmp[k] = v[b]; b = b + 1 else tmp[k] = v[a]; a = a + 1 end
+        k = k + 1
+      end
+      while a < mid do tmp[k] = v[a]; a = a + 1; k = k + 1 end
+      while b < hi do tmp[k] = v[b]; b = b + 1; k = k + 1 end
+      i = hi
+    end
+    for j = 1, n do v[j] = tmp[j] end
+    width = width * 2
+  end
+end
+
+local function visit(ent: *Ent, depth: integer)
+  stack[depth] = ent
+  if ent.info == FTS_D then
+    if ent.level == 0 then fts_dev = ent.dev end
+    update(rm_fts(ent, depth))
+    if ent.skip then return end
+    if x.one_file_system and ent.dev ~= fts_dev then
+      ent.info = FTS_DP
+      update(rm_fts(ent, depth))
+      return
+    end
+    local fd = sys.open(ent.path, sys.O_RDONLY | sys.O_DIRECTORY | O_NOCTTY | sys.O_NOFOLLOW | O_NONBLOCK, 0)
+    local d: *sys.DIR = nilptr
+    if fd >= 0 then
+      d = c_fdopendir(fd)
+      if d == nilptr then sys.close(fd) end
+    end
+    if d == nilptr then
+      ent.err = sys.errno()
+      ent.info = FTS_DNR
+      update(rm_fts(ent, depth))
+      return
+    end
+    local kids: sequence(Child)
+    while true do
+      local e = sys.readdir(d)
+      if e == nilptr then break end
+      local n = sys.cstr(&e.d_name)
+      if n ~= '.' and n ~= '..' then kids:push({name = string.copy(n), dtype = e.d_type, ino = e.d_ino}) end
+    end
+    sys.closedir(d)
+    if #kids > 10000 then
+      local fs: sys.Statfs
+      local ft: int64 = 0
+      if sys.statfs(ent.path, &fs) == 0 then ft = fs.f_type end
+      if ft ~= 0xFF534D42 and ft ~= 0x6969 and ft ~= 0x01021994 then sort_by_inode(&kids) end
+    end
+    local base = ent.path:sub(-1) == '/' and ent.path:sub(1, #ent.path - 1) or ent.path
+    for i = 1, #kids do
+      local k = &kids[i]
+      local ce: Ent
+      ce.path = base .. '/' .. k.name
+      ce.level = ent.level + 1
+      if k.dtype ~= DT_UNKNOWN and k.dtype ~= DT_DIR then ce.info = FTS_NSOK
+      else fts_stat(&ce) end
+      if depth + 1 > #stack then stack:push(&ce) end
+      visit(&ce, depth + 1)
+      stack[depth] = ent
+    end
+    ent.info = FTS_DP
+    update(rm_fts(ent, depth))
+    return
+  end
+  update(rm_fts(ent, depth))
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'rm --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function diagnose_leading_hyphen(args: sequence(string))
+  for i = 1, #args do
+    local a = args[i]
+    local st: sys.Stat
+    if #a > 1 and a:byte(1) == 45 and sys.lstat(a, &st) == 0 then
+      util.flush()
+      local m = "Try 'rm ./" .. quotearg.style(a, quotearg.SHELL_ESCAPE) .. "' to remove the file " .. util.quoteaf(a) .. '.\n'
+      sys.write(2, m.data, m.size)
+      break
+    end
+  end
+end
+
+global function applet_rm(args: sequence(string)): integer
+  local preserve_root = true
+  local prompt_once = false
+  x = {interactive = RMI_SOMETIMES, stdin_tty = sys.isatty(0) == 1}
+  local longs: []util.LongOpt = {
+    {'force', 0, 102}, {'interactive', 2, 256}, {'one-file-system', 0, 257},
+    {'no-preserve-root', 0, 258}, {'preserve-root', 2, 259}, {'-presume-input-tty', 0, 260},
+    {'recursive', 0, 114}, {'dir', 0, 100}, {'verbose', 0, 118},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'dfirvIR', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then
+      if #g.errmsg > 0 then util.err(g.errmsg) end
+      diagnose_leading_hyphen(args)
+      usage_fail('')
+    end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 100 then x.remove_empty_directories = true
+    elseif c == 102 then x.interactive = RMI_NEVER; x.ignore_missing_files = true; prompt_once = false
+    elseif c == 105 then x.interactive = RMI_ALWAYS; x.ignore_missing_files = false; prompt_once = false
+    elseif c == 73 then x.interactive = RMI_SOMETIMES; x.ignore_missing_files = false; prompt_once = true
+    elseif c == 114 or c == 82 then x.recursive = true
+    elseif c == 256 then
+      local i = 2
+      if g.has_optarg then
+        local names: []string = {'never', 'no', 'none', 'once', 'always', 'yes'}
+        local values: []integer = {0, 0, 0, 1, 2, 2}
+        i = util.argmatch('--interactive', g.optarg, &names, &values, 6)
+        if i < 0 then usage_fail('') end
+      end
+      if i == 0 then x.interactive = RMI_NEVER; prompt_once = false
+      elseif i == 1 then x.interactive = RMI_SOMETIMES; x.ignore_missing_files = false; prompt_once = true
+      else x.interactive = RMI_ALWAYS; x.ignore_missing_files = false; prompt_once = false end
+    elseif c == 257 then x.one_file_system = true
+    elseif c == 258 then
+      if args[g.arg_index] ~= '--no-preserve-root' then
+        util.err('you may not abbreviate the --no-preserve-root option')
+        util.flush()
+        c_exit(1)
+      end
+      preserve_root = false
+    elseif c == 259 then
+      if g.has_optarg then
+        if g.optarg == 'all' then x.preserve_all_root = true
+        else
+          util.err('unrecognized --preserve-root argument: ' .. util.quoteaf(g.optarg))
+          util.flush()
+          c_exit(1)
+        end
+      end
+      preserve_root = true
+    elseif c == 260 then x.stdin_tty = true
+    elseif c == 118 then x.verbose = true
+    end
+  end
+  local ops = g:operands()
+  if #ops == 0 then
+    if x.ignore_missing_files then return 0 end
+    usage_fail('missing operand')
+  end
+  if x.recursive and preserve_root then
+    local st: sys.Stat
+    if sys.lstat('/', &st) ~= 0 then
+      util.err(errno_msg('failed to get attributes of ' .. util.quoteaf('/'), sys.errno()))
+      util.flush()
+      c_exit(1)
+    end
+    x.have_root = true; x.root_dev = st.st_dev; x.root_ino = st.st_ino
+  end
+  local n_files = #ops
+  if prompt_once and (x.recursive or 3 < n_files) then
+    if x.recursive then
+      prompt_out('remove ' .. tostring(n_files) .. (n_files == 1 and ' argument recursively? ' or ' arguments recursively? '))
+    else
+      prompt_out('remove ' .. tostring(n_files) .. ' arguments? ')
+    end
+    if not yesno() then close_stdin(); util.flush(); return 0 end
+  end
+  status = RM_OK
+  stack:clear()
+  for _, f in ipairs(ops) do
+    local len = #f
+    if 2 < len and f:byte(len) == 47 then
+      while 1 < len and f:byte(len - 1) == 47 do len = len - 1 end
+    end
+    local ent: Ent
+    ent.path = f:sub(1, len)
+    ent.level = 0
+    fts_stat(&ent)
+    if #stack < 1 then stack:push(&ent) end
+    visit(&ent, 1)
+  end
+  close_stdin()
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return status == RM_ERROR and 1 or 0
+end

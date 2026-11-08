@@ -845,35 +845,6 @@ local function rm_tree(path: string, force: boolean, verbose: boolean): boolean
   return ok
 end
 
-global function applet_rm(args: sequence(string)): integer
-  local o = util.parsel(args, 'rRfvi', &longopts.rm, #longopts.rm)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then
-    if o:has('f') then return 0 end
-    return util.die('missing operand')
-  end
-  local rc: integer = 0
-  local recursive = o:has('r') or o:has('R')
-  for _, p in ipairs(o.operands) do
-    if recursive then
-      if not rm_tree(p, o:has('f'), o:has('v')) then rc = 1 end
-    else
-      local st: sys.Stat
-      if sys.lstat(p, &st) ~= 0 then
-        if not (o:has('f') and sys.errno() == sys.ENOENT) then
-          util.err("cannot remove '" .. p .. "': " .. sys.errstr()); rc = 1
-        end
-      elseif (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
-        util.err("cannot remove '" .. p .. "': Is a directory"); rc = 1
-      elseif sys.unlink(p) ~= 0 then
-        util.err("cannot remove '" .. p .. "': " .. sys.errstr()); rc = 1
-      elseif o:has('v') then
-        util.line("removed '" .. p .. "'")
-      end
-    end
-  end
-  return rc
-end
 
 -- "@SECONDS", "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]", or "YYYY-MM-DDTHH:MM[:SS]" in local time.
 global function parse_datetime(s: string): (clong, boolean)

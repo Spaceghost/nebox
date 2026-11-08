@@ -60,6 +60,7 @@ test: $(OUT)/nebox
 	python3 tests/split_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/shuf_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/stat_compare.py $(abspath $(OUT)/nebox) 400
+	python3 tests/rm_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400

@@ -153,6 +153,21 @@ Stated here rather than worked around:
   rather than libselinux. `tests/stat_compare.py`: 279 fixed cases plus 400
   random format strings over a shared fixture, 0 mismatches (1500 random
   also run clean).
+- `rm` ports rm.c and remove.c over a traversal that hands remove.c's
+  logic what gnulib fts (FTS_CWDFD|FTS_NOSTAT|FTS_PHYSICAL) would: lazily
+  stat'ed operands with trailing slashes trimmed to one, readdir order,
+  d_type instead of a stat for non-directories, FTS_DNR for unreadable
+  directories, ancestors marked so their removal is declined quietly. -d,
+  -f, -i, -I, `--interactive=WHEN`, -r, -v, `--one-file-system`,
+  `--preserve-root[=all]`, `--no-preserve-root` (unabbreviated only),
+  `---presume-input-tty`; prompts read replies as gnulib yesno does and give
+  unread input back to a seekable stdin. `tests/rm_compare.py`: 134 cases
+  on tmpfs fixtures, 0 mismatches (readdir order on ZFS differs between
+  identical trees, so the fixtures live on tmpfs). Not exercised by the
+  tests: the refusal to remove `/` (not run, for safety), the inode-order
+  sort past 10000 entries, and `--one-file-system` across a real mount
+  point. Paths are used whole, so names longer than PATH_MAX fail where fts
+  would cope.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
