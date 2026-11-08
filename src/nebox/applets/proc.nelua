@@ -51,51 +51,6 @@ global function parse_duration(s: string, ts: *sys.Timespec): boolean
 end
 
 
-local function print_environ()
-  local i: usize = 0
-  while environ[i] ~= nilptr do
-    util.line(environ[i])
-    i = i + 1
-  end
-end
-
-
-global function applet_env(args: sequence(string)): integer
-  local i: integer = 1
-  local clear = false
-  while i <= #args do
-    local a = args[i]
-    if a == '-i' then clear = true
-    elseif a == '-u' then
-      i = i + 1
-      if i > #args then return util.die("option requires an argument -- 'u'") end
-      sys.unsetenv(args[i])
-    elseif a == '--' then i = i + 1; break
-    elseif a.size > 1 and a:byte(1) == 45 then return util.die("invalid option -- '" .. a:sub(2, 2) .. "'")
-    else break end
-    i = i + 1
-  end
-  if clear then
-    -- drop every variable by clearing the pointer array in place
-    environ[0] = nilptr
-  end
-  while i <= #args do
-    local a = args[i]
-    local eq = a:find('=', 1, true)
-    if eq <= 1 then break end
-    sys.setenv(a:sub(1, eq - 1), a:sub(eq + 1), 1)
-    i = i + 1
-  end
-  if i > #args then print_environ(); return 0 end
-  local argv: sequence(cstring)
-  for j: integer = i, #args do argv:push(args[j]) end
-  argv:push(nilptr)
-  util.flush()
-  sys.execvp(args[i], &argv[1])
-  local e = sys.errno()
-  util.err("'" .. args[i] .. "': " .. sys.errstr())
-  return e == sys.ENOENT and 127 or 126
-end
 
 global function applet_uname(args: sequence(string)): integer
   local o = util.parsel(args, 'asnrvmpio', &longopts.uname, #longopts.uname)

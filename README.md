@@ -289,6 +289,16 @@ Stated here rather than worked around:
   (`sh_builtin_test`). `tests/test_compare.py`: 62 fixed and 3000 random
   argument vectors through both forms, 0 mismatches (8000 random also run
   clean).
+- `env` ports env.c: -i and `-`, -u applied after all options, NAME=VALUE
+  through putenv, -0, -C, -v debug messages, -S split strings (quotes,
+  \_ \c and the C escapes, ${VARNAME}, # comments, GNU's errors)
+  re-scanned as options, and --default-signal, --ignore-signal,
+  --block-signal and --list-signal-handling over signals 1..64 (32 and 33
+  skipped the way glibc's sigaction refuses them).
+  `tests/env_compare.py`: 124 cases, signals checked through
+  --list-signal-handling and the child's /proc/self/status, 0 mismatches.
+  One difference: an operand with an empty name ("=x") fails, because
+  nelibc's putenv refuses it with EINVAL as musl does (glibc adds it).
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

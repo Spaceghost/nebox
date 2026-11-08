@@ -74,6 +74,7 @@ test: $(OUT)/nebox
 	python3 tests/tac_compare.py $(abspath $(OUT)/nebox) 300
 	python3 tests/tsort_compare.py $(abspath $(OUT)/nebox) 400
 	python3 tests/test_compare.py $(abspath $(OUT)/nebox) 3000
+	python3 tests/env_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400
