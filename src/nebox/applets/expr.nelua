@@ -1,0 +1,441 @@
+-- expr: a port of GNU coreutils 9.1 src/expr.c. The same recursive-descent
+-- evaluator (| & comparisons + - * / % : and the match/substr/index/length
+-- keywords, '+' quoting, parentheses), short-circuit evaluation that skips
+-- arithmetic and regex errors, arbitrary-precision integers (GMP's mpz in
+-- GNU, a decimal bignum here) with truncating / and %, strintcmp for
+-- integer comparisons, anchored BRE matching with GNU's syntax bits
+-- (RE_SYNTAX_POSIX_BASIC without RE_CONTEXT_INVALID_DUP and
+-- RE_NO_EMPTY_RANGES) and glibc's messages, exit statuses 0/1/2/3. The C
+-- locale only: lengths and positions count bytes.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local EXPR_INVALID: cint <comptime> = 2
+local EXPR_FAILURE: cint <comptime> = 3
+
+-- Decimal bignum: little-endian digits, no leading zeros, zero is {}.
+local Big = @record{neg: boolean, d: sequence(byte)}
+
+local function big_from(s: string): Big
+  local b: Big
+  local i = 1
+  if s:byte(1) == 45 then b.neg = true; i = 2 end
+  while i <= #s and s:byte(i) == 48 do i = i + 1 end
+  for k = #s, i, -1 do b.d:push(s:byte(k) - 48) end
+  if #b.d == 0 then b.neg = false end
+  return b
+end
+
+local function big_small(v: integer): Big
+  local b: Big
+  while v > 0 do b.d:push((@byte)(v % 10)); v = v // 10 end
+  return b
+end
+
+local function big_str(b: Big): string
+  if #b.d == 0 then return '0' end
+  local sb: stringbuilder
+  if b.neg then sb:writebyte(45) end
+  for k = #b.d, 1, -1 do sb:writebyte(48 + b.d[k]) end
+  return sb:promote()
+end
+
+local function trim(b: *Big)
+  while #b.d > 0 and b.d[#b.d] == 0 do b.d:pop() end
+  if #b.d == 0 then b.neg = false end
+end
+
+local function cmpabs(a: Big, b: Big): integer
+  if #a.d ~= #b.d then return #a.d < #b.d and -1 or 1 end
+  for k = #a.d, 1, -1 do
+    if a.d[k] ~= b.d[k] then return a.d[k] < b.d[k] and -1 or 1 end
+  end
+  return 0
+end
+
+local function addabs(a: Big, b: Big): Big
+  local r: Big
+  local carry = 0
+  local n = #a.d > #b.d and #a.d or #b.d
+  for k = 1, n do
+    local x = carry
+    if k <= #a.d then x = x + a.d[k] end
+    if k <= #b.d then x = x + b.d[k] end
+    r.d:push((@byte)(x % 10)); carry = x // 10
+  end
+  if carry > 0 then r.d:push((@byte)(carry)) end
+  return r
+end
+
+-- |a| - |b| for |a| >= |b|
+local function subabs(a: Big, b: Big): Big
+  local r: Big
+  local borrow = 0
+  for k = 1, #a.d do
+    local x: integer = a.d[k] - borrow
+    if k <= #b.d then x = x - b.d[k] end
+    if x < 0 then x = x + 10; borrow = 1 else borrow = 0 end
+    r.d:push((@byte)(x))
+  end
+  trim(&r)
+  return r
+end
+
+local function big_add(a: Big, b: Big): Big
+  local r: Big
+  if a.neg == b.neg then
+    r = addabs(a, b); r.neg = a.neg
+  elseif cmpabs(a, b) >= 0 then
+    r = subabs(a, b); r.neg = a.neg
+  else
+    r = subabs(b, a); r.neg = b.neg
+  end
+  trim(&r)
+  return r
+end
+
+local function big_neg(a: Big): Big
+  local r: Big
+  for k = 1, #a.d do r.d:push(a.d[k]) end
+  r.neg = not a.neg
+  trim(&r)
+  return r
+end
+
+local function big_mul(a: Big, b: Big): Big
+  local r: Big
+  if #a.d == 0 or #b.d == 0 then return r end
+  local acc: sequence(integer)
+  for _ = 1, #a.d + #b.d do acc:push(0) end
+  for i = 1, #a.d do
+    for j = 1, #b.d do acc[i + j - 1] = acc[i + j - 1] + a.d[i] * b.d[j] end
+  end
+  local carry = 0
+  for k = 1, #acc do
+    local x = acc[k] + carry
+    r.d:push((@byte)(x % 10)); carry = x // 10
+  end
+  while carry > 0 do r.d:push((@byte)(carry % 10)); carry = carry // 10 end
+  r.neg = a.neg ~= b.neg
+  trim(&r)
+  return r
+end
+
+-- mpz_tdiv_q / mpz_tdiv_r: the quotient truncates toward zero, the
+-- remainder takes the dividend's sign.
+local function big_divmod(a: Big, b: Big): (Big, Big)
+  local q: Big
+  local r: Big
+  local bb: Big
+  for k = 1, #b.d do bb.d:push(b.d[k]) end
+  local qd: sequence(byte)
+  for k = #a.d, 1, -1 do
+    -- r = r * 10 + digit
+    local nr: Big
+    nr.d:push(a.d[k])
+    for m = 1, #r.d do nr.d:push(r.d[m]) end
+    trim(&nr)
+    r = nr
+    local digit: byte = 0
+    while cmpabs(r, bb) >= 0 do r = subabs(r, bb); digit = digit + 1 end
+    qd:push(digit)
+  end
+  for k = #qd, 1, -1 do q.d:push(qd[k]) end
+  q.neg = a.neg ~= b.neg
+  trim(&q)
+  r.neg = a.neg
+  trim(&r)
+  return q, r
+end
+
+local Value = @record{isint: boolean, s: string, n: Big}
+
+local function int_value(n: Big): Value return {isint = true, n = n} end
+local function str_value(s: string): Value return {isint = false, s = s} end
+
+local function tostr(v: *Value)
+  if v.isint then v.s = big_str(v.n); v.isint = false end
+end
+
+local function looks_like_integer(s: string): boolean
+  local i = 1
+  if s:byte(1) == 45 then i = 2 end
+  if i > #s then return false end
+  for k = i, #s do
+    local c = s:byte(k)
+    if c < 48 or c > 57 then return false end
+  end
+  return true
+end
+
+local function toarith(v: *Value): boolean
+  if v.isint then return true end
+  if not looks_like_integer(v.s) then return false end
+  v.n = big_from(v.s)
+  v.isint = true
+  return true
+end
+
+local function null(v: Value): boolean
+  if v.isint then return #v.n.d == 0 end
+  local s = v.s
+  if #s == 0 then return true end
+  local i = 1
+  if s:byte(1) == 45 then i = 2 end
+  if i > #s then return false end
+  for k = i, #s do if s:byte(k) ~= 48 then return false end end
+  return true
+end
+
+-- getsize: SIZE_MAX for a negative value, SIZE_MAX - 1 when too large.
+local SIZE_MAX: uint64 <comptime> = 0xffffffffffffffff
+local function getsize(n: Big): uint64
+  if n.neg then return SIZE_MAX end
+  if #n.d > 20 then return SIZE_MAX - 1 end
+  local v: uint64 = 0
+  for k = #n.d, 1, -1 do
+    local nv = v * 10 + n.d[k]
+    if nv // 10 ~= v then return SIZE_MAX - 1 end
+    v = nv
+  end
+  if v == SIZE_MAX then return SIZE_MAX - 1 end
+  return v
+end
+
+local args: sequence(string)
+local ai: integer = 1
+
+local function die(status: cint, msg: string)
+  util.err(msg)
+  c_exit(status)
+end
+
+local function nextarg(s: string): boolean
+  if ai > #args then return false end
+  if args[ai] == s then ai = ai + 1; return true end
+  return false
+end
+
+local function nomoreargs(): boolean return ai > #args end
+
+local function require_more_args()
+  if nomoreargs() then die(EXPR_INVALID, 'syntax error: missing argument after ' .. util.quote(args[ai - 1])) end
+end
+
+local function docolon(sv: *Value, pv: *Value): Value
+  tostr(sv); tostr(pv)
+  local prog, err = regex.compile_opts(pv.s, false, false, false, false, regex.EMPTY_RANGES | regex.GLIBC_ERRORS)
+  if #err > 0 then die(EXPR_INVALID, err) end
+  local caps: regex.Caps
+  local matched = prog:matchat(sv.s, 0, &caps)
+  if prog.toocomplex then
+    -- glibc's matcher fails with -2 on exhaustion; nebox's bounds its threads
+    die(EXPR_FAILURE, 'error in regular expression matcher: pattern too complex')
+  end
+  if matched then
+    if prog.nsub > 0 then
+      if caps.at[3] < 0 or caps.at[2] < 0 then return str_value('') end
+      return str_value(sv.s:sub(caps.at[2] + 1, caps.at[3]))
+    end
+    return int_value(big_small(caps.at[1] - caps.at[0]))
+  end
+  if prog.nsub > 0 then return str_value('') end
+  return int_value(big_small(0))
+end
+
+local function eval(evaluate: boolean): Value <forwarddecl> end
+
+local function eval7(evaluate: boolean): Value
+  require_more_args()
+  if nextarg('(') then
+    local v = eval(evaluate)
+    if nomoreargs() then die(EXPR_INVALID, "syntax error: expecting ')' after " .. util.quote(args[ai - 1])) end
+    if not nextarg(')') then die(EXPR_INVALID, "syntax error: expecting ')' instead of " .. util.quote(args[ai])) end
+    return v
+  end
+  if nextarg(')') then die(EXPR_INVALID, "syntax error: unexpected ')'") end
+  ai = ai + 1
+  return str_value(args[ai - 1])
+end
+
+local function eval6(evaluate: boolean): Value
+  if nextarg('+') then
+    require_more_args()
+    ai = ai + 1
+    return str_value(args[ai - 1])
+  elseif nextarg('length') then
+    local r = eval6(evaluate)
+    tostr(&r)
+    return int_value(big_small(#r.s))
+  elseif nextarg('match') then
+    local l = eval6(evaluate)
+    local r = eval6(evaluate)
+    if evaluate then return docolon(&l, &r) end
+    return l
+  elseif nextarg('index') then
+    local l = eval6(evaluate)
+    local r = eval6(evaluate)
+    tostr(&l); tostr(&r)
+    local pos = 0
+    if #r.s > 0 then
+      for k = 1, #l.s do
+        if r.s:find(string.char(l.s:byte(k)), 1, true) > 0 then pos = k; break end
+      end
+    end
+    return int_value(big_small(pos))
+  elseif nextarg('substr') then
+    local l = eval6(evaluate)
+    local i1 = eval6(evaluate)
+    local i2 = eval6(evaluate)
+    tostr(&l)
+    if not toarith(&i1) or not toarith(&i2) then return str_value('') end
+    local pos = getsize(i1.n)
+    local len = getsize(i2.n)
+    local llen: uint64 = #l.s
+    if llen < pos or pos == 0 or len == 0 or len == SIZE_MAX then return str_value('') end
+    local vlen = llen - pos + 1
+    if len < vlen then vlen = len end
+    return str_value(l.s:sub((@integer)(pos), (@integer)(pos + vlen - 1)))
+  end
+  return eval7(evaluate)
+end
+
+local function eval5(evaluate: boolean): Value
+  local l = eval6(evaluate)
+  while true do
+    if nextarg(':') then
+      local r = eval6(evaluate)
+      if evaluate then l = docolon(&l, &r) end
+    else
+      return l
+    end
+  end
+  return l
+end
+
+local function eval4(evaluate: boolean): Value
+  local l = eval5(evaluate)
+  while true do
+    local op = 0
+    if nextarg('*') then op = 1 elseif nextarg('/') then op = 2 elseif nextarg('%') then op = 3 else return l end
+    local r = eval5(evaluate)
+    if evaluate then
+      if not toarith(&l) or not toarith(&r) then die(EXPR_INVALID, 'non-integer argument') end
+      if op ~= 1 and #r.n.d == 0 then die(EXPR_INVALID, 'division by zero') end
+      if op == 1 then l.n = big_mul(l.n, r.n)
+      else
+        local q, rem = big_divmod(l.n, r.n)
+        if op == 2 then l.n = q else l.n = rem end
+      end
+    end
+  end
+  return l
+end
+
+local function eval3(evaluate: boolean): Value
+  local l = eval4(evaluate)
+  while true do
+    local minus = false
+    if nextarg('+') then minus = false elseif nextarg('-') then minus = true else return l end
+    local r = eval4(evaluate)
+    if evaluate then
+      if not toarith(&l) or not toarith(&r) then die(EXPR_INVALID, 'non-integer argument') end
+      if minus then l.n = big_add(l.n, big_neg(r.n)) else l.n = big_add(l.n, r.n) end
+    end
+  end
+  return l
+end
+
+local function eval2(evaluate: boolean): Value
+  local l = eval3(evaluate)
+  while true do
+    local op = 0
+    if nextarg('<') then op = 1
+    elseif nextarg('<=') then op = 2
+    elseif nextarg('=') or nextarg('==') then op = 3
+    elseif nextarg('!=') then op = 4
+    elseif nextarg('>=') then op = 5
+    elseif nextarg('>') then op = 6
+    else return l end
+    local r = eval3(evaluate)
+    local val = false
+    if evaluate then
+      tostr(&l); tostr(&r)
+      local cmp: integer
+      if looks_like_integer(l.s) and looks_like_integer(r.s) then cmp = util.strintcmp(l.s, r.s)
+      elseif l.s == r.s then cmp = 0
+      else cmp = l.s < r.s and -1 or 1 end
+      if op == 1 then val = cmp < 0 elseif op == 2 then val = cmp <= 0 elseif op == 3 then val = cmp == 0
+      elseif op == 4 then val = cmp ~= 0 elseif op == 5 then val = cmp >= 0 else val = cmp > 0 end
+    end
+    l = int_value(big_small(val and 1 or 0))
+  end
+  return l
+end
+
+local function eval1(evaluate: boolean): Value
+  local l = eval2(evaluate)
+  while true do
+    if nextarg('&') then
+      local r = eval2(evaluate and not null(l))
+      if null(l) or null(r) then l = int_value(big_small(0)) end
+    else
+      return l
+    end
+  end
+  return l
+end
+
+function eval(evaluate: boolean): Value
+  local l = eval1(evaluate)
+  while true do
+    if nextarg('|') then
+      local r = eval1(evaluate and null(l))
+      if null(l) then
+        l = r
+        if null(l) then l = int_value(big_small(0)) end
+      end
+    else
+      return l
+    end
+  end
+  return l
+end
+
+global function applet_expr(argv: sequence(string)): integer
+  -- parse_long_options: only a lone --help or --version (or a prefix)
+  if #argv == 1 and #argv[1] > 2 and argv[1]:sub(1, 2) == '--' then
+    local name = argv[1]:sub(3)
+    if ('help'):sub(1, #name) == name or ('version'):sub(1, #name) == name then
+      util.err("option '" .. argv[1] .. "' is not supported")
+      util.flush()
+      local m = "Try 'expr --help' for more information.\n"
+      sys.write(2, m.data, m.size)
+      return EXPR_INVALID
+    end
+  end
+  args = {}
+  for k = 1, #argv do args:push(argv[k]) end
+  ai = 1
+  if #args >= 1 and args[1] == '--' then ai = 2 end
+  if ai > #args then
+    util.err('missing operand')
+    util.flush()
+    local m = "Try 'expr --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return EXPR_INVALID
+  end
+  local v = eval(true)
+  if not nomoreargs() then die(EXPR_INVALID, 'syntax error: unexpected argument ' .. util.quote(args[ai])) end
+  if v.isint then util.line(big_str(v.n)) else util.line(v.s) end
+  if not util.flush() then util.err('write error: ' .. sys.errstr()); return EXPR_FAILURE end
+  return null(v) and 1 or 0
+end

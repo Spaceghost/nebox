@@ -1,0 +1,488 @@
+-- printf: a port of GNU coreutils 9.1 src/printf.c. Escapes (\NNN \xHH
+-- \uHHHH \UHHHHHHHH and the C letters, \c), %b with \0NNN octal, %q
+-- (shell-escape quoting), every flag/width/precision with '*' arguments,
+-- conversions diouxX (intmax_t), aAeEfFgG (long double), c and s with
+-- length modifiers dropped, character constants ('a "a) with GNU's warning,
+-- strtoimax/strtoumax/strtold diagnostics, format reuse and the excess
+-- argument warning. In the C locale, \u characters outside ASCII print as
+-- gnulib's \uXXXX fallback. The sh builtin calls applet_printf too, so
+-- fatal errors and \c end the call instead of the process.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.quotearg'
+require 'memory'
+
+local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
+local function c_strtoimax(s: cstring, e: *cstring, base: cint): int64 <cimport 'strtoimax', cinclude '<inttypes.h>'> end
+local function c_strtoumax(s: cstring, e: *cstring, base: cint): uint64 <cimport 'strtoumax', cinclude '<inttypes.h>'> end
+local function c_strtold(s: cstring, e: *cstring): clongdouble <cimport 'strtold', cinclude '<stdlib.h>'> end
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+
+local State = @record{
+  status: integer,
+  stop: boolean,      -- \c or a fatal error: no further output
+  posixly_correct: boolean,
+}
+
+local function cdup(s: string): cstring
+  local p: *[0]byte = (@*[0]byte)(c_malloc(#s + 1))
+  for i = 0, < #s do p[i] = s.data[i] end
+  p[#s] = 0
+  return (@cstring)(p)
+end
+
+local function fatal(st: *State, msg: string)
+  if st.stop then return end
+  util.err(msg)
+  st.status = 1
+  st.stop = true
+end
+
+local function at(s: string, i: integer): byte
+  if i >= 1 and i <= #s then return s:byte(i) end
+  return 0
+end
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+local function isodigit(c: byte): boolean return c >= 48 and c <= 55 end
+local function isxdigit(c: byte): boolean
+  return isdigit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+end
+
+-- verify_numeric and the STRTOX character-constant rule. `kind` 0 signed,
+-- 1 unsigned, 2 long double.
+local NumVal = @record{i: int64, u: uint64, ld: clongdouble}
+local function vstrto(st: *State, s: string, kind: integer): NumVal
+  local v: NumVal
+  local c1 = at(s, 1)
+  if (c1 == 34 or c1 == 39) and #s >= 2 then
+    local ch = s:byte(2)
+    v.i = ch; v.u = ch; v.ld = ch
+    if #s > 2 and not st.posixly_correct then
+      util.err('warning: ' .. s:sub(3) .. ': character(s) following character constant have been ignored')
+    end
+    return v
+  end
+  local cs = cdup(s)
+  local e: cstring
+  sys.seterrno(0)
+  if kind == 0 then v.i = c_strtoimax(cs, &e, 0)
+  elseif kind == 1 then v.u = c_strtoumax(cs, &e, 0)
+  else v.ld = c_strtold(cs, &e) end
+  local err = sys.errno()
+  local used = (@usize)((@pointer)(e)) - (@usize)((@pointer)(cs))
+  c_free(cs)
+  if err ~= 0 then
+    util.err(util.quote(s) .. ': ' .. sys.errstr())
+    st.status = 1
+  elseif used < #s then
+    if used == 0 then util.err(util.quote(s) .. ': expected a numeric value')
+    else util.err(util.quote(s) .. ': value not completely converted') end
+    st.status = 1
+  end
+  return v
+end
+
+local function print_esc_char(st: *State, c: byte)
+  if c == 97 then util.writebyte(7)
+  elseif c == 98 then util.writebyte(8)
+  elseif c == 99 then st.stop = true; st.status = 0
+  elseif c == 101 then util.writebyte(27)
+  elseif c == 102 then util.writebyte(12)
+  elseif c == 110 then util.writebyte(10)
+  elseif c == 114 then util.writebyte(13)
+  elseif c == 116 then util.writebyte(9)
+  elseif c == 118 then util.writebyte(11)
+  else util.writebyte(c) end
+end
+
+local function hexdigits(v: uint32, n: integer): string
+  local sb: stringbuilder
+  for k = n - 1, 0, -1 do
+    local d = (v >> (k * 4)) & 15
+    sb:writebyte(d < 10 and 48 + d or 87 + d)
+  end
+  return sb:promote()
+end
+
+-- print_esc: the escape whose backslash is at position i; returns the
+-- number of characters after the backslash that it used.
+local function print_esc(st: *State, s: string, i: integer, octal_0: boolean): integer
+  local p = i + 1
+  local c = at(s, p)
+  if c == 120 then
+    local v: integer = 0
+    local n = 0
+    p = p + 1
+    while n < 2 and isxdigit(at(s, p)) do v = v * 16 + util.hexval(at(s, p)); n = n + 1; p = p + 1 end
+    if n == 0 then fatal(st, 'missing hexadecimal number in escape'); return p - i - 1 end
+    util.writebyte((@byte)(v))
+  elseif isodigit(c) then
+    local v: integer = 0
+    local n = 0
+    if octal_0 and c == 48 then p = p + 1 end
+    while n < 3 and isodigit(at(s, p)) do v = v * 8 + (at(s, p) - 48); n = n + 1; p = p + 1 end
+    util.writebyte((@byte)(v & 255))
+  elseif c ~= 0 and ('"\\abcefnrtv'):find(string.char(c), 1, true) > 0 then
+    print_esc_char(st, c)
+    p = p + 1
+  elseif c == 117 or c == 85 then
+    local n = c == 117 and 4 or 8
+    local v: uint32 = 0
+    p = p + 1
+    for _ = 1, n do
+      if not isxdigit(at(s, p)) then fatal(st, 'missing hexadecimal number in escape'); return p - i - 1 end
+      v = v * 16 + (@uint32)(util.hexval(at(s, p)))
+      p = p + 1
+    end
+    if (v <= 0x9f and v ~= 0x24 and v ~= 0x40 and v ~= 0x60) or (v >= 0xd800 and v <= 0xdfff) then
+      fatal(st, 'invalid universal character name \\' .. string.char(c) .. hexdigits(v, n))
+      return p - i - 1
+    end
+    -- print_unicode_char in the C locale: ASCII as is, the rest as the
+    -- \uXXXX / \UXXXXXXXX fallback
+    if v < 0x80 then util.writebyte((@byte)(v))
+    elseif v < 0x10000 then util.write('\\u' .. hexdigits(v, 4):upper())
+    else util.write('\\U' .. hexdigits(v, 8):upper()) end
+  else
+    util.writebyte(92)
+    if c ~= 0 then util.writebyte(c); p = p + 1 end
+  end
+  return p - i - 1
+end
+
+local function print_esc_string(st: *State, s: string)
+  local i = 1
+  while i <= #s and not st.stop do
+    if s:byte(i) == 92 then i = i + print_esc(st, s, i, true)
+    else util.writebyte(s:byte(i)) end
+    i = i + 1
+  end
+end
+
+local KIND_INT <comptime> = 0
+local KIND_UINT <comptime> = 1
+local KIND_LD <comptime> = 2
+local KIND_CHAR <comptime> = 3
+local KIND_STR <comptime> = 4
+
+-- Format one value with a C directive through snprintf and write it.
+local function emit(st: *State, spec: string, kind: integer, v: NumVal, ch: cint, str: cstring)
+  local buf: [512]byte
+  local fmt = cdup(spec)
+  local function run(fmt: cstring, b: cstring, size: csize, kind: integer, v: NumVal, ch: cint, str: cstring): cint
+    if kind == KIND_INT then return c_snprintf(b, size, fmt, v.i)
+    elseif kind == KIND_UINT then return c_snprintf(b, size, fmt, v.u)
+    elseif kind == KIND_LD then return c_snprintf(b, size, fmt, v.ld)
+    elseif kind == KIND_CHAR then return c_snprintf(b, size, fmt, ch)
+    else return c_snprintf(b, size, fmt, str) end
+  end
+  local n = run(fmt, (@cstring)(&buf[0]), 512, kind, v, ch, str)
+  if n >= 0 and n < 512 then
+    util.writebytes(&buf, (@usize)(n))
+  elseif n >= 512 then
+    local big: *[0]byte = (@*[0]byte)(c_malloc((@usize)(n) + 1))
+    run(fmt, (@cstring)(big), (@usize)(n) + 1, kind, v, ch, str)
+    util.writebytes(big, (@usize)(n))
+    c_free(big)
+  else
+    -- xprintf: a failed conversion (nelibc refuses widths and precisions
+    -- above 100000 with EOVERFLOW) ends the program
+    fatal(st, 'cannot perform formatted output: ' .. sys.errstr())
+  end
+  c_free(fmt)
+end
+
+-- glibc's printf_fphex for the x87 80-bit long double (ldbl-96): the
+-- leading hex digit is the top nibble of the 64-bit mantissa, so 1 prints
+-- as 0x8p-3; denormals use exponent -16385; rounding to a precision is to
+-- nearest with ties to even, a carry out of 'f' giving leading 1 and +4.
+local function fphex(ld: clongdouble, upper: boolean, left: boolean, plus: boolean, space: boolean,
+                     alt: boolean, zero: boolean, width: integer, precision: integer): string
+  local raw: [2]uint64
+  memory.copy(&raw, &ld, 10)
+  local mant: uint64 = raw[0]
+  local se: uint64 = raw[1] & 0xffff
+  local negative = (se & 0x8000) ~= 0
+  local expo_field: integer = (@integer)(se & 0x7fff)
+  local sb: stringbuilder
+  local signch: byte = 0
+  if negative then signch = 45 elseif plus then signch = 43 elseif space then signch = 32 end
+  if expo_field == 0x7fff then
+    local word: string
+    if (mant << 1) ~= 0 then word = upper and 'NAN' or 'nan' else word = upper and 'INF' or 'inf' end
+    local w = width - 3 - (signch ~= 0 and 1 or 0)
+    if not left then for _ = 1, w do sb:writebyte(32) end end
+    if signch ~= 0 then sb:writebyte(signch) end
+    sb:write(word)
+    if left then for _ = 1, w do sb:writebyte(32) end end
+    return sb:promote()
+  end
+  local alphabet = upper and '0123456789ABCDEF' or '0123456789abcdef'
+  local digits: [16]byte
+  for k = 0, 15 do digits[k] = alphabet:byte(((mant >> (60 - 4 * k)) & 15) + 1) end
+  local leading = digits[0]
+  local expnegative = false
+  local exponent: integer
+  if expo_field == 0 then
+    if mant == 0 then exponent = 0
+    else expnegative = true; exponent = 16382 + 3 end
+  elseif expo_field >= 16383 + 3 then
+    exponent = expo_field - (16383 + 3)
+  else
+    expnegative = true
+    exponent = -(expo_field - (16383 + 3))
+  end
+  local numend = 15 -- digits[1..numend] are the fraction digits kept
+  while numend > 0 and digits[numend] == 48 do numend = numend - 1 end
+  local function val(c: byte): integer
+    if c >= 97 then return c - 87 elseif c >= 65 then return c - 55 end
+    return c - 48
+  end
+  if precision < 0 then
+    precision = numend
+  elseif precision < numend then
+    local last = precision > 0 and digits[precision] or leading
+    local nextd = val(digits[precision + 1])
+    local more_bits = (nextd & 7) ~= 0 or precision + 1 < numend
+    if nextd >= 8 and ((val(last) & 1) ~= 0 or more_bits) then
+      local k = precision
+      local carry = true
+      while carry and k >= 1 do
+        local d = val(digits[k])
+        if d == 15 then digits[k] = 48; k = k - 1
+        else digits[k] = alphabet:byte(d + 2); carry = false end
+      end
+      if carry then
+        if leading == 57 then leading = upper and 65 or 97
+        elseif val(leading) < 15 then leading = alphabet:byte(val(leading) + 2)
+        else
+          leading = 49
+          if expnegative then
+            exponent = exponent - 4
+            if exponent <= 0 then exponent = -exponent; expnegative = false end
+          else
+            exponent = exponent + 4
+          end
+        end
+      end
+    end
+  end
+  local expstr = tostring(exponent)
+  local point = precision > 0 or alt
+  local w = width - ((signch ~= 0 and 1 or 0) + 2 + 1 + (point and 1 or 0) + precision + 2 + #expstr)
+  local zpad = zero and not left
+  if not left and not zpad then for _ = 1, w do sb:writebyte(32) end end
+  if signch ~= 0 then sb:writebyte(signch) end
+  sb:writebyte(48); sb:writebyte(upper and 88 or 120)
+  if zpad then for _ = 1, w do sb:writebyte(48) end end
+  sb:writebyte(leading)
+  if point then sb:writebyte(46) end
+  for k = 1, precision do sb:writebyte(k <= 15 and digits[k] or 48) end
+  sb:writebyte(upper and 80 or 112)
+  sb:writebyte(expnegative and 45 or 43)
+  sb:write(expstr)
+  if left then for _ = 1, w do sb:writebyte(32) end end
+  return sb:promote()
+end
+
+-- print_direc: the directive text runs from position ds for dl bytes.
+local function print_direc(st: *State, f: string, ds: integer, dl: integer, conversion: byte,
+                           have_fw: boolean, fw: integer, have_prec: boolean, prec: integer, argument: string)
+  local sb: stringbuilder
+  local k = ds
+  while k < ds + dl do
+    local c = f:byte(k)
+    if c == 46 and k + 1 < ds + dl and f:byte(k + 1) == 42 then
+      -- ".*": a negative precision means none
+      if prec >= 0 then sb:write('.', tostring(prec)) end
+      k = k + 1
+    elseif c == 42 then
+      sb:write(tostring(fw))
+    elseif c == 39 or c == 73 then
+      -- grouping and locale digits do nothing in the C locale
+    else
+      sb:writebyte(c)
+    end
+    k = k + 1
+  end
+  local v: NumVal
+  local kind = KIND_STR
+  local ch: cint = 0
+  local cs: cstring = nilptr
+  if conversion == 100 or conversion == 105 then
+    sb:write('j'); kind = KIND_INT; v = vstrto(st, argument, 0)
+  elseif conversion == 111 or conversion == 117 or conversion == 120 or conversion == 88 then
+    sb:write('j'); kind = KIND_UINT; v = vstrto(st, argument, 1)
+  elseif conversion == 99 then
+    kind = KIND_CHAR; ch = at(argument, 1)
+  elseif conversion == 115 then
+    kind = KIND_STR; cs = cdup(argument)
+  elseif conversion == 97 or conversion == 65 then
+    v = vstrto(st, argument, 2)
+    local left, plus, space, alt, zero = false, false, false, false, false
+    local width: integer = 0
+    local precision: integer = -1
+    local k = ds + 1
+    while k < ds + dl do
+      local c = f:byte(k)
+      if c == 45 then left = true elseif c == 43 then plus = true elseif c == 32 then space = true
+      elseif c == 35 then alt = true elseif c == 48 then zero = true
+      elseif c == 39 or c == 73 then
+      else break end
+      k = k + 1
+    end
+    if k < ds + dl and f:byte(k) == 42 then
+      width = fw; k = k + 1
+    else
+      while k < ds + dl and isdigit(f:byte(k)) do width = width * 10 + (f:byte(k) - 48); k = k + 1 end
+    end
+    if k < ds + dl and f:byte(k) == 46 then
+      k = k + 1
+      if k < ds + dl and f:byte(k) == 42 then
+        precision = prec
+      else
+        precision = 0
+        while k < ds + dl and isdigit(f:byte(k)) do precision = precision * 10 + (f:byte(k) - 48); k = k + 1 end
+      end
+    end
+    if width < 0 then left = true; width = -width end
+    util.write(fphex(v.ld, conversion == 65, left, plus, space, alt, zero, width, precision))
+    return
+  else
+    sb:write('L'); kind = KIND_LD; v = vstrto(st, argument, 2)
+  end
+  sb:writebyte(conversion)
+  emit(st, sb:promote(), kind, v, ch, cs)
+  if cs ~= nilptr then c_free(cs) end
+end
+
+-- print_formatted: returns how many arguments were used.
+local function print_formatted(st: *State, f: string, args: *sequence(string), first: integer): integer
+  local ai = first
+  local nargs = #$args
+  local i = 1
+  while i <= #f and not st.stop do
+    local c = f:byte(i)
+    if c == 37 then
+      local ds = i
+      i = i + 1
+      local dl = 1
+      local have_fw, have_prec = false, false
+      local fw, prec: integer = 0, 0
+      local fc = at(f, i)
+      if fc == 37 then
+        util.writebyte(37)
+      elseif fc == 98 then
+        if ai <= nargs then print_esc_string(st, args[ai]); ai = ai + 1 end
+      elseif fc == 113 then
+        if ai <= nargs then util.write(quotearg.style(args[ai], quotearg.SHELL_ESCAPE)); ai = ai + 1 end
+      else
+        local ok: [256]boolean
+        local okset = 'aAcdeEfFgGiosuxX'
+        for k = 1, #okset do ok[okset:byte(k)] = true end
+        local function clear(ok: *[256]boolean, s: string) for k = 1, #s do ok[s:byte(k)] = false end end
+        while true do
+          local x = at(f, i)
+          if x == 73 or x == 39 then clear(&ok, 'aAceEosxX')
+          elseif x == 45 or x == 43 or x == 32 then
+          elseif x == 35 then clear(&ok, 'cdisu')
+          elseif x == 48 then clear(&ok, 'cs')
+          else break end
+          i = i + 1; dl = dl + 1
+        end
+        if at(f, i) == 42 then
+          i = i + 1; dl = dl + 1
+          if ai <= nargs then
+            local a = args[ai]
+            local w = vstrto(st, a, 0).i
+            if w >= -2147483648 and w <= 2147483647 then fw = w
+            else fatal(st, 'invalid field width: ' .. util.quote(a)); return ai - first end
+            ai = ai + 1
+          else
+            fw = 0
+          end
+          have_fw = true
+        else
+          while isdigit(at(f, i)) do i = i + 1; dl = dl + 1 end
+        end
+        if at(f, i) == 46 then
+          i = i + 1; dl = dl + 1
+          ok[99] = false
+          if at(f, i) == 42 then
+            i = i + 1; dl = dl + 1
+            if ai <= nargs then
+              local a = args[ai]
+              local pv = vstrto(st, a, 0).i
+              if pv < 0 then prec = -1
+              elseif pv > 2147483647 then fatal(st, 'invalid precision: ' .. util.quote(a)); return ai - first
+              else prec = pv end
+              ai = ai + 1
+            else
+              prec = 0
+            end
+            have_prec = true
+          else
+            while isdigit(at(f, i)) do i = i + 1; dl = dl + 1 end
+          end
+        end
+        while true do
+          local x = at(f, i)
+          if x == 108 or x == 76 or x == 104 or x == 106 or x == 116 or x == 122 then i = i + 1 else break end
+        end
+        local conv = at(f, i)
+        if not ok[conv] then
+          local upto = i <= #f and i or #f
+          fatal(st, f:sub(ds, upto) .. ': invalid conversion specification')
+          return ai - first
+        end
+        local argument = ''
+        if ai <= nargs then argument = args[ai]; ai = ai + 1 end
+        print_direc(st, f, ds, dl, conv, have_fw, fw, have_prec, prec, argument)
+      end
+    elseif c == 92 then
+      i = i + print_esc(st, f, i, false)
+    else
+      util.writebyte(c)
+    end
+    i = i + 1
+  end
+  return ai - first
+end
+
+global function applet_printf(args: sequence(string)): integer
+  local st: State
+  st.posixly_correct = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  if #args == 1 and (args[1] == '--help' or args[1] == '--version') then
+    util.err("option '" .. args[1] .. "' is not supported")
+    util.flush()
+    local m = "Try 'printf --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  local first = 1
+  if #args >= 1 and args[1] == '--' then first = 2 end
+  if #args < first then
+    util.err('missing operand')
+    util.flush()
+    local m = "Try 'printf --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    return 1
+  end
+  local format = args[first]
+  local ai = first + 1
+  repeat
+    local used = print_formatted(&st, format, &args, ai)
+    ai = ai + used
+  until st.stop or used == 0 or ai > #args
+  if not st.stop and ai <= #args then
+    util.err('warning: ignoring excess arguments, starting with ' .. util.quote(args[ai]))
+  end
+  if not util.flush() then util.err('write error: ' .. sys.errstr()); return 1 end
+  return st.status
+end

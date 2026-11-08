@@ -299,6 +299,15 @@ Stated here rather than worked around:
   --list-signal-handling and the child's /proc/self/status, 0 mismatches.
   One difference: an operand with an empty name ("=x") fails, because
   nelibc's putenv refuses it with EINVAL as musl does (glibc adds it).
+- `expr` ports expr.c: the same recursive-descent evaluator, short-circuit
+  `|` and `&` that skip arithmetic and regex errors, arbitrary-precision
+  integers (a decimal bignum in place of GMP) with truncating `/` and `%`,
+  strintcmp comparisons, `match`/`substr`/`index`/`length` and `+`
+  quoting, anchored BRE matches with GNU's syntax bits (empty ranges,
+  `\{,n\}`, RE_DUP_MAX 32767) and glibc's compile messages, exit
+  statuses 0-3 (a match over nebox's thread bound fails with status 3 where
+  GNU backtracks for hours). `tests/expr_compare.py`: 175 fixed and 3000 random
+  expressions, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
@@ -650,9 +659,17 @@ Stated here rather than worked around:
   resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
   has no `getpwuid`); unknown ids print as numbers.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
-- `printf` (the applet and the `sh` builtin) has `%s %b %c %d %i %u %o
-  %x %X %f %F %e %E %g %G %%` with flags, width and precision; no `*`
-  width or precision, no `%a`, and arguments are reused until consumed.
+- `printf` (the applet and the `sh` builtin) ports printf.c: escapes
+  including \u/\U (gnulib's \uXXXX fallback in the C locale), `%b`, `%q`,
+  every flag, `*` widths and precisions, length modifiers dropped and
+  intmax_t / long double conversions, character constants, strtoimax /
+  strtold diagnostics, format reuse and the excess-argument warning; `%a`
+  ports glibc's x87 printf_fphex (1 prints as 0x8p-3). \c and fatal errors
+  end the call, not the shell. `tests/printf_compare.py`: 169 fixed and
+  2000 random argument vectors, 0 mismatches (one random case hits the
+  limit below and is counted separately).
+  Difference: nelibc refuses widths and precisions above 100000
+  (EOVERFLOW), so those fail with "cannot perform formatted output".
 - `seq` follows GNU seq 9.1: long double operands (decimal, exponent, hex,
   `inf`), output precision from the fraction digits of FIRST and INCREMENT
   (`%Lg` for hex operands), the extra last number when it prints as LAST

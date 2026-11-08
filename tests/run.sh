@@ -452,7 +452,9 @@ expect re-too-complex-sed 'exit=4' 'head -c 400 /dev/zero | tr "\\0" a | sed -E 
 # Equivalence classes are not implemented: "[[=a=]]" parses as the set {[ = a}
 # followed by a literal "]", so this does not match where GNU grep would.
 expect re-equiv-unsupported 'exit=1' 'echo a | grep "[[=a=]]"'
-expect re-too-complex-expr 'exit=2' 'expr "$(head -c 400 /dev/zero | tr "\\0" a)" : "\(.*\)\(.*\)\(.*\)\3\2\1" 2>/dev/null'
+# GNU expr backtracks for hours here; nebox stops at its thread bound
+# with status 3 (EXPR_FAILURE, as for glibc's matcher failing).
+expect re-too-complex-expr 'exit=3' 'expr "$(head -c 400 /dev/zero | tr "\\0" a)" : "\(.*\)\(.*\)\(.*\)\3\2\1" 2>/dev/null'
 # cmp / comm / tac
 same cmp-same 'cmp words.txt words.txt; echo $?'
 same cmp-diff 'cmp words.txt case.txt; echo $?'

@@ -4,7 +4,9 @@ Usage: tests/stat_compare.py path/to/nebox [random-cases]
 One fixture (file types, modes, odd names, symlinks, fixed timestamps
 including negative and nanosecond ones) is shared by both, then fixed cases
 and random format strings (flags, widths, precisions on every directive)
-are compared: stdout, diagnostics (minus "Try --help") and exit status."""
+are compared: stdout, diagnostics (minus "Try --help") and exit status.
+stat -f uses /sys, not /: free counts on a live root file system change
+between the two runs."""
 import os, random, shutil, socket, subprocess, sys, tempfile
 
 NEBOX = os.path.abspath(sys.argv[1])
@@ -41,7 +43,7 @@ FILES = ['reg', 'empty', 'dir', 'lnk', 'dangling', 'fifo', 'sock', "'sp ace'", "
 CASES = []
 for f in FILES:
     CASES += ['@stat %s' % f, '@stat -L %s' % f, '@stat -t %s' % f, '@stat -c %%N %s' % f, '@stat -L -c %%N %s' % f]
-for f in ['reg', 'dir', '/', '/dev/null', 'nonexistent', '-', '/proc']:
+for f in ['reg', 'dir', '/sys', '/dev/null', 'nonexistent', '-', '/proc']:
     CASES += ['@stat -f %s' % f, '@stat -f -t %s' % f]
 DIR = 'nNdDiaAfFhuUgGmsrRtTBbowWxXyYzZC'
 FSDIR = 'naibfdlsStTcz'
@@ -49,7 +51,7 @@ for c in DIR:
     CASES.append("@stat -c '[%%%s]' reg dir lnk fifo /dev/zero" % c)
     CASES.append("@stat -L -c '[%%%s]' lnk dangling" % c)
 for c in FSDIR:
-    CASES.append("@stat -f -c '[%%%s]' . /" % c)
+    CASES.append("@stat -f -c '[%%%s]' . /sys" % c)
 for q in ['literal', 'shell', 'shell-always', 'shell-escape', 'shell-escape-always', 'c', 'c-maybe', 'escape',
           'locale', 'clocale', 'sh', 'c-m', 'bogus', '']:
     CASES.append("QUOTING_STYLE=%s @stat -c '%%N|%%n' %s" % (q, ' '.join(FILES[:19])))

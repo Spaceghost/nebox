@@ -327,6 +327,27 @@ function util.Getopt:next(): integer
   return c
 end
 
+-- gnulib strintcmp: decimal integers of any length.
+function util.strintcmp(a: string, b: string): integer
+  local function parts(s: string): (boolean, string)
+    local neg = #s > 0 and s:byte(1) == 45
+    local i = neg and 2 or 1
+    while i <= #s and s:byte(i) == 48 do i = i + 1 end
+    local j = i
+    while j <= #s and (s:byte(j) >= 48 and s:byte(j) <= 57) do j = j + 1 end
+    local digits = s:sub(i, j - 1)
+    if #digits == 0 then neg = false end
+    return neg, digits
+  end
+  local an, ad = parts(a)
+  local bn, bd = parts(b)
+  if an ~= bn then return an and -1 or 1 end
+  local c = 0
+  if #ad ~= #bd then c = #ad < #bd and -1 or 1
+  elseif ad ~= bd then c = ad < bd and -1 or 1 end
+  return an and -c or c
+end
+
 function util.hexval(c: byte): integer
   if c >= 48 and c <= 57 then return c - 48 end
   if c >= 97 and c <= 102 then return c - 87 end
