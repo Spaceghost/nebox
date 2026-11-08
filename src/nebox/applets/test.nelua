@@ -1,0 +1,330 @@
+-- test and [: a port of GNU coreutils 9.1 src/test.c. POSIX's rules for
+-- one to four arguments, then -a/-o expressions with parentheses and !;
+-- integer comparisons on decimal strings of any length (gnulib
+-- strintcmp, -l LENGTH operands), -nt/-ot/-ef, every unary file test with
+-- euidaccess for -r -w -x, and the status 2 diagnostics. ("[" checks its
+-- closing "]".) The shell's test builtin keeps dash's messages.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_faccessat(fd: cint, path: cstring, mode: cint, flags: cint): cint <cimport 'faccessat', cinclude '<unistd.h>'> end
+local function c_getegid(): cuint <cimport 'getegid', cinclude '<unistd.h>'> end
+
+local argv: sequence(string)
+local argc = 0
+local pos = 0
+
+local function syntax_error(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(2)
+end
+
+local function beyond() syntax_error('missing argument after ' .. util.quote(argv[argc])) end
+
+local function A(i: integer): string return argv[i + 1] end
+
+local function advance(f: boolean)
+  pos = pos + 1
+  if f and pos >= argc then beyond() end
+end
+
+local function unary_advance()
+  advance(true)
+  pos = pos + 1
+end
+
+local function isblank(c: byte): boolean return c == 32 or c == 9 end
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+
+-- find_int: the number's start (a leading '+' skipped, '-' kept).
+local function find_int(s: string): string
+  local p = 1
+  while p <= #s and isblank(s:byte(p)) do p = p + 1 end
+  local start: integer
+  if p <= #s and s:byte(p) == 43 then
+    p = p + 1
+    start = p
+  else
+    start = p
+    if p <= #s and s:byte(p) == 45 then p = p + 1 end
+  end
+  if p <= #s and isdigit(s:byte(p)) then
+    p = p + 1
+    while p <= #s and isdigit(s:byte(p)) do p = p + 1 end
+    while p <= #s and isblank(s:byte(p)) do p = p + 1 end
+    if p > #s then return s:sub(start) end
+  end
+  syntax_error('invalid integer ' .. util.quote(s))
+  return ''
+end
+
+-- gnulib strintcmp: decimal integers of any length.
+local function strintcmp(a: string, b: string): integer
+  local function parts(s: string): (boolean, string)
+    local neg = #s > 0 and s:byte(1) == 45
+    local i = neg and 2 or 1
+    while i <= #s and s:byte(i) == 48 do i = i + 1 end
+    local j = i
+    while j <= #s and isdigit(s:byte(j)) do j = j + 1 end
+    local digits = s:sub(i, j - 1)
+    if #digits == 0 then neg = false end
+    return neg, digits
+  end
+  local an, ad = parts(a)
+  local bn, bd = parts(b)
+  if an ~= bn then return an and -1 or 1 end
+  local c = 0
+  if #ad ~= #bd then c = #ad < #bd and -1 or 1
+  elseif ad ~= bd then c = ad < bd and -1 or 1 end
+  return an and -c or c
+end
+
+local function get_mtime(name: string): (boolean, int64, int64)
+  local st: sys.Stat
+  if sys.stat(name, &st) ~= 0 then return false, 0, 0 end
+  return true, st.st_mtim.tv_sec, st.st_mtim.tv_nsec
+end
+
+local function binop(s: string): boolean
+  return s == '=' or s == '!=' or s == '==' or s == '-nt' or s == '-ot' or s == '-ef' or s == '-eq'
+    or s == '-ne' or s == '-lt' or s == '-le' or s == '-gt' or s == '-ge'
+end
+
+local function binary_operator(l_is_l: boolean): boolean
+  if l_is_l then advance(false) end
+  local op = pos + 1
+  local r_is_l = false
+  if op < argc - 2 and A(op + 1) == '-l' then
+    r_is_l = true
+    advance(false)
+  end
+  local o = A(op)
+  if o:byte(1) == 45 then
+    local c1: byte = #o >= 2 and o:byte(2) or 0
+    local c2: byte = #o >= 3 and o:byte(3) or 0
+    if (((c1 == 108 or c1 == 103) and (c2 == 101 or c2 == 116)) or (c1 == 101 and c2 == 113) or (c1 == 110 and c2 == 101)) and #o == 3 then
+      local l = l_is_l and tostring(#A(op - 1)) or find_int(A(op - 1))
+      local r = r_is_l and tostring(#A(op + 2)) or find_int(A(op + 1))
+      local cmp = strintcmp(l, r)
+      local xe = c2 == 101
+      pos = pos + 3
+      if c1 == 108 then return cmp < (xe and 1 or 0) end
+      if c1 == 103 then return cmp > -(xe and 1 or 0) end
+      return (cmp ~= 0) == xe
+    end
+    if o == '-nt' or o == '-ot' then
+      pos = pos + 3
+      if l_is_l or r_is_l then syntax_error(o .. ' does not accept -l') end
+      local le, ls, lns = get_mtime(A(op - 1))
+      local re, rs, rns = get_mtime(A(op + 1))
+      local c = 0
+      if ls ~= rs then c = ls < rs and -1 or 1 elseif lns ~= rns then c = lns < rns and -1 or 1 end
+      if o == '-nt' then return le and (not re or c > 0) end
+      return re and (not le or c < 0)
+    end
+    if o == '-ef' then
+      pos = pos + 3
+      if l_is_l or r_is_l then syntax_error('-ef does not accept -l') end
+      local a: sys.Stat
+      local b: sys.Stat
+      return sys.stat(A(op - 1), &a) == 0 and sys.stat(A(op + 1), &b) == 0 and a.st_dev == b.st_dev and a.st_ino == b.st_ino
+    end
+    syntax_error(util.quote(o) .. ': unknown binary operator')
+  end
+  if o == '=' or o == '==' then
+    local v = A(pos) == A(pos + 2)
+    pos = pos + 3
+    return v
+  end
+  -- "!="
+  local v = A(pos) ~= A(pos + 2)
+  pos = pos + 3
+  return v
+end
+
+local function unary_operator(): boolean
+  local a = A(pos)
+  local c: byte = a:byte(2)
+  local st: sys.Stat
+  local function isfmt(m: cuint, f: cuint): boolean return (m & 0xF000) == f end
+  if c == 101 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0
+  elseif c == 114 then unary_advance(); return c_faccessat(-100, A(pos - 1), 4, 0x200) == 0
+  elseif c == 119 then unary_advance(); return c_faccessat(-100, A(pos - 1), 2, 0x200) == 0
+  elseif c == 120 then unary_advance(); return c_faccessat(-100, A(pos - 1), 1, 0x200) == 0
+  elseif c == 78 then
+    unary_advance()
+    if sys.stat(A(pos - 1), &st) ~= 0 then return false end
+    local ms, mn, as, an = st.st_mtim.tv_sec, st.st_mtim.tv_nsec, st.st_atim.tv_sec, st.st_atim.tv_nsec
+    return ms > as or (ms == as and mn > an)
+  elseif c == 79 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and sys.geteuid() == st.st_uid
+  elseif c == 71 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and c_getegid() == st.st_gid
+  elseif c == 102 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0x8000)
+  elseif c == 100 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0x4000)
+  elseif c == 115 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and st.st_size > 0
+  elseif c == 83 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0xC000)
+  elseif c == 99 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0x2000)
+  elseif c == 98 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0x6000)
+  elseif c == 112 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0x1000)
+  elseif c == 76 or c == 104 then unary_advance(); return sys.lstat(A(pos - 1), &st) == 0 and isfmt(st.st_mode, 0xA000)
+  elseif c == 117 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and (st.st_mode & 0x800) ~= 0
+  elseif c == 103 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and (st.st_mode & 0x400) ~= 0
+  elseif c == 107 then unary_advance(); return sys.stat(A(pos - 1), &st) == 0 and (st.st_mode & 0x200) ~= 0
+  elseif c == 116 then
+    unary_advance()
+    local n = find_int(A(pos - 1))
+    -- strtol: ERANGE past LONG_MAX
+    local neg = #n > 0 and n:byte(1) == 45
+    if neg then return false end
+    local v: int64 = 0
+    local over = false
+    for i = 1, #n do
+      local d = n:byte(i)
+      if d < 48 or d > 57 then break end
+      if v > (0x7fffffffffffffff - (d - 48)) // 10 then over = true; break end
+      v = v * 10 + d - 48
+    end
+    return not over and v <= 0x7fffffff and sys.isatty((@cint)(v)) == 1
+  elseif c == 110 then unary_advance(); return #A(pos - 1) ~= 0
+  elseif c == 122 then unary_advance(); return #A(pos - 1) == 0
+  end
+  syntax_error(util.quote(a) .. ': unary operator expected')
+  return false
+end
+
+local expr: function(): boolean
+local posixtest: function(integer): boolean
+
+local function term(): boolean
+  local value: boolean
+  local negated = false
+  while pos < argc and A(pos) == '!' do
+    advance(true)
+    negated = not negated
+  end
+  if pos >= argc then beyond() end
+  local a = A(pos)
+  if a == '(' then
+    advance(true)
+    local nargs = 1
+    while pos + nargs < argc and A(pos + nargs) ~= ')' do
+      if nargs == 4 then nargs = argc - pos; break end
+      nargs = nargs + 1
+    end
+    value = posixtest(nargs)
+    -- argv[argc] is NULL for test but still "]" for [
+    if pos >= #argv then syntax_error(util.quote(')') .. ' expected')
+    elseif A(pos) ~= ')' then syntax_error(util.quote(')') .. ' expected, found ' .. util.quote(A(pos))) end
+    advance(false)
+  elseif 4 <= argc - pos and a == '-l' and binop(A(pos + 2)) then
+    value = binary_operator(true)
+  elseif 3 <= argc - pos and binop(A(pos + 1)) then
+    value = binary_operator(false)
+  elseif #a == 2 and a:byte(1) == 45 then
+    value = unary_operator()
+  else
+    value = #a ~= 0
+    advance(false)
+  end
+  return negated ~= value
+end
+
+local function and_(): boolean
+  local value = true
+  while true do
+    if not term() then value = false end
+    if not (pos < argc and A(pos) == '-a') then return value end
+    advance(false)
+  end
+  return value
+end
+
+local function or_(): boolean
+  local value = false
+  while true do
+    if and_() then value = true end
+    if not (pos < argc and A(pos) == '-o') then return value end
+    advance(false)
+  end
+  return value
+end
+
+expr = function(): boolean
+  if pos >= argc then beyond() end
+  return or_()
+end
+
+local function one_argument(): boolean
+  local v = #A(pos) ~= 0
+  pos = pos + 1
+  return v
+end
+
+local function two_arguments(): boolean
+  local a = A(pos)
+  if a == '!' then
+    advance(false)
+    return not one_argument()
+  elseif #a == 2 and a:byte(1) == 45 then
+    return unary_operator()
+  end
+  beyond()
+  return false
+end
+
+local function three_arguments(): boolean
+  if binop(A(pos + 1)) then return binary_operator(false)
+  elseif A(pos) == '!' then
+    advance(true)
+    return not two_arguments()
+  elseif A(pos) == '(' and A(pos + 2) == ')' then
+    advance(false)
+    local v = one_argument()
+    advance(false)
+    return v
+  elseif A(pos + 1) == '-a' or A(pos + 1) == '-o' then
+    return expr()
+  end
+  syntax_error(util.quote(A(pos + 1)) .. ': binary operator expected')
+  return false
+end
+
+posixtest = function(nargs: integer): boolean
+  if nargs == 1 then return one_argument()
+  elseif nargs == 2 then return two_arguments()
+  elseif nargs == 3 then return three_arguments()
+  elseif nargs == 4 then
+    if A(pos) == '!' then
+      advance(true)
+      return not three_arguments()
+    end
+    if A(pos) == '(' and A(pos + 3) == ')' then
+      advance(false)
+      local v = two_arguments()
+      advance(false)
+      return v
+    end
+  end
+  return expr()
+end
+
+global function applet_test(args: sequence(string)): integer
+  argv:clear()
+  argv:push(util.applet)
+  for _, a in ipairs(args) do argv:push(a) end
+  argc = #argv
+  if util.applet == '[' then
+    if argc < 2 or argv[argc] ~= ']' then syntax_error('missing ' .. util.quote(']')) end
+    argc = argc - 1
+  end
+  pos = 1
+  if pos >= argc then return 1 end
+  local value = posixtest(argc - 1)
+  if pos ~= argc then syntax_error('extra argument ' .. util.quote(A(pos))) end
+  return value and 0 or 1
+end

@@ -1288,7 +1288,8 @@ local function test_eval(args: sequence(string), lo: integer, hi: integer): (boo
   return false, false
 end
 
-global function applet_test(args: sequence(string)): integer
+-- The sh builtin's test (dash's messages); the test/[ applets are GNU's.
+global function sh_builtin_test(args: sequence(string)): integer
   local hi = #args
   if util.applet == '[' then
     if hi == 0 or args[hi] ~= ']' then util.err("missing ']'"); return 2 end

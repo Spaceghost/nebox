@@ -1131,7 +1131,7 @@ end
 local function bi_test(args: sequence(string)): integer
   local saved = util.applet
   util.applet = args[1]
-  local rc = applet_test(rest_args(args))
+  local rc = sh_builtin_test(rest_args(args))
   util.applet = saved
   return rc
 end

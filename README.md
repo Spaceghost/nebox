@@ -281,6 +281,14 @@ Stated here rather than worked around:
   each cycle listed on standard error before a relation is dropped to break
   it, read errors taken as end of input. `tests/tsort_compare.py`: 19 fixed
   cases plus 400 random graphs, 0 mismatches.
+- `test` and `[` port test.c: POSIX's one-to-four-argument rules, -a/-o
+  expressions with parentheses and !, integer comparisons on decimal
+  strings of any length (gnulib strintcmp, `-l STRING` lengths), -nt -ot
+  -ef, every unary file test (euidaccess for -r -w -x), status 2
+  diagnostics. The shell's `test` builtin keeps dash's messages
+  (`sh_builtin_test`). `tests/test_compare.py`: 62 fixed and 3000 random
+  argument vectors through both forms, 0 mismatches (8000 random also run
+  clean).
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
