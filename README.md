@@ -319,6 +319,13 @@ Stated here rather than worked around:
   bignum path is slower than GMP. `tests/factor_compare.py`: 72 fixed and
   600 random numbers up to about 2^200 plus pipe and write-error cases,
   0 mismatches.
+- `cmp` ports GNU diffutils 3.8 cmp.c: -b, -i SKIP and SKIP1:SKIP2 (with
+  gnulib's suffixes and bases), -l with its column width, -n, -s, the SKIP
+  operands, lseek or read-and-discard skipping, the same-name, same-inode
+  and (with -s) different-size shortcuts, silence when standard output is
+  /dev/null, POSIX's "differ: char" message in the C locale, every "EOF
+  on" form and stdio's write-error messages. `tests/cmp_compare.py`: 110
+  fixed and 400 random cases, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

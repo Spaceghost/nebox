@@ -9,47 +9,6 @@ require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.longopts'
 
--- cmp: -s silent, -l list every differing byte
-global function applet_cmp(args: sequence(string)): integer
-  local o = util.parse(args, 'sl')
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands < 1 then return util.die('missing operand') end
-  local a = o.operands[1]
-  local b: string = '-'
-  if #o.operands >= 2 then b = o.operands[2] end
-  local da, oka = util.readfile(a)
-  if not oka then return 2 end
-  local db, okb = util.readfile(b)
-  if not okb then return 2 end
-  local n = da.size < db.size and da.size or db.size
-  local line: integer = 1
-  local rc: integer = 0
-  local width: integer = 1
-  local m = da.size > db.size and da.size or db.size
-  while m >= 10 do m = m // 10; width = width + 1 end
-  for i: usize = 0, < n do
-    if da.data[i] ~= db.data[i] then
-      if o:has('l') then
-        rc = 1
-        util.padnum((@integer)(i) + 1, width)
-        util.writef(' %3o %3o\n', da.data[i], db.data[i])
-      else
-        if not o:has('s') then
-          util.writef('%s %s differ: char %d, line %d\n', a, b, i + 1, line)
-        end
-        return 1
-      end
-    end
-    if da.data[i] == 10 then line = line + 1 end
-  end
-  if da.size ~= db.size then
-    if not o:has('s') then
-      util.err('cmp: EOF on ' .. (da.size < db.size and a or b) .. ' after byte ' .. string.format('%d', n))
-    end
-    return 1
-  end
-  return rc
-end
 
 -- comm: three-column compare of sorted files; -1 -2 -3 suppress columns
 

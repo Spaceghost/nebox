@@ -1,0 +1,378 @@
+-- cmp: a port of GNU diffutils 3.8 src/cmp.c. -b/-c, -i SKIP or
+-- SKIP1:SKIP2 (gnulib xstrtoimax with "kKMGTPEZY0" suffixes, maxima kept
+-- over repeats), -l, -n, -s and the SKIP operands; skips by lseek where it
+-- works and by reading otherwise; the shortcuts for the same name, the
+-- same inode and position, and (with -s) regular files of different sizes;
+-- no output when standard output is /dev/null; POSIX's "differ: char"
+-- message in the C locale, the -l column width from the file sizes, the
+-- "cmp: EOF on ..." forms, and stdio's write-error reporting (a failed
+-- buffer write is "write failed", a failed final flush names standard
+-- output). Exit 0 same, 1 different, 2 trouble.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_read(fd: cint, buf: pointer, n: csize): clong <cimport 'read', cinclude '<unistd.h>'> end
+
+local EXIT_TROUBLE: cint <comptime> = 2
+local T_FIRST <comptime> = 0
+local T_ALL <comptime> = 1
+local T_NOSTDOUT <comptime> = 2
+local T_STATUS <comptime> = 3
+local BUFSIZE: integer <comptime> = 65536
+
+local file: [2]string
+local fd: [2]cint
+local st: [2]sys.Stat
+local ignore_initial: [2]int64
+local comparison_type: integer = -1
+local positioned: [2]boolean
+local position: [2]int64
+
+-- stdout as stdio would buffer it (st_blksize bytes, full buffering)
+local obuf: sequence(byte)
+local ocap: integer = 4096
+local oerror = false
+
+local function obyte(c: byte)
+  if oerror then return end
+  obuf:push(c)
+  if #obuf >= ocap then
+    local done = 0
+    while done < #obuf do
+      local r = sys.write(1, &obuf[done + 1], (@usize)(#obuf - done))
+      if r < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        oerror = true; obuf:clear(); return
+      end
+      done = done + r
+    end
+    obuf:clear()
+  end
+end
+
+local function owrite(s: string)
+  for k = 1, #s do obyte(s:byte(k)) end
+end
+
+-- a decimal number right-aligned in WIDTH columns
+local function onum(v: int64, width: integer)
+  local d: [24]byte
+  local n = 0
+  repeat d[n] = (@byte)(48 + v % 10); v = v // 10; n = n + 1 until v == 0
+  for _ = n + 1, width do obyte(32) end
+  for k = n - 1, 0, -1 do obyte(d[k]) end
+end
+
+-- printf "%3o"
+local function ooct3(c: byte)
+  local d: [3]byte
+  local n = 0
+  repeat d[n] = 48 + (c & 7); c = c >> 3; n = n + 1 until c == 0
+  for _ = n + 1, 3 do obyte(32) end
+  for k = n - 1, 0, -1 do obyte(d[k]) end
+end
+
+-- sprintc (cat -t style), padded with spaces to WIDTH
+local function ochar(c: byte, width: integer)
+  local n = 1
+  if not (c >= 32 and c < 127) then
+    if c >= 128 then obyte(77); obyte(45); n = n + 2; c = c - 128 end
+    if c < 32 then obyte(94); n = n + 1; c = c + 64
+    elseif c == 127 then obyte(94); n = n + 1; c = 63 end
+  end
+  obyte(c)
+  for _ = n + 1, width do obyte(32) end
+end
+
+-- fclose(stdout): true when the remaining bytes are written
+local function oflush(): boolean
+  local done = 0
+  while done < #obuf do
+    local r = sys.write(1, &obuf[done + 1], (@usize)(#obuf - done))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return false
+    end
+    done = done + r
+  end
+  obuf:clear()
+  return true
+end
+
+local function try_help(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "cmp: Try 'cmp --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(EXIT_TROUBLE)
+end
+
+local function die(msg: string)
+  util.err(msg)
+  c_exit(EXIT_TROUBLE)
+end
+
+-- ARG is parsed; SHOWN is what the message quotes (GNU quotes the whole
+-- option argument for SKIP1 and the rest after ':' for SKIP2)
+local function specify_ignore_initial(f: integer, arg: string, shown: string)
+  local stt, v = util.xstrtoimax_base(arg, 0, 'kKMGTPEZY0')
+  if stt ~= 0 or v < 0 then try_help("invalid --ignore-initial value '" .. shown .. "'") end
+  if ignore_initial[f] < v then ignore_initial[f] = v end
+end
+
+local function specify_comparison_type(t: integer)
+  if comparison_type >= 0 and comparison_type ~= t then try_help('options -l and -s are incompatible') end
+  comparison_type = t
+end
+
+local function file_position(f: integer): int64
+  if not positioned[f] then
+    positioned[f] = true
+    position[f] = sys.lseek(fd[f], ignore_initial[f], sys.SEEK_CUR)
+  end
+  return position[f]
+end
+
+-- block_read: fill n bytes unless at end of file; -1 on error
+local function block_read(f: integer, buf: *[0]byte, n: integer): integer
+  local got = 0
+  while got < n do
+    local r = c_read(fd[f], &buf[got], (@csize)(n - got))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return -1
+    end
+    if r == 0 then break end
+    got = got + r
+  end
+  return got
+end
+
+local function isreg(s: *sys.Stat): boolean return (s.st_mode & sys.S_IFMT) == sys.S_IFREG end
+
+local buf0: [BUFSIZE + 8]byte
+local buf1: [BUFSIZE + 8]byte
+
+local function cmp(bytes: int64, print_bytes: boolean): integer
+  local at_line_start = true
+  local line_number: int64 = 1
+  local byte_number: int64 = 1
+  local remaining = bytes
+  local differing = 0
+  local offset_width = 0
+  if comparison_type == T_ALL then
+    local maxv: int64 = (bytes >= 0) and bytes or 0x7fffffffffffffff
+    for f = 0, 1 do
+      if isreg(&st[f]) then
+        local fb = st[f].st_size - file_position(f)
+        if fb < maxv then maxv = fb end
+      end
+    end
+    -- C's truncating division (the size left can be negative)
+    local function cdiv10(v: int64): int64
+      local q = v // 10
+      if v < 0 and v % 10 ~= 0 then q = q + 1 end
+      return q
+    end
+    offset_width = 1
+    maxv = cdiv10(maxv)
+    while maxv ~= 0 do offset_width = offset_width + 1; maxv = cdiv10(maxv) end
+  end
+  for f = 0, 1 do
+    local ig = ignore_initial[f]
+    if ig ~= 0 and file_position(f) == -1 then
+      repeat
+        local want: integer = ig < BUFSIZE and (@integer)(ig) or BUFSIZE
+        local r = block_read(f, &buf0, want)
+        if r ~= want then
+          if r < 0 then die(file[f] .. ': ' .. sys.errstr()) end
+          break
+        end
+        ig = ig - r
+      until ig == 0
+    end
+  end
+  local read0, read1 = 0, 0
+  repeat
+    local want = BUFSIZE
+    if remaining >= 0 then
+      if remaining < want then want = (@integer)(remaining) end
+      remaining = remaining - want
+    end
+    read0 = block_read(0, &buf0, want)
+    if read0 < 0 then die(file[0] .. ': ' .. sys.errstr()) end
+    read1 = block_read(1, &buf1, want)
+    if read1 < 0 then die(file[1] .. ': ' .. sys.errstr()) end
+    local smaller = read0 < read1 and read0 or read1
+    local first_diff = 0
+    while first_diff < smaller and buf0[first_diff] == buf1[first_diff] do first_diff = first_diff + 1 end
+    byte_number = byte_number + first_diff
+    if comparison_type == T_FIRST and first_diff ~= 0 then
+      for k = 0, < first_diff do if buf0[k] == 10 then line_number = line_number + 1 end end
+      at_line_start = buf0[first_diff - 1] == 10
+    end
+    if first_diff < smaller then
+      if comparison_type == T_FIRST then
+        owrite(file[0]); obyte(32); owrite(file[1])
+        if not print_bytes then
+          owrite(' differ: char '); onum(byte_number, 0); owrite(', line '); onum(line_number, 0); obyte(10)
+        else
+          local c0, c1 = buf0[first_diff], buf1[first_diff]
+          owrite(' differ: byte '); onum(byte_number, 0); owrite(', line '); onum(line_number, 0)
+          owrite(' is '); ooct3(c0); obyte(32); ochar(c0, 0); obyte(32); ooct3(c1); obyte(32); ochar(c1, 0); obyte(10)
+        end
+        return 1
+      elseif comparison_type == T_STATUS then
+        return 1
+      elseif comparison_type == T_ALL then
+        repeat
+          local c0, c1 = buf0[first_diff], buf1[first_diff]
+          if c0 ~= c1 then
+            onum(byte_number, offset_width); obyte(32); ooct3(c0); obyte(32)
+            if not print_bytes then
+              ooct3(c1)
+            else
+              ochar(c0, 4); obyte(32); ooct3(c1); obyte(32); ochar(c1, 0)
+            end
+            obyte(10)
+          end
+          byte_number = byte_number + 1
+          first_diff = first_diff + 1
+        until first_diff >= smaller
+        differing = -1
+      else
+        differing = 1
+      end
+    end
+    if read0 ~= read1 then
+      if differing <= 0 and comparison_type ~= T_STATUS then
+        local shorter = file[read1 < read0 and 1 or 0]
+        local msg: string
+        if byte_number == 1 then
+          msg = 'cmp: EOF on ' .. shorter .. ' which is empty\n'
+        elseif comparison_type == T_FIRST then
+          local ln = line_number - (at_line_start and 1 or 0)
+          if at_line_start then
+            msg = 'cmp: EOF on ' .. shorter .. ' after byte ' .. tostring(byte_number - 1) .. ', line ' .. tostring(ln) .. '\n'
+          else
+            msg = 'cmp: EOF on ' .. shorter .. ' after byte ' .. tostring(byte_number - 1) .. ', in line ' .. tostring(ln) .. '\n'
+          end
+        else
+          msg = 'cmp: EOF on ' .. shorter .. ' after byte ' .. tostring(byte_number - 1) .. '\n'
+        end
+        sys.write(2, msg.data, msg.size)
+      end
+      return 1
+    end
+  until not (differing <= 0 and read0 == BUFSIZE)
+  return differing == 0 and 0 or 1
+end
+
+global function applet_cmp(args: sequence(string)): integer
+  local print_bytes = false
+  local bytes: int64 = -1
+  comparison_type = -1
+  local longs: []util.LongOpt = {
+    {'print-bytes', 0, 98}, {'print-chars', 0, 99}, {'ignore-initial', 1, 105}, {'verbose', 0, 108},
+    {'bytes', 1, 110}, {'silent', 0, 115}, {'quiet', 0, 115}, {'version', 0, util.UNSUPPORTED},
+    {'help', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'bci:ln:sv', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 98 or c == 99 then print_bytes = true
+    elseif c == 105 then
+      local a = g.optarg
+      local colon = a:find(':', 1, true)
+      if colon > 0 then
+        specify_ignore_initial(0, a:sub(1, colon - 1), a)
+        specify_ignore_initial(1, a:sub(colon + 1), a:sub(colon + 1))
+      else
+        specify_ignore_initial(0, a, a)
+        if ignore_initial[1] < ignore_initial[0] then ignore_initial[1] = ignore_initial[0] end
+      end
+    elseif c == 108 then specify_comparison_type(T_ALL)
+    elseif c == 110 then
+      local stt, n = util.xstrtoimax_base(g.optarg, 0, 'kKMGTPEZY0')
+      if stt ~= 0 or n < 0 then try_help("invalid --bytes value '" .. g.optarg .. "'") end
+      if not (0 <= bytes and bytes < n) then bytes = n end
+    elseif c == 115 then specify_comparison_type(T_STATUS)
+    elseif c == 118 or c == util.UNSUPPORTED then
+      try_help("option '" .. (c == 118 and '-v' or '--' .. g.longname) .. "' is not supported")
+    else
+      try_help(g.errmsg)
+    end
+  end
+  if comparison_type < 0 then comparison_type = T_FIRST end
+  local ops = g:operands()
+  if #ops == 0 then
+    try_help("missing operand after '" .. (#args > 0 and args[#args] or 'cmp') .. "'")
+  end
+  file[0] = ops[1]
+  file[1] = #ops >= 2 and ops[2] or '-'
+  local oi = 3
+  for f = 0, 1 do
+    if oi <= #ops then specify_ignore_initial(f, ops[oi], ops[oi]); oi = oi + 1 end
+  end
+  if oi <= #ops then try_help("extra operand '" .. ops[oi] .. "'") end
+  for f = 0, 1 do
+    if f == 1 and ignore_initial[0] == ignore_initial[1] and file[0] == file[1] then return 0 end
+    if file[f] == '-' then
+      fd[f] = 0
+    else
+      fd[f] = sys.open(file[f], 0, 0)
+    end
+    if fd[f] < 0 or sys.fstat(fd[f], &st[f]) ~= 0 then
+      if fd[f] < 0 and comparison_type == T_STATUS then return EXIT_TROUBLE end
+      die(file[f] .. ': ' .. sys.errstr())
+    end
+  end
+  local s0, s1 = &st[0], &st[1]
+  local same = (s0.st_ino == s1.st_ino and s0.st_dev == s1.st_dev)
+  if not same then
+    local t0, t1 = s0.st_mode & sys.S_IFMT, s1.st_mode & sys.S_IFMT
+    same = t0 == t1 and (t0 == 0x6000 or t0 == 0x2000) and s0.st_rdev == s1.st_rdev
+  end
+  if same and s0.st_mode == s1.st_mode and s0.st_nlink == s1.st_nlink and s0.st_uid == s1.st_uid
+      and s0.st_gid == s1.st_gid and s0.st_size == s1.st_size and s0.st_mtim.tv_sec == s1.st_mtim.tv_sec
+      and s0.st_ctim.tv_sec == s1.st_ctim.tv_sec and file_position(0) == file_position(1) then
+    return 0
+  end
+  if comparison_type ~= T_STATUS then
+    local outst: sys.Stat
+    local nullst: sys.Stat
+    if sys.fstat(1, &outst) == 0 and sys.stat('/dev/null', &nullst) == 0 then
+      local o_same = outst.st_ino == nullst.st_ino and outst.st_dev == nullst.st_dev
+      if not o_same then
+        local t0, t1 = outst.st_mode & sys.S_IFMT, nullst.st_mode & sys.S_IFMT
+        o_same = t0 == t1 and (t0 == 0x6000 or t0 == 0x2000) and outst.st_rdev == nullst.st_rdev
+      end
+      if o_same then comparison_type = T_NOSTDOUT end
+    end
+    if outst.st_blksize > 0 then ocap = outst.st_blksize end
+  end
+  if comparison_type == T_STATUS and isreg(s0) and isreg(s1) then
+    local z0 = s0.st_size - file_position(0)
+    local z1 = s1.st_size - file_position(1)
+    if z0 < 0 then z0 = 0 end
+    if z1 < 0 then z1 = 0 end
+    local mn = z0 < z1 and z0 or z1
+    if z0 ~= z1 and (bytes < 0 or mn < bytes) then return 1 end
+  end
+  local status = cmp(bytes, print_bytes)
+  for f = 0, 1 do
+    if sys.close(fd[f]) ~= 0 then die(file[f] .. ': ' .. sys.errstr()) end
+  end
+  if status ~= 0 and comparison_type < T_NOSTDOUT then
+    if oerror then die('write failed') end
+    if not oflush() then die('standard output: ' .. sys.errstr()) end
+  end
+  return status
+end

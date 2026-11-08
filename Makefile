@@ -78,6 +78,7 @@ test: $(OUT)/nebox
 	python3 tests/printf_compare.py $(abspath $(OUT)/nebox) 2000
 	python3 tests/expr_compare.py $(abspath $(OUT)/nebox) 3000
 	python3 tests/factor_compare.py $(abspath $(OUT)/nebox) 600
+	python3 tests/cmp_compare.py $(abspath $(OUT)/nebox) 400
 	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400
