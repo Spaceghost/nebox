@@ -530,8 +530,9 @@ Stated here rather than worked around:
   empty does nothing and succeeds (implementation-defined; dash does the
   same); OPTIND inside a group like `-ab` already names the next argument,
   as in dash. `echo` is the XSI echo (escapes always, `-n` only first).
-- `grep`, `sed`, `expr` and `find -regex` use nebox's own regex engine
-  (`src/nebox/regex.nelua`): POSIX BRE and ERE with brackets, named classes,
+- `sed`, `expr`, `awk` and `find -regex` use nebox's own regex engine
+  (`src/nebox/regex.nelua`; grep runs its own parsers' trees on the same
+  matcher): POSIX BRE and ERE with brackets, named classes,
   intervals, groups, alternation, back-references, and the GNU
   `\w \W \s \S \b \B \< \>` escapes. Matching is a Pike VM with GNU (glibc)
   leftmost-longest semantics: the earliest start wins, then the longest match
@@ -549,9 +550,9 @@ Stated here rather than worked around:
   (grep exit 2, sed exit 4, expr exit 2) where GNU keeps searching
   (`re-too-complex*`; `re-pathological-backref` stays within the bound).
   Not implemented: multibyte locales (bytes only; `-i` folds ASCII; the test
-  harness runs in the C locale, so this has no case), equivalence classes
-  `[=a=]` and collating symbols `[.a.]` (`re-equiv-unsupported` pins the
-  current non-matching behavior). `\`` and `\'` match only at the ends of
+  harness runs in the C locale, so this has no case), and outside grep
+  equivalence classes `[=a=]` and collating symbols `[.a.]` (grep's
+  parsers take single-character ones as glibc does, `grep-equiv`). `\`` and `\'` match only at the ends of
   the subject, as in GNU regex (`sed-buffer-anchors`); `.` and `[^...]`
   match a newline unless REG_NEWLINE is in effect (sed's `M` flag).
 - `patch` follows GNU patch 2.7.6 (read from its source): unified,
@@ -633,32 +634,65 @@ Stated here rather than worked around:
   options (`--label` and the rest), -p/-F function headers, -y side by side,
   -t/-T, -I, -x/-X, -l, -n (RCS), -D (ifdef), --minimal and
   --speed-large-files.
-- `grep` takes -i -v -n -b -c -l -L -q -s -H -h -r -F -E -G -w -x -o -e -f -m -z -Z
-  and
-  the context options -A, -B, -C and -NUM, following GNU grep 3.8's prtext:
-  `--` before a group that is not adjacent to the previous output (also
-  across files), -C and -NUM as a default that -A/-B override whatever the
-  order (the last -C/-NUM wins; digits accumulate within one argument),
-  trailing context still printed after -m stops (matching lines there are
-  context lines), `-o` printing the matches of matching lines (under -v
-  those are the context lines) and the separators but no other context,
-  `-b` giving the offset of the line or, with -o, of the match, and no
-  context for -c/-l/-q (`grep-ctx-*`). -F strings are matched as quoted
-  BREs, so -F works with -o (`grep-F-o`). -f reads one pattern per line
-  (an empty file gives no patterns, so nothing matches; `-f -` is standard
-  input), merged with -e patterns in command-line order. -L lists files
-  without a selected line; as in GNU grep 3.5 and later the exit status
-  still says whether any line was selected, and of -l and -L the last one
-  given wins. -z reads and writes NUL-terminated records (`.` matches a
-  newline inside a record, `^`/`$` only at its ends; the `--` separator and
-  -c counts still end in a newline); -Z writes a NUL after file names in
-  -l/-L/-c output and line prefixes. -s silences unreadable-file messages
-  but keeps exit status 2. `-o -w` prints the word without its delimiters
-  (`grep-o-w`). GNU grep's long options work (`--color`/`--colour` accept
-  never/auto, `--line-buffered` is accepted); -T, -P, -a/-I, --include and
-  the other options nebox lacks are refused by name. Not supported:
-  binary-file detection (a NUL byte does not make grep report
-  "binary file matches").
+- `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
+  Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
+  patches are kept (the `stray \` warnings appear only when
+  `DEB_GREP_ENABLE_STRAY_BACKSLASH_WARN` is set, and a newline after the
+  last pattern without a back-reference adds no empty alternative,
+  Debian #1029235). Ported as written: get_nondigit_option and every
+  option and long option with glibc getopt_long's messages, the pattern
+  table (duplicate patterns dropped, `FILE:LINE:` prefixes for compile
+  errors from -f files), try_fgrep_pattern and the -F/-G switches,
+  the early exits (`-m 0`, `-v ''`, -f of an empty file), the page-aligned
+  buffer with its 96 KiB first read, growth for long lines and the
+  SEEK_DATA skipping of NUL runs, binary detection per buffer (NULs, or a
+  hole found with SEEK_HOLE) with zap_nuls, "binary file matches" on
+  standard error, -a/-I/`--binary-files`, prtext/prpending context and
+  group separators (`--group-separator`, `--no-group-separator`), -o, -c,
+  -l/-L/-q and the -s/-q status rules, -b, -n, -T with its offset width,
+  -Z/-z, `--label`, `--line-buffered`, -u's warning, `--color` with
+  GREP_COLORS (every capability, `rv`, `ne`, parsing stopped at the first
+  malformed byte) and the deprecated GREP_COLOR with its warning,
+  "input file is also the output", standard output to /dev/null,
+  finalize_input (what -m and -q leave of a seekable standard input, a
+  pipe drained), devices (-D, FIFOs and sockets skipped in recursion),
+  directories (-d, "Is a directory"), and -r/-R through the gnulib fts port
+  (`src/nebox/fts.nelua`) in directory order with "recursive directory
+  loop" warnings, `--include`/`--exclude`/`--exclude-from`/`--exclude-dir`
+  as gnulib exclude.c's hashed and fnmatch segments (anchored for names
+  found in the walk, any suffix after `/` for command-line names). Standard
+  output is buffered as glibc's stdio does, so write errors (`/dev/full`)
+  are reported, or not, where GNU reports them. Patterns are compiled as
+  GEAcompile does: each line through a port of glibc regcomp's parser
+  (its messages, per line; with -i the pattern and subject are read through
+  toupper as glibc does), then all lines, wrapped in the -w/-x "motif",
+  through a port of dfa.c's lexer and parser (its warnings, its
+  `[:space:]` and other errors, its own reading of constructs where it and
+  glibc disagree). The dfa.c tree selects lines; the glibc trees give
+  back-references, the -w retry loop of EGexecute and the -o/--color match
+  spans, so a line can be selected with nothing printed by -o exactly where
+  GNU does that. Both trees run on the Pike VM of `src/nebox/regex.nelua`;
+  -F runs kwsearch.c's Fexecute over a leftmost-longest keyword search.
+  `tests/grep_compare.py`: 604 fixed cases and 3000 random patterns,
+  options and inputs, 0 mismatches (3 more runs of 3000 random cases with
+  other seeds also gave 0). Differences:
+  - -P is refused as by a GNU grep built without PCRE ("Perl matching not
+    supported in a --disable-perl-regexp build", status 2).
+  - `--help` omits GNU's bug-report paragraph; `--version` prints nebox's
+    line.
+  - Only the C locale: no multibyte characters or encoding errors, so a
+    byte above 127 never makes a file binary (as in GNU's C locale).
+  - A pattern with back-references that needs more than 65536 simultaneous
+    states stops with "pattern too complex" (status 2) where GNU keeps
+    searching (`re-too-complex`). Back-references are matched exactly
+    (every capture assignment is tried); glibc's backtracking matcher is not
+    reproduced where it would answer otherwise.
+  - The size of each read after the first 96 KiB depends on the page
+    alignment of the buffer's address, nebox's from nelibc's malloc and
+    GNU's from glibc's; where the two differ, so does the point at which a
+    NUL past the first read turns a file binary, and so which lines before
+    it are printed (the fixtures with such a NUL agree). From a pipe this
+    depends on the writer's timing in both.
 - `sed` covers -n -e -f -E -s -i[SUFFIX] -z, every address form (`I` and
   `M` after a regex address), and the commands
   `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F e`.

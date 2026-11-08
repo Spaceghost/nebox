@@ -267,7 +267,14 @@ function util.Getopt:next(): integer
   end
   local c = self.nextchar:byte(1)
   self.nextchar = self.nextchar:sub(2)
-  local pos = c ~= 58 and self.shortopts:find(string.char(c), 1, true) or 0
+  -- a byte search: string.find's plain mode still parses a pattern without
+  -- the specials it checks for, so ')' or ']' would be a malformed pattern
+  local pos = 0
+  if c ~= 58 then
+    for k = 1, #self.shortopts do
+      if self.shortopts:byte(k) == c then pos = k; break end
+    end
+  end
   if pos <= 0 then
     return getopt_err(self, "invalid option -- '" .. string.char(c) .. "'")
   end

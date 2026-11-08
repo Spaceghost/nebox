@@ -45,6 +45,7 @@ global regex.Prog = @record{
   hasref: boolean,      -- program contains a back-reference
   nlanchor: boolean,    -- ^ and $ also match after/before a newline (sed M)
   toocomplex: boolean,  -- last execution exceeded the thread bound
+  noteol: boolean,      -- $ does not match at the end of the subject (REG_NOTEOL)
   -- Executor scratch, allocated on first use and kept for the program's life.
   clist: sequence(Thread),
   nlist: sequence(Thread),
@@ -563,6 +564,104 @@ function regex.compile(pat: string, ere: boolean, icase: boolean): (regex.Prog, 
   return regex.compile_nl(pat, ere, icase, false, false)
 end
 
+-- Programs from a postfix token list ----------------------------------------
+--
+-- grep parses its patterns with ports of dfa.c's and glibc regcomp's parsers
+-- and hands the result over as postfix tokens: T_CSET leaves (x is a 1-based
+-- index into `sets`, the bytes the leaf matches), the zero-width T_BEGLINE
+-- T_ENDLINE (subject ends; $ obeys noteol), T_BEGBUF T_ENDBUF, the word
+-- assertions, T_BACKREF x, T_EMPTY, and the operators T_CAT T_OR (binary),
+-- T_STAR T_PLUS T_QMARK and T_GROUP x (unary; group x is captured when
+-- x <= 9). `icase` makes back-references compare ASCII case-insensitively.
+global regex.Tok = @record{ kind: byte, x: integer }
+global regex.T_CSET: byte <comptime> = 1
+global regex.T_BEGLINE: byte <comptime> = 2
+global regex.T_ENDLINE: byte <comptime> = 3
+global regex.T_BEGBUF: byte <comptime> = 4
+global regex.T_ENDBUF: byte <comptime> = 5
+global regex.T_BEGWORD: byte <comptime> = 6
+global regex.T_ENDWORD: byte <comptime> = 7
+global regex.T_LIMWORD: byte <comptime> = 8
+global regex.T_NOTLIMWORD: byte <comptime> = 9
+global regex.T_BACKREF: byte <comptime> = 10
+global regex.T_EMPTY: byte <comptime> = 11
+global regex.T_CAT: byte <comptime> = 12
+global regex.T_OR: byte <comptime> = 13
+global regex.T_STAR: byte <comptime> = 14
+global regex.T_PLUS: byte <comptime> = 15
+global regex.T_QMARK: byte <comptime> = 16
+global regex.T_GROUP: byte <comptime> = 17
+
+function regex.from_postfix(toks: *sequence(regex.Tok), sets: sequence(regex.Set), icase: boolean): regex.Prog
+  local prog: regex.Prog
+  prog.icase = icase
+  local stack: sequence(Frag)
+  local nsub: integer = 0
+  for i = 1, #toks do
+    local t = toks[i]
+    local k = t.kind
+    if k == regex.T_CSET then
+      local f: Frag
+      f:push(inst(OP_CLASS, 0, t.x, 0))
+      stack:push(f)
+    elseif k >= regex.T_BEGLINE and k <= regex.T_BACKREF then
+      local f: Frag
+      if k == regex.T_BEGLINE then f:push(inst(OP_BOL, 0, 0, 0))
+      elseif k == regex.T_ENDLINE then f:push(inst(OP_EOL, 0, 0, 0))
+      elseif k == regex.T_BEGBUF then f:push(inst(OP_BOL, 1, 0, 0))
+      elseif k == regex.T_ENDBUF then f:push(inst(OP_EOL, 1, 0, 0))
+      elseif k == regex.T_BEGWORD then f:push(inst(OP_WSTART, 0, 0, 0))
+      elseif k == regex.T_ENDWORD then f:push(inst(OP_WEND, 0, 0, 0))
+      elseif k == regex.T_LIMWORD then f:push(inst(OP_WORDB, 0, 0, 0))
+      elseif k == regex.T_NOTLIMWORD then f:push(inst(OP_NWORDB, 0, 0, 0))
+      else f:push(inst(OP_BACKREF, 0, t.x, 0)); prog.hasref = true end
+      stack:push(f)
+    elseif k == regex.T_EMPTY then
+      local f: Frag
+      stack:push(f)
+    elseif k == regex.T_CAT or k == regex.T_OR then
+      local b = stack:pop()
+      local a = stack:pop()
+      if k == regex.T_CAT then
+        append(&a, b)
+        b:destroy()
+        stack:push(a)
+      else
+        local out: Frag
+        out:push(inst(OP_SPLIT, 0, 1, #a + 2))
+        append(&out, a)
+        out:push(inst(OP_JMP, 0, #a + #b + 2, 0))
+        append(&out, b)
+        a:destroy(); b:destroy()
+        stack:push(out)
+      end
+    else
+      local a = stack:pop()
+      local out: Frag
+      if k == regex.T_STAR then out = rep_star(a)
+      elseif k == regex.T_PLUS then out = rep_plus(a)
+      elseif k == regex.T_QMARK then out = rep_quest(a)
+      else
+        if t.x > nsub then nsub = t.x end
+        if t.x >= 1 and t.x <= 9 then out:push(inst(OP_SAVE, 0, 2 * t.x, 0)) end
+        append(&out, a)
+        if t.x >= 1 and t.x <= 9 then out:push(inst(OP_SAVE, 0, 2 * t.x + 1, 0)) end
+      end
+      a:destroy()
+      stack:push(out)
+    end
+  end
+  prog.code:push(inst(OP_SAVE, 0, 0, 0))
+  if #stack > 0 then append(&prog.code, stack[#stack]) end
+  prog.code:push(inst(OP_SAVE, 0, 1, 0))
+  prog.code:push(inst(OP_MATCH, 0, 0, 0))
+  for i = 1, #stack do stack[i]:destroy() end
+  stack:destroy()
+  prog.nsub = nsub
+  prog.sets = sets
+  return prog
+end
+
 -- Executor ------------------------------------------------------------------
 --
 -- A Pike VM: at every text position the live threads are kept in a list in
@@ -587,7 +686,10 @@ local function zw_ok(prog: *regex.Prog, ins: regex.Inst, text: string, pos: isiz
   local op = ins.op
   local n: isize = (@isize)(text.size)
   if op == OP_BOL then return pos == 0 or (ins.c == 0 and prog.nlanchor and text.data[pos - 1] == 10) end
-  if op == OP_EOL then return pos == n or (ins.c == 0 and prog.nlanchor and text.data[pos] == 10) end
+  if op == OP_EOL then
+    if pos == n then return ins.c ~= 0 or not prog.noteol end
+    return ins.c == 0 and prog.nlanchor and text.data[pos] == 10
+  end
   local before = pos > 0 and isword(text.data[pos - 1])
   local after = pos < n and isword(text.data[pos])
   if op == OP_WORDB then return before ~= after end

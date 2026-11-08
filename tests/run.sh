@@ -449,9 +449,9 @@ same re-pathological-backref 'A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo $
 # its thread bound and reports "pattern too complex" (exit 2).
 expect re-too-complex 'exit=2' 'head -c 400 /dev/zero | tr "\\0" a | grep -cE "(.*)(.*)(.*)\3\2\1" 2>/dev/null'
 expect re-too-complex-sed 'exit=4' 'head -c 400 /dev/zero | tr "\\0" a | sed -E "s/(.*)(.*)(.*)\3\2\1/X/" 2>/dev/null'
-# Equivalence classes are not implemented: "[[=a=]]" parses as the set {[ = a}
-# followed by a literal "]", so this does not match where GNU grep would.
-expect re-equiv-unsupported 'exit=1' 'echo a | grep "[[=a=]]"'
+# grep parses brackets with its glibc regcomp and dfa.c ports, which take
+# single-character equivalence classes and collating symbols (C locale).
+same grep-equiv 'echo a | grep "[[=a=]]"; echo $?; echo b- | grep -o "[[.b.][.-.]]*"; echo a | grep "[[=ab=]]"; echo $?'
 # GNU expr backtracks for hours here; nebox stops at its thread bound
 # with status 3 (EXPR_FAILURE, as for glibc's matcher failing).
 expect re-too-complex-expr 'exit=3' 'expr "$(head -c 400 /dev/zero | tr "\\0" a)" : "\(.*\)\(.*\)\(.*\)\3\2\1" 2>/dev/null'

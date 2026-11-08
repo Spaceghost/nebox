@@ -54,10 +54,17 @@ def run(cmd, which):
     p = subprocess.run(['bash', '-c', c], cwd=d, env=env, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
     err = p.stderr.replace(NEBOX.encode() + b' ', b'')
     err = b'\n'.join(l for l in err.split(b'\n') if not l.startswith(b"Try '"))
-    # /dev/shm is shared with other test writers, so its used/available/inode
+    # /dev/shm and the root file system are shared with other writers, so their
+    # used/available/inode
     # counts (and Use%) move between the two runs: mask the digits of its rows
-    out = b'\n'.join(re.sub(rb'\d', b'#', l) if l.rstrip().endswith(b'/dev/shm') else l
-                      for l in p.stdout.split(b'\n'))
+    # and of the --total row that sums them; with --output columns but no
+    # target the rows cannot be told apart, so all their digits are masked
+    lines = p.stdout.split(b'\n')
+    m = re.search(r'--output=(\S+)', cmd)
+    blind = m is not None and 'target' not in m.group(1)  # rows not identifiable
+    out = b'\n'.join(re.sub(rb'\d', b'#', l) if (i > 0 and blind) or l.rstrip().endswith(b'/dev/shm')
+                      or l.rstrip().endswith(b' /') or l.startswith(b'total ') else l
+                      for i, l in enumerate(lines))
     return p.returncode, out, err
 
 

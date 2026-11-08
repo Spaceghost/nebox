@@ -1,0 +1,3304 @@
+-- grep: a port of GNU grep 3.8 (src/grep.c, dfasearch.c, kwsearch.c,
+-- searchutils.c and the gnulib pieces they use) in the C locale, with the
+-- two behaviour patches of Debian's grep 3.8-5: the stray-backslash
+-- warnings only when DEB_GREP_ENABLE_STRAY_BACKSLASH_WARN is set, and the
+-- fix for a last pattern with a back-reference (Debian #1029235).
+--
+-- The functions keep grep.c's names and control flow: option parsing with
+-- get_nondigit_option, the pattern table with duplicate removal and
+-- pattern-file locations, try_fgrep_pattern and fgrep_to_grep_pattern,
+-- the page-aligned buffer (reset, fillbuf with its growth and SEEK_DATA
+-- skipping of NUL runs, the 96 KiB first read), binary detection per
+-- buffer (NULs, holes) with zap_nuls, grep/grepbuf/prtext/prpending/
+-- prline/print_line_head/middle/tail, --color with GREP_COLORS and
+-- GREP_COLOR, -T alignment, finalize_input on standard input, grepdesc
+-- and grepdirent over the gnulib-fts port (src/nebox/fts.nelua) with
+-- --include/--exclude/--exclude-dir as gnulib exclude.c segments, and
+-- stdio's full buffering of standard output with grep's write-error rules.
+--
+-- Patterns are compiled twice, as GNU does: a port of dfa.c's lexer and
+-- parser (its warnings and errors, -w/-x through the wrapped "motif")
+-- gives the line-selection program, and a port of glibc regcomp's parser
+-- (with its error messages, per pattern line) gives the programs that
+-- EGexecute runs for back-references, -w checks and match positions. Both
+-- become Pike VM programs of src/nebox/regex.nelua through postfix tokens.
+-- -F uses kwsearch.c's Fexecute over a leftmost-longest keyword search.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'hashmap'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+require 'nebox.fts'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+local function c_fnmatch(pat: cstring, s: cstring, flags: cint): cint <cimport 'fnmatch', cinclude '<fnmatch.h>'> end
+local function c_openat(dirfd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function c_fstatat(dirfd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+
+local EXIT_TROUBLE: cint <comptime> = 2
+local O_NOCTTY: cint <comptime> = 0x100
+local O_NONBLOCK: cint <comptime> = 0x800
+local SEEK_SET: cint <comptime> = 0
+local SEEK_CUR: cint <comptime> = 1
+local SEEK_END: cint <comptime> = 2
+local SEEK_DATA: cint <comptime> = 3
+local SEEK_HOLE: cint <comptime> = 4
+local EBADF: cint <comptime> = 9
+local EINVAL: cint <comptime> = 22
+local ENXIO: cint <comptime> = 6
+local ESPIPE: cint <comptime> = 29
+local EMLINK: cint <comptime> = 31
+local ELOOP: cint <comptime> = 40
+local INTMAX_MAX: int64 <comptime> = 0x7fffffffffffffff
+local UWORD_SIZE: isize <comptime> = 8
+local INITIAL_BUFSIZE: isize <comptime> = 96 * 1024
+local RE_DUP_MAX: integer <comptime> = 0x7fff
+
+-- regex.h syntax bits
+local RE_BACKSLASH_ESCAPE_IN_LISTS: integer <comptime> = 1
+local RE_BK_PLUS_QM: integer <comptime> = 1 << 1
+local RE_CHAR_CLASSES: integer <comptime> = 1 << 2
+local RE_CONTEXT_INDEP_ANCHORS: integer <comptime> = 1 << 3
+local RE_CONTEXT_INDEP_OPS: integer <comptime> = 1 << 4
+local RE_CONTEXT_INVALID_OPS: integer <comptime> = 1 << 5
+local RE_DOT_NEWLINE: integer <comptime> = 1 << 6
+local RE_DOT_NOT_NULL: integer <comptime> = 1 << 7
+local RE_HAT_LISTS_NOT_NEWLINE: integer <comptime> = 1 << 8
+local RE_INTERVALS: integer <comptime> = 1 << 9
+local RE_LIMITED_OPS: integer <comptime> = 1 << 10
+local RE_NEWLINE_ALT: integer <comptime> = 1 << 11
+local RE_NO_BK_BRACES: integer <comptime> = 1 << 12
+local RE_NO_BK_PARENS: integer <comptime> = 1 << 13
+local RE_NO_BK_REFS: integer <comptime> = 1 << 14
+local RE_NO_BK_VBAR: integer <comptime> = 1 << 15
+local RE_NO_EMPTY_RANGES: integer <comptime> = 1 << 16
+local RE_UNMATCHED_RIGHT_PAREN_ORD: integer <comptime> = 1 << 17
+local RE_NO_GNU_OPS: integer <comptime> = 1 << 19
+local RE_INVALID_INTERVAL_ORD: integer <comptime> = 1 << 21
+local RE_ICASE: integer <comptime> = 1 << 22
+local RE_CARET_ANCHORS_HERE: integer <comptime> = 1 << 23
+local RE_CONTEXT_INVALID_DUP: integer <comptime> = 1 << 24
+
+local RE_POSIX_COMMON: integer <comptime> = RE_CHAR_CLASSES | RE_DOT_NEWLINE | RE_DOT_NOT_NULL | RE_INTERVALS | RE_NO_EMPTY_RANGES
+local RE_SYNTAX_POSIX_BASIC: integer <comptime> = RE_POSIX_COMMON | RE_BK_PLUS_QM | RE_CONTEXT_INVALID_DUP
+local RE_SYNTAX_POSIX_EXTENDED: integer <comptime> = RE_POSIX_COMMON | RE_CONTEXT_INDEP_ANCHORS
+  | RE_CONTEXT_INDEP_OPS | RE_NO_BK_BRACES | RE_NO_BK_PARENS | RE_NO_BK_VBAR | RE_CONTEXT_INVALID_OPS
+  | RE_UNMATCHED_RIGHT_PAREN_ORD
+local RE_SYNTAX_GREP: integer <comptime> = (RE_SYNTAX_POSIX_BASIC | RE_NEWLINE_ALT) & ~(RE_CONTEXT_INVALID_DUP | RE_DOT_NOT_NULL)
+local RE_SYNTAX_EGREP: integer <comptime> = (RE_SYNTAX_POSIX_EXTENDED | RE_INVALID_INTERVAL_ORD | RE_NEWLINE_ALT)
+  & ~(RE_CONTEXT_INVALID_OPS | RE_DOT_NOT_NULL)
+local RE_SYNTAX_AWK: integer <comptime> = RE_BACKSLASH_ESCAPE_IN_LISTS | RE_DOT_NOT_NULL | RE_NO_BK_PARENS
+  | RE_NO_BK_REFS | RE_NO_BK_VBAR | RE_NO_EMPTY_RANGES | RE_DOT_NEWLINE | RE_CONTEXT_INDEP_ANCHORS
+  | RE_CHAR_CLASSES | RE_UNMATCHED_RIGHT_PAREN_ORD | RE_NO_GNU_OPS
+local RE_SYNTAX_GNU_AWK: integer <comptime> = (RE_SYNTAX_POSIX_EXTENDED | RE_BACKSLASH_ESCAPE_IN_LISTS | RE_INVALID_INTERVAL_ORD)
+  & ~(RE_DOT_NOT_NULL | RE_CONTEXT_INDEP_OPS | RE_CONTEXT_INVALID_OPS)
+local RE_SYNTAX_POSIX_AWK: integer <comptime> = RE_SYNTAX_POSIX_EXTENDED | RE_BACKSLASH_ESCAPE_IN_LISTS
+  | RE_INTERVALS | RE_NO_GNU_OPS | RE_INVALID_INTERVAL_ORD
+
+-- <ctype.h> in the C locale
+local function c_isupper(c: integer): boolean return c >= 65 and c <= 90 end
+local function c_islower(c: integer): boolean return c >= 97 and c <= 122 end
+local function c_isalpha(c: integer): boolean return c_isupper(c) or c_islower(c) end
+local function c_isdigit(c: integer): boolean return c >= 48 and c <= 57 end
+local function c_isalnum(c: integer): boolean return c_isalpha(c) or c_isdigit(c) end
+local function c_isspace(c: integer): boolean return c == 32 or (c >= 9 and c <= 13) end
+local function c_isblank(c: integer): boolean return c == 32 or c == 9 end
+local function c_iscntrl(c: integer): boolean return c < 32 or c == 127 end
+local function c_isprint(c: integer): boolean return c >= 32 and c <= 126 end
+local function c_isgraph(c: integer): boolean return c >= 33 and c <= 126 end
+local function c_ispunct(c: integer): boolean return c_isgraph(c) and not c_isalnum(c) end
+local function c_isxdigit(c: integer): boolean return c_isdigit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102) end
+local function c_toupper(c: integer): integer if c_islower(c) then return c - 32 end return c end
+local function c_tolower(c: integer): integer if c_isupper(c) then return c + 32 end return c end
+local function wordchar(c: integer): boolean return c == 95 or c_isalnum(c) end
+
+-- the class predicates by name; 0 for an unknown name
+local function class_index(name: string): integer
+  local names: []string = {'alpha', 'upper', 'lower', 'digit', 'xdigit', 'space', 'punct', 'alnum',
+                           'print', 'graph', 'cntrl', 'blank'}
+  for i = 0, < #names do if names[i] == name then return i + 1 end end
+  return 0
+end
+
+local function class_has(k: integer, c: integer): boolean
+  if k == 1 then return c_isalpha(c) elseif k == 2 then return c_isupper(c)
+  elseif k == 3 then return c_islower(c) elseif k == 4 then return c_isdigit(c)
+  elseif k == 5 then return c_isxdigit(c) elseif k == 6 then return c_isspace(c)
+  elseif k == 7 then return c_ispunct(c) elseif k == 8 then return c_isalnum(c)
+  elseif k == 9 then return c_isprint(c) elseif k == 10 then return c_isgraph(c)
+  elseif k == 11 then return c_iscntrl(c) end
+  return c_isblank(c)
+end
+
+local function cpath(s: string): cstring
+  if #s == 0 then return (@cstring)('') end
+  return (@cstring)(s.data)
+end
+
+local function setbit(s: *regex.Set, c: integer) s.bits[c >> 3] = s.bits[c >> 3] | (1 << (c & 7)) end
+local function clrbit(s: *regex.Set, c: integer) s.bits[c >> 3] = s.bits[c >> 3] & ~(1 << (c & 7)) end
+local function tstbit(s: *regex.Set, c: integer): boolean return (s.bits[c >> 3] & (1 << (c & 7))) ~= 0 end
+local function notset(s: *regex.Set) for i = 0, 31 do s.bits[i] = ~s.bits[i] end end
+
+-- Global matching flags (grep.h).
+local match_icase = false
+local match_words = false
+local match_lines = false
+local eolbyte: byte = 10
+local stray_warn = false   -- Debian: DEB_GREP_ENABLE_STRAY_BACKSLASH_WARN
+
+------------------------------------------------------------------------------
+-- Standard output as glibc's stdio buffers it (full buffering in blocks of
+-- st_blksize, at most BUFSIZ; line buffering on a terminal), so that write
+-- errors surface where they do in GNU grep.
+------------------------------------------------------------------------------
+
+local obuf: [8192]byte
+local ocap: isize = 4096
+local olen: isize = 0
+local oalloc = false      -- the buffer exists (after the first write)
+local oerr = false        -- ferror (stdout)
+local oline = false       -- line buffered
+local oprobed = false
+local stdout_errno: cint = 0
+local exit_failure: cint = EXIT_TROUBLE
+
+local function oprobe()
+  oprobed = true
+  ocap = 8192
+  local st: sys.Stat
+  if sys.fstat(1, &st) == 0 then
+    if (st.st_mode & sys.S_IFMT) == sys.S_IFCHR and sys.isatty(1) ~= 0 then oline = true end
+    if st.st_blksize > 0 and st.st_blksize < 8192 then ocap = st.st_blksize end
+  end
+end
+
+-- write(2) everything, as _IO_new_file_write does; the count written
+local function write_raw(p: *[0]byte, n: isize): isize
+  local done: isize = 0
+  while done < n do
+    local r = sys.write(1, &p[done], (@usize)(n - done))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      oerr = true
+      break
+    end
+    done = done + r
+  end
+  return done
+end
+
+-- _IO_do_flush: the buffer is emptied even when the write fails
+local function oflush_buf(): boolean
+  if olen == 0 then return true end
+  local n = olen
+  local w = write_raw(&obuf[0], n)
+  olen = 0
+  return w == n
+end
+
+-- fwrite (_IO_new_file_xsputn); false when not everything was written
+local function owrite_raw(p: *[0]byte, n: isize): boolean
+  if not oprobed then oprobe() end
+  if n <= 0 then return true end
+  local s: isize = 0
+  local to_do = n
+  if oline then
+    -- simplified line buffering: buffer, then flush through the last newline
+    local ok = true
+    while to_do > 0 do
+      if olen == ocap and not oflush_buf() then ok = false end
+      obuf[olen] = p[s]; olen = olen + 1
+      if p[s] == 10 and not oflush_buf() then ok = false end
+      s = s + 1; to_do = to_do - 1
+    end
+    oalloc = true
+    return ok
+  end
+  if oalloc then
+    local count = ocap - olen
+    if count > to_do then count = to_do end
+    for i = 0, < count do obuf[olen + i] = p[s + i] end
+    olen = olen + count; s = s + count; to_do = to_do - count
+  end
+  if to_do > 0 then
+    oalloc = true
+    if not oflush_buf() then return false end
+    local do_write = to_do - to_do % ocap
+    if do_write > 0 then
+      local w = write_raw(&p[s], do_write)
+      if w < do_write then return false end
+      s = s + do_write; to_do = to_do - do_write
+    end
+    for i = 0, < to_do do obuf[olen + i] = p[s + i] end
+    olen = olen + to_do
+  end
+  return true
+end
+
+local function fwrite_errno(p: *[0]byte, n: isize)
+  if not owrite_raw(p, n) then stdout_errno = sys.errno() end
+end
+
+local function fputs_errno(s: string)
+  fwrite_errno(s.data, (@isize)(s.size))
+end
+
+-- putchar (__overflow when the buffer is full)
+local function putchar_errno(c: byte)
+  if not oprobed then oprobe() end
+  if oline then
+    local b: [1]byte = {c}
+    fwrite_errno((@*[0]byte)(&b), 1)
+    return
+  end
+  oalloc = true
+  if olen == ocap and not oflush_buf() then stdout_errno = sys.errno(); return end
+  obuf[olen] = c
+  olen = olen + 1
+end
+
+local function fflush_errno()
+  if not oflush_buf() then stdout_errno = sys.errno() end
+end
+
+-- error (0, ERRNUM, "%s", MSG): stdout is flushed first, as glibc's error does
+local function gerror(msg: string, errnum: cint)
+  oflush_buf()
+  local sb: stringbuilder
+  sb:write('grep: ', msg)
+  if errnum ~= 0 then sb:write(': ', sys.strerror(errnum)) end
+  sb:writebyte(10)
+  local m = sb:promote()
+  local done: usize = 0
+  while done < m.size do
+    local r = sys.write(2, &m.data[done], m.size - done)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      break
+    end
+    done = done + (@usize)(r)
+  end
+  m:destroy()
+end
+
+-- exit: atexit's clean_up_stdout (close_stdout unless a write error has
+-- already been reported), then the status
+local function gexit(status: cint)
+  if stdout_errno == 0 then
+    local pending = olen > 0
+    local prev_fail = oerr
+    local fail = not oflush_buf()
+    local e = sys.errno()
+    if prev_fail or (fail and (pending or e ~= EBADF)) then
+      gerror('write error', fail and e or 0)
+      sys._exit(exit_failure)
+    end
+  end
+  c_exit(status)
+end
+
+local function die(status: cint, errnum: cint, msg: string)
+  gerror(msg, errnum)
+  gexit(status)
+end
+
+------------------------------------------------------------------------------
+-- glibc regcomp.c's parser (peek_token, parse_reg_exp ... parse_dup_op,
+-- parse_bracket_exp) in a unibyte locale with no collation rules. With
+-- RE_ICASE the pattern is read through toupper as re_string_t does (except
+-- the byte after a backslash and class names) and so is the subject; the
+-- sets built here are over subject bytes after that mapping.
+------------------------------------------------------------------------------
+
+local REG_NOERROR <comptime> = 0
+local REG_BADPAT <comptime> = 2
+local REG_ECOLLATE <comptime> = 3
+local REG_ECTYPE <comptime> = 4
+local REG_EESCAPE <comptime> = 5
+local REG_ESUBREG <comptime> = 6
+local REG_EBRACK <comptime> = 7
+local REG_EPAREN <comptime> = 8
+local REG_EBRACE <comptime> = 9
+local REG_BADBR <comptime> = 10
+local REG_ERANGE <comptime> = 11
+local REG_ESPACE <comptime> = 12
+local REG_BADRPT <comptime> = 13
+local REG_EEND <comptime> = 14
+local REG_ESIZE <comptime> = 15
+local REG_ERPAREN <comptime> = 16
+
+local function reg_errmsg(e: integer): string
+  local msgs: []string = {'Success', 'No match', 'Invalid regular expression', 'Invalid collation character',
+    'Invalid character class name', 'Trailing backslash', 'Invalid back reference',
+    'Unmatched [, [^, [:, [., or [=', 'Unmatched ( or \\(', 'Unmatched \\{', 'Invalid content of \\{\\}',
+    'Invalid range end', 'Memory exhausted', 'Invalid preceding regular expression',
+    'Premature end of regular expression', 'Regular expression too big', 'Unmatched ) or \\)'}
+  return msgs[e]
+end
+
+-- token types
+local TK_CHARACTER <comptime> = 1
+local TK_END <comptime> = 2
+local TK_ALT <comptime> = 3
+local TK_DUP_ASTERISK <comptime> = 4
+local TK_DUP_PLUS <comptime> = 5
+local TK_DUP_QUESTION <comptime> = 6
+local TK_OPEN_DUP_NUM <comptime> = 7
+local TK_CLOSE_DUP_NUM <comptime> = 8
+local TK_OPEN_SUBEXP <comptime> = 9
+local TK_CLOSE_SUBEXP <comptime> = 10
+local TK_OPEN_BRACKET <comptime> = 11
+local TK_PERIOD <comptime> = 12
+local TK_ANCHOR <comptime> = 13
+local TK_BACK_REF <comptime> = 14
+local TK_WORD <comptime> = 15
+local TK_NOTWORD <comptime> = 16
+local TK_SPACE <comptime> = 17
+local TK_NOTSPACE <comptime> = 18
+local TK_BACK_SLASH <comptime> = 19
+local TK_CLOSE_BRACKET <comptime> = 20
+local TK_NON_MATCH_LIST <comptime> = 21
+local TK_CHARSET_RANGE <comptime> = 22
+local TK_OPEN_COLL_ELEM <comptime> = 23
+local TK_OPEN_EQUIV_CLASS <comptime> = 24
+local TK_OPEN_CHAR_CLASS <comptime> = 25
+
+-- anchor kinds (the postfix token they become)
+local AN_LINE_FIRST <comptime> = 1
+local AN_LINE_LAST <comptime> = 2
+local AN_BUF_FIRST <comptime> = 3
+local AN_BUF_LAST <comptime> = 4
+local AN_WORD_FIRST <comptime> = 5
+local AN_WORD_LAST <comptime> = 6
+local AN_WORD_DELIM <comptime> = 7
+local AN_NOT_WORD_DELIM <comptime> = 8
+
+local RToken = @record{ type: integer, c: integer, ctx: integer, idx: integer }
+
+-- bracket elements
+local BE_SB_CHAR <comptime> = 1
+local BE_COLL_SYM <comptime> = 2
+local BE_EQUIV_CLASS <comptime> = 3
+local BE_CHAR_CLASS <comptime> = 4
+local BElem = @record{ type: integer, ch: integer, name: string }
+
+local Rx = @record{
+  raw: string,
+  len: isize,
+  cur: isize,
+  icase: boolean,
+  syntax: integer,
+  err: integer,
+  nsub: integer,
+  completed: integer,     -- completed_bkref_map
+  toks: sequence(regex.Tok),
+  sets: sequence(regex.Set),
+}
+
+function Rx:byte_at(i: isize): integer
+  local c: integer = self.raw.data[i]
+  if self.icase then c = c_toupper(c) end
+  return c
+end
+function Rx:peek(off: isize): integer return self:byte_at(self.cur + off) end
+function Rx:peek_case(off: isize): integer return self.raw.data[self.cur + off] end
+function Rx:eoi(): boolean return self.cur >= self.len end
+
+-- a leaf matching the subject bytes whose translation is in S
+function Rx:leaf(s: *regex.Set)
+  local r: regex.Set
+  for b = 0, 255 do
+    local u = self.icase and c_toupper(b) or b
+    if tstbit(s, u) then setbit(&r, b) end
+  end
+  self.sets:push(r)
+  self.toks:push({kind = regex.T_CSET, x = #self.sets})
+end
+
+function Rx:emit(kind: byte, x: integer) self.toks:push({kind = kind, x = x}) end
+
+function Rx:peek_token(tok: *RToken, syntax: integer): isize
+  if self:eoi() then tok.type = TK_END; return 0 end
+  local c = self:peek(0)
+  tok.c = c
+  if c == 92 then
+    if self.cur + 1 >= self.len then tok.type = TK_BACK_SLASH; return 1 end
+    local c2 = self:peek_case(1)
+    tok.c = c2
+    tok.type = TK_CHARACTER
+    local gnu = (syntax & RE_NO_GNU_OPS) == 0
+    if c2 == 124 then
+      if (syntax & RE_LIMITED_OPS) == 0 and (syntax & RE_NO_BK_VBAR) == 0 then tok.type = TK_ALT end
+    elseif c2 >= 49 and c2 <= 57 then
+      if (syntax & RE_NO_BK_REFS) == 0 then tok.type = TK_BACK_REF; tok.idx = c2 - 49 end
+    elseif c2 == 60 then if gnu then tok.type = TK_ANCHOR; tok.ctx = AN_WORD_FIRST end
+    elseif c2 == 62 then if gnu then tok.type = TK_ANCHOR; tok.ctx = AN_WORD_LAST end
+    elseif c2 == 98 then if gnu then tok.type = TK_ANCHOR; tok.ctx = AN_WORD_DELIM end
+    elseif c2 == 66 then if gnu then tok.type = TK_ANCHOR; tok.ctx = AN_NOT_WORD_DELIM end
+    elseif c2 == 119 then if gnu then tok.type = TK_WORD end
+    elseif c2 == 87 then if gnu then tok.type = TK_NOTWORD end
+    elseif c2 == 115 then if gnu then tok.type = TK_SPACE end
+    elseif c2 == 83 then if gnu then tok.type = TK_NOTSPACE end
+    elseif c2 == 96 then if gnu then tok.type = TK_ANCHOR; tok.ctx = AN_BUF_FIRST end
+    elseif c2 == 39 then if gnu then tok.type = TK_ANCHOR; tok.ctx = AN_BUF_LAST end
+    elseif c2 == 40 then if (syntax & RE_NO_BK_PARENS) == 0 then tok.type = TK_OPEN_SUBEXP end
+    elseif c2 == 41 then if (syntax & RE_NO_BK_PARENS) == 0 then tok.type = TK_CLOSE_SUBEXP end
+    elseif c2 == 43 then
+      if (syntax & RE_LIMITED_OPS) == 0 and (syntax & RE_BK_PLUS_QM) ~= 0 then tok.type = TK_DUP_PLUS end
+    elseif c2 == 63 then
+      if (syntax & RE_LIMITED_OPS) == 0 and (syntax & RE_BK_PLUS_QM) ~= 0 then tok.type = TK_DUP_QUESTION end
+    elseif c2 == 123 then
+      if (syntax & RE_INTERVALS) ~= 0 and (syntax & RE_NO_BK_BRACES) == 0 then tok.type = TK_OPEN_DUP_NUM end
+    elseif c2 == 125 then
+      if (syntax & RE_INTERVALS) ~= 0 and (syntax & RE_NO_BK_BRACES) == 0 then tok.type = TK_CLOSE_DUP_NUM end
+    end
+    return 2
+  end
+  tok.type = TK_CHARACTER
+  if c == 10 then
+    if (syntax & RE_NEWLINE_ALT) ~= 0 then tok.type = TK_ALT end
+  elseif c == 124 then
+    if (syntax & RE_LIMITED_OPS) == 0 and (syntax & RE_NO_BK_VBAR) ~= 0 then tok.type = TK_ALT end
+  elseif c == 42 then tok.type = TK_DUP_ASTERISK
+  elseif c == 43 then
+    if (syntax & RE_LIMITED_OPS) == 0 and (syntax & RE_BK_PLUS_QM) == 0 then tok.type = TK_DUP_PLUS end
+  elseif c == 63 then
+    if (syntax & RE_LIMITED_OPS) == 0 and (syntax & RE_BK_PLUS_QM) == 0 then tok.type = TK_DUP_QUESTION end
+  elseif c == 123 then
+    if (syntax & RE_INTERVALS) ~= 0 and (syntax & RE_NO_BK_BRACES) ~= 0 then tok.type = TK_OPEN_DUP_NUM end
+  elseif c == 125 then
+    if (syntax & RE_INTERVALS) ~= 0 and (syntax & RE_NO_BK_BRACES) ~= 0 then tok.type = TK_CLOSE_DUP_NUM end
+  elseif c == 40 then
+    if (syntax & RE_NO_BK_PARENS) ~= 0 then tok.type = TK_OPEN_SUBEXP end
+  elseif c == 41 then
+    if (syntax & RE_NO_BK_PARENS) ~= 0 then tok.type = TK_CLOSE_SUBEXP end
+  elseif c == 91 then tok.type = TK_OPEN_BRACKET
+  elseif c == 46 then tok.type = TK_PERIOD
+  elseif c == 94 then
+    local anchor = true
+    if (syntax & (RE_CONTEXT_INDEP_ANCHORS | RE_CARET_ANCHORS_HERE)) == 0 and self.cur ~= 0 then
+      local prev = self:peek(-1)
+      if (syntax & RE_NEWLINE_ALT) == 0 or prev ~= 10 then anchor = false end
+    end
+    if anchor then tok.type = TK_ANCHOR; tok.ctx = AN_LINE_FIRST end
+  elseif c == 36 then
+    local anchor = true
+    if (syntax & RE_CONTEXT_INDEP_ANCHORS) == 0 and self.cur + 1 ~= self.len then
+      local nxt: RToken
+      self.cur = self.cur + 1
+      self:peek_token(&nxt, syntax)
+      self.cur = self.cur - 1
+      if nxt.type ~= TK_ALT and nxt.type ~= TK_CLOSE_SUBEXP then anchor = false end
+    end
+    if anchor then tok.type = TK_ANCHOR; tok.ctx = AN_LINE_LAST end
+  end
+  return 1
+end
+
+function Rx:fetch_token(tok: *RToken, syntax: integer)
+  self.cur = self.cur + self:peek_token(tok, syntax)
+end
+
+function Rx:peek_token_bracket(tok: *RToken, syntax: integer): isize
+  if self:eoi() then tok.type = TK_END; return 0 end
+  local c = self:peek(0)
+  tok.c = c
+  if c == 92 and (syntax & RE_BACKSLASH_ESCAPE_IN_LISTS) ~= 0 and self.cur + 1 < self.len then
+    self.cur = self.cur + 1
+    tok.c = self:peek(0)
+    tok.type = TK_CHARACTER
+    return 1
+  end
+  if c == 91 then
+    local c2: integer = 0
+    if self.cur + 1 < self.len then c2 = self:peek(1) end
+    tok.c = c2
+    if c2 == 46 then tok.type = TK_OPEN_COLL_ELEM; return 2 end
+    if c2 == 61 then tok.type = TK_OPEN_EQUIV_CLASS; return 2 end
+    if c2 == 58 and (syntax & RE_CHAR_CLASSES) ~= 0 then tok.type = TK_OPEN_CHAR_CLASS; return 2 end
+    tok.type = TK_CHARACTER
+    tok.c = c
+    return 1
+  end
+  if c == 93 then tok.type = TK_CLOSE_BRACKET
+  elseif c == 94 then tok.type = TK_NON_MATCH_LIST
+  elseif c == 45 then
+    -- "---" stands for a single '-'
+    if not (self.cur + 2 < self.len and self:peek(1) == 45 and self:peek(2) == 45) then
+      tok.type = TK_CHARSET_RANGE
+    else
+      self.cur = self.cur + 2
+      tok.type = TK_CHARACTER
+    end
+  else
+    tok.type = TK_CHARACTER
+  end
+  return 1
+end
+
+function Rx:parse_bracket_symbol(elem: *BElem, tok: *RToken): integer
+  local delim = tok.c
+  if self:eoi() then return REG_EBRACK end
+  local sb: stringbuilder
+  local i = 0
+  while true do
+    if i >= 32 then return REG_EBRACK end
+    local ch: integer
+    if tok.type == TK_OPEN_CHAR_CLASS then ch = self:peek_case(0) else ch = self:peek(0) end
+    self.cur = self.cur + 1
+    if self:eoi() then return REG_EBRACK end
+    if ch == delim and self:peek(0) == 93 then break end
+    sb:writebyte((@byte)(ch))
+    i = i + 1
+  end
+  self.cur = self.cur + 1
+  elem.name = sb:promote()
+  if tok.type == TK_OPEN_COLL_ELEM then elem.type = BE_COLL_SYM
+  elseif tok.type == TK_OPEN_EQUIV_CLASS then elem.type = BE_EQUIV_CLASS
+  else elem.type = BE_CHAR_CLASS end
+  return REG_NOERROR
+end
+
+function Rx:parse_bracket_element(elem: *BElem, tok: *RToken, token_len: isize, syntax: integer, accept_hyphen: boolean): integer
+  self.cur = self.cur + token_len
+  if tok.type == TK_OPEN_COLL_ELEM or tok.type == TK_OPEN_CHAR_CLASS or tok.type == TK_OPEN_EQUIV_CLASS then
+    return self:parse_bracket_symbol(elem, tok)
+  end
+  if tok.type == TK_CHARSET_RANGE and not accept_hyphen then
+    local t2: RToken
+    self:peek_token_bracket(&t2, syntax)
+    if t2.type ~= TK_CLOSE_BRACKET then return REG_ERANGE end
+  end
+  elem.type = BE_SB_CHAR
+  elem.ch = tok.c
+  return REG_NOERROR
+end
+
+-- lookup_collation_sequence_value with no collation rules
+local function collseq(e: *BElem): integer
+  if e.type == BE_SB_CHAR then return e.ch end
+  if e.type == BE_COLL_SYM and #e.name == 1 then return e.name:byte(1) end
+  return -1
+end
+
+function Rx:parse_bracket_exp(tok: *RToken, syntax: integer): boolean
+  local sbcset: regex.Set
+  local non_match = false
+  local token_len = self:peek_token_bracket(tok, syntax)
+  if tok.type == TK_END then self.err = REG_BADPAT; return false end
+  if tok.type == TK_NON_MATCH_LIST then
+    non_match = true
+    if (syntax & RE_HAT_LISTS_NOT_NEWLINE) ~= 0 then setbit(&sbcset, 10) end
+    self.cur = self.cur + token_len
+    token_len = self:peek_token_bracket(tok, syntax)
+    if tok.type == TK_END then self.err = REG_BADPAT; return false end
+  end
+  if tok.type == TK_CLOSE_BRACKET then tok.type = TK_CHARACTER end
+  local first_round = true
+  while true do
+    local start_elem: BElem
+    local end_elem: BElem
+    local is_range = false
+    local tok2: RToken
+    local token_len2: isize = 0
+    start_elem.type = BE_COLL_SYM
+    local ret = self:parse_bracket_element(&start_elem, tok, token_len, syntax, first_round)
+    if ret ~= REG_NOERROR then self.err = ret; return false end
+    first_round = false
+    token_len = self:peek_token_bracket(tok, syntax)
+    if start_elem.type ~= BE_CHAR_CLASS and start_elem.type ~= BE_EQUIV_CLASS then
+      if tok.type == TK_END then self.err = REG_EBRACK; return false end
+      if tok.type == TK_CHARSET_RANGE then
+        self.cur = self.cur + token_len
+        token_len2 = self:peek_token_bracket(&tok2, syntax)
+        if tok2.type == TK_END then self.err = REG_EBRACK; return false end
+        if tok2.type == TK_CLOSE_BRACKET then
+          self.cur = self.cur - token_len
+          tok.type = TK_CHARACTER
+        else
+          is_range = true
+        end
+      end
+    end
+    if is_range then
+      end_elem.type = BE_COLL_SYM
+      ret = self:parse_bracket_element(&end_elem, &tok2, token_len2, syntax, true)
+      if ret ~= REG_NOERROR then self.err = ret; return false end
+      token_len = self:peek_token_bracket(tok, syntax)
+      -- build_range_exp
+      if start_elem.type == BE_EQUIV_CLASS or start_elem.type == BE_CHAR_CLASS
+         or end_elem.type == BE_EQUIV_CLASS or end_elem.type == BE_CHAR_CLASS then
+        self.err = REG_ERANGE; return false
+      end
+      local lo, hi = collseq(&start_elem), collseq(&end_elem)
+      if lo < 0 or hi < 0 then self.err = REG_ECOLLATE; return false end
+      if (syntax & RE_NO_EMPTY_RANGES) ~= 0 and lo > hi then self.err = REG_ERANGE; return false end
+      for ch = 0, 255 do
+        if lo <= ch and ch <= hi then setbit(&sbcset, ch) end
+      end
+    else
+      if start_elem.type == BE_SB_CHAR then
+        setbit(&sbcset, start_elem.ch)
+      elseif start_elem.type == BE_EQUIV_CLASS or start_elem.type == BE_COLL_SYM then
+        if #start_elem.name ~= 1 then self.err = REG_ECOLLATE; return false end
+        setbit(&sbcset, start_elem.name:byte(1))
+      else
+        local name = start_elem.name
+        if (syntax & RE_ICASE) ~= 0 and (name == 'upper' or name == 'lower') then name = 'alpha' end
+        local k = class_index(name)
+        if k == 0 then self.err = REG_ECTYPE; return false end
+        for ch = 0, 255 do if class_has(k, ch) then setbit(&sbcset, ch) end end
+      end
+    end
+    if tok.type == TK_END then self.err = REG_EBRACK; return false end
+    if tok.type == TK_CLOSE_BRACKET then break end
+  end
+  self.cur = self.cur + token_len
+  if non_match then notset(&sbcset) end
+  self:leaf(&sbcset)
+  return true
+end
+
+-- fetch_number: -1 missing, -2 invalid, RE_DUP_MAX + 1 when too large
+function Rx:fetch_number(tok: *RToken, syntax: integer): integer
+  local num: integer = -1
+  while true do
+    self:fetch_token(tok, syntax)
+    local c = tok.c
+    if tok.type == TK_END then return -2 end
+    if tok.type == TK_CLOSE_DUP_NUM or c == 44 then break end
+    if tok.type ~= TK_CHARACTER or c < 48 or c > 57 or num == -2 then num = -2
+    elseif num == -1 then num = c - 48
+    else
+      num = num * 10 + c - 48
+      if num > RE_DUP_MAX + 1 then num = RE_DUP_MAX + 1 end
+    end
+  end
+  return num
+end
+
+-- copy the tokens [from, to] (1-based) to the end
+function Rx:copy_toks(from: integer, to: integer)
+  for i = from, to do self.toks:push(self.toks[i]) end
+end
+
+function Rx:parse_reg_exp(tok: *RToken, syntax: integer, nest: integer): boolean <forwarddecl> end
+
+-- parse_dup_op over the tree whose tokens start at ELEM_START (1-based);
+-- returns whether a tree is left
+function Rx:parse_dup_op(has_elem: boolean, elem_start: integer, tok: *RToken, syntax: integer): boolean
+  local start_idx = self.cur
+  local start_token = $tok
+  local start: integer, end_: integer
+  if tok.type == TK_OPEN_DUP_NUM then
+    end_ = 0
+    start = self:fetch_number(tok, syntax)
+    if start == -1 then
+      if tok.type == TK_CHARACTER and tok.c == 44 then start = 0
+      else self.err = REG_BADBR; return false end
+    end
+    if start ~= -2 then
+      if tok.type == TK_CLOSE_DUP_NUM then end_ = start
+      elseif tok.type == TK_CHARACTER and tok.c == 44 then end_ = self:fetch_number(tok, syntax)
+      else end_ = -2 end
+    end
+    if start == -2 or end_ == -2 then
+      if (syntax & RE_INVALID_INTERVAL_ORD) == 0 then
+        if tok.type == TK_END then self.err = REG_EBRACE else self.err = REG_BADBR end
+        return false
+      end
+      self.cur = start_idx
+      $tok = start_token
+      tok.type = TK_CHARACTER
+      return has_elem
+    end
+    if (end_ ~= -1 and start > end_) or tok.type ~= TK_CLOSE_DUP_NUM then self.err = REG_BADBR; return false end
+    if RE_DUP_MAX < (end_ == -1 and start or end_) then self.err = REG_ESIZE; return false end
+  else
+    start = tok.type == TK_DUP_PLUS and 1 or 0
+    end_ = tok.type == TK_DUP_QUESTION and 1 or -1
+  end
+  self:fetch_token(tok, syntax)
+  if not has_elem then return false end
+  local elem_end = #self.toks
+  if start == 0 and end_ == 0 then
+    self.toks:resize(elem_start - 1)
+    return false
+  end
+  local e: sequence(regex.Tok)
+  for i = elem_start, elem_end do e:push(self.toks[i]) end
+  local function put(rx: *Rx, e: *sequence(regex.Tok)) for i = 1, #e do rx.toks:push(e[i]) end end
+  -- the first copy is already in place
+  if start > 0 then
+    for _ = 2, start do put(self, &e); self:emit(regex.T_CAT, 0) end
+    if start == end_ then e:destroy(); return true end
+    put(self, &e)
+  end
+  if end_ == -1 then
+    self:emit(regex.T_STAR, 0)
+  else
+    self:emit(regex.T_QMARK, 0)
+    for _ = start + 2, end_ do
+      put(self, &e); self:emit(regex.T_CAT, 0); self:emit(regex.T_QMARK, 0)
+    end
+  end
+  if start > 0 then self:emit(regex.T_CAT, 0) end
+  e:destroy()
+  return true
+end
+
+function Rx:parse_sub_exp(tok: *RToken, syntax: integer, nest: integer): boolean
+  local cur_nsub = self.nsub
+  self.nsub = self.nsub + 1
+  self:fetch_token(tok, syntax | RE_CARET_ANCHORS_HERE)
+  if tok.type == TK_CLOSE_SUBEXP then
+    self:emit(regex.T_EMPTY, 0)
+  else
+    local has = self:parse_reg_exp(tok, syntax, nest)
+    if self.err == REG_NOERROR and tok.type ~= TK_CLOSE_SUBEXP then self.err = REG_EPAREN end
+    if self.err ~= REG_NOERROR then return false end
+    if not has then self:emit(regex.T_EMPTY, 0) end
+  end
+  if cur_nsub <= 8 then self.completed = self.completed | (1 << cur_nsub) end
+  self:emit(regex.T_GROUP, cur_nsub + 1)
+  return true
+end
+
+function Rx:parse_expression(tok: *RToken, syntax: integer, nest: integer): boolean
+  local mark = #self.toks + 1
+  local t = tok.type
+  if t == TK_CHARACTER then
+    local s: regex.Set
+    setbit(&s, tok.c)
+    self:leaf(&s)
+  elseif t == TK_OPEN_SUBEXP then
+    if not self:parse_sub_exp(tok, syntax, nest + 1) then return false end
+  elseif t == TK_OPEN_BRACKET then
+    if not self:parse_bracket_exp(tok, syntax) then return false end
+  elseif t == TK_BACK_REF then
+    if (self.completed & (1 << tok.idx)) == 0 then self.err = REG_ESUBREG; return false end
+    self:emit(regex.T_BACKREF, tok.idx + 1)
+  elseif t == TK_OPEN_DUP_NUM or t == TK_DUP_ASTERISK or t == TK_DUP_PLUS or t == TK_DUP_QUESTION
+         or t == TK_CLOSE_SUBEXP or t == TK_CLOSE_DUP_NUM then
+    if t == TK_OPEN_DUP_NUM and (syntax & RE_CONTEXT_INVALID_DUP) ~= 0 then self.err = REG_BADRPT; return false end
+    if t ~= TK_CLOSE_SUBEXP and t ~= TK_CLOSE_DUP_NUM then
+      if (syntax & RE_CONTEXT_INVALID_OPS) ~= 0 then self.err = REG_BADRPT; return false end
+      if (syntax & RE_CONTEXT_INDEP_OPS) ~= 0 then
+        self:fetch_token(tok, syntax)
+        return self:parse_expression(tok, syntax, nest)
+      end
+    end
+    if t == TK_CLOSE_SUBEXP and (syntax & RE_UNMATCHED_RIGHT_PAREN_ORD) == 0 then
+      self.err = REG_ERPAREN; return false
+    end
+    tok.type = TK_CHARACTER
+    local s: regex.Set
+    setbit(&s, tok.c)
+    self:leaf(&s)
+  elseif t == TK_ANCHOR then
+    local k: byte
+    local x = tok.ctx
+    if x == AN_LINE_FIRST then k = regex.T_BEGLINE elseif x == AN_LINE_LAST then k = regex.T_ENDLINE
+    elseif x == AN_BUF_FIRST then k = regex.T_BEGBUF elseif x == AN_BUF_LAST then k = regex.T_ENDBUF
+    elseif x == AN_WORD_FIRST then k = regex.T_BEGWORD elseif x == AN_WORD_LAST then k = regex.T_ENDWORD
+    elseif x == AN_WORD_DELIM then k = regex.T_LIMWORD else k = regex.T_NOTLIMWORD end
+    self:emit(k, 0)
+    -- an anchor takes no repetition operator
+    self:fetch_token(tok, syntax)
+    return true
+  elseif t == TK_PERIOD then
+    local s: regex.Set
+    for b = 0, 255 do setbit(&s, b) end
+    if (syntax & RE_DOT_NEWLINE) == 0 then clrbit(&s, 10) end
+    if (syntax & RE_DOT_NOT_NULL) ~= 0 then clrbit(&s, 0) end
+    self.sets:push(s)
+    self:emit(regex.T_CSET, #self.sets)
+  elseif t == TK_WORD or t == TK_NOTWORD or t == TK_SPACE or t == TK_NOTSPACE then
+    local s: regex.Set
+    for b = 0, 255 do
+      if (t == TK_WORD or t == TK_NOTWORD) and (c_isalnum(b) or b == 95) then setbit(&s, b) end
+      if (t == TK_SPACE or t == TK_NOTSPACE) and c_isspace(b) then setbit(&s, b) end
+    end
+    if t == TK_NOTWORD or t == TK_NOTSPACE then notset(&s) end
+    self:leaf(&s)
+  elseif t == TK_ALT or t == TK_END then
+    return false
+  elseif t == TK_BACK_SLASH then
+    self.err = REG_EESCAPE; return false
+  else
+    return false
+  end
+  self:fetch_token(tok, syntax)
+  local has = true
+  while tok.type == TK_DUP_ASTERISK or tok.type == TK_DUP_PLUS or tok.type == TK_DUP_QUESTION
+        or tok.type == TK_OPEN_DUP_NUM do
+    has = self:parse_dup_op(has, mark, tok, syntax)
+    if self.err ~= REG_NOERROR then return false end
+    if (syntax & RE_CONTEXT_INVALID_DUP) ~= 0 and (tok.type == TK_DUP_ASTERISK or tok.type == TK_OPEN_DUP_NUM) then
+      self.err = REG_BADRPT; return false
+    end
+  end
+  return has
+end
+
+function Rx:parse_branch(tok: *RToken, syntax: integer, nest: integer): boolean
+  local tree = self:parse_expression(tok, syntax, nest)
+  if self.err ~= REG_NOERROR then return false end
+  while tok.type ~= TK_ALT and tok.type ~= TK_END and (nest == 0 or tok.type ~= TK_CLOSE_SUBEXP) do
+    local expr = self:parse_expression(tok, syntax, nest)
+    if self.err ~= REG_NOERROR then return false end
+    if tree and expr then self:emit(regex.T_CAT, 0)
+    elseif not tree then tree = expr end
+  end
+  return tree
+end
+
+function Rx:parse_reg_exp(tok: *RToken, syntax: integer, nest: integer): boolean
+  local initial = self.completed
+  local tree = self:parse_branch(tok, syntax, nest)
+  if self.err ~= REG_NOERROR then return false end
+  while tok.type == TK_ALT do
+    if not tree then self:emit(regex.T_EMPTY, 0); tree = true end
+    self:fetch_token(tok, syntax | RE_CARET_ANCHORS_HERE)
+    local branch = false
+    if tok.type ~= TK_ALT and tok.type ~= TK_END and (nest == 0 or tok.type ~= TK_CLOSE_SUBEXP) then
+      local accumulated = self.completed
+      self.completed = initial
+      branch = self:parse_branch(tok, syntax, nest)
+      if self.err ~= REG_NOERROR then return false end
+      self.completed = self.completed | accumulated
+    end
+    if not branch then self:emit(regex.T_EMPTY, 0) end
+    self:emit(regex.T_OR, 0)
+  end
+  return tree
+end
+
+-- re_compile_pattern: 0 or a REG_* code; on success *PROG is the program
+local function rx_compile(pat: string, syntax: integer, prog: *regex.Prog): integer
+  local rx: Rx = {raw = pat, len = (@isize)(pat.size), icase = (syntax & RE_ICASE) ~= 0, syntax = syntax}
+  local tok: RToken
+  rx:fetch_token(&tok, syntax | RE_CARET_ANCHORS_HERE)
+  local tree = rx:parse_reg_exp(&tok, syntax, 0)
+  if rx.err ~= REG_NOERROR then
+    rx.toks:destroy(); rx.sets:destroy()
+    return rx.err
+  end
+  if not tree then rx:emit(regex.T_EMPTY, 0) end
+  $prog = regex.from_postfix(&rx.toks, rx.sets, rx.icase)
+  rx.toks:destroy()
+  return REG_NOERROR
+end
+
+------------------------------------------------------------------------------
+-- dfa.c's lexer and parser (lex, parse_bracket_exp, atom, closure, branch,
+-- regexp, dfaparse) for a unibyte locale: the same warnings and errors, and
+-- the same postfix token tree, which becomes the line-selection program.
+-- BACKREF stands for constructs left to the regex matcher.
+------------------------------------------------------------------------------
+
+local D_END <comptime> = -1
+local D_EMPTY <comptime> = 256
+local D_QMARK <comptime> = 257
+local D_STAR <comptime> = 258
+local D_PLUS <comptime> = 259
+local D_REPMN <comptime> = 260
+local D_CAT <comptime> = 261
+local D_OR <comptime> = 262
+local D_LPAREN <comptime> = 263
+local D_RPAREN <comptime> = 264
+local D_BEGLINE <comptime> = 265
+local D_ENDLINE <comptime> = 266
+local D_BEGWORD <comptime> = 267
+local D_ENDWORD <comptime> = 268
+local D_LIMWORD <comptime> = 269
+local D_NOTLIMWORD <comptime> = 270
+local D_BACKREF <comptime> = 271
+local D_CSET <comptime> = 1000
+
+local DFA_CONFUSING_BRACKETS_ERROR <comptime> = 1
+local DFA_STRAY_BACKSLASH_WARN <comptime> = 2
+local DFA_PLUS_WARN <comptime> = 4
+local DFA_STAR_WARN <comptime> = 8
+local DFA_EOL_NUL <comptime> = 16
+
+local Dfa = @record{
+  syntax: integer,
+  opts: integer,
+  case_fold: boolean,
+  pat: string,
+  ptr: isize,
+  left: isize,
+  lasttok: integer,
+  parens: integer,
+  minrep: integer,
+  maxrep: integer,
+  laststart: boolean,
+  tok: integer,
+  tokens: sequence(integer),
+  sets: sequence(regex.Set),
+  canychar: integer,
+  backref: boolean,
+}
+
+local function dfaerror(msg: string) die(EXIT_TROUBLE, 0, msg) end
+local function dfawarn(msg: string) gerror('warning: ' .. msg, 0) end
+
+function Dfa:cset(s: *regex.Set): integer
+  self.sets:push($s)
+  return D_CSET + #self.sets
+end
+
+function Dfa:fetch(): integer
+  local c: integer = self.pat.data[self.ptr]
+  self.ptr = self.ptr + 1
+  self.left = self.left - 1
+  return c
+end
+
+function Dfa:bracket_fetch(): integer
+  if self.left == 0 then dfaerror('unbalanced [') end
+  return self:fetch()
+end
+
+local function setbit_case_fold_c(b: integer, s: *regex.Set)
+  local ub = c_toupper(b)
+  for i = 0, 255 do if c_toupper(i) == ub then setbit(s, i) end end
+end
+
+function Dfa:parse_bracket_exp(): integer
+  local known = true
+  local ccl: regex.Set
+  local c = self:bracket_fetch()
+  local invert = c == 94
+  if invert then c = self:bracket_fetch() end
+  local cws: integer = c == 58 and 1 or 0   -- colon_warning_state
+  local c1: integer
+  while true do
+    c1 = 256
+    cws = cws & ~2
+    local handled = false
+    if c == 91 then
+      c1 = self:bracket_fetch()
+      if (c1 == 58 and (self.syntax & RE_CHAR_CLASSES) ~= 0) or c1 == 46 or c1 == 61 then
+        local sb: stringbuilder
+        local len = 0
+        local bad = false
+        while true do
+          c = self:bracket_fetch()
+          if self.left == 0 or (c == c1 and self.pat.data[self.ptr] == 93) then break end
+          if len < 32 then sb:writebyte((@byte)(c)); len = len + 1 else bad = true end
+        end
+        local str = sb:promote()
+        if bad then str = '' end
+        c = self:bracket_fetch()
+        if c1 == 58 then
+          local class = str
+          if self.case_fold and (str == 'upper' or str == 'lower') then class = 'alpha' end
+          local k = class_index(class)
+          if k == 0 then dfaerror('invalid character class') end
+          for c2 = 0, 255 do if class_has(k, c2) then setbit(&ccl, c2) end end
+        else
+          known = false
+        end
+        cws = cws | 8
+        c1 = self:bracket_fetch()
+        handled = true
+      end
+    end
+    if not handled then
+      if c == 92 and (self.syntax & RE_BACKSLASH_ESCAPE_IN_LISTS) ~= 0 then c = self:bracket_fetch() end
+      if c1 == 256 then c1 = self:bracket_fetch() end
+      if c1 == 45 then
+        local c2 = self:bracket_fetch()
+        if c2 == 91 and self.pat.data[self.ptr] == 46 then known = false; c2 = 93 end
+        if c2 == 93 then
+          self.ptr = self.ptr - 1
+          self.left = self.left + 1
+        else
+          if c2 == 92 and (self.syntax & RE_BACKSLASH_ESCAPE_IN_LISTS) ~= 0 then c2 = self:bracket_fetch() end
+          cws = cws | 8
+          c1 = self:bracket_fetch()
+          if c ~= c2 then
+            for ci = c, c2 do
+              if self.case_fold and c_isalpha(ci) then setbit_case_fold_c(ci, &ccl) else setbit(&ccl, ci) end
+            end
+            handled = true
+          end
+        end
+      end
+      if not handled then
+        cws = cws | (c == 58 and 2 or 4)
+        if self.case_fold and c_isalpha(c) then setbit_case_fold_c(c, &ccl) else setbit(&ccl, c) end
+      end
+    end
+    c = c1
+    if c == 93 then break end
+  end
+  if cws == 7 then
+    if (self.opts & DFA_CONFUSING_BRACKETS_ERROR) ~= 0 then
+      dfaerror('character class syntax is [[:space:]], not [:space:]')
+    else
+      dfawarn('character class syntax is [[:space:]], not [:space:]')
+    end
+  end
+  if not known then return D_BACKREF end
+  if invert then
+    notset(&ccl)
+    if (self.syntax & RE_HAT_LISTS_NOT_NEWLINE) ~= 0 then clrbit(&ccl, 10) end
+  end
+  return self:cset(&ccl)
+end
+
+function Dfa:stray(c: integer)
+  if (self.opts & DFA_STRAY_BACKSLASH_WARN) == 0 then return end
+  if not c_isprint(c) then dfawarn('stray \\ before unprintable character')
+  elseif c_isspace(c) then dfawarn('stray \\ before white space')
+  else dfawarn('stray \\ before ' .. string.char(c)) end
+end
+
+function Dfa:normal_char(c: integer): integer
+  self.laststart = false
+  if self.case_fold and c_isalpha(c) then
+    local ccl: regex.Set
+    setbit_case_fold_c(c, &ccl)
+    self.lasttok = self:cset(&ccl)
+    return self.lasttok
+  end
+  self.lasttok = c
+  return c
+end
+
+function Dfa:ret(t: integer): integer
+  self.lasttok = t
+  return t
+end
+
+function Dfa:lex(): integer
+  local backslash = false
+  for _ = 1, 2 do
+    if self.left == 0 then return self:ret(D_END) end
+    local c = self:fetch()
+    local sx = self.syntax
+    if c == 92 then
+      if backslash then return self:normal_char(c) end
+      if self.left == 0 then dfaerror('unfinished \\ escape') end
+      backslash = true
+      continue
+    end
+    if c == 94 then
+      if backslash then return self:normal_char(c) end
+      if (sx & RE_CONTEXT_INDEP_ANCHORS) ~= 0 or self.lasttok == D_END or self.lasttok == D_LPAREN
+         or self.lasttok == D_OR then
+        return self:ret(D_BEGLINE)
+      end
+      return self:normal_char(c)
+    elseif c == 36 then
+      if backslash then return self:normal_char(c) end
+      local p = self.ptr
+      local kp: isize = (sx & RE_NO_BK_PARENS) == 0 and 1 or 0
+      local kv: isize = (sx & RE_NO_BK_VBAR) == 0 and 1 or 0
+      local bs: isize = (self.left > 0 and self.pat.data[p] == 92) and 1 or 0
+      if (sx & RE_CONTEXT_INDEP_ANCHORS) ~= 0 or self.left == 0
+         or (self.left > kp and self.pat.data[p + (kp & bs)] == 41)
+         or (self.left > kv and self.pat.data[p + (kv & bs)] == 124)
+         or ((sx & RE_NEWLINE_ALT) ~= 0 and self.left > 0 and self.pat.data[p] == 10) then
+        return self:ret(D_ENDLINE)
+      end
+      return self:normal_char(c)
+    elseif c >= 49 and c <= 57 then
+      if not backslash then return self:normal_char(c) end
+      if (sx & RE_NO_BK_REFS) ~= 0 then self:stray(c); return self:normal_char(c) end
+      self.laststart = false
+      self.backref = true
+      return self:ret(D_BACKREF)
+    elseif c == 96 or c == 39 or c == 60 or c == 62 or c == 98 or c == 66 then
+      if not backslash then return self:normal_char(c) end
+      if (sx & RE_NO_GNU_OPS) ~= 0 then self:stray(c); return self:normal_char(c) end
+      if c == 96 then return self:ret(D_BEGLINE)
+      elseif c == 39 then return self:ret(D_ENDLINE)
+      elseif c == 60 then return self:ret(D_BEGWORD)
+      elseif c == 62 then return self:ret(D_ENDWORD)
+      elseif c == 98 then return self:ret(D_LIMWORD) end
+      return self:ret(D_NOTLIMWORD)
+    elseif c == 63 or c == 42 or c == 43 then
+      local default_case = false
+      if c ~= 42 and (sx & RE_LIMITED_OPS) ~= 0 then default_case = true
+      elseif c == 42 then
+        if backslash then return self:normal_char(c) end
+      else
+        if backslash ~= ((sx & RE_BK_PLUS_QM) ~= 0) then return self:normal_char(c) end
+      end
+      if not default_case and self.laststart then
+        if (sx & RE_CONTEXT_INDEP_OPS) == 0 then
+          default_case = true
+        elseif c == 42 then
+          if (self.opts & DFA_STAR_WARN) ~= 0 then dfawarn('* at start of expression') end
+        elseif (self.opts & DFA_PLUS_WARN) ~= 0 then
+          dfawarn(c == 63 and '? at start of expression' or '+ at start of expression')
+        end
+      end
+      if default_case then
+        if backslash then self:stray(c) end
+        return self:normal_char(c)
+      end
+      return self:ret(c == 63 and D_QMARK or (c == 42 and D_STAR or D_PLUS))
+    elseif c == 123 then
+      if (sx & RE_INTERVALS) == 0 then
+        if backslash then self:stray(c) end
+        return self:normal_char(c)
+      end
+      if backslash ~= ((sx & RE_NO_BK_BRACES) == 0) then return self:normal_char(c) end
+      local p = self.ptr
+      local lim = self.ptr + self.left
+      self.minrep = -1; self.maxrep = -1
+      while p ~= lim and c_isdigit(self.pat.data[p]) do
+        local d: integer = self.pat.data[p] - 48
+        if self.minrep < 0 then self.minrep = d
+        else
+          self.minrep = self.minrep * 10 + d
+          if self.minrep > RE_DUP_MAX + 1 then self.minrep = RE_DUP_MAX + 1 end
+        end
+        p = p + 1
+      end
+      if p ~= lim then
+        if self.pat.data[p] ~= 44 then
+          self.maxrep = self.minrep
+        else
+          if self.minrep < 0 then self.minrep = 0 end
+          p = p + 1
+          while p ~= lim and c_isdigit(self.pat.data[p]) do
+            local d: integer = self.pat.data[p] - 48
+            if self.maxrep < 0 then self.maxrep = d
+            else
+              self.maxrep = self.maxrep * 10 + d
+              if self.maxrep > RE_DUP_MAX + 1 then self.maxrep = RE_DUP_MAX + 1 end
+            end
+            p = p + 1
+          end
+        end
+      end
+      local valid = true
+      if backslash then
+        if p ~= lim and self.pat.data[p] == 92 then p = p + 1 else valid = false end
+      end
+      if valid then
+        if p ~= lim and self.pat.data[p] == 125 then p = p + 1 else valid = false end
+      end
+      if valid then
+        valid = 0 <= self.minrep and (self.maxrep < 0 or self.minrep <= self.maxrep)
+      end
+      if not valid and (sx & RE_INVALID_INTERVAL_ORD) ~= 0 then return self:normal_char(c) end
+      if self.laststart then
+        if (sx & RE_CONTEXT_INDEP_OPS) == 0 then
+          if backslash then self:stray(c) end
+          return self:normal_char(c)
+        end
+        if (self.opts & DFA_PLUS_WARN) ~= 0 then dfawarn('{...} at start of expression') end
+      end
+      if not valid then dfaerror('invalid content of \\{\\}') end
+      if RE_DUP_MAX < self.maxrep then dfaerror('regular expression too big') end
+      self.ptr = p
+      self.left = lim - p
+      self.laststart = false
+      return self:ret(D_REPMN)
+    elseif c == 124 then
+      if (sx & RE_LIMITED_OPS) ~= 0 then
+        if backslash then self:stray(c) end
+        return self:normal_char(c)
+      end
+      if backslash ~= ((sx & RE_NO_BK_VBAR) == 0) then return self:normal_char(c) end
+      self.laststart = true
+      return self:ret(D_OR)
+    elseif c == 10 then
+      if (sx & RE_NEWLINE_ALT) == 0 then
+        if backslash then self:stray(c) end
+        return self:normal_char(c)
+      end
+      if backslash then return self:normal_char(c) end
+      self.laststart = true
+      return self:ret(D_OR)
+    elseif c == 40 then
+      if backslash ~= ((sx & RE_NO_BK_PARENS) == 0) then return self:normal_char(c) end
+      self.parens = self.parens + 1
+      self.laststart = true
+      return self:ret(D_LPAREN)
+    elseif c == 41 then
+      if backslash ~= ((sx & RE_NO_BK_PARENS) == 0) then return self:normal_char(c) end
+      if self.parens == 0 and (sx & RE_UNMATCHED_RIGHT_PAREN_ORD) ~= 0 then return self:normal_char(c) end
+      self.parens = self.parens - 1
+      self.laststart = false
+      return self:ret(D_RPAREN)
+    elseif c == 46 then
+      if backslash then return self:normal_char(c) end
+      if self.canychar < 0 then
+        local ccl: regex.Set
+        for b = 0, 255 do setbit(&ccl, b) end
+        if (sx & RE_DOT_NEWLINE) == 0 then clrbit(&ccl, 10) end
+        if (sx & RE_DOT_NOT_NULL) ~= 0 then clrbit(&ccl, 0) end
+        self.canychar = self:cset(&ccl)
+      end
+      self.laststart = false
+      return self:ret(self.canychar)
+    elseif c == 115 or c == 83 or c == 119 or c == 87 then
+      if not backslash then return self:normal_char(c) end
+      if (sx & RE_NO_GNU_OPS) ~= 0 then self:stray(c); return self:normal_char(c) end
+      local ccl: regex.Set
+      for b = 0, 255 do
+        if (c == 115 or c == 83) and c_isspace(b) then setbit(&ccl, b) end
+        if (c == 119 or c == 87) and b ~= eolbyte and wordchar(b) then setbit(&ccl, b) end
+      end
+      if c == 83 or c == 87 then notset(&ccl) end
+      self.laststart = false
+      return self:ret(self:cset(&ccl))
+    elseif c == 91 then
+      if backslash then return self:normal_char(c) end
+      self.laststart = false
+      return self:ret(self:parse_bracket_exp())
+    elseif c == 93 or c == 125 then
+      return self:normal_char(c)
+    else
+      if backslash then self:stray(c) end
+      return self:normal_char(c)
+    end
+  end
+  return D_END
+end
+
+function Dfa:addtok(t: integer)
+  if t == D_BACKREF then self.backref = true end
+  self.tokens:push(t)
+end
+
+function Dfa:regexp() <forwarddecl> end
+
+function Dfa:atom()
+  local t = self.tok
+  if (t >= 0 and t < 256) or t >= D_CSET or t == D_BACKREF or t == D_BEGLINE or t == D_ENDLINE
+     or t == D_BEGWORD or t == D_ENDWORD or t == D_LIMWORD or t == D_NOTLIMWORD then
+    self:addtok(t)
+    self.tok = self:lex()
+  elseif t == D_LPAREN then
+    self.tok = self:lex()
+    self:regexp()
+    if self.tok ~= D_RPAREN then dfaerror('unbalanced (') end
+    self.tok = self:lex()
+  else
+    self:addtok(D_EMPTY)
+  end
+end
+
+-- the number of tokens in the subexpression ending at TINDEX (1-based count)
+function Dfa:nsubtoks(tindex: integer): integer
+  local t = self.tokens[tindex]
+  if t == D_QMARK or t == D_STAR or t == D_PLUS then return 1 + self:nsubtoks(tindex - 1) end
+  if t == D_CAT or t == D_OR then
+    local n1 = self:nsubtoks(tindex - 1)
+    return 1 + n1 + self:nsubtoks(tindex - 1 - n1)
+  end
+  return 1
+end
+
+function Dfa:copytoks(tindex: integer, ntokens: integer)
+  for i = 0, < ntokens do self:addtok(self.tokens[tindex + i]) end
+end
+
+function Dfa:closure()
+  self:atom()
+  while self.tok == D_QMARK or self.tok == D_STAR or self.tok == D_PLUS or self.tok == D_REPMN do
+    if self.tok == D_REPMN and (self.minrep ~= 0 or self.maxrep ~= 0) then
+      local ntokens = self:nsubtoks(#self.tokens)
+      local tindex = #self.tokens - ntokens + 1
+      if self.maxrep < 0 then self:addtok(D_PLUS) end
+      if self.minrep == 0 then self:addtok(D_QMARK) end
+      local i = 1
+      while i < self.minrep do
+        self:copytoks(tindex, ntokens); self:addtok(D_CAT)
+        i = i + 1
+      end
+      while i < self.maxrep do
+        self:copytoks(tindex, ntokens); self:addtok(D_QMARK); self:addtok(D_CAT)
+        i = i + 1
+      end
+      self.tok = self:lex()
+    elseif self.tok == D_REPMN then
+      self.tokens:resize(#self.tokens - self:nsubtoks(#self.tokens))
+      self.tok = self:lex()
+      self:closure()
+    else
+      self:addtok(self.tok)
+      self.tok = self:lex()
+    end
+  end
+end
+
+function Dfa:branch()
+  self:closure()
+  while self.tok ~= D_RPAREN and self.tok ~= D_OR and self.tok >= 0 do
+    self:closure()
+    self:addtok(D_CAT)
+  end
+end
+
+function Dfa:regexp()
+  self:branch()
+  while self.tok == D_OR do
+    self.tok = self:lex()
+    self:branch()
+    self:addtok(D_OR)
+  end
+end
+
+-- dfasyntax + dfaparse; the tokens become a Pike VM program
+local function dfa_compile(s: string, syntax: integer, opts: integer, prog: *regex.Prog): boolean
+  local d: Dfa = {syntax = syntax, opts = opts, case_fold = (syntax & RE_ICASE) ~= 0, pat = s,
+                  ptr = 0, left = (@isize)(s.size), lasttok = D_END, laststart = true, canychar = -1}
+  d.tok = d:lex()
+  d:regexp()
+  if d.tok ~= D_END then dfaerror('unbalanced )') end
+  -- postfix tokens for the VM; a BACKREF leaf (never used for matching
+  -- when present) becomes EMPTY
+  local toks: sequence(regex.Tok)
+  local charset: [256]integer
+  for i = 1, #d.tokens do
+    local t = d.tokens[i]
+    if t >= 0 and t < 256 then
+      if charset[t] == 0 then
+        local one: regex.Set
+        setbit(&one, t)
+        d.sets:push(one)
+        charset[t] = #d.sets
+      end
+      toks:push({kind = regex.T_CSET, x = charset[t]})
+    elseif t >= D_CSET then toks:push({kind = regex.T_CSET, x = t - D_CSET})
+    elseif t == D_EMPTY or t == D_BACKREF then toks:push({kind = regex.T_EMPTY, x = 0})
+    elseif t == D_QMARK then toks:push({kind = regex.T_QMARK, x = 0})
+    elseif t == D_STAR then toks:push({kind = regex.T_STAR, x = 0})
+    elseif t == D_PLUS then toks:push({kind = regex.T_PLUS, x = 0})
+    elseif t == D_CAT then toks:push({kind = regex.T_CAT, x = 0})
+    elseif t == D_OR then toks:push({kind = regex.T_OR, x = 0})
+    elseif t == D_BEGLINE then toks:push({kind = regex.T_BEGLINE, x = 0})
+    elseif t == D_ENDLINE then toks:push({kind = regex.T_ENDLINE, x = 0})
+    elseif t == D_BEGWORD then toks:push({kind = regex.T_BEGWORD, x = 0})
+    elseif t == D_ENDWORD then toks:push({kind = regex.T_ENDWORD, x = 0})
+    elseif t == D_LIMWORD then toks:push({kind = regex.T_LIMWORD, x = 0})
+    else toks:push({kind = regex.T_NOTLIMWORD, x = 0}) end
+  end
+  $prog = regex.from_postfix(&toks, d.sets, false)
+  toks:destroy()
+  d.tokens:destroy()
+  return d.backref
+end
+
+------------------------------------------------------------------------------
+-- Pattern bookkeeping (grep.c's patloc) used for error messages
+------------------------------------------------------------------------------
+
+local PatLoc = @record{ lineno: integer, filename: string, fileline: integer }
+local patloc: sequence(PatLoc)
+
+-- pattern_file_name: the file a pattern line came from ("" for the command
+-- line) and its line number there
+local function pattern_file_name(lineno: integer): (string, integer)
+  local i = 2
+  while i <= #patloc do
+    if lineno < patloc[i].lineno then break end
+    i = i + 1
+  end
+  local p = patloc[i - 1]
+  return p.filename, lineno - p.lineno + p.fileline
+end
+
+------------------------------------------------------------------------------
+-- dfasearch.c
+------------------------------------------------------------------------------
+
+local DfaComp = @record{
+  dfaprog: regex.Prog,               -- the dfa: line selection without back-references
+  unsupported: boolean,              -- the dfa holds a BACKREF: lines go to the regexes
+  patterns: sequence(regex.Prog),    -- the regex matchers (re_search)
+  regs: regex.Caps,
+}
+
+local function possible_backrefs_in_pattern(keys: string, from: isize, len: isize): boolean
+  len = len - 1
+  if 0 <= len then
+    local lim = from + len
+    local p = from
+    while p < lim do
+      if keys.data[p] == 92 then
+        local c = keys.data[p + 1]
+        if c >= 49 and c <= 57 then return true end
+        if c == 92 then
+          p = p + 1
+          if p == lim then break end
+        end
+      end
+      p = p + 1
+    end
+  end
+  return false
+end
+
+-- regex_compile: report a failure with the pattern's file and line
+local function regex_compile(dc: *DfaComp, p: string, lineno: integer, syntax_bits: integer, syntax_only: boolean): boolean
+  local prog: regex.Prog
+  local err = rx_compile(p, syntax_bits, &prog)
+  if err == REG_NOERROR then
+    if not syntax_only then dc.patterns:push(prog) end
+    return true
+  end
+  local fname: string = ''
+  local fline: integer = 0
+  if lineno >= 0 then fname, fline = pattern_file_name(lineno) end
+  if #fname == 0 then gerror(reg_errmsg(err), 0)
+  else gerror(string.format('%s:%d: %s', fname, fline, reg_errmsg(err)), 0) end
+  return false
+end
+
+local function GEAcompile(pattern: string, syntax_bits: integer, exact: boolean): *DfaComp
+  local dc: *DfaComp = (@*DfaComp)(c_malloc(#DfaComp))
+  $dc = {}
+  if match_icase then syntax_bits = syntax_bits | RE_ICASE end
+  local dfaopts = DFA_CONFUSING_BRACKETS_ERROR | DFA_PLUS_WARN
+  if stray_warn then dfaopts = dfaopts | DFA_STRAY_BACKSLASH_WARN end
+  if (syntax_bits & RE_CONTEXT_INDEP_OPS) ~= 0 then dfaopts = dfaopts | DFA_STAR_WARN end
+  if eolbyte == 0 then dfaopts = dfaopts | DFA_EOL_NUL end
+  local size: isize = (@isize)(pattern.size)
+  local p: isize = 0
+  local prev: isize = 0
+  local buf: stringbuilder
+  local have_buf = false
+  local compilation_failed = false
+  local lineno = 0
+  -- the patterns with back-references are compiled one by one; the others
+  -- are collected in BUF
+  local backref_progs: sequence(regex.Prog)
+  repeat
+    local sep = p
+    while sep < size and pattern.data[sep] ~= 10 do sep = sep + 1 end
+    local len = sep - p
+    local backref = possible_backrefs_in_pattern(pattern, p, len)
+    if backref and prev < p then
+      buf:write((@string){data = &pattern.data[prev], size = (@usize)(p - prev)})
+      have_buf = true
+    end
+    local line: string = (@string){data = len > 0 and &pattern.data[p] or nilptr, size = (@usize)(len)}
+    if not regex_compile(dc, line, lineno, syntax_bits, not backref) then compilation_failed = true end
+    p = sep + 1
+    lineno = lineno + 1
+    if backref then prev = p end
+  until p > size
+  if compilation_failed then gexit(EXIT_TROUBLE) end
+  local bufstr: string
+  if prev <= size then
+    if 0 < prev then
+      buf:write((@string){data = &pattern.data[prev], size = (@usize)(size - prev)})
+      have_buf = true
+      bufstr = buf:promote()
+    else
+      bufstr = pattern
+      have_buf = true
+    end
+  elseif have_buf then
+    -- Debian #1029235: the newline after the last pattern without a
+    -- back-reference does not add an empty alternative
+    bufstr = buf:promote()
+    bufstr.size = bufstr.size - 1
+  end
+  local motif = pattern
+  if match_words or match_lines then
+    local bk = (syntax_bits & RE_NO_BK_PARENS) == 0
+    local pre: string, post: string
+    if match_lines then
+      pre = bk and '^\\(' or '^('
+      post = bk and '\\)$' or ')$'
+    else
+      pre = bk and '\\(^\\|[^[:alnum:]_]\\)\\(' or '(^|[^[:alnum:]_])('
+      post = bk and '\\)\\([^[:alnum:]_]\\|$\\)' or ')([^[:alnum:]_]|$)'
+    end
+    motif = pre .. pattern .. post
+  end
+  dc.unsupported = dfa_compile(motif, syntax_bits, dfaopts, &dc.dfaprog)
+  if have_buf and (exact or dc.unsupported) then
+    local prog: regex.Prog
+    if rx_compile(bufstr, syntax_bits, &prog) ~= REG_NOERROR then gexit(EXIT_TROUBLE) end
+    -- it goes first, as patterns[-1] does in GNU
+    local all: sequence(regex.Prog)
+    all:push(prog)
+    for i = 1, #dc.patterns do all:push(dc.patterns[i]) end
+    dc.patterns = all
+  end
+  return dc
+end
+
+local function sv(buf: *[0]byte, from: isize, len: isize): string
+  return (@string){data = &buf[from], size = (@usize)(len)}
+end
+
+local function wordchar_next(buf: *[0]byte, p: isize, e: isize): boolean
+  return p < e and wordchar(buf[p])
+end
+
+local function wordchar_prev(buf: *[0]byte, b: isize, cur: isize): boolean
+  if b == cur then return false end
+  return wordchar(buf[cur - 1])
+end
+
+-- re_search over BEG[0, LEN) from START: the match start or -1
+local function re_search(prog: *regex.Prog, buf: *[0]byte, beg: isize, len: isize, start: isize, regs: *regex.Caps): isize
+  local found = prog:search(sv(buf, beg, len), start, regs)
+  if prog.toocomplex then die(EXIT_TROUBLE, 0, 'pattern too complex') end
+  if found then return regs.at[0] end
+  return -1
+end
+
+-- re_match: the length of the longest match at START in BEG[0, LEN), or -1
+local function re_match(prog: *regex.Prog, buf: *[0]byte, beg: isize, len: isize, start: isize, regs: *regex.Caps): isize
+  if start < 0 or start > len then return -1 end
+  local found = prog:matchat(sv(buf, beg, len), start, regs)
+  if prog.toocomplex then die(EXIT_TROUBLE, 0, 'pattern too complex') end
+  if found then return regs.at[1] - start end
+  return -1
+end
+
+local function EGexecute(dc: *DfaComp, buf: *[0]byte, bstart: isize, size: isize, match_size: *isize, start_ptr: isize): isize
+  local eol = eolbyte
+  local buflim = bstart + size
+  local beg: isize = bstart
+  local end_: isize = bstart
+  while end_ < buflim do
+    beg = end_
+    end_ = buflim
+    local ptr: isize
+    if start_ptr < 0 then
+      -- the dfa, line by line
+      local found = false
+      local ls = beg
+      while ls < buflim do
+        local le = ls
+        while le < buflim and buf[le] ~= eol do le = le + 1 end
+        local lend = le < buflim and le + 1 or buflim
+        if dc.unsupported or dc.dfaprog:search(sv(buf, ls, le - ls), 0, &dc.regs) then
+          beg = ls; end_ = lend; found = true
+          break
+        end
+        ls = lend
+      end
+      if not found then return -1 end
+      if not dc.unsupported then
+        $match_size = end_ - beg
+        return beg - bstart
+      end
+      ptr = beg
+    else
+      ptr = start_ptr
+    end
+    local best_match = end_
+    local best_len: isize = 0
+    local linelen = end_ - beg - 1
+    for i = 1, #dc.patterns do
+      local pat = &dc.patterns[i]
+      pat.noteol = false
+      local start = re_search(pat, buf, beg, linelen, ptr - beg, &dc.regs)
+      if start >= 0 then
+        local len = dc.regs.at[1] - start
+        local match = beg + start
+        local assess = false
+        if match > best_match then continue end
+        if start_ptr >= 0 and not match_words then
+          assess = true
+        elseif (not match_lines and not match_words) or (match_lines and len == end_ - ptr - 1) then
+          match = ptr
+          len = end_ - ptr
+          assess = true
+        elseif not match_lines and match_words then
+          while match <= best_match do
+            local shorter_len: isize = 0
+            if not wordchar_next(buf, match + len, end_ - 1) and not wordchar_prev(buf, beg, match) then
+              assess = true
+              break
+            end
+            if len > 0 then
+              len = len - 1
+              pat.noteol = true
+              shorter_len = re_match(pat, buf, beg, match + len - ptr, match - beg, &dc.regs)
+            end
+            if 0 < shorter_len then
+              len = shorter_len
+            else
+              if match == end_ - 1 then break end
+              match = match + 1
+              pat.noteol = false
+              start = re_search(pat, buf, beg, linelen, match - beg, &dc.regs)
+              if start < 0 then break end
+              len = dc.regs.at[1] - start
+              match = beg + start
+            end
+          end
+        end
+        if assess then
+          if start_ptr < 0 then
+            $match_size = end_ - beg
+            return beg - bstart
+          end
+          if match < best_match or (match == best_match and len > best_len) then
+            best_match = match
+            best_len = len
+          end
+        end
+      end
+    end
+    if best_match < end_ then
+      $match_size = best_len
+      return best_match - bstart
+    end
+  end
+  return -1
+end
+
+------------------------------------------------------------------------------
+-- kwset (leftmost, then longest, keyword search) and kwsearch.c
+------------------------------------------------------------------------------
+
+local KwSearch = @record{
+  words: sequence(string),
+  trans: boolean,               -- -i: compare through toupper
+  pattern: string,              -- the user's patterns, for the -w fallback
+  re: *DfaComp,
+}
+
+-- kwsexec: the offset of the leftmost match in BUF[TEXT, TEXT+LEN) (the
+-- longest one there) and its size, or -1
+local function kwsexec(kw: *KwSearch, buf: *[0]byte, text: isize, len: isize): (isize, isize)
+  for pos = 0, len do
+    local best: isize = -1
+    for k = 1, #kw.words do
+      local w = kw.words[k]
+      local wl: isize = (@isize)(w.size)
+      if pos + wl <= len and wl > best then
+        local ok = true
+        for j = 0, < wl do
+          local a: integer = buf[text + pos + j]
+          local b: integer = w.data[j]
+          if kw.trans then a = c_toupper(a); b = c_toupper(b) end
+          if a ~= b then ok = false; break end
+        end
+        if ok then best = wl end
+      end
+    end
+    if best >= 0 then return pos, best end
+  end
+  return -1, 0
+end
+
+local function Fcompile(pattern: string): *KwSearch
+  local kw: *KwSearch = (@*KwSearch)(c_malloc(#KwSearch))
+  $kw = {}
+  kw.trans = match_icase
+  local size: isize = (@isize)(pattern.size)
+  local p: isize = 0
+  repeat
+    local sep = p
+    while sep < size and pattern.data[sep] ~= 10 do sep = sep + 1 end
+    local w = pattern:sub(p + 1, sep)
+    if match_lines then
+      local sb: stringbuilder
+      sb:writebyte(eolbyte); sb:write(w); sb:writebyte(eolbyte)
+      w = sb:promote()
+    end
+    kw.words:push(w)
+    p = sep + 1
+  until p > size
+  kw.pattern = pattern
+  return kw
+end
+
+local function fgrep_to_grep_pattern(keys: string): string
+  local sb: stringbuilder
+  for i = 0, < (@isize)(keys.size) do
+    local c = keys.data[i]
+    if c == 36 or c == 42 or c == 46 or c == 91 or c == 92 or c == 94 then sb:writebyte(92) end
+    sb:writebyte(c)
+  end
+  return sb:promote()
+end
+
+local function memrchr_line(buf: *[0]byte, from: isize, to: isize, eol: byte): isize
+  local i = to - 1
+  while i >= from do
+    if buf[i] == eol then return i end
+    i = i - 1
+  end
+  return -1
+end
+
+local function Fexecute(kw: *KwSearch, buf: *[0]byte, bstart: isize, size: isize, match_size: *isize, start_ptr: isize): isize
+  local eol = eolbyte
+  local ml: isize = match_lines and 1 or 0
+  local bend = bstart + size
+  local beg: isize = start_ptr >= 0 and start_ptr or bstart
+  local mb_start = beg
+  local len: isize = 0
+  local end_: isize = 0
+  local outcome = 0   -- 1 success, 2 success_match_words, 3 success_in_beg_and_len
+  while beg <= bend do
+    local offset, ksize = kwsexec(kw, buf, beg - ml, bend - beg + ml)
+    if offset < 0 then break end
+    len = ksize - 2 * ml
+    beg = beg + offset
+    if start_ptr >= 0 and not match_words then outcome = 3; break end
+    if match_lines then
+      if start_ptr < 0 then len = len + 1 end
+      outcome = 3; break
+    end
+    if not match_words then outcome = 1; break end
+    local nl = memrchr_line(buf, mb_start, beg, eol)
+    if nl >= 0 then mb_start = nl + 1 end
+    if not wordchar_prev(buf, mb_start, beg) then
+      while true do
+        if not wordchar_next(buf, beg + len, bend) then
+          outcome = start_ptr >= 0 and 3 or 1
+          break
+        end
+        if start_ptr < 0 then
+          if kw.re == nilptr then
+            kw.pattern = fgrep_to_grep_pattern(kw.pattern)
+            kw.re = GEAcompile(kw.pattern, RE_SYNTAX_GREP, false)
+          end
+          if beg + len < bend then
+            end_ = beg + len
+            while buf[end_] ~= eol do end_ = end_ + 1 end
+            end_ = end_ + 1
+          else
+            end_ = bend
+          end
+          if 0 <= EGexecute(kw.re, buf, beg, end_ - beg, match_size, -1) then outcome = 2; break end
+          beg = end_ - 1
+          break
+        end
+        if len == 0 then break end
+        len = len - 1
+        local off2, sz2 = kwsexec(kw, buf, beg, len)
+        if off2 ~= 0 then break end
+        len = sz2
+      end
+      if outcome ~= 0 then break end
+    end
+    -- skip the word constituents: they cannot precede the next match
+    while beg < bend and wordchar(buf[beg]) do beg = beg + 1 end
+    mb_start = beg
+    beg = beg + 1
+  end
+  if outcome == 0 then return -1 end
+  if outcome == 1 then
+    if beg + len < bend then
+      end_ = beg + len
+      while buf[end_] ~= eol do end_ = end_ + 1 end
+      end_ = end_ + 1
+    else
+      end_ = bend
+    end
+  end
+  if outcome == 1 or outcome == 2 then
+    local nl = memrchr_line(buf, bstart, beg, eol)
+    beg = nl >= 0 and nl + 1 or bstart
+    len = end_ - beg
+  end
+  $match_size = len
+  return beg - bstart
+end
+
+------------------------------------------------------------------------------
+-- gnulib exclude.c: segments of hashed names and of fnmatch patterns,
+-- searched from the last added; the first segment decides the default
+------------------------------------------------------------------------------
+
+local EXCLUDE_ANCHORED: integer <comptime> = 1 << 30
+local EXCLUDE_INCLUDE: integer <comptime> = 1 << 29
+local EXCLUDE_WILDCARDS: integer <comptime> = 1 << 28
+
+local ExSeg = @record{ hash: boolean, options: integer, pats: sequence(string) }
+local Exclude = @record{ used: boolean, segs: sequence(ExSeg) }
+
+local function fnmatch_pattern_has_wildcards(s: string): boolean
+  local i: isize = 0
+  local n: isize = (@isize)(s.size)
+  while i < n do
+    local c = s.data[i]
+    i = i + 1
+    if c == 92 then
+      if i < n then i = i + 1 end
+    elseif c == 63 or c == 42 or c == 91 then
+      return true
+    end
+  end
+  return false
+end
+
+local function unescape_pattern(s: string): string
+  local sb: stringbuilder
+  local i: isize = 0
+  local n: isize = (@isize)(s.size)
+  while i < n do
+    if s.data[i] == 92 and i + 1 < n then i = i + 1 end
+    sb:writebyte(s.data[i])
+    i = i + 1
+  end
+  return sb:promote()
+end
+
+local function add_exclude(ex: *Exclude, pattern: string, options: integer)
+  ex.used = true
+  local n = #ex.segs
+  if (options & EXCLUDE_WILDCARDS) ~= 0 and fnmatch_pattern_has_wildcards(pattern) then
+    if not (n > 0 and not ex.segs[n].hash
+            and (ex.segs[n].options & EXCLUDE_INCLUDE) == (options & EXCLUDE_INCLUDE)) then
+      ex.segs:push({hash = false, options = options})
+    end
+    ex.segs[#ex.segs].pats:push(string.copy(pattern))
+  else
+    local flags = EXCLUDE_INCLUDE | EXCLUDE_ANCHORED
+    if not (n > 0 and ex.segs[n].hash and (ex.segs[n].options & flags) == (options & flags)) then
+      ex.segs:push({hash = true, options = options})
+    end
+    local str = pattern
+    if (options & EXCLUDE_WILDCARDS) ~= 0 then str = unescape_pattern(pattern) else str = string.copy(pattern) end
+    ex.segs[#ex.segs].pats:push(str)
+  end
+end
+
+local function fnmatch0(pat: string, f: string): boolean
+  return c_fnmatch(cpath(pat), cpath(f), 0) == 0
+end
+
+local function exclude_fnmatch(pat: string, f: string, options: integer): boolean
+  local matched = fnmatch0(pat, f)
+  if (options & EXCLUDE_ANCHORED) == 0 then
+    local i: isize = 0
+    local n: isize = (@isize)(f.size)
+    while i < n and not matched do
+      if f.data[i] == 47 and (i + 1 >= n or f.data[i + 1] ~= 47) then
+        matched = fnmatch0(pat, f:sub(i + 2))
+      end
+      i = i + 1
+    end
+  end
+  return matched
+end
+
+local function seg_matches(seg: *ExSeg, f: string): boolean
+  if seg.hash then
+    local cur = f
+    while true do
+      for k = 1, #seg.pats do if seg.pats[k] == cur then return true end end
+      if (seg.options & EXCLUDE_ANCHORED) ~= 0 then break end
+      local slash = cur:find('/', 1, true)
+      if slash <= 0 then break end
+      cur = cur:sub(slash + 1)
+    end
+    return false
+  end
+  for k = 1, #seg.pats do
+    if exclude_fnmatch(seg.pats[k], f, seg.options) then return true end
+  end
+  return false
+end
+
+local function excluded_file_name(ex: *Exclude, f: string): boolean
+  if #ex.segs == 0 then return false end
+  local invert = false
+  local i = #ex.segs
+  while true do
+    if seg_matches(&ex.segs[i], f) then break end
+    if i == 1 then invert = true; break end
+    i = i - 1
+  end
+  return invert ~= ((ex.segs[i].options & EXCLUDE_INCLUDE) == 0)
+end
+
+------------------------------------------------------------------------------
+-- grep.c
+------------------------------------------------------------------------------
+
+local SEP_CHAR_SELECTED: byte <comptime> = 58
+local SEP_CHAR_REJECTED: byte <comptime> = 45
+
+local READ_DIRECTORIES <comptime> = 2
+local RECURSE_DIRECTORIES <comptime> = 3
+local SKIP_DIRECTORIES <comptime> = 4
+local READ_COMMAND_LINE_DEVICES <comptime> = 0
+local READ_DEVICES <comptime> = 1
+local SKIP_DEVICES <comptime> = 2
+local BINARY_BINARY_FILES <comptime> = 0
+local TEXT_BINARY_FILES <comptime> = 1
+local WITHOUT_MATCH_BINARY_FILES <comptime> = 2
+local LISTFILES_NONE <comptime> = 0
+local LISTFILES_MATCHING <comptime> = 1
+local LISTFILES_NONMATCHING <comptime> = 2
+
+local G_MATCHER_INDEX <comptime> = 0
+local E_MATCHER_INDEX <comptime> = 1
+local F_MATCHER_INDEX <comptime> = 2
+
+local basic_fts_options: integer <comptime> = fts.CWDFD | fts.NOSTAT | fts.TIGHT_CYCLE_CHECK
+
+local out_stat: sys.Stat
+local show_help = false
+local show_version = false
+local suppress_errors = false
+local color_option: integer = 0
+local only_matching = false
+local align_tabs = false
+local offset_width: integer = 0
+local group_separator: string = '--'
+local has_group_separator = true
+local directories: integer = READ_DIRECTORIES
+local fts_options: integer = basic_fts_options | fts.COMFOLLOW | fts.PHYSICAL
+local devices: integer = READ_COMMAND_LINE_DEVICES
+local binary_files: integer = BINARY_BINARY_FILES
+local list_files: integer = LISTFILES_NONE
+local out_file: integer = 0
+local filename_mask: byte = 0xff
+local out_quiet = false
+local out_invert = false
+local out_line = false
+local out_byte = false
+local out_before: int64 = -1
+local out_after: int64 = -1
+local count_matches = false
+local max_count: int64 = INTMAX_MAX
+local line_buffered = false
+local label: string
+local has_label = false
+local filename: string
+local has_filename = false
+local omit_dot_slash = false
+local errseen = false
+local excluded_patterns: [2]Exclude
+local excluded_directory_patterns: [2]Exclude
+
+-- colors
+local selected_match_color: string = '01;31'
+local context_match_color: string = '01;31'
+local filename_color: string = '35'
+local line_num_color: string = '32'
+local byte_num_color: string = '32'
+local sep_color: string = '36'
+local selected_line_color: string = ''
+local context_line_color: string = ''
+local sgr_el = true    -- "\33[K" after the SGR sequences (cleared by "ne")
+
+-- the matcher
+local matcher_f = false
+local compiled_dfa: *DfaComp = nilptr
+local compiled_kw: *KwSearch = nilptr
+
+local function execute(buf: *[0]byte, bstart: isize, size: isize, match_size: *isize, start_ptr: isize): isize
+  if matcher_f then return Fexecute(compiled_kw, buf, bstart, size, match_size, start_ptr) end
+  return EGexecute(compiled_dfa, buf, bstart, size, match_size, start_ptr)
+end
+
+local function pr_sgr_start(s: string)
+  if #s > 0 then
+    fputs_errno('\27[')
+    fputs_errno(s)
+    fputs_errno(sgr_el and 'm\27[K' or 'm')
+  end
+end
+local function pr_sgr_end(s: string)
+  if #s > 0 then fputs_errno(sgr_el and '\27[m\27[K' or '\27[m') end
+end
+local function pr_sgr_start_if(s: string) if color_option ~= 0 then pr_sgr_start(s) end end
+local function pr_sgr_end_if(s: string) if color_option ~= 0 then pr_sgr_end(s) end end
+
+local function input_filename(): string
+  if not has_filename then filename = '(standard input)'; has_filename = true end
+  return filename
+end
+
+local function suppressible_error(errnum: cint)
+  if not suppress_errors then gerror(input_filename(), errnum) end
+  errseen = true
+end
+
+local function is_device_mode(m: cuint): boolean
+  local f = m & sys.S_IFMT
+  return f == sys.S_IFCHR or f == sys.S_IFBLK or f == sys.S_IFSOCK or f == sys.S_IFIFO
+end
+
+local function skip_devices(command_line: boolean): boolean
+  return devices == SKIP_DEVICES or (devices == READ_COMMAND_LINE_DEVICES and not command_line)
+end
+
+local function usable_st_size(st: *sys.Stat): boolean
+  return (st.st_mode & sys.S_IFMT) == sys.S_IFREG
+end
+
+local function exclude_options(command_line: boolean): integer
+  return EXCLUDE_WILDCARDS | (command_line and 0 or EXCLUDE_ANCHORED)
+end
+
+local function skipped_file(name: string, command_line: boolean, is_dir: boolean): boolean
+  local pats: *[2]Exclude
+  if not is_dir then
+    pats = &excluded_patterns
+  elseif directories == SKIP_DIRECTORIES then
+    return true
+  elseif command_line and omit_dot_slash then
+    return false
+  else
+    pats = &excluded_directory_patterns
+  end
+  local k = command_line and 1 or 0
+  return pats[k].used and excluded_file_name(&pats[k], name)
+end
+
+-- the buffer
+local buffer: *[0]byte = nilptr
+local bufalloc: isize = 0
+local bufdesc: cint = 0
+local bufbeg: isize = 0
+local buflim: isize = 0
+local pagesize: isize = 4096
+local bufoffset: int64 = 0
+local after_last_match: int64 = 0
+local skip_nuls = false
+local skip_empty_lines = false
+local totalnl: int64 = 0
+local seek_failed = false
+local seek_data_failed = false
+local read_errno: cint = 0
+
+local totalcc: int64 = 0
+local lastnl: isize = 0
+local lastout: isize = -1
+local outleft: int64 = 0
+local pending: int64 = 0
+local done_on_match = false
+local exit_on_match = false
+local dev_null_output = false
+local used = false
+
+-- the index at or after I in BASE whose address is aligned to the page size
+local function align_in(base: *[0]byte, i: isize): isize
+  local addr = (@usize)(base) + (@usize)(i)
+  local r = (@isize)(addr % (@usize)(pagesize))
+  if r == 0 then return i end
+  return i + pagesize - r
+end
+
+local function memmove_bytes(dst: *[0]byte, di: isize, src: *[0]byte, si: isize, n: isize)
+  if (@usize)(&dst[di]) < (@usize)(&src[si]) then
+    for k = 0, < n do dst[di + k] = src[si + k] end
+  else
+    for k = n - 1, 0, -1 do dst[di + k] = src[si + k] end
+  end
+end
+
+local function reset(fd: cint, st: *sys.Stat): boolean
+  bufbeg = align_in(buffer, 1)
+  buflim = bufbeg
+  buffer[bufbeg - 1] = eolbyte
+  bufdesc = fd
+  bufoffset = 0
+  if fd == 0 then bufoffset = sys.lseek(fd, 0, SEEK_CUR) end
+  seek_failed = bufoffset < 0
+  seek_data_failed = seek_failed
+  if seek_failed then
+    if sys.errno() ~= ESPIPE then
+      suppressible_error(sys.errno())
+      return false
+    end
+    bufoffset = 0
+  end
+  return true
+end
+
+local function safe_read(fd: cint, p: *[0]byte, n: isize): isize
+  if n > 0x7ff00000 then n = 0x7ff00000 end
+  while true do
+    local r = sys.read(fd, p, (@usize)(n))
+    if r < 0 and sys.errno() == sys.EINTR then continue end
+    return r
+  end
+  return -1
+end
+
+local function all_zeros(p: isize, n: isize): boolean
+  for i = p, < p + n do if buffer[i] ~= 0 then return false end end
+  return true
+end
+
+-- gnulib xpalloc (PA null): the new allocation size
+local function xpalloc_size(n0: isize, incr_min: isize, n_max: isize): isize
+  local n = n0 + (n0 >> 1)
+  if 0 <= n_max and n_max < n then n = n_max end
+  if n - n0 < incr_min then
+    n = n0 + incr_min
+    if 0 <= n_max and n_max < n then die(EXIT_TROUBLE, 0, 'memory exhausted') end
+  end
+  return n
+end
+
+local function fillbuf(save: isize, st: *sys.Stat): boolean
+  local readbuf: isize
+  local min_after_buflim = pagesize + UWORD_SIZE
+  if min_after_buflim <= bufalloc - buflim then
+    readbuf = buflim
+  else
+    local newbuf = buffer
+    local newalloc = bufalloc
+    local minsize = save + pagesize
+    local incr_min = minsize - bufalloc + min_after_buflim
+    if incr_min > 0 then
+      local alloc_max: isize = -1
+      if usable_st_size(st) then
+        local to_be_read: int64 = st.st_size - bufoffset
+        if 0 <= to_be_read then
+          local a = to_be_read + save + min_after_buflim
+          alloc_max = a > bufalloc + incr_min and a or bufalloc + incr_min
+        end
+      end
+      newalloc = xpalloc_size(bufalloc, incr_min, alloc_max)
+      newbuf = (@*[0]byte)(c_malloc((@csize)(newalloc)))
+      if newbuf == nilptr then die(EXIT_TROUBLE, 0, 'memory exhausted') end
+    end
+    readbuf = align_in(newbuf, 1 + save)
+    local moved = save + 1
+    memmove_bytes(newbuf, readbuf - moved, buffer, buflim - moved, moved)
+    if 0 < incr_min then
+      c_free(buffer)
+      buffer = newbuf
+      bufalloc = newalloc
+    end
+  end
+  bufbeg = readbuf - save
+  local readsize = bufalloc - UWORD_SIZE - readbuf
+  readsize = readsize - readsize % pagesize
+  local fillsize: isize
+  local cc = true
+  while true do
+    fillsize = safe_read(bufdesc, &buffer[readbuf], readsize)
+    if fillsize < 0 then
+      read_errno = sys.errno()
+      fillsize = 0
+      cc = false
+    end
+    bufoffset = bufoffset + fillsize
+    if fillsize == 0 or not skip_nuls or not all_zeros(readbuf, fillsize) then break end
+    totalnl = totalnl + fillsize
+    if not seek_data_failed then
+      local data_start: int64 = sys.lseek(bufdesc, bufoffset, SEEK_DATA)
+      if data_start < 0 and sys.errno() == ENXIO and usable_st_size(st) and bufoffset < st.st_size then
+        data_start = sys.lseek(bufdesc, 0, SEEK_END)
+      end
+      if data_start < 0 then
+        seek_data_failed = true
+      else
+        totalnl = totalnl + data_start - bufoffset
+        bufoffset = data_start
+      end
+    end
+  end
+  buflim = readbuf + fillsize
+  for k = 0, < UWORD_SIZE do buffer[buflim + k] = 0 end
+  return cc
+end
+
+local function nlscan(lim: isize)
+  local newlines: int64 = 0
+  for i = lastnl, < lim do if buffer[i] == eolbyte then newlines = newlines + 1 end end
+  totalnl = totalnl + newlines
+  lastnl = lim
+end
+
+local function print_filename()
+  pr_sgr_start_if(filename_color)
+  fputs_errno(input_filename())
+  pr_sgr_end_if(filename_color)
+end
+
+local function print_sep(sep: byte)
+  pr_sgr_start_if(sep_color)
+  putchar_errno(sep)
+  pr_sgr_end_if(sep_color)
+end
+
+local function print_offset(pos: int64, color: string)
+  pr_sgr_start_if(color)
+  local d: [24]byte
+  local n = 0
+  local v = pos
+  repeat d[n] = (@byte)(48 + v % 10); v = v // 10; n = n + 1 until v == 0
+  for _ = n + 1, offset_width do putchar_errno(32) end
+  for k = n - 1, 0, -1 do putchar_errno(d[k]) end
+  pr_sgr_end_if(color)
+end
+
+local function print_line_head(beg: isize, len: isize, lim: isize, sep: byte): boolean
+  if out_file ~= 0 then
+    print_filename()
+    if filename_mask ~= 0 then print_sep(sep) else putchar_errno(0) end
+  end
+  if out_line then
+    if lastnl < lim then
+      nlscan(beg)
+      totalnl = totalnl + 1
+      lastnl = lim
+    end
+    print_offset(totalnl, line_num_color)
+    print_sep(sep)
+  end
+  if out_byte then
+    print_offset(totalcc + (beg - bufbeg), byte_num_color)
+    print_sep(sep)
+  end
+  if align_tabs and (out_file ~= 0 or out_line or out_byte) and len ~= 0 then putchar_errno(9) end
+  return true
+end
+
+local function print_line_middle(beg: isize, lim: isize, line_color: string, match_color: string): isize
+  local cur = beg
+  local mid: isize = -1
+  while cur < lim do
+    local match_size: isize = 0
+    local match_offset = execute(buffer, beg, lim - beg, &match_size, cur)
+    if match_offset < 0 then break end
+    local b = beg + match_offset
+    if b == lim then break end
+    if match_size == 0 then
+      match_size = 1
+      if mid < 0 then mid = cur end
+    else
+      if only_matching then
+        local sep = out_invert and SEP_CHAR_REJECTED or SEP_CHAR_SELECTED
+        if not print_line_head(b, match_size, lim, sep) then return -1 end
+      else
+        pr_sgr_start(line_color)
+        if mid >= 0 then cur = mid; mid = -1 end
+        fwrite_errno(&buffer[cur], b - cur)
+      end
+      pr_sgr_start_if(match_color)
+      fwrite_errno(&buffer[b], match_size)
+      pr_sgr_end_if(match_color)
+      if only_matching then putchar_errno(eolbyte) end
+    end
+    cur = b + match_size
+  end
+  if only_matching then cur = lim
+  elseif mid >= 0 then cur = mid end
+  return cur
+end
+
+local function print_line_tail(beg: isize, lim: isize, line_color: string): isize
+  local eol_size: isize = (lim > beg and buffer[lim - 1] == eolbyte) and 1 or 0
+  if lim - eol_size > beg and buffer[lim - (1 + eol_size)] == 13 then eol_size = eol_size + 1 end
+  local tail_size = lim - eol_size - beg
+  if tail_size > 0 then
+    pr_sgr_start(line_color)
+    fwrite_errno(&buffer[beg], tail_size)
+    beg = beg + tail_size
+    pr_sgr_end(line_color)
+  end
+  return beg
+end
+
+local function prline(beg: isize, lim: isize, sep: byte)
+  if not only_matching then
+    if not print_line_head(beg, lim - beg - 1, lim, sep) then return end
+  end
+  local matching = (sep == SEP_CHAR_SELECTED) ~= out_invert
+  local line_color: string = ''
+  local match_color: string = ''
+  if color_option ~= 0 then
+    line_color = ((sep == SEP_CHAR_SELECTED) ~= (out_invert and color_option < 0)) and selected_line_color or context_line_color
+    match_color = sep == SEP_CHAR_SELECTED and selected_match_color or context_match_color
+  end
+  if (only_matching and matching) or (color_option ~= 0 and (#line_color > 0 or #match_color > 0)) then
+    if matching and (only_matching or #match_color > 0) then
+      beg = print_line_middle(beg, lim, line_color, match_color)
+      if beg < 0 then return end
+    end
+    if not only_matching and #line_color > 0 then beg = print_line_tail(beg, lim, line_color) end
+  end
+  if not only_matching and lim > beg then fwrite_errno(&buffer[beg], lim - beg) end
+  if line_buffered then fflush_errno() end
+  if stdout_errno ~= 0 then die(EXIT_TROUBLE, stdout_errno, 'write error') end
+  lastout = lim
+end
+
+local function next_eol(p: isize): isize
+  while buffer[p] ~= eolbyte do p = p + 1 end
+  return p
+end
+
+local function prpending(lim: isize)
+  if lastout < 0 then lastout = bufbeg end
+  while 0 < pending and lastout < lim do
+    local nl = next_eol(lastout)
+    prline(lastout, nl + 1, SEP_CHAR_REJECTED)
+    pending = pending - 1
+  end
+end
+
+local function prtext(beg: isize, lim: isize)
+  local eol = eolbyte
+  if not out_quiet and pending > 0 then prpending(beg) end
+  local p = beg
+  if not out_quiet then
+    local bp = lastout >= 0 and lastout or bufbeg
+    local i: int64 = 0
+    while i < out_before do
+      if p > bp then
+        repeat p = p - 1 until buffer[p - 1] == eol
+      end
+      i = i + 1
+    end
+    if (0 <= out_before or 0 <= out_after) and used and p ~= lastout and has_group_separator then
+      pr_sgr_start_if(sep_color)
+      fputs_errno(group_separator)
+      pr_sgr_end_if(sep_color)
+      putchar_errno(10)
+    end
+    while p < beg do
+      local nl = next_eol(p) + 1
+      prline(p, nl, SEP_CHAR_REJECTED)
+      p = nl
+    end
+  end
+  local n: int64 = 0
+  if out_invert then
+    while p < lim and n < outleft do
+      local nl = next_eol(p) + 1
+      if not out_quiet then prline(p, nl, SEP_CHAR_SELECTED) end
+      p = nl
+      n = n + 1
+    end
+  else
+    if not out_quiet then prline(beg, lim, SEP_CHAR_SELECTED) end
+    n = 1
+    p = lim
+  end
+  after_last_match = bufoffset - (buflim - p)
+  pending = 0
+  if not out_quiet and out_after > 0 then pending = out_after end
+  used = true
+  outleft = outleft - n
+end
+
+local function zap_nuls(p: isize, lim: isize, eol: byte)
+  if eol ~= 0 then
+    for i = p, < lim do if buffer[i] == 0 then buffer[i] = eol end end
+    buffer[lim] = eol
+  end
+end
+
+local function grepbuf(beg: isize, lim: isize): int64
+  local outleft0 = outleft
+  local p = beg
+  while p < lim do
+    local match_size: isize = 0
+    local match_offset = execute(buffer, p, lim - p, &match_size, -1)
+    if match_offset < 0 then
+      if not out_invert then break end
+      match_offset = lim - p
+      match_size = 0
+    end
+    local b = p + match_offset
+    local endp = b + match_size
+    if not out_invert and b == lim then break end
+    if not out_invert or p < b then
+      local prbeg = out_invert and p or b
+      local prend = out_invert and b or endp
+      prtext(prbeg, prend)
+      if outleft == 0 or done_on_match then
+        if exit_on_match then gexit(errseen and exit_failure or 0) end
+        break
+      end
+    end
+    p = endp
+  end
+  return outleft0 - outleft
+end
+
+local function buf_has_nulls(p: isize, n: isize): boolean
+  buffer[p + n] = 0
+  for i = p, < p + n do if buffer[i] == 0 then return true end end
+  return false
+end
+
+local function file_must_have_nulls(size: isize, fd: cint, st: *sys.Stat): boolean
+  if not seek_failed and usable_st_size(st) and size < st.st_size then
+    local cur: int64 = size
+    if fd == 0 then
+      cur = sys.lseek(fd, 0, SEEK_CUR)
+      if cur < 0 then return false end
+    end
+    local hole_start: int64 = sys.lseek(fd, cur, SEEK_HOLE)
+    if 0 <= hole_start then
+      if sys.lseek(fd, cur, SEEK_SET) < 0 then suppressible_error(sys.errno()) end
+      if hole_start < st.st_size then return true end
+    end
+  end
+  return false
+end
+
+local function grep(fd: cint, st: *sys.Stat, ineof: *boolean): int64
+  local nlines: int64 = 0
+  local residue: isize = 0
+  local save: isize = 0
+  local eol = eolbyte
+  local nul_zapper: byte = 0
+  local done_on_match_0 = done_on_match
+  local out_quiet_0 = out_quiet
+  local nlines_first_null: int64 = -1
+  if not reset(fd, st) then return 0 end
+  totalcc = 0
+  lastout = -1
+  totalnl = 0
+  outleft = max_count
+  after_last_match = 0
+  pending = 0
+  skip_nuls = skip_empty_lines and eol == 0
+  if not fillbuf(save, st) then
+    suppressible_error(read_errno)
+    return 0
+  end
+  offset_width = 0
+  if align_tabs then
+    local num: int64 = usable_st_size(st) and st.st_size or INTMAX_MAX
+    if out_line and num < INTMAX_MAX then num = num + 1 end
+    repeat offset_width = offset_width + 1; num = num // 10 until num == 0
+  end
+  local firsttime = true
+  local finished = false
+  while true do
+    if nlines_first_null < 0 and eol ~= 0 and binary_files ~= TEXT_BINARY_FILES
+       and (buf_has_nulls(bufbeg, buflim - bufbeg) or (firsttime and file_must_have_nulls(buflim - bufbeg, fd, st))) then
+      if binary_files == WITHOUT_MATCH_BINARY_FILES then return 0 end
+      if not count_matches then
+        done_on_match = true
+        out_quiet = true
+      end
+      nlines_first_null = nlines
+      nul_zapper = eol
+      skip_nuls = skip_empty_lines
+    end
+    firsttime = false
+    lastnl = bufbeg
+    if lastout >= 0 then lastout = bufbeg end
+    local beg = bufbeg + save
+    if beg == buflim then
+      $ineof = true
+      break
+    end
+    zap_nuls(beg, buflim, nul_zapper)
+    local oldc = buffer[beg - 1]
+    buffer[beg - 1] = eol
+    local lim = buflim - 1
+    while buffer[lim] ~= eol do lim = lim - 1 end
+    lim = lim + 1
+    buffer[beg - 1] = oldc
+    if lim == beg then lim = beg - residue end
+    beg = beg - residue
+    residue = buflim - lim
+    if beg < lim then
+      if outleft ~= 0 then nlines = nlines + grepbuf(beg, lim) end
+      if pending ~= 0 then prpending(lim) end
+      local nfn: int64 = nlines_first_null > 0 and nlines_first_null or 0
+      if (outleft == 0 and pending == 0) or (done_on_match and nfn < nlines) then
+        finished = true
+        break
+      end
+    end
+    local i: int64 = 0
+    beg = lim
+    while i < out_before and beg > bufbeg and beg ~= lastout do
+      i = i + 1
+      repeat beg = beg - 1 until buffer[beg - 1] == eol
+    end
+    if beg ~= lastout then lastout = -1 end
+    save = residue + lim - beg
+    if out_byte then totalcc = totalcc + (buflim - bufbeg - save) end
+    if out_line then nlscan(beg) end
+    if not fillbuf(save, st) then
+      suppressible_error(read_errno)
+      finished = true
+      break
+    end
+  end
+  if not finished and residue ~= 0 then
+    buffer[buflim] = eol
+    buflim = buflim + 1
+    if outleft ~= 0 then nlines = nlines + grepbuf(bufbeg + save - residue, buflim) end
+    if pending ~= 0 then prpending(buflim) end
+  end
+  done_on_match = done_on_match_0
+  out_quiet = out_quiet_0
+  if binary_files == BINARY_BINARY_FILES and not out_quiet
+     and 0 <= nlines_first_null and nlines_first_null < nlines then
+    gerror(input_filename() .. ': binary file matches', 0)
+  end
+  return nlines
+end
+
+local function grepfile(dirdesc: cint, name: string, follow: boolean, command_line: boolean): boolean <forwarddecl> end
+local function grepdesc(desc: cint, command_line: boolean): boolean <forwarddecl> end
+
+local function grepdirent(sp: *fts.FTS, ent: *fts.Ent, command_line: boolean): boolean
+  command_line = command_line and ent.level == 0
+  if ent.info == fts.DP then return true end
+  if not command_line and skipped_file(ent.name, false,
+       ent.info == fts.D or ent.info == fts.DC or ent.info == fts.DNR) then
+    fts.set(ent, fts.SKIP)
+    return true
+  end
+  filename = ent.path
+  has_filename = true
+  if omit_dot_slash and #filename > 1 then filename = filename:sub(3) end
+  local follow = (sp.options & fts.LOGICAL) ~= 0 or ((sp.options & fts.COMFOLLOW) ~= 0 and command_line)
+  local info = ent.info
+  if info == fts.D then
+    if directories == RECURSE_DIRECTORIES then return true end
+    fts.set(ent, fts.SKIP)
+  elseif info == fts.DC then
+    if not suppress_errors then gerror(filename .. ': warning: recursive directory loop', 0) end
+    return true
+  elseif info == fts.DNR or info == fts.ERR or info == fts.NS then
+    suppressible_error(ent.err)
+    return true
+  elseif info == fts.DEFAULT or info == fts.NSOK then
+    if skip_devices(command_line) then
+      local st: sys.Stat = ent.st
+      if st.st_mode == 0 then
+        local flag: cint = follow and 0 or sys.AT_SYMLINK_NOFOLLOW
+        if c_fstatat(sys.AT_FDCWD, cpath(ent.path), &st, flag) ~= 0 then
+          suppressible_error(sys.errno())
+          return true
+        end
+      end
+      if is_device_mode(st.st_mode) then return true end
+    end
+  elseif info == fts.SL then
+    return true
+  end
+  return grepfile(sys.AT_FDCWD, ent.path, follow, command_line)
+end
+
+function grepfile(dirdesc: cint, name: string, follow: boolean, command_line: boolean): boolean
+  local oflag: cint = sys.O_RDONLY | O_NOCTTY | (follow and 0 or sys.O_NOFOLLOW)
+    | (skip_devices(command_line) and O_NONBLOCK or 0)
+  local desc = c_openat(dirdesc, cpath(name), oflag, 0)
+  if desc < 0 then
+    local e = sys.errno()
+    if follow or not (e == ELOOP or e == EMLINK) then suppressible_error(e) end
+    return true
+  end
+  return grepdesc(desc, command_line)
+end
+
+local function drain_input(fd: cint): boolean
+  while true do
+    local n = safe_read(fd, buffer, bufalloc)
+    if n == 0 then return true end
+    if n < 0 then return false end
+  end
+  return true
+end
+
+local function finalize_input(fd: cint, st: *sys.Stat, ineof: boolean)
+  if fd ~= 0 then return end
+  local fail = false
+  if outleft ~= 0 then
+    if not ineof then
+      local need = seek_failed
+      if not need then
+        if sys.lseek(fd, 0, SEEK_END) < 0 and sys.errno() ~= EINVAL then need = true end
+      end
+      if need and not drain_input(fd) then fail = true end
+    end
+  else
+    if bufoffset ~= after_last_match and not seek_failed and sys.lseek(fd, after_last_match, SEEK_SET) < 0 then
+      fail = true
+    end
+  end
+  if fail then suppressible_error(sys.errno()) end
+end
+
+local function printf_count(count: int64)
+  local s = string.format('%d\n', count)
+  fputs_errno(s)
+  s:destroy()
+end
+
+function grepdesc(desc: cint, command_line: boolean): boolean
+  local status = true
+  local ineof = false
+  local st: sys.Stat
+  local isdir = false
+  if sys.fstat(desc, &st) ~= 0 then
+    suppressible_error(sys.errno())
+    goto closeout
+  end
+  isdir = (st.st_mode & sys.S_IFMT) == sys.S_IFDIR
+  if desc ~= 0 and skip_devices(command_line) and is_device_mode(st.st_mode) then goto closeout end
+  if desc ~= 0 and command_line and skipped_file(filename, true, isdir) then goto closeout end
+  if out_file < 0 then out_file = isdir and 1 or 0 end
+  if desc ~= 0 and directories == RECURSE_DIRECTORIES and isdir then
+    local opts = fts_options
+    if not command_line then opts = opts & ~fts.COMFOLLOW end
+    if sys.close(desc) ~= 0 then suppressible_error(sys.errno()) end
+    local args: sequence(string)
+    args:push(filename)
+    local sp = fts.open(args, opts)
+    while true do
+      local ent = fts.read(&sp)
+      if ent == nilptr then break end
+      if not grepdirent(&sp, ent, command_line) then status = false end
+    end
+    return status
+  end
+  if desc ~= 0 and ((directories == SKIP_DIRECTORIES and isdir)
+     or ((devices == SKIP_DEVICES or (devices == READ_COMMAND_LINE_DEVICES and not command_line))
+         and is_device_mode(st.st_mode))) then
+    goto closeout
+  end
+  if not out_quiet and list_files == LISTFILES_NONE and 1 < max_count
+     and (st.st_mode & sys.S_IFMT) == sys.S_IFREG and st.st_ino == out_stat.st_ino and st.st_dev == out_stat.st_dev then
+    if not suppress_errors then gerror(input_filename() .. ': input file is also the output', 0) end
+    errseen = true
+    goto closeout
+  end
+  do
+    local count = grep(desc, &st, &ineof)
+    if count_matches then
+      if out_file ~= 0 then
+        print_filename()
+        if filename_mask ~= 0 then print_sep(SEP_CHAR_SELECTED) else putchar_errno(0) end
+      end
+      printf_count(count)
+      if line_buffered then fflush_errno() end
+    end
+    status = count == 0
+    if list_files == LISTFILES_NONE then
+      finalize_input(desc, &st, ineof)
+    elseif list_files == (status and LISTFILES_NONMATCHING or LISTFILES_MATCHING) then
+      print_filename()
+      putchar_errno(10 & filename_mask)
+      if line_buffered then fflush_errno() end
+    end
+  end
+::closeout::
+  if desc ~= 0 and sys.close(desc) ~= 0 then suppressible_error(sys.errno()) end
+  return status
+end
+
+local function grep_command_line_arg(arg: string): boolean
+  if arg == '-' then
+    filename = label
+    has_filename = has_label
+    return grepdesc(0, true)
+  end
+  filename = arg
+  has_filename = true
+  return grepfile(sys.AT_FDCWD, arg, true, true)
+end
+
+------------------------------------------------------------------------------
+-- main
+------------------------------------------------------------------------------
+
+local function usage(status: cint)
+  if status ~= 0 then
+    local m = "Usage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.\n"
+    oflush_buf()
+    sys.write(2, m.data, m.size)
+  else
+    fputs_errno([[
+Usage: grep [OPTION]... PATTERNS [FILE]...
+Search for PATTERNS in each FILE.
+Example: grep -i 'hello world' menu.h main.c
+PATTERNS can contain multiple patterns separated by newlines.
+
+Pattern selection and interpretation:
+  -E, --extended-regexp     PATTERNS are extended regular expressions
+  -F, --fixed-strings       PATTERNS are strings
+  -G, --basic-regexp        PATTERNS are basic regular expressions
+  -P, --perl-regexp         PATTERNS are Perl regular expressions
+  -e, --regexp=PATTERNS     use PATTERNS for matching
+  -f, --file=FILE           take PATTERNS from FILE
+  -i, --ignore-case         ignore case distinctions in patterns and data
+      --no-ignore-case      do not ignore case distinctions (default)
+  -w, --word-regexp         match only whole words
+  -x, --line-regexp         match only whole lines
+  -z, --null-data           a data line ends in 0 byte, not newline
+
+Miscellaneous:
+  -s, --no-messages         suppress error messages
+  -v, --invert-match        select non-matching lines
+  -V, --version             display version information and exit
+      --help                display this help text and exit
+
+Output control:
+  -m, --max-count=NUM       stop after NUM selected lines
+  -b, --byte-offset         print the byte offset with output lines
+  -n, --line-number         print line number with output lines
+      --line-buffered       flush output on every line
+  -H, --with-filename       print file name with output lines
+  -h, --no-filename         suppress the file name prefix on output
+      --label=LABEL         use LABEL as the standard input file name prefix
+  -o, --only-matching       show only nonempty parts of lines that match
+  -q, --quiet, --silent     suppress all normal output
+      --binary-files=TYPE   assume that binary files are TYPE;
+                            TYPE is 'binary', 'text', or 'without-match'
+  -a, --text                equivalent to --binary-files=text
+  -I                        equivalent to --binary-files=without-match
+  -d, --directories=ACTION  how to handle directories;
+                            ACTION is 'read', 'recurse', or 'skip'
+  -D, --devices=ACTION      how to handle devices, FIFOs and sockets;
+                            ACTION is 'read' or 'skip'
+  -r, --recursive           like --directories=recurse
+  -R, --dereference-recursive  likewise, but follow all symlinks
+      --include=GLOB        search only files that match GLOB (a file pattern)
+      --exclude=GLOB        skip files that match GLOB
+      --exclude-from=FILE   skip files that match any file pattern from FILE
+      --exclude-dir=GLOB    skip directories that match GLOB
+  -L, --files-without-match  print only names of FILEs with no selected lines
+  -l, --files-with-matches  print only names of FILEs with selected lines
+  -c, --count               print only a count of selected lines per FILE
+  -T, --initial-tab         make tabs line up (if needed)
+  -Z, --null                print 0 byte after FILE name
+
+Context control:
+  -B, --before-context=NUM  print NUM lines of leading context
+  -A, --after-context=NUM   print NUM lines of trailing context
+  -C, --context=NUM         print NUM lines of output context
+  -NUM                      same as --context=NUM
+      --group-separator=SEP  print SEP on line between matches with context
+      --no-group-separator  do not print separator for matches with context
+      --color[=WHEN],
+      --colour[=WHEN]       use markers to highlight the matching strings;
+                            WHEN is 'always', 'never', or 'auto'
+  -U, --binary              do not strip CR characters at EOL (MSDOS/Windows)
+
+When FILE is '-', read standard input.  With no FILE, read '.' if
+recursive, '-' otherwise.  With fewer than two FILEs, assume -h.
+Exit status is 0 if any line is selected, 1 otherwise;
+if any error occurs and -q is not given, the exit status is 2.
+]])
+  end
+  gexit(status)
+end
+
+-- context_length_arg: a nonnegative decimal (an overflow saturates)
+local function context_length_arg(str: string): int64
+  local st, v = util.xstrtoimax_base(str, 10, '')
+  if (st == 0 or st == 1) and 0 <= v then return v end
+  die(EXIT_TROUBLE, 0, str .. ': invalid context length argument')
+  return 0
+end
+
+-- the patterns, each followed by a newline, with duplicates removed
+local keys: stringbuilder
+local have_keys = false
+local n_patterns: integer = 0
+local pattern_table: hashmap(string, boolean)
+
+local function update_patterns(text: string, fname: string)
+  local fileline = 1
+  local prev_inserted = false
+  local i: isize = 0
+  local n: isize = (@isize)(text.size)
+  while i < n do
+    local j = i
+    while text.data[j] ~= 10 do j = j + 1 end
+    local pat = text:sub(i + 1, j)
+    local inserted = pattern_table:peek(pat) == nilptr
+    if inserted then
+      pattern_table[pat] = true
+      keys:write(pat)
+      keys:writebyte(10)
+      if not prev_inserted then
+        patloc:push({lineno = n_patterns, filename = fname, fileline = fileline})
+      end
+      n_patterns = n_patterns + 1
+    end
+    prev_inserted = inserted
+    fileline = fileline + 1
+    i = j + 1
+  end
+end
+
+local function setmatcher(m: string, matcher: integer): integer
+  local names: []string = {'grep', 'egrep', 'fgrep', 'awk', 'gawk', 'posixawk'}
+  for i = 0, < #names do
+    if m == names[i] then
+      if 0 <= matcher and matcher ~= i then die(EXIT_TROUBLE, 0, 'conflicting matchers specified') end
+      return i
+    end
+  end
+  if m == 'perl' then die(EXIT_TROUBLE, 0, 'Perl matching not supported in a --disable-perl-regexp build') end
+  die(EXIT_TROUBLE, 0, 'invalid matcher ' .. m)
+  return -1
+end
+
+local function try_fgrep_pattern(matcher: integer, keysp: *string): integer
+  local k = $keysp
+  local sb: stringbuilder
+  local q: isize = 0
+  local len: isize = (@isize)(k.size)
+  while len ~= 0 do
+    local c = k.data[q]
+    if c == 36 or c == 42 or c == 46 or c == 91 or c == 94 then sb:destroy(); return matcher end
+    if (c == 40 or c == 43 or c == 63 or c == 123 or c == 124) and matcher ~= G_MATCHER_INDEX then
+      sb:destroy(); return matcher
+    end
+    if c == 92 and 1 < len then
+      local c2 = k.data[q + 1]
+      if c2 == 10 or c2 == 66 or c2 == 83 or c2 == 87 or c2 == 39 or c2 == 60 or c2 == 98
+         or c2 == 115 or c2 == 119 or c2 == 96 or c2 == 62 or (c2 >= 49 and c2 <= 57) then
+        sb:destroy(); return matcher
+      end
+      if (c2 == 40 or c2 == 43 or c2 == 63 or c2 == 123 or c2 == 124 or c2 == 41) and matcher == G_MATCHER_INDEX then
+        sb:destroy(); return matcher
+      end
+      q = q + 1; len = len - 1
+    end
+    sb:writebyte(k.data[q])
+    q = q + 1; len = len - 1
+  end
+  $keysp = sb:promote()
+  return F_MATCHER_INDEX
+end
+
+-- parse_grep_colors: GREP_COLORS, applied as far as it is well formed.
+-- ISUSER tracks whether the match colors are still GREP_COLOR's value.
+local function parse_grep_colors(p: string, isuser: *[2]boolean)
+  if #p == 0 then return end
+  local i: isize = 0
+  local n: isize = (@isize)(p.size)
+  local name_start: isize = 0
+  local val_start: isize = -1
+  while true do
+    local c: byte = i < n and p.data[i] or 0
+    if c == 58 or c == 0 then
+      local name: string
+      local val: string
+      if val_start >= 0 then
+        name = p:sub(name_start + 1, val_start - 1)
+        val = p:sub(val_start + 1, i)
+      else
+        name = p:sub(name_start + 1, i)
+      end
+      local has_val = val_start >= 0
+      if name == 'mt' then
+        if has_val then selected_match_color = val; isuser[0] = false end
+        context_match_color = selected_match_color
+        isuser[1] = isuser[0]
+      elseif name == 'ms' then if has_val then selected_match_color = val; isuser[0] = false end
+      elseif name == 'mc' then if has_val then context_match_color = val; isuser[1] = false end
+      elseif name == 'fn' then if has_val then filename_color = val end
+      elseif name == 'ln' then if has_val then line_num_color = val end
+      elseif name == 'bn' then if has_val then byte_num_color = val end
+      elseif name == 'se' then if has_val then sep_color = val end
+      elseif name == 'sl' then if has_val then selected_line_color = val end
+      elseif name == 'cx' then if has_val then context_line_color = val end
+      elseif name == 'rv' then color_option = -1
+      elseif name == 'ne' then sgr_el = false end
+      if c == 0 then return end
+      i = i + 1
+      name_start = i
+      val_start = -1
+    elseif c == 61 then
+      if i == name_start or val_start >= 0 then return end
+      i = i + 1
+      val_start = i
+    elseif val_start < 0 then
+      i = i + 1
+    elseif c == 59 or c_isdigit(c) then
+      i = i + 1
+    else
+      return
+    end
+  end
+end
+
+local BINARY_FILES_OPTION <comptime> = 256
+local COLOR_OPTION <comptime> = 257
+local EXCLUDE_DIRECTORY_OPTION <comptime> = 258
+local EXCLUDE_OPTION <comptime> = 259
+local EXCLUDE_FROM_OPTION <comptime> = 260
+local GROUP_SEPARATOR_OPTION <comptime> = 261
+local INCLUDE_OPTION <comptime> = 262
+local LINE_BUFFERED_OPTION <comptime> = 263
+local LABEL_OPTION <comptime> = 264
+local NO_IGNORE_CASE_OPTION <comptime> = 265
+local HELP_OPTION <comptime> = 266
+local NO_GROUP_SEPARATOR_OPTION <comptime> = 267
+
+local long_options: []util.LongOpt = {
+  {'basic-regexp', 0, 71}, {'extended-regexp', 0, 69}, {'fixed-regexp', 0, 70}, {'fixed-strings', 0, 70},
+  {'perl-regexp', 0, 80}, {'after-context', 1, 65}, {'before-context', 1, 66},
+  {'binary-files', 1, BINARY_FILES_OPTION}, {'byte-offset', 0, 98}, {'context', 1, 67},
+  {'color', 2, COLOR_OPTION}, {'colour', 2, COLOR_OPTION}, {'count', 0, 99}, {'devices', 1, 68},
+  {'directories', 1, 100}, {'exclude', 1, EXCLUDE_OPTION}, {'exclude-from', 1, EXCLUDE_FROM_OPTION},
+  {'exclude-dir', 1, EXCLUDE_DIRECTORY_OPTION}, {'file', 1, 102}, {'files-with-matches', 0, 108},
+  {'files-without-match', 0, 76}, {'group-separator', 1, GROUP_SEPARATOR_OPTION}, {'help', 0, HELP_OPTION},
+  {'include', 1, INCLUDE_OPTION}, {'ignore-case', 0, 105}, {'no-ignore-case', 0, NO_IGNORE_CASE_OPTION},
+  {'initial-tab', 0, 84}, {'label', 1, LABEL_OPTION}, {'line-buffered', 0, LINE_BUFFERED_OPTION},
+  {'line-number', 0, 110}, {'line-regexp', 0, 120}, {'max-count', 1, 109},
+  {'no-filename', 0, 104}, {'no-group-separator', 0, NO_GROUP_SEPARATOR_OPTION}, {'no-messages', 0, 115},
+  {'null', 0, 90}, {'null-data', 0, 122}, {'only-matching', 0, 111}, {'quiet', 0, 113},
+  {'recursive', 0, 114}, {'dereference-recursive', 0, 82}, {'regexp', 1, 101}, {'invert-match', 0, 118},
+  {'silent', 0, 113}, {'text', 0, 97}, {'binary', 0, 85}, {'unix-byte-offsets', 0, 117},
+  {'version', 0, 86}, {'with-filename', 0, 72}, {'word-regexp', 0, 119},
+}
+
+-- read a whole file (or standard input) for -f and --exclude-from
+local function slurp(path: string): (string, boolean, cint)
+  local fd: cint = 0
+  if path ~= '-' then
+    fd = sys.open(cpath(path), sys.O_RDONLY, 0)
+    if fd < 0 then return '', false, sys.errno() end
+  end
+  local sb: stringbuilder
+  local chunk: [65536]byte
+  while true do
+    local r = sys.read(fd, &chunk[0], #chunk)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      local e = sys.errno()
+      if fd ~= 0 then sys.close(fd) end
+      return '', false, e
+    end
+    if r == 0 then break end
+    sb:write((@string){data = &chunk[0], size = (@usize)(r)})
+  end
+  if fd ~= 0 then sys.close(fd) end
+  return sb:promote(), true, 0
+end
+
+global function applet_grep(args: sequence(string)): integer
+  local matcher: integer = -1
+  local default_context: int64 = -1
+  local filename_option = 0
+  local last_recursive = 0
+  exit_failure = EXIT_TROUBLE
+  stray_warn = sys.getenv('DEB_GREP_ENABLE_STRAY_BACKSLASH_WARN') ~= nilptr
+
+  local gg = util.getopt(args, '0123456789A:B:C:D:EFGHIPTUVX:abcd:e:f:hiLlm:noqRrsuvwxyZz', &long_options, #long_options)
+  gg.quiet = true
+  -- get_nondigit_option: digits within one argument accumulate into a
+  -- context length
+  local digits: stringbuilder
+  local ndigits = 0
+  local was_digit = false
+  local last_elem: integer = -1
+  local overflowed = false
+  while true do
+    local opt = gg:next()
+    if opt >= 48 and opt <= 57 then
+      if not (was_digit and gg.arg_index == last_elem) then
+        digits:clear(); ndigits = 0
+      elseif ndigits == 1 and digits:view():byte(1) == 48 then
+        digits:clear(); ndigits = 0
+      end
+      if ndigits == 21 then
+        digits:write('...')
+        context_length_arg(digits:promote())
+      end
+      digits:writebyte((@byte)(opt)); ndigits = ndigits + 1
+      was_digit = true
+      last_elem = gg.arg_index
+      continue
+    end
+    if ndigits > 0 then
+      default_context = context_length_arg(digits:view())
+      digits:clear(); ndigits = 0
+    end
+    was_digit = false
+    if opt == -1 then break end
+    if opt == 63 then
+      if #gg.errmsg > 0 then gerror(gg.errmsg, 0) end
+      usage(EXIT_TROUBLE)
+    end
+    local optarg = gg.optarg
+    if opt == 65 then out_after = context_length_arg(optarg)
+    elseif opt == 66 then out_before = context_length_arg(optarg)
+    elseif opt == 67 then default_context = context_length_arg(optarg)
+    elseif opt == 68 then
+      if optarg == 'read' then devices = READ_DEVICES
+      elseif optarg == 'skip' then devices = SKIP_DEVICES
+      else die(EXIT_TROUBLE, 0, 'unknown devices method') end
+    elseif opt == 69 then matcher = setmatcher('egrep', matcher)
+    elseif opt == 70 then matcher = setmatcher('fgrep', matcher)
+    elseif opt == 80 then matcher = setmatcher('perl', matcher)
+    elseif opt == 71 then matcher = setmatcher('grep', matcher)
+    elseif opt == 88 then matcher = setmatcher(optarg, matcher)
+    elseif opt == 72 then filename_option = 1
+    elseif opt == 73 then binary_files = WITHOUT_MATCH_BINARY_FILES
+    elseif opt == 84 then align_tabs = true
+    elseif opt == 85 then -- -U: O_BINARY is 0
+    elseif opt == 117 then gerror('warning: --unix-byte-offsets (-u) is obsolete', 0)
+    elseif opt == 86 then show_version = true
+    elseif opt == 97 then binary_files = TEXT_BINARY_FILES
+    elseif opt == 98 then out_byte = true
+    elseif opt == 99 then count_matches = true
+    elseif opt == 100 then
+      local names: []string = {'read', 'recurse', 'skip'}
+      local values: []integer = {READ_DIRECTORIES, RECURSE_DIRECTORIES, SKIP_DIRECTORIES}
+      local v = util.argmatch('--directories', optarg, &names, &values, 3)
+      if v < 0 then usage(1) end
+      directories = v
+      if directories == RECURSE_DIRECTORIES then last_recursive = 1 end
+    elseif opt == 101 then
+      local t = optarg .. '\n'
+      have_keys = true
+      update_patterns(t, '')
+    elseif opt == 102 then
+      local data, ok, e = slurp(optarg)
+      if not ok then die(EXIT_TROUBLE, e, optarg) end
+      have_keys = true
+      if #data > 0 and data:byte(-1) ~= 10 then data = data .. '\n' end
+      update_patterns(data, string.copy(optarg))
+    elseif opt == 104 then filename_option = -1
+    elseif opt == 105 or opt == 121 then match_icase = true
+    elseif opt == NO_IGNORE_CASE_OPTION then match_icase = false
+    elseif opt == 76 then list_files = LISTFILES_NONMATCHING
+    elseif opt == 108 then list_files = LISTFILES_MATCHING
+    elseif opt == 109 then
+      local st, v = util.xstrtoimax_base(optarg, 10, '')
+      if st ~= 0 and st ~= 1 then die(EXIT_TROUBLE, 0, 'invalid max count') end
+      max_count = v
+    elseif opt == 110 then out_line = true
+    elseif opt == 111 then only_matching = true
+    elseif opt == 113 then exit_on_match = true; exit_failure = 0
+    elseif opt == 82 or opt == 114 then
+      if opt == 82 then fts_options = basic_fts_options | fts.LOGICAL end
+      directories = RECURSE_DIRECTORIES
+      last_recursive = 1
+    elseif opt == 115 then suppress_errors = true
+    elseif opt == 118 then out_invert = true
+    elseif opt == 119 then match_words = true
+    elseif opt == 120 then match_lines = true
+    elseif opt == 90 then filename_mask = 0
+    elseif opt == 122 then eolbyte = 0
+    elseif opt == BINARY_FILES_OPTION then
+      if optarg == 'binary' then binary_files = BINARY_BINARY_FILES
+      elseif optarg == 'text' then binary_files = TEXT_BINARY_FILES
+      elseif optarg == 'without-match' then binary_files = WITHOUT_MATCH_BINARY_FILES
+      else die(EXIT_TROUBLE, 0, 'unknown binary-files type') end
+    elseif opt == COLOR_OPTION then
+      if gg.has_optarg then
+        local sb: stringbuilder
+        for k = 1, #optarg do sb:writebyte((@byte)(c_tolower(optarg:byte(k)))) end
+        local l = sb:promote()
+        if l == 'always' or l == 'yes' or l == 'force' then color_option = 1
+        elseif l == 'never' or l == 'no' or l == 'none' then color_option = 0
+        elseif l == 'auto' or l == 'tty' or l == 'if-tty' then color_option = 2
+        else show_help = true end
+      else
+        color_option = 2
+      end
+    elseif opt == EXCLUDE_OPTION or opt == INCLUDE_OPTION then
+      for cmd = 0, 1 do
+        add_exclude(&excluded_patterns[cmd], optarg,
+          (opt == INCLUDE_OPTION and EXCLUDE_INCLUDE or 0) | exclude_options(cmd == 1))
+      end
+    elseif opt == EXCLUDE_FROM_OPTION then
+      for cmd = 0, 1 do
+        local data, ok, e = slurp(optarg)
+        if not ok then die(EXIT_TROUBLE, e, optarg) end
+        excluded_patterns[cmd].used = true
+        -- add_exclude_fp with '\n': trailing white space and empty lines dropped
+        local n: isize = (@isize)(data.size)
+        local lim = n
+        if n > 0 and data.data[n - 1] ~= 10 then lim = n + 1 end
+        local start: isize = 0
+        for i = 0, < lim do
+          if i == n or data.data[i] == 10 then
+            local e = i
+            while e > start and c_isspace(data.data[e - 1]) do e = e - 1 end
+            if e > start then
+              add_exclude(&excluded_patterns[cmd], data:sub(start + 1, e), exclude_options(cmd == 1))
+            end
+            start = i + 1
+          end
+        end
+      end
+    elseif opt == EXCLUDE_DIRECTORY_OPTION then
+      local d = optarg
+      local len = #d
+      while len > 1 and d:byte(len) == 47 do len = len - 1 end
+      d = d:sub(1, len)
+      for cmd = 0, 1 do
+        add_exclude(&excluded_directory_patterns[cmd], d, exclude_options(cmd == 1))
+      end
+    elseif opt == GROUP_SEPARATOR_OPTION then
+      group_separator = optarg
+      has_group_separator = true
+    elseif opt == NO_GROUP_SEPARATOR_OPTION then
+      has_group_separator = false
+    elseif opt == LINE_BUFFERED_OPTION then line_buffered = true
+    elseif opt == LABEL_OPTION then label = optarg; has_label = true
+    elseif opt == HELP_OPTION then show_help = true
+    else
+      usage(EXIT_TROUBLE)
+    end
+  end
+  local operands = gg:operands()
+
+  if show_version then
+    fputs_errno('grep (nebox) after GNU grep 3.8\n')
+    gexit(0)
+  end
+  if show_help then usage(0) end
+
+  local pattern: string
+  if have_keys then
+    pattern = keys:promote()
+    if #pattern == 0 then
+      out_invert = not out_invert
+      match_lines = false
+      match_words = false
+      pattern = '\n'
+    end
+  elseif #operands > 0 then
+    local pat = operands[1]
+    operands:remove(1)
+    local skip_bs = matcher ~= F_MATCHER_INDEX and #pat >= 2 and pat:byte(1) == 92 and pat:byte(2) == 45
+    if skip_bs then pat = pat:sub(2) end
+    update_patterns(pat .. '\n', '')
+    pattern = keys:promote()
+  else
+    usage(EXIT_TROUBLE)
+  end
+  -- strip the trailing newline
+  pattern.size = pattern.size - 1
+
+  local possibly_tty = false
+  if not exit_on_match then
+    local tmp: sys.Stat
+    if sys.fstat(1, &tmp) == 0 then
+      local f = tmp.st_mode & sys.S_IFMT
+      if f == sys.S_IFREG then
+        out_stat = tmp
+      elseif f == sys.S_IFCHR then
+        local null_stat: sys.Stat
+        if sys.stat('/dev/null', &null_stat) == 0 and tmp.st_ino == null_stat.st_ino and tmp.st_dev == null_stat.st_dev then
+          dev_null_output = true
+        else
+          possibly_tty = true
+        end
+      end
+    end
+  end
+  if exit_on_match or dev_null_output then list_files = LISTFILES_NONE end
+  if exit_on_match or dev_null_output or list_files ~= LISTFILES_NONE then
+    count_matches = false
+    done_on_match = true
+  end
+  out_quiet = count_matches or done_on_match
+  if out_after < 0 then out_after = default_context end
+  if out_before < 0 then out_before = default_context end
+
+  if (max_count == 0 or (pattern.size == 0 and out_invert and not match_lines and not match_words))
+     and list_files ~= LISTFILES_NONMATCHING then
+    gexit(1)
+  end
+
+  if color_option == 2 then
+    local t = sys.getenv('TERM')
+    color_option = (possibly_tty and t ~= nilptr and (@string)(t) ~= 'dumb' and sys.isatty(1) ~= 0) and 1 or 0
+  end
+  if color_option ~= 0 then
+    local isuser: [2]boolean
+    local userval: string = ''
+    local uv = sys.getenv('GREP_COLOR')
+    if uv ~= nilptr then
+      userval = (@string)(uv)
+      if #userval > 0 then
+        local ok = true
+        for k = 1, #userval do
+          local ch = userval:byte(k)
+          if not (ch == 59 or c_isdigit(ch)) then ok = false; break end
+        end
+        if ok then
+          selected_match_color = userval
+          context_match_color = userval
+          isuser[0] = true
+          isuser[1] = true
+        end
+      end
+    end
+    local gc = sys.getenv('GREP_COLORS')
+    if gc ~= nilptr then parse_grep_colors((@string)(gc), &isuser) end
+    if isuser[0] or isuser[1] then
+      gerror("warning: GREP_COLOR='" .. userval .. "' is deprecated; use GREP_COLORS='mt=" .. userval .. "'", 0)
+    end
+  end
+
+  if matcher < 0 then matcher = G_MATCHER_INDEX end
+  if matcher == F_MATCHER_INDEX then
+    if n_patterns == 1 and match_words then
+      pattern = fgrep_to_grep_pattern(pattern)
+      matcher = G_MATCHER_INDEX
+    end
+  elseif (matcher == E_MATCHER_INDEX or matcher == G_MATCHER_INDEX) and 1 < n_patterns then
+    matcher = try_fgrep_pattern(matcher, &pattern)
+  end
+
+  local exact = only_matching or color_option ~= 0
+  if matcher == F_MATCHER_INDEX then
+    matcher_f = true
+    compiled_kw = Fcompile(pattern)
+  else
+    local syntaxes: []integer = {RE_SYNTAX_GREP, RE_SYNTAX_EGREP, 0, RE_SYNTAX_AWK, RE_SYNTAX_GNU_AWK, RE_SYNTAX_POSIX_AWK}
+    compiled_dfa = GEAcompile(pattern, syntaxes[matcher], exact)
+  end
+  do
+    local eolbytes: [3]byte = {0, eolbyte, 0}
+    local ms: isize = 0
+    skip_empty_lines = (execute(&eolbytes, 1, 1, &ms, -1) == 0) == out_invert
+  end
+
+  local num_operands = #operands
+  if filename_option == 0 and num_operands <= 1 then
+    out_file = directories == RECURSE_DIRECTORIES and -1 or 0
+  else
+    out_file = 0 <= filename_option and 1 or 0
+  end
+
+  local ps = sys.sysconf(30)
+  if ps > 0 then pagesize = ps end
+  bufalloc = INITIAL_BUFSIZE
+  if bufalloc % pagesize ~= 0 then bufalloc = bufalloc + pagesize - bufalloc % pagesize end
+  bufalloc = bufalloc + pagesize + UWORD_SIZE
+  buffer = (@*[0]byte)(c_malloc((@csize)(bufalloc)))
+
+  if (fts_options & fts.LOGICAL) ~= 0 and devices == READ_COMMAND_LINE_DEVICES then devices = READ_DEVICES end
+
+  local files: sequence(string)
+  if 0 < num_operands then
+    files = operands
+  elseif directories == RECURSE_DIRECTORIES and 0 < last_recursive then
+    files:push('.')
+    omit_dot_slash = true
+  else
+    files:push('-')
+  end
+  local status = true
+  for i = 1, #files do
+    if not grep_command_line_arg(files[i]) then status = false end
+  end
+  gexit(errseen and EXIT_TROUBLE or (status and 1 or 0))
+  return 0
+end
