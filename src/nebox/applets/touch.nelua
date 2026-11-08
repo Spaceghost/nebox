@@ -1,0 +1,294 @@
+-- touch: a port of GNU coreutils 9.1 src/touch.c with gnulib posixtm.c
+-- (-t and the obsolete MMDDhhmm[YY] operand under _POSIX2_VERSION < 200112)
+-- and parse_datetime (util.getdate) for -d, relative to the -r file's times
+-- when both are given. -a -c -d -f -h -m -r -t --time, "-" as standard
+-- output, "-d now" treated as no date, and GNU's choice between "cannot
+-- touch" and "setting times of".
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.getdate'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
+local function c_futimens(fd: cint, ts: *[2]sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
+local function c_time(t: *clong): clong <cimport 'time', cinclude '<time.h>'> end
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local UTIME_NOW: clong <comptime> = 0x3fffffff
+local UTIME_OMIT: clong <comptime> = 0x3ffffffe
+local CH_ATIME <comptime> = 1
+local CH_MTIME <comptime> = 2
+
+local PDS_TRAILING_YEAR <comptime> = 1
+local PDS_CENTURY <comptime> = 2
+local PDS_SECONDS <comptime> = 4
+local PDS_PRE_2000 <comptime> = 8
+
+local change_times = 0
+local no_create = false
+local no_dereference = false
+local amtime_now = false
+local newtime: [2]sys.Timespec
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function die(msg: string) util.err(msg); util.flush(); c_exit(1) end
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'touch --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+
+-- posixtm.c year (): N digit pairs of year.
+local function year(tm: *sys.Tm, pair: *[6]integer, at: integer, n: integer, bits: integer): boolean
+  if n == 1 then
+    tm.tm_year = pair[at]
+    if pair[at] <= 68 then
+      if (bits & PDS_PRE_2000) ~= 0 then return false end
+      tm.tm_year = tm.tm_year + 100
+    end
+  elseif n == 2 then
+    if (bits & PDS_CENTURY) == 0 then return false end
+    tm.tm_year = pair[at] * 100 + pair[at + 1] - 1900
+  else
+    local now: clong = c_time(nilptr)
+    local t: sys.Tm
+    if sys.localtime_r(&now, &t) == nilptr then return false end
+    tm.tm_year = t.tm_year
+  end
+  return true
+end
+
+local function posix_time_parse(tm: *sys.Tm, s: string, bits: integer): boolean
+  local s_len = #s
+  local len = s_len
+  local dot = 0
+  if (bits & PDS_SECONDS) ~= 0 then
+    dot = s:find('.', 1, true)
+    if dot > 0 then
+      len = dot - 1
+      if s_len - len ~= 3 then return false end
+    end
+  end
+  if not (8 <= len and len <= 12 and len % 2 == 0) then return false end
+  for i = 1, len do if not isdigit(s:byte(i)) then return false end end
+  len = len // 2
+  local pair: [6]integer
+  for i = 0, len - 1 do pair[i] = 10 * (s:byte(2 * i + 1) - 48) + s:byte(2 * i + 2) - 48 end
+  local p = 0
+  if (bits & PDS_TRAILING_YEAR) == 0 then
+    if not year(tm, &pair, p, len - 4, bits) then return false end
+    p = p + len - 4
+    len = 4
+  end
+  tm.tm_mon = pair[p] - 1
+  tm.tm_mday = pair[p + 1]
+  tm.tm_hour = pair[p + 2]
+  tm.tm_min = pair[p + 3]
+  p = p + 4
+  len = len - 4
+  if (bits & PDS_TRAILING_YEAR) ~= 0 then
+    if not year(tm, &pair, p, len, bits) then return false end
+  end
+  if dot == 0 then tm.tm_sec = 0
+  elseif isdigit(s:byte(dot + 1)) and isdigit(s:byte(dot + 2)) then
+    tm.tm_sec = 10 * (s:byte(dot + 1) - 48) + s:byte(dot + 2) - 48
+  else
+    return false
+  end
+  return true
+end
+
+local function posixtime(s: string, bits: integer): (boolean, int64)
+  local tm0: sys.Tm
+  local leapsec = 0
+  if not posix_time_parse(&tm0, s, bits) then return false, 0 end
+  while true do
+    local tm1: sys.Tm = {}
+    tm1.tm_sec = tm0.tm_sec; tm1.tm_min = tm0.tm_min; tm1.tm_hour = tm0.tm_hour
+    tm1.tm_mday = tm0.tm_mday; tm1.tm_mon = tm0.tm_mon; tm1.tm_year = tm0.tm_year
+    tm1.tm_wday = -1; tm1.tm_isdst = -1
+    local t = sys.mktime(&tm1)
+    if tm1.tm_wday < 0 then return false, 0 end
+    if tm0.tm_year == tm1.tm_year and tm0.tm_mon == tm1.tm_mon and tm0.tm_mday == tm1.tm_mday
+        and tm0.tm_hour == tm1.tm_hour and tm0.tm_min == tm1.tm_min and tm0.tm_sec == tm1.tm_sec then
+      return true, t + leapsec
+    end
+    if tm0.tm_sec ~= 60 then return false, 0 end
+    tm0.tm_sec = 59
+    leapsec = 1
+  end
+  return false, 0
+end
+
+local function get_reldate(result: *sys.Timespec, flex_date: string, now: *sys.Timespec)
+  local t, ns, ok = util.getdate(flex_date, now.tv_sec, now.tv_nsec)
+  if not ok then die('invalid date format ' .. util.quote(flex_date)) end
+  result.tv_sec = t
+  result.tv_nsec = ns
+end
+
+local function touch(file: string): boolean
+  local fd: cint = -1
+  local open_errno: cint = 0
+  if file == '-' then
+    fd = 1
+  elseif not (no_create or no_dereference) then
+    fd = sys.open(file, sys.O_WRONLY | 0x40 | 0x800 | 0x100, 0x1B6)
+    if fd < 0 then open_errno = sys.errno() end
+  end
+  if change_times ~= (CH_ATIME | CH_MTIME) then
+    if change_times == CH_MTIME then newtime[0].tv_nsec = UTIME_OMIT
+    else newtime[1].tv_nsec = UTIME_OMIT end
+  end
+  local r: cint
+  if fd >= 0 then
+    if amtime_now then r = c_futimens(fd, nilptr) else r = c_futimens(fd, &newtime) end
+  else
+    local flags = no_dereference and AT_SYMLINK_NOFOLLOW or 0
+    if amtime_now then r = c_utimensat(AT_FDCWD, file, nilptr, flags) else r = c_utimensat(AT_FDCWD, file, &newtime, flags) end
+  end
+  local utime_errno: cint = r == 0 and 0 or sys.errno()
+  if fd >= 0 and fd ~= 1 then
+    if sys.close(fd) ~= 0 then
+      util.err(errno_msg('failed to close ' .. util.quoteaf(file), sys.errno()))
+      return false
+    end
+  elseif fd == 1 then
+    if utime_errno == 9 and no_create then return true end
+  end
+  if utime_errno ~= 0 then
+    local st: sys.Stat
+    if open_errno ~= 0 and not (open_errno == 21 or (open_errno == 22 and sys.stat(file, &st) == 0 and (st.st_mode & 0xF000) == 0x4000)) then
+      util.err(errno_msg('cannot touch ' .. util.quoteaf(file), open_errno))
+    else
+      if no_create and utime_errno == 2 then return true end
+      util.err(errno_msg('setting times of ' .. util.quoteaf(file), utime_errno))
+    end
+    return false
+  end
+  return true
+end
+
+global function applet_touch(args: sequence(string)): integer
+  local date_set = false
+  local ok = true
+  local flex_date = ''
+  local have_flex = false
+  local use_ref = false
+  local ref_file = ''
+  change_times = 0
+  local longs: []util.LongOpt = {
+    {'time', 1, 256}, {'no-create', 0, 99}, {'date', 1, 100}, {'reference', 1, 114},
+    {'no-dereference', 0, 104}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'acd:fhmr:t:', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 97 then change_times = change_times | CH_ATIME
+    elseif c == 99 then no_create = true
+    elseif c == 100 then flex_date = g.optarg; have_flex = true
+    elseif c == 102 then
+    elseif c == 104 then no_dereference = true
+    elseif c == 109 then change_times = change_times | CH_MTIME
+    elseif c == 114 then use_ref = true; ref_file = g.optarg
+    elseif c == 116 then
+      local okp, t = posixtime(g.optarg, PDS_CENTURY | PDS_SECONDS)
+      if not okp then die('invalid date format ' .. util.quote(g.optarg)) end
+      newtime[0].tv_sec = t; newtime[0].tv_nsec = 0
+      newtime[1] = newtime[0]
+      date_set = true
+    elseif c == 256 then
+      local names: []string = {'atime', 'access', 'use', 'mtime', 'modify'}
+      local values: []integer = {CH_ATIME, CH_ATIME, CH_ATIME, CH_MTIME, CH_MTIME}
+      local v = util.argmatch('--time', g.optarg, &names, &values, 5)
+      if v < 0 then usage_fail('') end
+      change_times = change_times | v
+    end
+  end
+  if change_times == 0 then change_times = CH_ATIME | CH_MTIME end
+  if date_set and (use_ref or have_flex) then usage_fail('cannot specify times from more than one source') end
+  if use_ref then
+    local rs: sys.Stat
+    local r: cint
+    if no_dereference then r = sys.lstat(ref_file, &rs) else r = sys.stat(ref_file, &rs) end
+    if r ~= 0 then die(errno_msg('failed to get attributes of ' .. util.quoteaf(ref_file), sys.errno())) end
+    newtime[0] = rs.st_atim
+    newtime[1] = rs.st_mtim
+    date_set = true
+    if have_flex then
+      if (change_times & CH_ATIME) ~= 0 then local base = newtime[0]; get_reldate(&newtime[0], flex_date, &base) end
+      if (change_times & CH_MTIME) ~= 0 then local base = newtime[1]; get_reldate(&newtime[1], flex_date, &base) end
+    end
+  elseif have_flex then
+    local now: sys.Timespec
+    sys.clock_gettime(0, &now)
+    get_reldate(&newtime[0], flex_date, &now)
+    newtime[1] = newtime[0]
+    date_set = true
+    if change_times == (CH_ATIME | CH_MTIME) and newtime[0].tv_sec == now.tv_sec and newtime[0].tv_nsec == now.tv_nsec then
+      local notnow: sys.Timespec = {tv_sec = now.tv_sec ~ 1, tv_nsec = now.tv_nsec}
+      local notnow1: sys.Timespec
+      get_reldate(&notnow1, flex_date, &notnow)
+      if notnow1.tv_sec == notnow.tv_sec and notnow1.tv_nsec == notnow.tv_nsec then date_set = false end
+    end
+  end
+  local ops = g:operands()
+  local first = 1
+  if not date_set and 2 <= #ops then
+    local pv: int64 = 200809
+    local e = sys.getenv('_POSIX2_VERSION')
+    if e ~= nilptr and #(@string)(e) > 0 then
+      local s = (@string)(e)
+      local neg = s:byte(1) == 45
+      local okn = true
+      local v: int64 = 0
+      for i = neg and 2 or 1, #s do
+        local ch = s:byte(i)
+        if ch < 48 or ch > 57 then okn = false; break end
+        v = v * 10 + ch - 48
+      end
+      if okn then pv = neg and -v or v end
+    end
+    if pv < 200112 then
+      local okp, t = posixtime(ops[1], PDS_TRAILING_YEAR | PDS_PRE_2000)
+      if okp then
+        newtime[0].tv_sec = t; newtime[0].tv_nsec = 0
+        newtime[1] = newtime[0]
+        date_set = true
+        if sys.getenv('POSIXLY_CORRECT') == nilptr then
+          local tt: clong = t
+          local tm: sys.Tm
+          if sys.localtime_r(&tt, &tm) ~= nilptr then
+            util.err(string.format("warning: 'touch %s' is obsolete; use 'touch -t %04d%02d%02d%02d%02d.%02d'",
+              ops[1], tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec))
+          end
+        end
+        first = 2
+      end
+    end
+  end
+  if not date_set then
+    if change_times == (CH_ATIME | CH_MTIME) then amtime_now = true
+    else newtime[0].tv_nsec = UTIME_NOW; newtime[1].tv_nsec = UTIME_NOW end
+  end
+  if first > #ops then usage_fail('missing file operand') end
+  for i = first, #ops do ok = touch(ops[i]) and ok end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end

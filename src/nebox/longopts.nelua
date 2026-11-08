@@ -17,10 +17,6 @@ global longopts.mkdir: []util.LongOpt = {
   {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.touch: []util.LongOpt = {
-  {'time', 1, 200}, {'no-create', 0, 99}, {'date', 1, 100}, {'reference', 1, 114},
-  {'no-dereference', 0, 104}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.sort: []util.LongOpt = {
   {'ignore-leading-blanks', 0, 98}, {'check', 2, 200},
   {'compress-program', 1, util.UNSUPPORTED}, {'debug', 0, util.UNSUPPORTED},

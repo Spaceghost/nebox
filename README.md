@@ -244,6 +244,16 @@ Stated here rather than worked around:
   child, umask 0. `--preserve-context` and `-Z`/`--context` warn as GNU does
   without SELinux. `tests/install_compare.py`: 100 cases, 0 mismatches as an
   ordinary user and as root.
+- `touch` ports touch.c with gnulib posixtm.c (-t, and the obsolete
+  MMDDhhmm[YY] operand when `_POSIX2_VERSION` is below 200112) and
+  parse_datetime (`util.getdate`) for -d, relative to the -r file's times
+  when both are given: -a -c -d -f -h -m -r -t `--time`, "-" for standard
+  output, "-d now" treated as no date. `util.getdate` gained parse-datetime's
+  month names (three-letter or "abc." abbreviations, "sept"), MON D, D MON
+  [Y], D-MON-Y and MON-D-Y, the bare-number rule (a year after a date,
+  YYYYMMDD, else HH or HHMM), am/pm after a bare hour or glued to a time,
+  and a comma as the decimal point in seconds. `tests/touch_compare.py`: 113
+  cases, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

@@ -916,63 +916,6 @@ global function parse_touch_t(s: string): (clong, boolean)
   return t + leap, ok
 end
 
-global function applet_touch(args: sequence(string)): integer
-  local o = util.parsel(args, 'acd:fhmr:t:', &longopts.touch, #longopts.touch)
-  if not o:ok() then return util.optfail(o) end
-  -- --time=WORD: atime/access/use is -a, mtime/modify is -m (XARGMATCH)
-  for idx, k in ipairs(o.keys) do
-    if k == 200 then
-      local names: []string = {'atime', 'access', 'use', 'mtime', 'modify'}
-      local values: []integer = {97, 97, 97, 109, 109}
-      local v = util.argmatch('--time', o.vals[idx], &names, &values, 5)
-      if v < 0 then
-        util.flush()
-        local m = "Try 'touch --help' for more information.\n"
-        sys.write(2, m.data, m.size)
-        return 1
-      end
-      o.set[v] = true
-    end
-  end
-  if #o.operands == 0 then return util.die('missing file operand') end
-  local times: [2]sys.Timespec
-  local have_time = false
-  if o:has('r') then
-    local st: sys.Stat
-    if sys.stat(o:get('r'), &st) ~= 0 then return util.die("failed to get attributes of '" .. o:get('r') .. "': " .. sys.errstr()) end
-    times[0] = st.st_atim; times[1] = st.st_mtim; have_time = true
-  elseif o:has('d') or o:has('t') then
-    local secs: clong, ok: boolean
-    if o:has('d') then secs, ok = parse_datetime(o:get('d')) else secs, ok = parse_touch_t(o:get('t')) end
-    if not ok then return util.die("invalid date format '" .. (o:has('d') and o:get('d') or o:get('t')) .. "'") end
-    times[0].tv_sec = secs; times[1].tv_sec = secs; have_time = true
-    if o:has('d') then
-      local ns = parse_datetime_nsec(o:get('d'))
-      times[0].tv_nsec = ns; times[1].tv_nsec = ns
-    end
-  end
-  if have_time then
-    -- UTIME_OMIT for the time not selected by -a / -m
-    if o:has('a') and not o:has('m') then times[1].tv_nsec = 0x3FFFFFFE end
-    if o:has('m') and not o:has('a') then times[0].tv_nsec = 0x3FFFFFFE end
-  end
-  local rc: integer = 0
-  for _, p in ipairs(o.operands) do
-    if not util.exists(p) then
-      if o:has('c') then continue end
-      local fd = sys.open(p, sys.O_WRONLY | sys.O_CREAT, 0x1B6)
-      if fd < 0 then util.err("cannot touch '" .. p .. "': " .. sys.errstr()); rc = 1; continue end
-      sys.close(fd)
-    end
-    local flags: cint = o:has('h') and sys.AT_SYMLINK_NOFOLLOW or 0
-    local tp: *[2]sys.Timespec = nilptr
-    if have_time then tp = &times end
-    if sys.utimensat(sys.AT_FDCWD, p, tp, flags) ~= 0 then
-      util.err("setting times of '" .. p .. "': " .. sys.errstr()); rc = 1
-    end
-  end
-  return rc
-end
 
 global function copy_file(src: string, dst: string, mode: cuint): boolean
   local ifd = sys.open(src, sys.O_RDONLY, 0)
