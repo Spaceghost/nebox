@@ -419,6 +419,45 @@ function util.xstrtol_msg(st: integer, opt: string, arg: string): string
   return 'invalid ' .. opt .. " argument '" .. arg .. "'"
 end
 
+-- gnulib xstrtoimax: like util.xstrtoumax_base for a signed value; an
+-- overflow saturates at INT64_MIN or INT64_MAX.
+function util.xstrtoimax_base(s: string, base: integer, suffixes: string): (integer, int64)
+  local p = 1
+  while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
+  local neg = false
+  if p <= #s and (s:byte(p) == 45 or s:byte(p) == 43) then neg = s:byte(p) == 45; p = p + 1 end
+  local rest = s:sub(p)
+  if #rest > 0 and (rest:byte(1) == 45 or rest:byte(1) == 43 or rest:byte(1) == 32 or (rest:byte(1) >= 9 and rest:byte(1) <= 13)) then
+    return 2, 0
+  end
+  local st, mag = util.xstrtoumax_base(rest, base, suffixes)
+  if st == 2 then return 2, 0 end
+  local v: int64
+  if neg then
+    if mag > 0x8000000000000000 then if st == 0 then st = 1 end; v = -0x7fffffffffffffff - 1
+    elseif mag == 0x8000000000000000 then v = -0x7fffffffffffffff - 1
+    else v = -(@int64)(mag) end
+    if st == 1 then v = -0x7fffffffffffffff - 1 end
+  else
+    if mag > 0x7fffffffffffffff then if st == 0 then st = 1 end; v = 0x7fffffffffffffff
+    else v = (@int64)(mag) end
+    if st == 1 then v = 0x7fffffffffffffff end
+  end
+  return st, v
+end
+
+-- gnulib xdectoimax: util.xstrtoimax_base (base 10) within [MIN, MAX].
+function util.xdectoimax(s: string, min: int64, max: int64, suffixes: string, msg: string): (boolean, int64, string)
+  local st, v = util.xstrtoimax_base(s, 10, suffixes)
+  local function fail(t: string): (boolean, int64, string) return false, 0, msg .. ': ' .. util.quote(s) .. t end
+  if st >= 2 then return fail('') end
+  if st == 1 then return fail(': Value too large for defined data type') end
+  if v < min or v > max then
+    return fail((v > 0x3fffffff or v < -0x3fffffff) and ': Value too large for defined data type' or ': Numerical result out of range')
+  end
+  return true, v, ''
+end
+
 -- gnulib xdectoumax: util.xstrtoumax within [MIN, MAX]. On failure it
 -- returns false and GNU's message "MSG: 'S'[: strerror]".
 function util.xdectoumax(s: string, min: uint64, max: uint64, suffixes: string, msg: string): (boolean, uint64, string)

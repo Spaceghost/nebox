@@ -254,6 +254,10 @@ Stated here rather than worked around:
   YYYYMMDD, else HH or HHMM), am/pm after a bare hour or glued to a time,
   and a comma as the decimal point in seconds. `tests/touch_compare.py`: 113
   cases, 0 mismatches.
+- `truncate` ports truncate.c: -c -o -r -s with the < > / % + - modifiers,
+  sizes through the new `util.xdectoimax` (gnulib's signed xdectoimax),
+  reference sizes, the overflow and division-by-zero checks.
+  `tests/truncate_compare.py`: 167 cases, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

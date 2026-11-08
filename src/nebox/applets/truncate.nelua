@@ -1,0 +1,197 @@
+-- truncate: a port of GNU coreutils 9.1 src/truncate.c. -c -o -r -s with
+-- the < > / % + - modifiers, gnulib xdectoimax sizes (EgGkKmMPtTYZ and the
+-- B/iB forms), reference sizes, the block-size overflow and rounding checks.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
+
+local RM_ABS <comptime> = 0
+local RM_REL <comptime> = 1
+local RM_MIN <comptime> = 2
+local RM_MAX <comptime> = 3
+local RM_RDN <comptime> = 4
+local RM_RUP <comptime> = 5
+local OFF_MAX: int64 <comptime> = 0x7fffffffffffffff
+local OFF_MIN: int64 <comptime> = -0x7fffffffffffffff - 1
+
+local no_create = false
+local block_mode = false
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function die(msg: string) util.err(msg); util.flush(); c_exit(1) end
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'truncate --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function usable_st_size(st: *sys.Stat): boolean
+  local f = st.st_mode & 0xF000
+  return f == 0x8000 or f == 0xA000
+end
+
+local function do_ftruncate(fd: cint, fname: string, ssize: int64, rsize: int64, rel_mode: integer): boolean
+  local sb: sys.Stat
+  local nsize: int64
+  if (block_mode or (rel_mode ~= RM_ABS and rsize < 0)) and sys.fstat(fd, &sb) ~= 0 then
+    util.err(errno_msg('cannot fstat ' .. util.quoteaf(fname), sys.errno()))
+    return false
+  end
+  if block_mode then
+    local blksize: int64 = sb.st_blksize
+    if blksize <= 0 or blksize > 0x2000000000000000 then blksize = 512 end
+    local ssize0 = ssize
+    local prod = ssize * blksize
+    if ssize ~= 0 and (prod // blksize ~= ssize or (ssize > 0) ~= (prod > 0)) then
+      util.err('overflow in ' .. tostring(ssize0) .. ' * ' .. tostring(blksize) .. ' byte blocks for file ' .. util.quoteaf(fname))
+      return false
+    end
+    ssize = prod
+  end
+  if rel_mode ~= RM_ABS then
+    local fsize: int64
+    if 0 <= rsize then
+      fsize = rsize
+    else
+      if usable_st_size(&sb) then
+        fsize = sb.st_size
+        if fsize < 0 then
+          util.err(util.quoteaf(fname) .. ' has unusable, apparently negative size')
+          return false
+        end
+      else
+        fsize = sys.lseek(fd, 0, 2)
+        if fsize < 0 then
+          util.err(errno_msg('cannot get the size of ' .. util.quoteaf(fname), sys.errno()))
+          return false
+        end
+      end
+    end
+    if rel_mode == RM_MIN then nsize = fsize > ssize and fsize or ssize
+    elseif rel_mode == RM_MAX then nsize = fsize < ssize and fsize or ssize
+    elseif rel_mode == RM_RDN then nsize = fsize - fsize % ssize
+    else
+      if rel_mode == RM_RUP then
+        local r = fsize % ssize
+        ssize = r == 0 and 0 or ssize - r
+      end
+      if (ssize > 0 and fsize > OFF_MAX - ssize) or (ssize < 0 and fsize < OFF_MIN - ssize) then
+        util.err('overflow extending size of file ' .. util.quoteaf(fname))
+        return false
+      end
+      nsize = fsize + ssize
+    end
+  else
+    nsize = ssize
+  end
+  if nsize < 0 then nsize = 0 end
+  if c_ftruncate(fd, nsize) ~= 0 then
+    util.err(errno_msg('failed to truncate ' .. util.quoteaf(fname) .. ' at ' .. tostring(nsize) .. ' bytes', sys.errno()))
+    return false
+  end
+  return true
+end
+
+global function applet_truncate(args: sequence(string)): integer
+  local got_size = false
+  local size: int64 = 0
+  local rsize: int64 = -1
+  local rel_mode = RM_ABS
+  local ref_file = ''
+  local have_ref = false
+  local longs: []util.LongOpt = {
+    {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'cor:s:', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 99 then no_create = true
+    elseif c == 111 then block_mode = true
+    elseif c == 114 then ref_file = g.optarg; have_ref = true
+    elseif c == 115 then
+      local a = g.optarg
+      local p = 1
+      while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+      local ch: byte = p <= #a and a:byte(p) or 0
+      if ch == 60 then rel_mode = RM_MAX; p = p + 1
+      elseif ch == 62 then rel_mode = RM_MIN; p = p + 1
+      elseif ch == 47 then rel_mode = RM_RDN; p = p + 1
+      elseif ch == 37 then rel_mode = RM_RUP; p = p + 1 end
+      while p <= #a and (a:byte(p) == 32 or (a:byte(p) >= 9 and a:byte(p) <= 13)) do p = p + 1 end
+      ch = p <= #a and a:byte(p) or 0
+      if ch == 43 or ch == 45 then
+        if rel_mode ~= RM_ABS then usage_fail('multiple relative modifiers specified') end
+        rel_mode = RM_REL
+      end
+      local ok, v, e = util.xdectoimax(a:sub(p), OFF_MIN, OFF_MAX, 'EgGkKmMPtTYZ0', 'Invalid number')
+      if not ok then die(e) end
+      size = v
+      if (rel_mode == RM_RUP or rel_mode == RM_RDN) and size == 0 then die('division by zero') end
+      got_size = true
+    end
+  end
+  local files = g:operands()
+  if not have_ref and not got_size then
+    usage_fail('you must specify either ' .. util.quote('--size') .. ' or ' .. util.quote('--reference'))
+  end
+  if have_ref and got_size and rel_mode == RM_ABS then
+    usage_fail('you must specify a relative ' .. util.quote('--size') .. ' with ' .. util.quote('--reference'))
+  end
+  if block_mode and not got_size then
+    usage_fail(util.quote('--io-blocks') .. ' was specified but ' .. util.quote('--size') .. ' was not')
+  end
+  if #files < 1 then usage_fail('missing file operand') end
+  if have_ref then
+    local sb: sys.Stat
+    local file_size: int64 = -1
+    if sys.stat(ref_file, &sb) ~= 0 then die(errno_msg('cannot stat ' .. util.quoteaf(ref_file), sys.errno())) end
+    if usable_st_size(&sb) then
+      file_size = sb.st_size
+    else
+      local ref_fd = sys.open(ref_file, sys.O_RDONLY, 0)
+      if 0 <= ref_fd then
+        local file_end = sys.lseek(ref_fd, 0, 2)
+        local saved = sys.errno()
+        sys.close(ref_fd)
+        if 0 <= file_end then file_size = file_end else sys.seterrno(saved) end
+      end
+    end
+    if file_size < 0 then die(errno_msg('cannot get the size of ' .. util.quoteaf(ref_file), sys.errno())) end
+    if not got_size then size = file_size else rsize = file_size end
+  end
+  local oflags = sys.O_WRONLY | (no_create and 0 or 0x40) | 0x800
+  local errors = false
+  for _, fname in ipairs(files) do
+    local fd = sys.open(fname, oflags, 0x1B6)
+    if fd < 0 then
+      if not (no_create and sys.errno() == 2) then
+        util.err(errno_msg('cannot open ' .. util.quoteaf(fname) .. ' for writing', sys.errno()))
+        errors = true
+      end
+    else
+      if not do_ftruncate(fd, fname, size, rsize, rel_mode) then errors = true end
+      if sys.close(fd) ~= 0 then
+        util.err(errno_msg('failed to close ' .. util.quoteaf(fname), sys.errno()))
+        errors = true
+      end
+    end
+  end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return errors and 1 or 0
+end

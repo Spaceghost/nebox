@@ -42,10 +42,6 @@ global longopts.fold: []util.LongOpt = {
   {'bytes', 0, 98}, {'spaces', 0, 115}, {'width', 1, 119}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.truncate: []util.LongOpt = {
-  {'no-create', 0, 99}, {'io-blocks', 0, 111}, {'reference', 1, 114}, {'size', 1, 115},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.uname: []util.LongOpt = {
   {'all', 0, 97}, {'kernel-name', 0, 115}, {'sysname', 0, 115}, {'nodename', 0, 110},
   {'kernel-release', 0, 114}, {'release', 0, 114}, {'kernel-version', 0, 118}, {'machine', 0, 109},
