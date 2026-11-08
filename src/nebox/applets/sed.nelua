@@ -1,7 +1,13 @@
--- sed: a stream editor over nebox's regex engine.
--- Supports -n -e -f -E/-r -s -i[SUFFIX] -z; addresses N, $, /re/[IM], \cREc,
--- first~step, addr,+N, addr,~N, 0,/re/, and !; commands { } s y p P d D n N
--- g G h H x a i c = l q Q r w W b t T : z F e and # comments.
+-- sed: a port of GNU sed 4.9 (sed/sed.c, compile.c, execute.c, regexp.c,
+-- debug.c, utils.c) for the C locale. The script is compiled the way
+-- compile.c reads it (inchar/savchar over each -e string or -f file, with
+-- its error positions), executed as execute.c does, and the stdio
+-- behaviour GNU sees is reproduced: input and output go through FILE-like
+-- buffers of glibc's size (st_blksize, at most 8192) so write errors
+-- surface at the same call with the same message, and a seekable standard
+-- input is left just after the last line consumed. Regular expressions use
+-- regex.compile_posix, a port of glibc's regcomp parser with sed's syntax
+-- bits; GNU's dfa only adds the "[:space:]" diagnostic, done here.
 ## pragmas.nogc = true
 
 require 'string'
@@ -11,887 +17,2723 @@ require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.regex'
 
-local ADDR_NONE: byte <comptime> = 0
-local ADDR_LINE: byte <comptime> = 1
-local ADDR_LAST: byte <comptime> = 2
-local ADDR_RE: byte <comptime> = 3
-local ADDR_STEP: byte <comptime> = 4
-local ADDR_PLUS: byte <comptime> = 5
-local ADDR_MULT: byte <comptime> = 6
+local function c_realloc(p: pointer, n: csize): pointer <cimport 'realloc', cinclude '<stdlib.h>'> end
+local function c_memcpy(d: pointer, s: pointer, n: csize): pointer <cimport 'memcpy', cinclude '<string.h>'> end
+local function c_memmove(d: pointer, s: pointer, n: csize): pointer <cimport 'memmove', cinclude '<string.h>'> end
+local function c_mkstemp(t: cstring): cint <cimport 'mkstemp', cinclude '<stdlib.h>'> end
+local function c_fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
+local function c_fchown(fd: cint, uid: cuint, gid: cuint): cint <cimport 'fchown', cinclude '<unistd.h>'> end
 
-local Addr = @record{ kind: byte, line: integer, step: integer, re: regex.Prog, has_re: boolean }
+local EXIT_BAD_USAGE: integer <comptime> = 1
+local EXIT_BAD_INPUT: integer <comptime> = 2
+local EXIT_PANIC: integer <comptime> = 4
+local EOF: integer <comptime> = -1
+local EBADF: cint <comptime> = 9
+local EINVAL: cint <comptime> = 22
+local ESPIPE: cint <comptime> = 29
+local ELOOP: cint <comptime> = 40
 
-local Cmd = @record{
-  a1: Addr, a2: Addr, negate: boolean,
-  name: byte,
-  text: string,          -- a/i/c text, label, file name, y target
-  re: regex.Prog, has_re: boolean,   -- s regex
-  repl: string,          -- s replacement (raw, with \N and &)
-  allm: boolean, print: integer, nth: integer, wfile: string,
-  eval: boolean,         -- s///e
+local Bytes = @*[0]byte
 
-  ymap: [256]byte,
-  target: integer,       -- matching } for {, or jump target for b/t/T
-  exitcode: integer,
-  -- range state
-  active: boolean, endline: integer, finished: boolean,
+local function xalloc(n: usize): Bytes
+  local p = (@Bytes)(c_realloc(nilptr, (@csize)(n + 1)))
+  return p
+end
+
+local function view(p: Bytes, n: usize): string
+  if n == 0 then return '' end
+  return (@string){data = p, size = n}
+end
+
+-- A copy that is a C string (NUL-terminated).
+local function cdup(s: string): string
+  return string.copy(s)
+end
+
+-- A C string in a reused buffer, cut at the first NUL (no allocation).
+local cbufs: [2]*[0]byte
+local ccaps: [2]usize
+local function ctmp(s: string, which: integer): cstring
+  local n = s.size
+  for i: usize = 0, < s.size do
+    if s.data[i] == 0 then n = i; break end
+  end
+  if ccaps[which] < n + 1 then
+    ccaps[which] = n + 64
+    cbufs[which] = (@*[0]byte)(c_realloc(cbufs[which], (@csize)(ccaps[which])))
+  end
+  if n > 0 then c_memcpy(cbufs[which], s.data, n) end
+  cbufs[which][n] = 0
+  return (@cstring)(cbufs[which])
+end
+
+-- The part of s before its first NUL, as strlen/xstrdup see it.
+local function cstr(s: string): string
+  for i: usize = 0, < s.size do
+    if s.data[i] == 0 then return string.copy(view(s.data, i)) end
+  end
+  return string.copy(s)
+end
+
+local function isdigit(c: integer): boolean return c >= 48 and c <= 57 end
+local function isblank(c: integer): boolean return c == 32 or c == 9 end
+local function isspace(c: integer): boolean return c == 32 or (c >= 9 and c <= 13) end
+local function isprint(c: integer): boolean return c >= 32 and c <= 126 end
+local function toupper(c: integer): integer
+  if c >= 97 and c <= 122 then return c - 32 end
+  return c
+end
+local function tolower(c: integer): integer
+  if c >= 65 and c <= 90 then return c + 32 end
+  return c
+end
+
+-- Growable byte buffer (utils.c struct buffer).
+local Buf = @record{ data: Bytes, len: usize, cap: usize }
+
+function Buf:reserve(n: usize)
+  if self.cap >= n then return end
+  local c = self.cap * 2
+  if c < n then c = n end
+  if c < 64 then c = 64 end
+  self.data = (@Bytes)(c_realloc(self.data, (@csize)(c + 1)))
+  self.cap = c
+end
+
+function Buf:add1(c: byte)
+  if self.len + 1 > self.cap then self:reserve(self.len + 1) end
+  self.data[self.len] = c
+  self.len = self.len + 1
+end
+
+function Buf:add(p: Bytes, n: usize)
+  if n == 0 then return end
+  if self.len + n > self.cap then self:reserve(self.len + n) end
+  c_memcpy(&self.data[self.len], p, n)
+  self.len = self.len + n
+end
+
+function Buf:str(): string return view(self.data, self.len) end
+function Buf:copy(): string return string.copy(view(self.data, self.len)) end
+
+-- Streams ---------------------------------------------------------------------
+--
+-- Out and In behave like the glibc FILEs GNU sed writes and reads: the
+-- buffer is allocated on first use with st_blksize bytes (at most 8192),
+-- a terminal is line buffered, fwrite fills the buffer, flushes it, writes
+-- whole blocks directly and buffers the rest; a failed write discards the
+-- buffer. `std` names the standard stream an object stands for (1 stdin,
+-- 2 stdout, 3 stderr) for utils_fp_name; `registered` is membership in
+-- utils.c's open_files list.
+
+local Out = @record{
+  fd: cint, name: string, registered: boolean, std: byte,
+  buf: Bytes, cap: usize, len: usize,
+  mode: byte,        -- 0 fully buffered, 1 line buffered, 2 unbuffered
+  setup: boolean,
+  nowrite: boolean,  -- a stream opened only for reading
 }
 
-local Sed = @record{
-  cmds: sequence(Cmd),
-  quiet: boolean, ere: boolean, separate: boolean, inplace: boolean, suffix: string,
-  delim: byte,            -- line delimiter: newline, or NUL with -z
-  missing: boolean,       -- the last output line lacked its delimiter
-  err: string,
-  -- runtime
-  lines: sequence(string), lineno: integer, idx: integer, total: integer,
-  lastnl: boolean,        -- input's final line ended with a newline
-  ps: string, hs: string,
-  appendq: sequence(string),   -- text queued by a / r for end of cycle
-  tflag: boolean,
-  quit: boolean, exitcode: integer,
-  lastre: regex.Prog, has_lastre: boolean,
-  wfiles: sequence(string), wfds: sequence(cint), wmiss: sequence(boolean),
-  rc: integer,
+local In = @record{
+  fd: cint, name: string, registered: boolean, std: byte,
+  buf: Bytes, cap: usize, pos: usize, len: usize,
+  setup: boolean, unbuffered: boolean,
+  eof: boolean, err: boolean, noread: boolean,
+  owned: boolean,
 }
 
-local sed: Sed
+local stdin_in: In = {fd = 0, std = 1}
+local stdout_out: Out = {fd = 1, std = 2}
+local stderr_out: Out = {fd = 2, std = 3, mode = 2, setup = true}
+local stdin_as_out: Out = {fd = 0, std = 1, nowrite = true}
+local stdout_as_in: In = {fd = 1, std = 2, noread = true}
+local stderr_as_in: In = {fd = 2, std = 3, noread = true}
 
--- Script parsing -------------------------------------------------------------
+local reg_outs: sequence(*Out)
+local reg_ins: sequence(*In)
 
-local Script = @record{ s: string, pos: usize }
-
-function Script:peek(): byte
-  if self.pos > self.s.size then return 0 end
-  return self.s:byte(self.pos)
+local function std_name(std: byte, registered: boolean, name: string): string
+  if registered then return name end
+  if std == 1 then return 'stdin' elseif std == 2 then return 'stdout' elseif std == 3 then return 'stderr' end
+  return '<unknown>'
 end
 
-function Script:more(): boolean return self.pos <= self.s.size end
-
-function Script:skip_ws()
-  while self:more() do
-    local c = self:peek()
-    if c == 32 or c == 9 then self.pos = self.pos + 1 else break end
-  end
-end
-
-function Script:skip_ws_nl()
-  while self:more() do
-    local c = self:peek()
-    if c == 32 or c == 9 or c == 10 or c == 59 then self.pos = self.pos + 1 else break end
-  end
-end
-
--- Read up to an unescaped delimiter; converts \delim to delim and leaves
--- other escapes alone. Returns the text and whether the delimiter was found.
-function Script:delimited(delim: byte, is_regex: boolean): (string, boolean)
-  local sb: stringbuilder
-  while self:more() do
-    local c = self:peek()
-    if c == delim then self.pos = self.pos + 1; return sb:promote(), true end
-    if c == 92 and self.pos < self.s.size then
-      local n = self.s:byte(self.pos + 1)
-      if n == delim then
-        sb:writebyte(delim)
-      elseif n == 10 then
-        sb:writebyte(10)
-      elseif is_regex then
-        sb:writebyte(92); sb:writebyte(n)
-      else
-        sb:writebyte(92); sb:writebyte(n)
-      end
-      self.pos = self.pos + 2
-      continue
-    end
-    if c == 10 and is_regex then break end
-    sb:writebyte(c)
-    self.pos = self.pos + 1
-  end
-  return sb:promote(), false
-end
-
-function Script:number(): (integer, boolean)
-  local v: integer = 0
-  local any = false
-  while self:more() and self:peek() >= 48 and self:peek() <= 57 do
-    v = v * 10 + (self:peek() - 48); self.pos = self.pos + 1; any = true
-  end
-  return v, any
-end
-
--- The M flag is REG_NEWLINE; as in GNU sed, ^ and $ match at embedded
--- newlines only when the line delimiter is newline (not with -z).
-local function compile_re(pat: string, icase: boolean, mline: boolean): (regex.Prog, boolean)
-  if pat.size == 0 then
-    if not sed.has_lastre then sed.err = 'no previous regular expression'; return sed.lastre, false end
-    return sed.lastre, true
-  end
-  local prog, err = regex.compile_nl(pat, sed.ere, icase, mline, mline and sed.delim == 10)
-  if err.size > 0 then sed.err = '-e expression #1, char 0: ' .. err; return prog, false end
-  sed.lastre = prog; sed.has_lastre = true
-  return prog, true
-end
-
-function Script:address(a: *Addr): boolean
-  local c = self:peek()
-  if c >= 48 and c <= 57 then
-    local n, _ = self:number()
-    if self:peek() == 126 then
-      self.pos = self.pos + 1
-      local step, ok = self:number()
-      if not ok then sed.err = 'expected step after ~'; return false end
-      a.kind = ADDR_STEP; a.line = n; a.step = step
-    else
-      a.kind = ADDR_LINE; a.line = n
-    end
-    return true
-  elseif c == 36 then
-    self.pos = self.pos + 1; a.kind = ADDR_LAST; return true
-  elseif c == 47 or c == 92 then
-    local delim: byte = 47
-    if c == 92 then
-      self.pos = self.pos + 1
-      delim = self:peek()
-    end
-    self.pos = self.pos + 1
-    local pat, ok = self:delimited(delim, true)
-    if not ok then sed.err = 'unterminated address regex'; return false end
-    local icase, mline = false, false
-    while self:peek() == 73 or self:peek() == 77 do
-      if self:peek() == 73 then icase = true else mline = true end
-      self.pos = self.pos + 1
-    end
-    local prog, rok = compile_re(pat, icase, mline)
-    if not rok then return false end
-    a.kind = ADDR_RE; a.re = prog; a.has_re = true
-    return true
+local function raw_write(fd: cint, p: Bytes, n: usize): boolean
+  local done: usize = 0
+  while done < n do
+    local r = sys.write(fd, &p[done], n - done)
+    if r < 0 then return false end
+    done = done + (@usize)(r)
   end
   return true
 end
 
--- Text argument for a/i/c: GNU one-liner form `a text` or classic `a\` newline text.
-function Script:text_arg(): string
-  self:skip_ws()
-  if self:peek() == 92 then
-    self.pos = self.pos + 1
-    if self:peek() == 10 then self.pos = self.pos + 1 end
-    self:skip_ws()
+local function out_setup(o: *Out)
+  if o.setup then return end
+  o.setup = true
+  local size: usize = 8192
+  local st: sys.Stat
+  if sys.fstat(o.fd, &st) == 0 then
+    if (st.st_mode & sys.S_IFMT) == sys.S_IFCHR and sys.isatty(o.fd) == 1 then o.mode = 1 end
+    if st.st_blksize > 0 and st.st_blksize < 8192 then size = (@usize)(st.st_blksize) end
   end
-  local sb: stringbuilder
-  while self:more() do
-    local c = self:peek()
-    if c == 92 and self.pos < self.s.size then
-      local n = self.s:byte(self.pos + 1)
-      sb:writebyte(n); self.pos = self.pos + 2
-      continue
+  o.buf = xalloc(size)
+  o.cap = size
+end
+
+local function out_flush(o: *Out): boolean
+  if o.len == 0 then return true end
+  local ok = raw_write(o.fd, o.buf, o.len)
+  o.len = 0
+  return ok
+end
+
+-- _IO_new_file_xsputn.
+local function out_put(o: *Out, p: Bytes, n: usize): boolean
+  if o.nowrite then sys.seterrno(EBADF); return false end
+  if n == 0 then return true end
+  out_setup(o)
+  if o.mode == 2 then return raw_write(o.fd, p, n) end
+  local to_do = n
+  local off: usize = 0
+  local must_flush = false
+  local count = o.cap - o.len
+  if o.mode == 1 and count >= n then
+    local j: isize = (@isize)(n) - 1
+    while j >= 0 do
+      if p[j] == 10 then count = (@usize)(j) + 1; must_flush = true; break end
+      j = j - 1
     end
-    if c == 10 then self.pos = self.pos + 1; break end
-    sb:writebyte(c); self.pos = self.pos + 1
+  end
+  if count > to_do then count = to_do end
+  if count > 0 then
+    c_memcpy(&o.buf[o.len], p, count)
+    o.len = o.len + count; off = count; to_do = to_do - count
+  end
+  if to_do > 0 or must_flush then
+    if not out_flush(o) then return false end
+    local block = o.cap
+    local do_write = to_do
+    if block >= 128 then do_write = to_do - to_do % block end
+    if do_write > 0 then
+      if not raw_write(o.fd, &p[off], do_write) then return false end
+      off = off + do_write; to_do = to_do - do_write
+    end
+    if to_do > 0 then
+      c_memcpy(&o.buf[o.len], &p[off], to_do)
+      o.len = o.len + to_do
+    end
+  end
+  return true
+end
+
+local function out_puts(o: *Out, s: string) out_put(o, s.data, s.size) end
+local function out_putc(o: *Out, c: byte)
+  local b: [1]byte = {c}
+  out_put(o, &b, 1)
+end
+
+local function in_setup(f: *In)
+  if f.setup then return end
+  f.setup = true
+  local size: usize = 8192
+  if f.unbuffered then
+    size = 1
+  else
+    local st: sys.Stat
+    if sys.fstat(f.fd, &st) == 0 and st.st_blksize > 0 and st.st_blksize < 8192 then size = (@usize)(st.st_blksize) end
+  end
+  f.buf = xalloc(size)
+  f.cap = size
+end
+
+-- __underflow; end of file is sticky (glibc 2.28 and later).
+local function in_fill(f: *In): boolean
+  if f.noread then f.err = true; sys.seterrno(EBADF); return false end
+  if f.eof then return false end
+  in_setup(f)
+  local r = sys.read(f.fd, f.buf, f.cap)
+  if r == 0 then f.eof = true; return false end
+  if r < 0 then f.err = true; return false end
+  f.pos = 0
+  f.len = (@usize)(r)
+  return true
+end
+
+local function in_getc(f: *In): integer
+  if f.pos >= f.len then
+    if not in_fill(f) then return EOF end
+  end
+  local c = f.buf[f.pos]
+  f.pos = f.pos + 1
+  return c
+end
+
+local function in_ungetc(f: *In)
+  if f.pos > 0 then f.pos = f.pos - 1 end
+end
+
+-- getdelim: the bytes up to and including DELIM (or to end of file) into
+-- out; -1 when nothing was left.
+local function in_getdelim(f: *In, delim: byte, out: *Buf): isize
+  out.len = 0
+  if f.pos >= f.len then
+    if not in_fill(f) then return -1 end
+  end
+  while true do
+    local s = f.pos
+    local e = f.len
+    local i = s
+    while i < e and f.buf[i] ~= delim do i = i + 1 end
+    if i < e then
+      out:add(&f.buf[s], i - s + 1)
+      f.pos = i + 1
+      return (@isize)(out.len)
+    end
+    out:add(&f.buf[s], e - s)
+    f.pos = e
+    if not in_fill(f) then break end
+  end
+  return (@isize)(out.len)
+end
+
+-- fread: up to n bytes.
+local function in_fread(f: *In, dst: Bytes, n: usize): usize
+  local got: usize = 0
+  while got < n do
+    if f.pos >= f.len then
+      if not in_fill(f) then break end
+    end
+    local k = f.len - f.pos
+    if k > n - got then k = n - got end
+    c_memcpy(&dst[got], &f.buf[f.pos], k)
+    f.pos = f.pos + k
+    got = got + k
+  end
+  return got
+end
+
+-- ftell
+local function in_tell(f: *In): clong
+  local off = sys.lseek(f.fd, 0, 1)
+  if off < 0 then return -1 end
+  return off - (@clong)(f.len - f.pos)
+end
+
+local function in_rewind(f: *In)
+  if sys.lseek(f.fd, 0, 0) >= 0 then f.pos = 0; f.len = 0 end
+  f.eof = false
+  f.err = false
+end
+
+-- Process exit -------------------------------------------------------------------
+
+local cleanup_file: string
+local has_cleanup = false
+
+-- exit(): the atexit cleanup removes an unrenamed -i temporary, then every
+-- stream is flushed (errors ignored) and a seekable standard input is
+-- moved back to its logical position (glibc's _IO_unbuffer_all).
+local function do_exit(status: integer)
+  if has_cleanup then sys.unlink(cleanup_file) end
+  for i = #reg_outs, 1, -1 do out_flush(reg_outs[i]) end
+  out_flush(&stdout_out)
+  if stdin_in.setup and not stdin_in.unbuffered and stdin_in.len > stdin_in.pos then
+    sys.lseek(0, -(@clong)(stdin_in.len - stdin_in.pos), 1)
+  end
+  sys._exit((@cint)(status & 0xff))
+end
+
+local function errmsg(s: string)
+  local m = util.applet .. ': ' .. s .. '\n'
+  raw_write(2, m.data, m.size)
+end
+
+local function panic(s: string)
+  errmsg(s)
+  do_exit(EXIT_PANIC)
+end
+
+local function strerror(e: cint): string
+  return sys.strerror(e)
+end
+
+-- ck_* wrappers ------------------------------------------------------------------
+
+local function out_name(o: *Out): string return std_name(o.std, o.registered, o.name) end
+local function in_name(f: *In): string return std_name(f.std, f.registered, f.name) end
+
+local function ck_fwrite(o: *Out, p: Bytes, n: usize)
+  if n > 0 and not out_put(o, p, n) then
+    local e = sys.errno()
+    if n == 1 then
+      panic(string.format("couldn't write %d item to %s: %s", n, out_name(o), strerror(e)))
+    else
+      panic(string.format("couldn't write %d items to %s: %s", n, out_name(o), strerror(e)))
+    end
+  end
+end
+
+local function ck_fflush(o: *Out)
+  if o.nowrite then return end
+  if not out_flush(o) then
+    local e = sys.errno()
+    if e ~= EBADF then panic(string.format("couldn't flush %s: %s", out_name(o), strerror(e))) end
+  end
+end
+
+local function open_out(name: string, fail: boolean): *Out
+  local fd = sys.open(ctmp(name, 0), sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
+  if fd < 0 then
+    if fail then panic(string.format("couldn't open file %s: %s", name, strerror(sys.errno()))) end
+    return nilptr
+  end
+  local o = default_allocator:new(@Out)
+  o.fd = fd; o.name = name; o.registered = true
+  reg_outs:push(o)
+  return o
+end
+
+local function open_in(name: string, fail: boolean): *In
+  local fd = sys.open(ctmp(name, 0), sys.O_RDONLY, 0)
+  if fd < 0 then
+    if fail then panic(string.format("couldn't open file %s: %s", name, strerror(sys.errno()))) end
+    return nilptr
+  end
+  local f = default_allocator:new(@In)
+  f.fd = fd; f.name = name; f.registered = true; f.owned = true
+  reg_ins:push(f)
+  return f
+end
+
+local function unregister_out(o: *Out)
+  for i = 1, #reg_outs do
+    if reg_outs[i] == o then reg_outs:remove(i); break end
+  end
+  o.registered = false
+end
+
+local function unregister_in(f: *In)
+  for i = 1, #reg_ins do
+    if reg_ins[i] == f then reg_ins:remove(i); break end
+  end
+  f.registered = false
+end
+
+-- ck_fclose for one stream: it leaves open_files first, so a flush error
+-- names it "<unknown>" (unless it is a standard stream); a close error
+-- uses the registered name.
+local function ck_fclose_out(o: *Out)
+  local name = o.name
+  local was = o.registered
+  if was then unregister_out(o) end
+  ck_fflush(o)
+  if sys.close(o.fd) ~= 0 then
+    panic(string.format("couldn't close %s: %s", was and name or out_name(o), strerror(sys.errno())))
+  end
+end
+
+local function ck_fclose_in(f: *In)
+  local name = f.name
+  local was = f.registered
+  if was then unregister_in(f) end
+  if sys.close(f.fd) ~= 0 then
+    panic(string.format("couldn't close %s: %s", was and name or in_name(f), strerror(sys.errno())))
+  end
+  if f.owned then
+    if f.buf ~= nilptr then c_realloc(f.buf, 0) end
+    default_allocator:delete(f)
+  end
+end
+
+-- ck_fclose(NULL): every registered stream, then stdout.
+local function ck_fclose_all()
+  while #reg_outs > 0 do ck_fclose_out(reg_outs[#reg_outs]) end
+  while #reg_ins > 0 do ck_fclose_in(reg_ins[#reg_ins]) end
+  ck_fflush(&stdout_out)
+  if sys.close(1) ~= 0 then
+    panic(string.format("couldn't close stdout: %s", strerror(sys.errno())))
+  end
+end
+
+local function ck_getdelim(f: *In, delim: byte, out: *Buf): isize
+  local r: isize = -1
+  local error = f.err
+  if not error then
+    r = in_getdelim(f, delim, out)
+    error = f.err
+  end
+  if error then panic(string.format('read error on %s: %s', in_name(f), strerror(sys.errno()))) end
+  return r
+end
+
+-- Options and global state (sed.c) -----------------------------------------------
+
+local POSIXLY_EXTENDED: byte <comptime> = 0
+local POSIXLY_CORRECT: byte <comptime> = 1
+local POSIXLY_BASIC: byte <comptime> = 2
+
+local extended_regexp = false
+local buffer_delimiter: byte = 10
+local unbuffered = false
+local no_default_output = false
+local separate_files = false
+local follow_symlinks = false
+local sandbox = false
+local debug = false
+local in_place = false
+local in_place_extension: string
+local posixicity: byte = POSIXLY_EXTENDED
+local posix_env = false
+local lcmd_out_line_len: uint64 = 70
+
+-- Compiled program (sed.h) --------------------------------------------------------
+
+local REG_ICASE: integer <comptime> = 2
+local REG_NEWLINE: integer <comptime> = 4
+
+local SedRegex = @record{
+  re: string, flags: integer, prog: regex.Prog, nsub: integer,
+  no_sub: boolean, begline: boolean, endline: boolean,
+  dfa_nul: boolean,   -- compiled under -z: GNU's dfa then has NUL as its line end
+}
+
+local ADDR_IS_NULL: byte <comptime> = 0
+local ADDR_IS_REGEX: byte <comptime> = 1
+local ADDR_IS_NUM: byte <comptime> = 2
+local ADDR_IS_NUM_MOD: byte <comptime> = 3
+local ADDR_IS_STEP: byte <comptime> = 4
+local ADDR_IS_STEP_MOD: byte <comptime> = 5
+local ADDR_IS_LAST: byte <comptime> = 6
+
+local RANGE_INACTIVE: byte <comptime> = 0
+local RANGE_ACTIVE: byte <comptime> = 1
+local RANGE_CLOSED: byte <comptime> = 2
+
+local Addr = @record{ atype: byte, num: uint64, step: uint64, re: *SedRegex }
+
+-- struct output: w/W/s///w files and R files.
+local Output = @record{ name: string, missing_newline: boolean, out: *Out, inp: *In }
+
+local REPL_ASIS: integer <comptime> = 0
+local REPL_UPPERCASE: integer <comptime> = 1
+local REPL_LOWERCASE: integer <comptime> = 2
+local REPL_UPPERCASE_FIRST: integer <comptime> = 4
+local REPL_LOWERCASE_FIRST: integer <comptime> = 8
+local REPL_MODIFIERS: integer <comptime> = 12
+
+local Repl = @record{ prefix: string, subst_id: integer, repl_type: integer }
+
+local Subst = @record{
+  regx: *SedRegex, repl: sequence(Repl), numb: uint64, outf: *Output,
+  isglobal: boolean, print: integer, eval: boolean, max_id: integer,
+}
+
+local Cmd = @record{
+  a1: *Addr, a2: *Addr,
+  range_state: byte, addr_bang: boolean, cmd: integer,
+  text: string, has_text: boolean,   -- a i c e (has_text false: NULL)
+  int_arg: int32,
+  jump_index: integer,
+  fname: string, append: boolean,
+  subst: *Subst,
+  outf: *Output,
+  translate: *[256]byte,
+  label_name: string, has_label: boolean,
+}
+
+local vec: sequence(Cmd)
+local v_length: integer = 0
+
+local function cmd_at(i: integer): *Cmd return &vec[i + 1] end
+
+-- Script input (compile.c prog_info / error_info) ------------------------------
+
+local ErrInfo = @record{ name: string, has_name: boolean, line: uint64, expr_count: uint64 }
+
+local prog_is_string = false
+local prog_str: string
+local prog_cur: integer = 0
+local prog_file: *In = nilptr
+local cur_input: ErrInfo
+local string_expr_count: uint64 = 0
+local first_script = true
+
+local Label = @record{ v_index: integer, name: string, err: ErrInfo }
+local jumps: sequence(Label)
+local labels: sequence(Label)
+local blocks: sequence(Label)
+
+local pending: Buf
+local has_pending = false
+local old_text_buf: integer = -1
+
+local file_read: sequence(*Output)
+local file_write: sequence(*Output)
+
+local special_stdin: Output = {name = '/dev/stdin'}
+local special_stdout: Output = {name = '/dev/stdout'}
+local special_stderr: Output = {name = '/dev/stderr'}
+
+local function bad_prog(why: string)
+  if cur_input.has_name then
+    errmsg(string.format('file %s line %d: %s', cur_input.name, cur_input.line, why))
+  else
+    local pos: integer = prog_is_string and prog_cur or 0
+    errmsg(string.format('-e expression #%d, char %d: %s', cur_input.expr_count, pos, why))
+  end
+  do_exit(EXIT_BAD_USAGE)
+end
+
+local BAD_BANG <comptime> = "multiple `!'s"
+local BAD_COMMA <comptime> = "unexpected `,'"
+local BAD_STEP <comptime> = "invalid usage of +N or ~N as first address"
+local EXCESS_OPEN_BRACE <comptime> = "unmatched `{'"
+local EXCESS_CLOSE_BRACE <comptime> = "unexpected `}'"
+local EXCESS_JUNK <comptime> = "extra characters after command"
+local EXPECTED_SLASH <comptime> = "expected \\ after `a', `c' or `i'"
+local NO_CLOSE_BRACE_ADDR <comptime> = "`}' doesn't want any addresses"
+local NO_COLON_ADDR <comptime> = ": doesn't want any addresses"
+local NO_SHARP_ADDR <comptime> = "comments don't accept any addresses"
+local NO_COMMAND <comptime> = "missing command"
+local ONE_ADDR <comptime> = "command only uses one address"
+local UNTERM_ADDR_RE <comptime> = "unterminated address regex"
+local UNTERM_S_CMD <comptime> = "unterminated `s' command"
+local UNTERM_Y_CMD <comptime> = "unterminated `y' command"
+local UNKNOWN_S_OPT <comptime> = "unknown option to `s'"
+local EXCESS_P_OPT <comptime> = "multiple `p' options to `s' command"
+local EXCESS_G_OPT <comptime> = "multiple `g' options to `s' command"
+local EXCESS_N_OPT <comptime> = "multiple number options to `s' command"
+local ZERO_N_OPT <comptime> = "number option to `s' command may not be zero"
+local Y_CMD_LEN <comptime> = "strings for `y' command are different lengths"
+local ANCIENT_VERSION <comptime> = "expected newer version of sed"
+local INVALID_LINE_0 <comptime> = "invalid usage of line address 0"
+local INCOMPLETE_CMD <comptime> = "incomplete command"
+local COLON_LACKS_LABEL <comptime> = "\":\" lacks a label"
+local RECURSIVE_ESCAPE_C <comptime> = "recursive escaping after \\c not allowed"
+local DISALLOWED_CMD <comptime> = "e/r/w commands disabled in sandbox mode"
+local MISSING_FILENAME <comptime> = "missing filename in r/R/w/W commands"
+local NO_REGEX <comptime> = "no previous regular expression"
+local BAD_MODIF <comptime> = "cannot specify modifiers on empty regexp"
+
+local function bad_command(ch: integer)
+  if ch == 0 then bad_prog('unknown command: `') end
+  bad_prog("unknown command: `" .. string.char((@byte)(ch & 0xff)) .. "'")
+end
+
+local function inchar(): integer
+  local ch: integer = EOF
+  if prog_is_string then
+    if prog_cur < (@integer)(prog_str.size) then
+      ch = prog_str.data[prog_cur]
+      prog_cur = prog_cur + 1
+    end
+  elseif prog_file ~= nilptr then
+    if not prog_file.eof then ch = in_getc(prog_file) end
+  end
+  if ch == 10 then cur_input.line = cur_input.line + 1 end
+  return ch
+end
+
+local function savchar(ch: integer)
+  if ch == EOF then return end
+  if ch == 10 and cur_input.line > 0 then cur_input.line = cur_input.line - 1 end
+  if prog_is_string then
+    if prog_cur <= 0 or prog_str.data[prog_cur - 1] ~= (@byte)(ch) then
+      panic(string.format('Called savchar with unexpected pushback (%x)', ch))
+    end
+    prog_cur = prog_cur - 1
+  else
+    in_ungetc(prog_file)
+  end
+end
+
+local function in_nonblank(): integer
+  local ch = inchar()
+  while isblank(ch) do ch = inchar() end
+  return ch
+end
+
+local function read_end_of_cmd()
+  local ch = in_nonblank()
+  if ch == 125 or ch == 35 then
+    savchar(ch)
+  elseif ch ~= EOF and ch ~= 10 and ch ~= 59 then
+    bad_prog(EXCESS_JUNK)
+  end
+end
+
+local function in_integer(ch: integer): uint64
+  local num: uint64 = 0
+  while isdigit(ch) do
+    num = num * 10 + (@uint64)(ch - 48)
+    ch = inchar()
+  end
+  savchar(ch)
+  return num
+end
+
+local function add_then_next(b: *Buf, ch: integer): integer
+  b:add1((@byte)(ch))
+  return inchar()
+end
+
+local function hexdigit(c: byte): integer
+  if c >= 48 and c <= 57 then return c - 48 end
+  if c >= 97 and c <= 102 then return c - 87 end
+  if c >= 65 and c <= 70 then return c - 55 end
+  return -1
+end
+
+-- normalize_text, in place exactly as the C does it (the bracket tracking
+-- reads bytes behind the write position).
+local TEXT_BUFFER: integer <comptime> = 0
+local TEXT_REPLACEMENT: integer <comptime> = 1
+local TEXT_REGEX: integer <comptime> = 2
+
+local function normalize_text(src: string, buftype: integer): string
+  local n = src.size
+  local b = xalloc(n + 2)
+  if n > 0 then c_memcpy(b, src.data, n) end
+  b[n] = 0; b[n + 1] = 0
+  local p: usize = 0
+  local q: usize = 0
+  local bracket_state: integer = 0
+  while p < n do
+    if b[p] == 92 and p + 1 < n and bracket_state == 0 then
+      p = p + 1
+      local e = b[p]
+      local handled = true
+      local base: integer = 0
+      if e == 97 then b[q] = 7; q = q + 1; p = p + 1
+      elseif e == 102 then b[q] = 12; q = q + 1; p = p + 1
+      elseif e == 10 or e == 110 then b[q] = 10; q = q + 1; p = p + 1
+      elseif e == 114 then b[q] = 13; q = q + 1; p = p + 1
+      elseif e == 116 then b[q] = 9; q = q + 1; p = p + 1
+      elseif e == 118 then b[q] = 11; q = q + 1; p = p + 1
+      elseif e == 100 or e == 120 or e == 111 then
+        if e == 100 then base = 10 elseif e == 120 then base = 16 else base = 8 end
+        -- convert_number
+        local num: integer = 0
+        local max: integer = 1
+        local r = p + 1
+        while r < n and max <= 255 do
+          local d = hexdigit(b[r])
+          if d < 0 or base <= d then break end
+          num = num * base + d
+          r = r + 1
+          max = max * base
+        end
+        local ch: byte
+        if r == p + 1 then ch = b[p] else ch = (@byte)(num & 0xff) end
+        p = r
+        if buftype == TEXT_REPLACEMENT and (ch == 38 or ch == 92) then b[q] = 92; q = q + 1 end
+        b[q] = ch; q = q + 1
+      elseif e == 99 then
+        p = p + 1
+        if p < n then
+          local x = b[p]
+          b[q] = (@byte)(toupper(x) ~ 0x40); q = q + 1
+          if x == 92 then
+            p = p + 1
+            if b[p] ~= 92 then bad_prog(RECURSIVE_ESCAPE_C) end
+          end
+          p = p + 1
+        else
+          if buftype ~= TEXT_BUFFER then b[q] = 92; q = q + 1 end
+        end
+      else
+        handled = false
+        if buftype ~= TEXT_BUFFER then b[q] = 92; q = q + 1 end
+      end
+      if handled then continue end
+    elseif buftype == TEXT_REGEX and posixicity ~= POSIXLY_EXTENDED then
+      local c = b[p]
+      if c == 91 then
+        if bracket_state == 0 then bracket_state = -1 end
+      elseif c == 58 or c == 46 or c == 61 then
+        if bracket_state == -1 and p > 0 and b[p - 1] == 91 then bracket_state = c end
+      elseif c == 93 then
+        if bracket_state == 0 then
+        elseif bracket_state == -1 then bracket_state = 0
+        elseif p >= 2 and b[p - 2] ~= (@byte)(bracket_state) and b[p - 1] == (@byte)(bracket_state) then
+          bracket_state = -1
+        end
+      end
+    end
+    b[q] = b[p]; q = q + 1; p = p + 1
+  end
+  return view(b, q)
+end
+
+-- Regular expressions (regexp.c) -----------------------------------------------
+
+local regs_start: [10]isize
+local regs_end: [10]isize
+local regs_num: integer = 0
+local regex_last: *SedRegex = nilptr
+
+-- GNU's dfa rejects "[:space:]"-style brackets (dfawarn, fatal unless
+-- POSIXLY_CORRECT is set); this follows dfa.c's parse_bracket_exp.
+local function fetch(pp: *string, ip: *integer, np: integer): integer
+  if $ip >= np then return -1 end
+  local v: integer = pp.data[$ip]
+  $ip = $ip + 1
+  return v
+end
+
+local function dfa_colon_check(pat: string)
+  local n: integer = (@integer)(pat.size)
+  local i: integer = 0
+  while i < n do
+    local c: integer = pat.data[i]
+    if c == 92 then i = i + 2; continue end
+    if c ~= 91 then i = i + 1; continue end
+    i = i + 1
+    c = fetch(&pat, &i, n)
+    if c == 94 then c = fetch(&pat, &i, n) end
+    local state: integer = c == 58 and 1 or 0
+    local c1: integer
+    repeat
+      c1 = -2
+      state = state & ~2
+      local skip = false
+      if c == 91 then
+        c1 = fetch(&pat, &i, n)
+        if c1 == 58 or c1 == 46 or c1 == 61 then
+          while true do
+            c = fetch(&pat, &i, n)
+            if i >= n or c < 0 or (c == c1 and pat.data[i] == 93) then break end
+          end
+          c = fetch(&pat, &i, n)
+          state = state | 8
+          c1 = fetch(&pat, &i, n)
+          skip = true
+        end
+      end
+      if not skip then
+        if c1 == -2 then c1 = fetch(&pat, &i, n) end
+        if c1 == 45 then
+          local c2 = fetch(&pat, &i, n)
+          if c2 == 91 and i < n and pat.data[i] == 46 then c2 = 93 end
+          if c2 == 93 then
+            i = i - 1
+          else
+            state = state | 8
+            c1 = fetch(&pat, &i, n)
+            skip = true
+          end
+        end
+        if not skip then
+          state = state | (c == 58 and 2 or 4)
+        end
+      end
+      c = c1
+    until c == 93 or c < 0
+    if state == 7 and not posix_env then
+      panic('character class syntax is [[:space:]], not [:space:]')
+    end
+  end
+end
+
+local function compile_regex_1(r: *SedRegex, needed_sub: integer)
+  local opts: integer = 0
+  if posixicity ~= POSIXLY_EXTENDED then opts = opts | regex.RPAREN_ORD end
+  if posixicity == POSIXLY_BASIC then
+    opts = opts | regex.NO_GNU_OPS
+    if not extended_regexp then opts = opts | regex.LIMITED_OPS end
+  end
+  local icase = (r.flags & REG_ICASE) ~= 0
+  local nl = (r.flags & REG_NEWLINE) ~= 0
+  local prog, err, nsub = regex.compile_posix(r.re, extended_regexp, icase, nl, buffer_delimiter == 10 and nl, opts)
+  if err.size > 0 then bad_prog(err) end
+  r.prog = prog
+  r.nsub = nsub
+  r.dfa_nul = buffer_delimiter ~= 10
+  if needed_sub > 0 and nsub < needed_sub - 1 and posixicity == POSIXLY_EXTENDED then
+    bad_prog(string.format("invalid reference \\%d on `s' command's RHS", needed_sub - 1))
+  end
+  dfa_colon_check(r.re)
+  r.no_sub = needed_sub == 0
+  r.begline = false
+  r.endline = false
+  if r.re.size == 1 then
+    if r.re.data[0] == 94 then r.begline = true end
+    if r.re.data[0] == 36 then r.endline = true end
+  end
+end
+
+local function compile_regex(b: *Buf, flags: integer, needed_sub: integer): *SedRegex
+  if b.len == 0 then
+    if flags > 0 then bad_prog(BAD_MODIF) end
+    return nilptr
+  end
+  local r = default_allocator:new(@SedRegex)
+  r.flags = flags
+  r.re = normalize_text(b:str(), TEXT_REGEX)
+  compile_regex_1(r, needed_sub)
+  return r
+end
+
+local function set_regs(caps: *regex.Caps, off: isize, nsub: integer)
+  local need = nsub + 2
+  if need > regs_num then regs_num = need end
+  for i = 0, 9 do
+    if i <= nsub and caps.at[2 * i] >= 0 and caps.at[2 * i + 1] >= 0 then
+      regs_start[i] = caps.at[2 * i] + off
+      regs_end[i] = caps.at[2 * i + 1] + off
+    else
+      regs_start[i] = -1; regs_end[i] = -1
+    end
+  end
+end
+
+local function search(r: *SedRegex, text: string, start: isize, caps: *regex.Caps): boolean
+  local ok = r.prog:search(text, start, caps)
+  if r.prog.toocomplex then panic('pattern too complex') end
+  return ok
+end
+
+local function search_buf(r: *SedRegex, buf: Bytes, buflen: usize, start: usize, caps: *regex.Caps, beg_out: *usize): boolean
+  $beg_out = 0
+  if (r.flags & REG_NEWLINE) ~= 0 and buffer_delimiter ~= 10 then
+    -- line by line on the delimiter, as newline_anchor cannot be used
+    local beg: usize = 0
+    if start > 0 then
+      local k: isize = (@isize)(start) - 1
+      while k >= 0 do
+        if buf[k] == buffer_delimiter then beg = (@usize)(k) + 1; break end
+        k = k - 1
+      end
+    end
+    local st = start
+    while true do
+      local e = beg
+      while e < buflen and buf[e] ~= buffer_delimiter do e = e + 1 end
+      if search(r, view(&buf[beg], e - beg), (@isize)(st - beg), caps) then
+        $beg_out = beg
+        return true
+      end
+      if e >= buflen then break end
+      beg = e + 1
+      st = beg
+    end
+    return false
+  end
+  return search(r, view(buf, buflen), (@isize)(start), caps)
+end
+
+local function match_regex(rx: *SedRegex, buf: Bytes, buflen: usize, start: usize, regsize: integer): boolean
+  local r = rx
+  if r == nilptr then
+    r = regex_last
+    if r == nilptr then bad_prog(NO_REGEX) end
+  else
+    regex_last = r
+  end
+  if buflen >= 0x7fffffff then panic('regex input buffer length larger than INT_MAX') end
+  if r.no_sub and regsize > 0 then compile_regex_1(r, regsize) end
+  if r.begline or r.endline then
+    local offset: usize = 0
+    if r.endline then
+      offset = buflen
+      if (r.flags & REG_NEWLINE) ~= 0 then
+        for i = start, < buflen do
+          if buf[i] == buffer_delimiter then offset = i; break end
+        end
+      end
+    elseif start == 0 then
+      offset = 0
+    elseif (r.flags & REG_NEWLINE) == 0 then
+      return false
+    elseif buf[start - 1] == buffer_delimiter then
+      offset = start
+    else
+      local found = false
+      for i = start, < buflen do
+        if buf[i] == buffer_delimiter then offset = i + 1; found = true; break end
+      end
+      if not found then return false end
+    end
+    if regsize > 0 then
+      if regs_num == 0 then regs_num = 1 end
+      regs_start[0] = (@isize)(offset); regs_end[0] = (@isize)(offset)
+      for i = 1, 9 do regs_start[i] = -1; regs_end[i] = -1 end
+    end
+    return true
+  end
+  local caps: regex.Caps
+  local beg: usize = 0
+  if start == 0 and r.dfa_nul then
+    -- GNU first asks its dfa, which (with NUL as its line end) does not
+    -- share glibc's newline contexts inside a match
+    r.prog.nlquirk = false
+    local ok = search_buf(r, buf, buflen, start, &caps, &beg)
+    r.prog.nlquirk = true
+    if not ok then return false end
+  end
+  if search_buf(r, buf, buflen, start, &caps, &beg) then
+    if regsize > 0 then set_regs(&caps, (@isize)(beg), r.nsub) end
+    return true
+  end
+  return false
+end
+
+-- Compilation (compile.c) -----------------------------------------------------
+
+local function read_filename(): Buf
+  if sandbox then bad_prog(DISALLOWED_CMD) end
+  local b: Buf
+  local ch = in_nonblank()
+  while ch ~= EOF and ch ~= 10 do ch = add_then_next(&b, ch) end
+  return b
+end
+
+local function get_openfile(list: *sequence(*Output), write: boolean, fail: boolean): *Output
+  local b = read_filename()
+  local name = cstr(b:str())
+  if name.size == 0 then bad_prog(MISSING_FILENAME) end
+  local p: *Output = nilptr
+  for i = #list, 1, -1 do
+    if list[i].name == name then p = list[i]; break end
+  end
+  if posixicity == POSIXLY_EXTENDED then
+    if name == '/dev/stdin' then return &special_stdin end
+    if name == '/dev/stdout' then return &special_stdout end
+    if name == '/dev/stderr' then return &special_stderr end
+  end
+  if p == nilptr then
+    p = default_allocator:new(@Output)
+    p.name = name
+    if write then p.out = open_out(name, fail) else p.inp = open_in(name, fail) end
+    list:push(p)
+  end
+  return p
+end
+
+local function next_cmd_entry(): *Cmd
+  if v_length == #vec then
+    local c: Cmd
+    vec:push(c)
+  end
+  local c = cmd_at(v_length)
+  $c = (@Cmd){}
+  c.range_state = RANGE_INACTIVE
+  c.int_arg = -1
+  return c
+end
+
+local function snarf_char_class(b: *Buf): integer
+  local state: integer = 0
+  local delim: integer = 0
+  local ch = inchar()
+  if ch == 94 then ch = add_then_next(b, ch) end
+  if ch == 93 then ch = add_then_next(b, ch) end
+  while true do
+    local cont = false
+    if ch == EOF or ch == 10 then return ch end
+    if ch == 46 or ch == 58 or ch == 61 then
+      if state == 1 then
+        delim = ch; state = 2; cont = true
+      elseif state == 2 and ch == delim then
+        state = 3; cont = true
+      end
+    elseif ch == 91 then
+      if state == 0 then state = 1 end
+      cont = true
+    elseif ch == 93 then
+      if state == 0 or state == 1 then return ch
+      elseif state == 3 then state = 0 end
+    end
+    if not cont then state = state & ~1 end
+    ch = add_then_next(b, ch)
+  end
+  return ch
+end
+
+local function match_slash(slash: integer, is_regex: boolean): (Buf, boolean)
+  local b: Buf
+  local ch: integer
+  while true do
+    ch = inchar()
+    if ch == EOF or ch == 10 then break end
+    if ch == slash then return b, true end
+    if ch == 92 then
+      ch = inchar()
+      if ch == EOF then break end
+      if ch ~= 10 and (ch ~= slash or (not is_regex and ch == 38)) then b:add1(92) end
+    elseif ch == 91 and is_regex then
+      b:add1((@byte)(ch))
+      ch = snarf_char_class(&b)
+      if ch ~= 93 then break end
+    end
+    b:add1((@byte)(ch))
+  end
+  if ch == 10 then savchar(ch) end
+  return b, false
+end
+
+local function mark_subst_opts(cmd: *Subst): integer
+  local flags: integer = 0
+  cmd.isglobal = false
+  cmd.print = 0
+  cmd.eval = false
+  cmd.numb = 0
+  cmd.outf = nilptr
+  while true do
+    local ch = in_nonblank()
+    if ch == 105 or ch == 73 then
+      if posixicity == POSIXLY_BASIC then bad_prog(UNKNOWN_S_OPT) end
+      flags = flags | REG_ICASE
+    elseif ch == 109 or ch == 77 then
+      if posixicity == POSIXLY_BASIC then bad_prog(UNKNOWN_S_OPT) end
+      flags = flags | REG_NEWLINE
+    elseif ch == 101 then
+      if posixicity == POSIXLY_BASIC then bad_prog(UNKNOWN_S_OPT) end
+      cmd.eval = true
+    elseif ch == 112 then
+      if cmd.print ~= 0 then bad_prog(EXCESS_P_OPT) end
+      cmd.print = cmd.print | (1 << (cmd.eval and 1 or 0))
+    elseif ch == 103 then
+      if cmd.isglobal then bad_prog(EXCESS_G_OPT) end
+      cmd.isglobal = true
+    elseif ch == 119 then
+      cmd.outf = get_openfile(&file_write, true, true)
+      return flags
+    elseif isdigit(ch) then
+      if cmd.numb ~= 0 then bad_prog(EXCESS_N_OPT) end
+      cmd.numb = in_integer(ch)
+      if cmd.numb == 0 then bad_prog(ZERO_N_OPT) end
+    elseif ch == 125 or ch == 35 then
+      savchar(ch)
+      return flags
+    elseif ch == EOF or ch == 10 or ch == 59 then
+      return flags
+    elseif ch == 13 then
+      if inchar() == 10 then return flags end
+      bad_prog(UNKNOWN_S_OPT)
+    else
+      bad_prog(UNKNOWN_S_OPT)
+    end
+  end
+  return flags
+end
+
+local function read_label(): string
+  local b: Buf
+  local ch = in_nonblank()
+  while ch ~= EOF and ch ~= 10 and not isblank(ch) and ch ~= 59 and ch ~= 125 and ch ~= 35 do
+    ch = add_then_next(&b, ch)
+  end
+  savchar(ch)
+  return cstr(b:str())
+end
+
+local function setup_replacement(sub: *Subst, text: string)
+  sub.max_id = 0
+  local base = normalize_text(text, TEXT_REPLACEMENT)
+  local b: Bytes = base.data
+  local text_end: usize = base.size
+  local repl_type: integer = REPL_ASIS
+  local save_type: integer = REPL_ASIS
+  local start: usize = 0          -- `base` in the C
+  local p: usize = 0
+  while p < text_end do
+    if b[p] == 92 then
+      local r: Repl = {prefix = view(&b[start], p - start), subst_id = -1, repl_type = repl_type}
+      repl_type = save_type
+      p = p + 1
+      local plen = p - 1 - start
+      if p == text_end then
+        plen = plen + 1
+        r.prefix = view(&b[start], plen)
+      elseif posixicity == POSIXLY_BASIC and not isdigit(b[p]) then
+        b[p - 1] = b[p]
+        plen = plen + 1
+        r.prefix = view(&b[start], plen)
+      else
+        local c = b[p]
+        if isdigit(c) then
+          r.subst_id = c - 48
+          if sub.max_id < r.subst_id then sub.max_id = r.subst_id end
+        elseif c == 76 then repl_type = REPL_LOWERCASE; save_type = REPL_LOWERCASE
+        elseif c == 85 then repl_type = REPL_UPPERCASE; save_type = REPL_UPPERCASE
+        elseif c == 69 then repl_type = REPL_ASIS; save_type = REPL_ASIS
+        elseif c == 108 then save_type = repl_type; repl_type = repl_type | REPL_LOWERCASE_FIRST
+        elseif c == 117 then save_type = repl_type; repl_type = repl_type | REPL_UPPERCASE_FIRST
+        else
+          b[p - 1] = b[p]
+          plen = plen + 1
+          r.prefix = view(&b[start], plen)
+        end
+      end
+      sub.repl:push(r)
+      start = p + 1
+    elseif b[p] == 38 then
+      local r: Repl = {prefix = view(&b[start], p - start), subst_id = 0, repl_type = repl_type}
+      repl_type = save_type
+      sub.repl:push(r)
+      start = p + 1
+    end
+    p = p + 1
+  end
+  if start < text_end then
+    local r: Repl = {prefix = view(&b[start], text_end - start), subst_id = -1, repl_type = repl_type}
+    sub.repl:push(r)
+  end
+end
+
+local function read_text(buf_idx: integer, leadin_ch: integer)
+  if buf_idx >= 0 then
+    pending = (@Buf){}
+    has_pending = true
+    local c = cmd_at(buf_idx)
+    c.text = ''
+    c.has_text = false
+    old_text_buf = buf_idx
+  end
+  if leadin_ch == EOF then return end
+  if leadin_ch ~= 10 then pending:add1((@byte)(leadin_ch)) end
+  local ch = inchar()
+  while ch ~= EOF and ch ~= 10 do
+    if ch == 92 then
+      ch = inchar()
+      if ch ~= EOF then pending:add1(92) end
+    end
+    if ch == EOF then
+      pending:add1(10)
+      return
+    end
+    ch = add_then_next(&pending, ch)
+  end
+  pending:add1(10)
+  if buf_idx < 0 then buf_idx = old_text_buf end
+  local c = cmd_at(buf_idx)
+  c.text = normalize_text(pending:str(), TEXT_BUFFER)
+  c.has_text = true
+  has_pending = false
+end
+
+local function compile_address(addr: *Addr, chin: integer): boolean
+  local ch = chin
+  addr.atype = ADDR_IS_NULL
+  addr.step = 0
+  addr.num = ~(@uint64)(0)
+  addr.re = nilptr
+  if ch == 47 or ch == 92 then
+    local flags: integer = 0
+    addr.atype = ADDR_IS_REGEX
+    if ch == 92 then ch = inchar() end
+    local b, ok = match_slash(ch, true)
+    if not ok then bad_prog(UNTERM_ADDR_RE) end
+    while true do
+      ch = in_nonblank()
+      if posixicity ~= POSIXLY_BASIC and ch == 73 then
+        flags = flags | REG_ICASE
+      elseif posixicity ~= POSIXLY_BASIC and ch == 77 then
+        flags = flags | REG_NEWLINE
+      else
+        savchar(ch)
+        addr.re = compile_regex(&b, flags, 0)
+        return true
+      end
+    end
+  elseif isdigit(ch) then
+    addr.num = in_integer(ch)
+    addr.atype = ADDR_IS_NUM
+    ch = in_nonblank()
+    if ch ~= 126 or posixicity == POSIXLY_BASIC then
+      savchar(ch)
+    else
+      local step = in_integer(in_nonblank())
+      if step > 0 then
+        addr.step = step
+        addr.atype = ADDR_IS_NUM_MOD
+      end
+    end
+  elseif (ch == 43 or ch == 126) and posixicity ~= POSIXLY_BASIC then
+    addr.step = in_integer(in_nonblank())
+    if addr.step == 0 then
+      -- ADDR_IS_NULL: the range stops at once
+    elseif ch == 43 then
+      addr.atype = ADDR_IS_STEP
+    else
+      addr.atype = ADDR_IS_STEP_MOD
+    end
+  elseif ch == 36 then
+    addr.atype = ADDR_IS_LAST
+  else
+    return false
+  end
+  return true
+end
+
+local function at(s: *string, k: usize): integer
+  if k >= s.size then return 0 end
+  return s.data[k]
+end
+local function cls(c: integer): integer
+  return (c == 48 and 1 or 0) + (isdigit(c) and 1 or 0)
+end
+
+-- glibc strverscmp over C strings.
+local function strverscmp(s1: string, s2: string): integer
+  local S_N: integer <comptime> = 0
+  local S_I: integer <comptime> = 3
+  local S_F: integer <comptime> = 6
+  local S_Z: integer <comptime> = 9
+  local CMP: integer <comptime> = 2
+  local LEN: integer <comptime> = 3
+  local next_state: [12]integer = {S_N, S_I, S_Z, S_N, S_I, S_I, S_N, S_F, S_F, S_N, S_F, S_Z}
+  local result_type: [36]integer = {
+    CMP, CMP, CMP, CMP, LEN, CMP, CMP, CMP, CMP,
+    CMP, -1, -1, 1, LEN, LEN, 1, LEN, LEN,
+    CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP,
+    CMP, 1, 1, -1, CMP, CMP, -1, CMP, CMP}
+  local a = cdup(s1)
+  local b = cdup(s2)
+  local i: usize = 0
+  local j: usize = 0
+  local c1 = at(&a, i); i = i + 1
+  local c2 = at(&b, j); j = j + 1
+  local state = S_N + cls(c1)
+  local diff: integer = c1 - c2
+  while diff == 0 do
+    if c1 == 0 then return 0 end
+    state = next_state[state]
+    c1 = at(&a, i); i = i + 1
+    c2 = at(&b, j); j = j + 1
+    state = state + cls(c1)
+    diff = c1 - c2
+  end
+  state = result_type[state * 3 + cls(c2)]
+  if state == CMP then return diff end
+  if state == LEN then
+    while isdigit(at(&a, i)) do
+      i = i + 1
+      local d2 = at(&b, j); j = j + 1
+      if not isdigit(d2) then return 1 end
+    end
+    i = i + 1
+    if isdigit(at(&b, j)) then return -1 end
+    return diff
+  end
+  return state
+end
+
+local function compile_program()
+  if has_pending then read_text(-1, 10) end
+  while true do
+    local ch = inchar()
+    while ch == 59 or isspace(ch) do ch = inchar() end
+    if ch == EOF then break end
+    local cur = next_cmd_entry()
+    local a: Addr
+    if compile_address(&a, ch) then
+      if a.atype == ADDR_IS_STEP or a.atype == ADDR_IS_STEP_MOD then bad_prog(BAD_STEP) end
+      cur.a1 = default_allocator:new(@Addr)
+      $cur.a1 = a
+      ch = in_nonblank()
+      if ch == 44 then
+        if not compile_address(&a, in_nonblank()) then bad_prog(BAD_COMMA) end
+        cur.a2 = default_allocator:new(@Addr)
+        $cur.a2 = a
+        ch = in_nonblank()
+      end
+      if cur.a1.atype == ADDR_IS_NUM and cur.a1.num == 0
+         and ((cur.a2 == nilptr and ch ~= 114)
+              or (cur.a2 ~= nilptr and cur.a2.atype ~= ADDR_IS_REGEX)
+              or posixicity == POSIXLY_BASIC) then
+        bad_prog(INVALID_LINE_0)
+      end
+    end
+    if ch == 33 then
+      cur.addr_bang = true
+      ch = in_nonblank()
+      if ch == 33 then bad_prog(BAD_BANG) end
+    end
+    if posixicity == POSIXLY_BASIC then
+      if ch == 101 or ch == 70 or ch == 118 or ch == 122 or ch == 76 or ch == 81 or ch == 84 or ch == 82 or ch == 87 then
+        bad_command(ch)
+      end
+      if ch == 97 or ch == 105 or ch == 108 or ch == 61 or ch == 114 then
+        if cur.a2 ~= nilptr then bad_prog(ONE_ADDR) end
+      end
+    end
+    cur.cmd = ch
+    local restart = false
+    if ch == 35 then
+      if cur.a1 ~= nilptr then bad_prog(NO_SHARP_ADDR) end
+      ch = inchar()
+      if ch == 110 and first_script and cur_input.line < 2 then
+        if (prog_is_string and prog_cur == 2) or (not prog_is_string and prog_file ~= nilptr and in_tell(prog_file) == 2) then
+          no_default_output = true
+        end
+      end
+      while ch ~= EOF and ch ~= 10 do ch = inchar() end
+      restart = true
+    elseif ch == 118 then
+      local version = read_label()
+      local compared = version.size == 0 and '4.0' or version
+      if strverscmp(compared, '4.9') > 0 then bad_prog(ANCIENT_VERSION) end
+      posixicity = POSIXLY_EXTENDED
+      restart = true
+    elseif ch == 123 then
+      blocks:push((@Label){v_index = v_length, err = cur_input})
+      cur.addr_bang = not cur.addr_bang
+    elseif ch == 125 then
+      if #blocks == 0 then bad_prog(EXCESS_CLOSE_BRACE) end
+      if cur.a1 ~= nilptr then bad_prog(NO_CLOSE_BRACE_ADDR) end
+      read_end_of_cmd()
+      cmd_at(blocks[#blocks].v_index).jump_index = v_length
+      blocks:pop()
+    elseif ch == 101 or ch == 97 or ch == 105 or ch == 99 then
+      local goto_text = true
+      if ch == 101 then
+        if sandbox then bad_prog(DISALLOWED_CMD) end
+        ch = in_nonblank()
+        if ch == EOF or ch == 10 then
+          cur.text = ''
+          cur.has_text = false
+          goto_text = false
+        end
+      else
+        ch = in_nonblank()
+      end
+      if goto_text then
+        if ch == EOF then bad_prog(EXPECTED_SLASH) end
+        if ch == 92 then
+          ch = inchar()
+        else
+          if posixicity == POSIXLY_BASIC then bad_prog(EXPECTED_SLASH) end
+          savchar(ch)
+          ch = 10
+        end
+        read_text(v_length, ch)
+      end
+    elseif ch == 58 then
+      if cur.a1 ~= nilptr then bad_prog(NO_COLON_ADDR) end
+      local label = read_label()
+      if label.size == 0 then bad_prog(COLON_LACKS_LABEL) end
+      labels:push((@Label){v_index = v_length, name = label})
+      if debug then cur.label_name = label; cur.has_label = true end
+    elseif ch == 84 or ch == 98 or ch == 116 then
+      jumps:push((@Label){v_index = v_length, name = read_label()})
+    elseif ch == 81 or ch == 113 or ch == 76 or ch == 108 then
+      if (ch == 81 or ch == 113) and cur.a2 ~= nilptr then bad_prog(ONE_ADDR) end
+      ch = in_nonblank()
+      if isdigit(ch) and posixicity ~= POSIXLY_BASIC then
+        cur.int_arg = (@int32)((@uint32)(in_integer(ch) & 0xffffffff))
+      else
+        cur.int_arg = -1
+        savchar(ch)
+      end
+      read_end_of_cmd()
+    elseif ch == 61 or ch == 100 or ch == 68 or ch == 70 or ch == 103 or ch == 71 or ch == 104
+           or ch == 72 or ch == 110 or ch == 78 or ch == 112 or ch == 80 or ch == 122 or ch == 120 then
+      read_end_of_cmd()
+    elseif ch == 114 then
+      local b = read_filename()
+      local name = cstr(b:str())
+      if name.size == 0 then bad_prog(MISSING_FILENAME) end
+      cur.fname = name
+      if cur.a1 ~= nilptr and cur.a1.atype == ADDR_IS_NUM and cur.a1.num == 0 and cur.a2 == nilptr then
+        cur.a1.num = 1
+        cur.append = false
+      else
+        cur.append = true
+      end
+    elseif ch == 82 then
+      cur.outf = get_openfile(&file_read, false, false)
+    elseif ch == 87 or ch == 119 then
+      cur.outf = get_openfile(&file_write, true, true)
+    elseif ch == 115 then
+      local slash = inchar()
+      local b, ok = match_slash(slash, true)
+      if not ok then bad_prog(UNTERM_S_CMD) end
+      local b2, ok2 = match_slash(slash, false)
+      if not ok2 then bad_prog(UNTERM_S_CMD) end
+      local sub = default_allocator:new(@Subst)
+      cur.subst = sub
+      setup_replacement(sub, b2:str())
+      local flags = mark_subst_opts(sub)
+      sub.regx = compile_regex(&b, flags, sub.max_id + 1)
+      if sub.eval and sandbox then bad_prog(DISALLOWED_CMD) end
+    elseif ch == 121 then
+      local slash = inchar()
+      local b, ok = match_slash(slash, false)
+      if not ok then bad_prog(UNTERM_Y_CMD) end
+      local src = normalize_text(b:str(), TEXT_BUFFER)
+      local b2, ok2 = match_slash(slash, false)
+      if not ok2 then bad_prog(UNTERM_Y_CMD) end
+      local dst = normalize_text(b2:str(), TEXT_BUFFER)
+      local tr = default_allocator:new(@[256]byte)
+      if src.size ~= dst.size then bad_prog(Y_CMD_LEN) end
+      for i = 0, 255 do tr[i] = (@byte)(i) end
+      for i: usize = 0, < dst.size do tr[src.data[i]] = dst.data[i] end
+      cur.translate = tr
+      read_end_of_cmd()
+    elseif ch == EOF then
+      bad_prog(NO_COMMAND)
+    else
+      bad_command(ch)
+    end
+    if not restart then v_length = v_length + 1 end
+  end
+  if posixicity == POSIXLY_BASIC and has_pending then bad_prog(INCOMPLETE_CMD) end
+end
+
+local function compile_string(s: string)
+  prog_file = nilptr
+  prog_is_string = true
+  prog_str = s
+  prog_cur = 0
+  cur_input.line = 0
+  cur_input.has_name = false
+  cur_input.name = ''
+  string_expr_count = string_expr_count + 1
+  cur_input.expr_count = string_expr_count
+  compile_program()
+  prog_is_string = false
+  prog_str = ''
+  prog_cur = 0
+  first_script = false
+end
+
+local function compile_file(name: string)
+  prog_is_string = false
+  prog_file = &stdin_in
+  if name ~= '-' then prog_file = open_in(name, true) end
+  cur_input.line = 1
+  cur_input.name = name
+  cur_input.has_name = true
+  cur_input.expr_count = 0
+  compile_program()
+  if prog_file ~= &stdin_in then ck_fclose_in(prog_file) end
+  prog_file = nilptr
+  first_script = false
+end
+
+local function check_final_program()
+  if #blocks > 0 then
+    cur_input = blocks[#blocks].err
+    bad_prog(EXCESS_OPEN_BRACE)
+  end
+  if has_pending then
+    local c = cmd_at(old_text_buf)
+    if pending.len > 0 then
+      c.text = pending:copy()
+      c.has_text = true
+    end
+    has_pending = false
+  end
+  for gi = #jumps, 1, -1 do
+    local go = jumps[gi]
+    local found = -1
+    for li = #labels, 1, -1 do
+      if labels[li].name == go.name then found = li; break end
+    end
+    if found > 0 then
+      cmd_at(go.v_index).jump_index = labels[found].v_index
+    else
+      if go.name.size > 0 then panic("can't find label for jump to `" .. go.name .. "'") end
+      cmd_at(go.v_index).jump_index = v_length
+    end
+  end
+end
+
+local function finish_program()
+  for i = #file_read, 1, -1 do
+    local p = file_read[i]
+    if p.inp ~= nilptr then ck_fclose_in(p.inp) end
+  end
+  for i = #file_write, 1, -1 do
+    local p = file_write[i]
+    if p.out ~= nilptr then ck_fclose_out(p.out) end
+  end
+end
+
+-- Debugging output (debug.c) ----------------------------------------------------
+
+local block_level: integer = 0
+local D: *Out = &stdout_out
+
+local function dputs(s: string) out_puts(D, s) end
+local function dputc(c: byte) out_putc(D, c) end
+
+local function debug_print_char(c: byte)
+  if isprint(c) and c ~= 92 then dputc(c); return end
+  dputc(92)
+  if c == 7 then dputc(97)
+  elseif c == 12 then dputc(102)
+  elseif c == 13 then dputc(114)
+  elseif c == 9 then dputc(116)
+  elseif c == 11 then dputc(118)
+  elseif c == 10 then dputc(110)
+  elseif c == 92 then dputc(92)
+  else
+    -- printf ("o%03o", (unsigned int) c) with a signed char
+    local v: uint32 = c
+    if c >= 128 then v = (@uint32)(0xffffff00) | v end
+    dputs(string.format('o%03o', v))
+  end
+end
+
+local function debug_print_regex_pattern(s: string)
+  for i: usize = 0, < s.size do
+    if s.data[i] == 47 then dputs('\\/') else debug_print_char(s.data[i]) end
+  end
+end
+
+local function debug_print_regex_flags(r: *SedRegex, addr: boolean)
+  if r == nilptr then return end
+  if (r.flags & REG_ICASE) ~= 0 then dputc(addr and 73 or 105) end
+  if (r.flags & REG_NEWLINE) ~= 0 then dputc(addr and 77 or 109) end
+end
+
+local function debug_print_regex(r: *SedRegex)
+  if r == nilptr then dputs('//'); return end
+  dputc(47)
+  debug_print_regex_pattern(r.re)
+  dputc(47)
+end
+
+local function debug_print_addr(a: *Addr)
+  if a == nilptr then return end
+  local t = a.atype
+  if t == ADDR_IS_NULL then dputs('[ADDR-NULL]')
+  elseif t == ADDR_IS_REGEX then debug_print_regex(a.re); debug_print_regex_flags(a.re, true)
+  elseif t == ADDR_IS_NUM then dputs(string.format('%d', a.num))
+  elseif t == ADDR_IS_NUM_MOD then dputs(string.format('%d~%d', a.num, a.step))
+  elseif t == ADDR_IS_STEP then dputs(string.format('+%d', a.step))
+  elseif t == ADDR_IS_STEP_MOD then dputs(string.format('~%d', a.step))
+  elseif t == ADDR_IS_LAST then dputc(36) end
+end
+
+local function debug_print_subst(s: *Subst)
+  if s == nilptr then return end
+  debug_print_regex(s.regx)
+  local last: integer = REPL_ASIS
+  for i = 1, #s.repl do
+    local p = s.repl[i]
+    if p.repl_type ~= last then
+      dputc(92)
+      if p.repl_type == 0 then dputc(69)
+      elseif p.repl_type == REPL_UPPERCASE then dputc(85)
+      elseif p.repl_type == REPL_LOWERCASE then dputc(76)
+      elseif (p.repl_type & REPL_MODIFIERS) == REPL_UPPERCASE_FIRST then dputc(117)
+      elseif (p.repl_type & REPL_MODIFIERS) == REPL_LOWERCASE_FIRST then dputc(108) end
+      last = p.repl_type
+    end
+    if p.prefix.size > 0 then dputs(p.prefix) end
+    if p.subst_id ~= -1 then
+      if p.subst_id == 0 then dputc(38) else dputs(string.format('\\%d', p.subst_id)) end
+    end
+  end
+  dputc(47)
+  debug_print_regex_flags(s.regx, false)
+  if s.isglobal then dputc(103) end
+  if s.eval then dputc(101) end
+  if s.print ~= 0 then dputc(112) end
+  if s.numb ~= 0 then dputs(string.format('%d', s.numb)) end
+  if s.outf ~= nilptr then
+    dputc(119)
+    dputs(s.outf.name)
+  end
+end
+
+local function debug_print_function(sc: *Cmd)
+  local c = sc.cmd
+  dputc((@byte)(c & 0xff))
+  if c == 58 then
+    if sc.has_label then dputs(sc.label_name) else dputs('(null)') end
+  elseif c == 97 or c == 99 or c == 105 then
+    dputs('\\')
+    if sc.has_text and sc.text.size > 0 then dputs(sc.text) end
+  elseif c == 98 or c == 116 or c == 84 then
+    if sc.jump_index < v_length then
+      local t = cmd_at(sc.jump_index)
+      if t.has_label then dputc(32); dputs(t.label_name) end
+    end
+  elseif c == 101 then
+    dputc(32)
+    if sc.has_text then dputs(sc.text) end
+  elseif c == 76 or c == 108 or c == 113 or c == 81 then
+    if sc.int_arg ~= -1 then dputs(string.format(' %d', sc.int_arg)) end
+  elseif c == 114 then
+    dputc(32); dputs(sc.fname)
+  elseif c == 82 then
+    dputc(32); dputs(sc.outf.name)
+  elseif c == 115 then
+    debug_print_subst(sc.subst)
+  elseif c == 87 or c == 119 then
+    dputs(sc.outf.name)
+  elseif c == 121 then
+    dputc(47)
+    for i = 0, 255 do if sc.translate[i] ~= (@byte)(i) then dputc((@byte)(i)) end end
+    dputc(47)
+    for i = 0, 255 do if sc.translate[i] ~= (@byte)(i) then dputc(sc.translate[i]) end end
+    dputc(47)
+  end
+end
+
+local function debug_print_command(sc: *Cmd)
+  if sc.cmd == 125 then block_level = block_level - 1 end
+  for _ = 1, block_level do dputs('  ') end
+  debug_print_addr(sc.a1)
+  if sc.a2 ~= nilptr then dputc(44) end
+  debug_print_addr(sc.a2)
+  local bang = sc.addr_bang
+  if sc.cmd == 123 then bang = not bang end
+  if bang then dputc(33) end
+  if sc.a1 ~= nilptr or sc.a2 ~= nilptr then dputc(32) end
+  debug_print_function(sc)
+  dputc(10)
+  if sc.cmd == 123 then block_level = block_level + 1 end
+end
+
+local function debug_print_program()
+  block_level = 1
+  dputs('SED PROGRAM:\n')
+  for i = 0, < v_length do debug_print_command(cmd_at(i)) end
+  block_level = 0
+end
+
+-- Execution (execute.c) ---------------------------------------------------------
+
+local Line = @record{ text: Bytes, active: usize, length: usize, alloc: usize, chomped: boolean }
+
+local INITIAL_BUFFER_SIZE: usize <comptime> = 50
+
+local function lp(l: *Line): Bytes return &l.text[l.active] end
+
+local function line_init(l: *Line, size: usize)
+  l.text = xalloc(size + 1)
+  l.active = 0
+  l.alloc = size
+  l.length = 0
+  l.chomped = true
+end
+
+local function resize_line(l: *Line, len: usize)
+  if l.active > 0 then
+    c_memmove(l.text, &l.text[l.active], l.length)
+    l.alloc = l.alloc + l.active
+    l.active = 0
+    if l.alloc >= len then return end
+  end
+  local a = l.alloc * 2
+  if a < len then a = len end
+  if a < INITIAL_BUFFER_SIZE then a = INITIAL_BUFFER_SIZE end
+  l.text = (@Bytes)(c_realloc(l.text, (@csize)(a + 1)))
+  l.alloc = a
+end
+
+local function str_append(to: *Line, p: Bytes, n: usize)
+  if n == 0 then return end
+  local nl = to.length + n
+  if to.alloc < nl then resize_line(to, nl) end
+  c_memcpy(&to.text[to.active + to.length], p, n)
+  to.length = nl
+end
+
+local function str_append1(to: *Line, c: byte)
+  local b: [1]byte = {c}
+  str_append(to, &b, 1)
+end
+
+local function line_reset(l: *Line)
+  if l.alloc == 0 then line_init(l, INITIAL_BUFFER_SIZE) else l.length = 0 end
+end
+
+local function line_copy(from: *Line, to: *Line)
+  to.alloc = to.alloc + to.active
+  to.active = 0
+  if to.alloc < from.length then
+    local a = to.alloc * 2
+    if a < from.length then a = from.length end
+    if a < INITIAL_BUFFER_SIZE then a = INITIAL_BUFFER_SIZE end
+    to.text = (@Bytes)(c_realloc(to.text, (@csize)(a + 1)))
+    to.alloc = a
+  end
+  to.length = from.length
+  to.chomped = from.chomped
+  if from.length > 0 then c_memcpy(to.text, lp(from), from.length) end
+end
+
+local function line_append(from: *Line, to: *Line)
+  str_append1(to, buffer_delimiter)
+  str_append(to, lp(from), from.length)
+  to.chomped = from.chomped
+end
+
+local function line_exchange(a: *Line, b: *Line)
+  local t = $a
+  $a = $b
+  $b = t
+end
+
+local line: Line
+local hold: Line
+local s_accum: Line
+local replaced = false
+
+local AppendItem = @record{ text: string, has_text: boolean, fname: string, has_fname: boolean }
+local append_queue: sequence(AppendItem)
+
+local output_file: Output
+
+local Input = @record{
+  file_list: sequence(string),
+  next_file: integer,
+  bad_count: integer,
+  line_number: uint64,
+  reset_at_next_file: boolean,
+  can_read: boolean,         -- read_fn is read_file_line
+  in_file_name: string,
+  out_file_name: string,
+  st: sys.Stat,
+  fp: *In,
+}
+
+local rbuf: Buf
+
+local function read_file_line(input: *Input): boolean
+  local result = ck_getdelim(input.fp, buffer_delimiter, &rbuf)
+  if result <= 0 then return false end
+  local n = (@usize)(result)
+  if rbuf.data[n - 1] == buffer_delimiter then
+    n = n - 1
+  else
+    line.chomped = false
+  end
+  str_append(&line, rbuf.data, n)
+  return true
+end
+
+local function output_missing_newline(o: *Output)
+  if o.missing_newline then
+    local d: [1]byte = {buffer_delimiter}
+    ck_fwrite(o.out, &d, 1)
+    o.missing_newline = false
+  end
+end
+
+local function flush_output(o: *Out)
+  if unbuffered then ck_fflush(o) end
+end
+
+local function output_line(text: Bytes, length: usize, nl: boolean, o: *Output)
+  output_missing_newline(o)
+  if length > 0 then ck_fwrite(o.out, text, length) end
+  if nl then
+    local d: [1]byte = {buffer_delimiter}
+    ck_fwrite(o.out, &d, 1)
+  else
+    o.missing_newline = true
+  end
+  flush_output(o.out)
+end
+
+local function print_file(name: string, o: *Out)
+  local fp = open_in(name, false)
+  if fp == nilptr then return end
+  local buf: [8192]byte
+  while true do
+    local cnt = in_fread(fp, &buf, 8192)
+    if cnt == 0 and fp.err then
+      panic(string.format('read error on %s: %s', in_name(fp), strerror(sys.errno())))
+    end
+    if cnt == 0 then break end
+    ck_fwrite(o, &buf, cnt)
+  end
+  ck_fclose_in(fp)
+end
+
+local function dump_append_queue()
+  output_missing_newline(&output_file)
+  for i = 1, #append_queue do
+    local p = append_queue[i]
+    if p.has_text then ck_fwrite(output_file.out, p.text.data, p.text.size) end
+    if p.has_fname then print_file(p.fname, output_file.out) end
+  end
+  flush_output(output_file.out)
+  append_queue:clear()
+end
+
+local function get_backup_file_name(name: string): string
+  local sb: stringbuilder
+  for i: usize = 0, < in_place_extension.size do
+    local c = in_place_extension.data[i]
+    if c == 42 then sb:write(name) else sb:writebyte(c) end
   end
   return sb:promote()
 end
 
-function Script:rest_of_line(): string
-  self:skip_ws()
-  local start = self.pos
-  while self:more() and self:peek() ~= 10 do self.pos = self.pos + 1 end
-  local s = self.s:sub(start, self.pos - 1)
-  if self:more() then self.pos = self.pos + 1 end
-  return s
-end
-
-function Script:label_arg(): string
-  self:skip_ws()
-  local start = self.pos
-  while self:more() and self:peek() ~= 10 and self:peek() ~= 59 do self.pos = self.pos + 1 end
-  local s = self.s:sub(start, self.pos - 1)
-  -- trim trailing blanks
-  local e = s.size
-  while e > 0 and (s:byte(e) == 32 or s:byte(e) == 9) do e = e - 1 end
-  return s:sub(1, e)
-end
-
-local function parse_script(text: string): boolean
-  local sc: Script = {s = text, pos = 1}
-  local stack: sequence(integer)
-  if text.size >= 2 and text:sub(1, 2) == '#n' and (text.size == 2 or text:byte(3) == 10) then sed.quiet = true end
+-- utils.c follow_symlink
+local function follow_symlink(fname: string): string
+  local fn = fname
+  local num_links: integer = 0
+  local buf: [4096]byte
   while true do
-    sc:skip_ws_nl()
-    if not sc:more() then break end
-    if sc:peek() == 35 then sc:rest_of_line(); continue end
-    local cmd: Cmd
-    if not sc:address(&cmd.a1) then return false end
-    sc:skip_ws()
-    if sc:peek() == 44 then
-      sc.pos = sc.pos + 1
-      sc:skip_ws()
-      local c = sc:peek()
-      if c == 43 or c == 126 then
-        sc.pos = sc.pos + 1
-        local n, ok = sc:number()
-        if not ok then sed.err = 'expected number'; return false end
-        cmd.a2.kind = c == 43 and ADDR_PLUS or ADDR_MULT; cmd.a2.line = n
-      else
-        if not sc:address(&cmd.a2) then return false end
-        if cmd.a2.kind == ADDR_NONE then sed.err = 'unexpected `,\''; return false end
-      end
+    local r = sys.readlink(cdup(fn), &buf, 4096)
+    if r < 0 then
+      if sys.errno() == EINVAL then break end
+      panic(string.format("couldn't readlink %s: %s", fn, strerror(sys.errno())))
     end
-    sc:skip_ws()
-    while sc:peek() == 33 do cmd.negate = not cmd.negate; sc.pos = sc.pos + 1; sc:skip_ws() end
-    if not sc:more() then sed.err = 'missing command'; return false end
-    local name = sc:peek()
-    sc.pos = sc.pos + 1
-    cmd.name = name
-    if name == 123 then
-      stack:push(#sed.cmds + 1)
-    elseif name == 125 then
-      if #stack == 0 then sed.err = 'unexpected `}\''; return false end
-      local open = stack[#stack]; stack:remove(#stack)
-      sed.cmds[open].target = #sed.cmds + 1
-    elseif name == 115 then
-      local delim = sc:peek()
-      if delim == 0 or delim == 10 or delim == 92 then sed.err = 'unterminated `s\' command'; return false end
-      sc.pos = sc.pos + 1
-      local pat, ok1 = sc:delimited(delim, true)
-      if not ok1 then sed.err = 'unterminated `s\' command'; return false end
-      local rep, ok2 = sc:delimited(delim, false)
-      if not ok2 then sed.err = 'unterminated `s\' command'; return false end
-      cmd.repl = rep
-      local icase, mline = false, false
-      cmd.nth = 0
-      while sc:more() do
-        local f = sc:peek()
-        if f == 103 then cmd.allm = true
-        elseif f == 112 then
-          -- GNU: p before e prints before evaluating, after e it prints the result
-          if cmd.print ~= 0 then sed.err = "multiple `p' options to `s' command"; return false end
-          cmd.print = cmd.eval and 2 or 1
-        elseif f == 105 or f == 73 then icase = true
-        elseif f == 109 or f == 77 then mline = true
-        elseif f == 101 then cmd.eval = true
-        elseif f >= 48 and f <= 57 then
-          local n, _ = sc:number(); cmd.nth = n; continue
-        elseif f == 119 then
-          sc.pos = sc.pos + 1
-          cmd.wfile = sc:rest_of_line()
-          local found = false
-          for _, f in ipairs(sed.wfiles) do if f == cmd.wfile then found = true end end
-          if not found then sed.wfiles:push(cmd.wfile) end
-          break
-        else break end
-        sc.pos = sc.pos + 1
-      end
-      local prog, rok = compile_re(pat, icase, mline)
-      if not rok then return false end
-      cmd.re = prog; cmd.has_re = true
-    elseif name == 121 then
-      local delim = sc:peek()
-      sc.pos = sc.pos + 1
-      local src, ok1 = sc:delimited(delim, false)
-      local dst, ok2 = sc:delimited(delim, false)
-      if not ok1 or not ok2 then sed.err = 'unterminated `y\' command'; return false end
-      local us, _ = util.unescape(src)
-      local ud, _ = util.unescape(dst)
-      if us.size ~= ud.size then sed.err = 'strings for `y\' command are different lengths'; return false end
-      for b = 0, 255 do cmd.ymap[b] = (@byte)(b) end
-      for i: usize = 1, us.size do cmd.ymap[us:byte(i)] = ud:byte(i) end
-    elseif name == 97 or name == 105 or name == 99 then
-      cmd.text = sc:text_arg()
-    elseif name == 101 then
-      cmd.text = sc:rest_of_line()
-    elseif name == 114 or name == 119 or name == 87 or name == 82 then
-      cmd.text = sc:rest_of_line()
-      if name == 119 or name == 87 then
-        local found = false
-        for _, f in ipairs(sed.wfiles) do if f == cmd.text then found = true end end
-        if not found then sed.wfiles:push(cmd.text) end
-      end
-    elseif name == 98 or name == 116 or name == 84 or name == 58 then
-      cmd.text = sc:label_arg()
-      if name == 58 and cmd.text.size == 0 then sed.err = '":" lacks a label'; return false end
-    elseif name == 113 or name == 81 or name == 108 or name == 76 then
-      sc:skip_ws()
-      local n, ok = sc:number()
-      if ok then cmd.exitcode = n end
-    elseif name == 112 or name == 80 or name == 100 or name == 68 or name == 110 or name == 78
-      or name == 103 or name == 71 or name == 104 or name == 72 or name == 120 or name == 61
-      or name == 122 or name == 70 then
+    if num_links >= 40 then
+      panic(string.format("couldn't follow symlink %s: %s", fname, strerror(ELOOP)))
+    end
+    local target = string.copy(view(&buf, (@usize)(r)))
+    local slash = -1
+    for i: usize = 0, < fn.size do if fn.data[i] == 47 then slash = (@integer)(i) end end
+    if (target.size == 0 or target.data[0] ~= 47) and slash >= 0 then
+      fn = string.copy(view(fn.data, (@usize)(slash + 1))) .. target
     else
-      sed.err = "unknown command: `" .. string.char(name) .. "'"
-      return false
+      fn = target
     end
-    sed.cmds:push(cmd)
-    -- command terminator
-    sc:skip_ws()
-    local t = sc:peek()
-    if t == 59 or t == 10 then sc.pos = sc.pos + 1
-    elseif t == 125 or t == 0 or t == 35 or name == 123 or (name == 115 and cmd.wfile.size > 0) then
-    elseif name == 97 or name == 105 or name == 99 or name == 114 or name == 119 or name == 98 or name == 116 or name == 84 or name == 58 or name == 101 then
-    else
-      sed.err = "extra characters after command"
-      return false
-    end
+    num_links = num_links + 1
   end
-  if #stack > 0 then sed.err = 'unmatched `{\''; return false end
-  -- resolve labels
-  for i = 1, #sed.cmds do
-    local c = sed.cmds[i]
-    if c.name == 98 or c.name == 116 or c.name == 84 then
-      if c.text.size == 0 then
-        sed.cmds[i].target = #sed.cmds + 1
-      else
-        local found = -1
-        for j = 1, #sed.cmds do
-          if sed.cmds[j].name == 58 and sed.cmds[j].text == c.text then found = j; break end
-        end
-        if found < 0 then sed.err = "can't find label for jump to `" .. c.text .. "'"; return false end
-        sed.cmds[i].target = found
-      end
-    end
-  end
-  return true
+  return fn
 end
 
--- Execution --------------------------------------------------------------------
-
-local function is_last(): boolean
-  return sed.idx >= sed.total
-end
-
-local function addr_match(a: *Addr): boolean
-  if a.kind == ADDR_LINE then return sed.lineno == a.line
-  elseif a.kind == ADDR_LAST then return is_last()
-  elseif a.kind == ADDR_RE then
-    local m = a.re:test(sed.ps)
-    if a.re.toocomplex then util.err('pattern too complex'); sed.quit = true; sed.exitcode = 4 end
-    return m
-  elseif a.kind == ADDR_STEP then
-    if a.step <= 0 then return sed.lineno == a.line end
-    return sed.lineno >= a.line and (sed.lineno - a.line) % a.step == 0
-  end
-  return true
-end
-
-local function selected(c: *Cmd): boolean
-  local m: boolean
-  if c.a1.kind == ADDR_NONE then
-    m = true
-  elseif c.a2.kind == ADDR_NONE then
-    m = addr_match(&c.a1)
-  elseif c.active then
-    -- inside a range: does this line close it?
-    m = true
-    if c.a2.kind == ADDR_LINE then
-      if sed.lineno >= c.endline then c.active = false end
-    elseif c.a2.kind == ADDR_PLUS or c.a2.kind == ADDR_MULT then
-      if sed.lineno >= c.endline then c.active = false end
-    elseif c.a2.kind == ADDR_LAST then
-      if is_last() then c.active = false end
-    elseif addr_match(&c.a2) then
-      c.active = false
-    end
+local function open_next_file(name: string, input: *Input)
+  input.in_file_name = name
+  if name == '-' and not in_place then
+    stdin_in.eof = false
+    stdin_in.err = false
+    input.fp = &stdin_in
   else
-    local start = false
-    if c.a1.kind == ADDR_LINE and c.a1.line == 0 then
-      -- 0,/re/: the range is open from the first line and the end regex may close it there
-      start = not c.finished
-      if start then
-        c.finished = true
-        c.active = true
-        if c.a2.kind == ADDR_RE and addr_match(&c.a2) then c.active = false end
-        return not c.negate
+    if follow_symlinks then input.in_file_name = follow_symlink(name) end
+    input.fp = open_in(name, false)
+    if input.fp == nilptr then
+      errmsg(string.format("can't read %s: %s", name, strerror(sys.errno())))
+      input.can_read = false
+      input.bad_count = input.bad_count + 1
+      return
+    end
+  end
+  input.can_read = true
+  if in_place then
+    local tmpdir: string
+    local slash = -1
+    local fnm = input.in_file_name
+    for i: usize = 0, < fnm.size do if fnm.data[i] == 47 then slash = (@integer)(i) end end
+    if slash >= 0 then tmpdir = string.copy(view(fnm.data, (@usize)(slash))) else tmpdir = '.' end
+    if sys.isatty(input.fp.fd) == 1 then panic(string.format("couldn't edit %s: is a terminal", input.in_file_name)) end
+    sys.fstat(input.fp.fd, &input.st)
+    if (input.st.st_mode & sys.S_IFMT) ~= sys.S_IFREG then
+      panic(string.format("couldn't edit %s: not a regular file", input.in_file_name))
+    end
+    local template = tmpdir .. '/sedXXXXXX'
+    local save_umask = sys.umask(0x3f)
+    local fd = c_mkstemp((@cstring)(template.data))
+    local err = sys.errno()
+    sys.umask(save_umask)
+    if fd < 0 then panic(string.format("couldn't open temporary file %s: %s", template, strerror(err))) end
+    input.out_file_name = template
+    cleanup_file = template
+    has_cleanup = true
+    local o = default_allocator:new(@Out)
+    o.fd = fd; o.name = template; o.registered = true
+    reg_outs:push(o)
+    output_file.out = o
+    output_file.missing_newline = false
+  else
+    if unbuffered then input.fp.unbuffered = true end
+    output_file.out = &stdout_out
+  end
+end
+
+local function closedown(input: *Input)
+  input.can_read = false
+  if input.fp == nilptr then return end
+  if in_place and output_file.out ~= nilptr then
+    local target = input.in_file_name
+    local ofd = output_file.out.fd
+    if c_fchown(ofd, input.st.st_uid, input.st.st_gid) == -1 then
+      c_fchown(ofd, 0xffffffff, input.st.st_gid)
+    end
+    c_fchmod(ofd, input.st.st_mode & 0xfff)
+    ck_fclose_in(input.fp)
+    ck_fclose_out(output_file.out)
+    if in_place_extension ~= '*' then
+      local backup = get_backup_file_name(target)
+      if sys.rename(cdup(target), cdup(backup)) ~= 0 then
+        panic(string.format('cannot rename %s: %s', target, strerror(sys.errno())))
       end
+    end
+    if sys.rename(cdup(input.out_file_name), cdup(target)) ~= 0 then
+      panic(string.format('cannot rename %s: %s', input.out_file_name, strerror(sys.errno())))
+    end
+    has_cleanup = false
+  elseif input.fp ~= &stdin_in then
+    ck_fclose_in(input.fp)
+  end
+  input.fp = nilptr
+end
+
+local function reset_addresses()
+  for i = 0, < v_length do
+    local c = cmd_at(i)
+    if c.a1 ~= nilptr and c.a1.atype == ADDR_IS_NUM and c.a1.num == 0 then
+      c.range_state = RANGE_ACTIVE
     else
-      start = addr_match(&c.a1)
+      c.range_state = RANGE_INACTIVE
     end
-    m = start
-    if start then
-      c.active = true
-      if c.a2.kind == ADDR_LINE then
-        c.endline = c.a2.line
-        if c.endline <= sed.lineno then c.active = false end
-      elseif c.a2.kind == ADDR_PLUS then
-        c.endline = sed.lineno + c.a2.line
-        if c.a2.line == 0 then c.active = false end
-      elseif c.a2.kind == ADDR_MULT then
-        if c.a2.line <= 0 or sed.lineno % c.a2.line == 0 then c.active = false
-        else c.endline = (sed.lineno // c.a2.line + 1) * c.a2.line end
-      elseif c.a2.kind == ADDR_LAST then
-        if is_last() then c.active = false end
+  end
+end
+
+local function rewind_read_files()
+  for i = #file_read, 1, -1 do
+    local p = file_read[i]
+    if p.inp ~= nilptr then in_rewind(p.inp) end
+  end
+  -- the special /dev/stdin R file is stdin itself
+end
+
+local function read_pattern_space(input: *Input, append: boolean): boolean
+  if #append_queue > 0 then dump_append_queue() end
+  replaced = false
+  if not append then line.length = 0 end
+  line.chomped = true
+  while not (input.can_read and read_file_line(input)) do
+    closedown(input)
+    if input.next_file > #input.file_list then return false end
+    if input.reset_at_next_file then
+      input.line_number = 0
+      hold.length = 0
+      reset_addresses()
+      rewind_read_files()
+      if in_place then output_file.missing_newline = false end
+      input.reset_at_next_file = separate_files
+    end
+    local name = input.file_list[input.next_file]
+    input.next_file = input.next_file + 1
+    open_next_file(name, input)
+  end
+  input.line_number = input.line_number + 1
+  return true
+end
+
+local function last_file_with_data_p(input: *Input): boolean
+  while true do
+    closedown(input)
+    if input.next_file > #input.file_list then return true end
+    local name = input.file_list[input.next_file]
+    input.next_file = input.next_file + 1
+    open_next_file(name, input)
+    if input.fp ~= nilptr then
+      local ch = in_getc(input.fp)
+      if ch ~= EOF then
+        in_ungetc(input.fp)
+        return false
       end
     end
   end
-  if c.negate then return not m end
-  return m
+  return true
 end
 
--- GNU output_missing_newline: a line printed without its delimiter (the
--- input's last line had none) gets it once anything else is printed.
-local function out_pending()
-  if sed.missing then util.writebyte(sed.delim); sed.missing = false end
+local function test_eof(input: *Input): boolean
+  if input.fp == nilptr then return separate_files or last_file_with_data_p(input) end
+  if input.fp.eof then return separate_files or last_file_with_data_p(input) end
+  local ch = in_getc(input.fp)
+  if ch == EOF then return separate_files or last_file_with_data_p(input) end
+  in_ungetc(input.fp)
+  return false
 end
 
-local function emit(s: string, newline: boolean)
-  out_pending()
-  util.write(s)
-  if newline then util.writebyte(sed.delim) end
-end
-
--- Print the pattern space with the input's trailing-newline convention.
-local function print_ps(s: string)
-  out_pending()
-  util.write(s)
-  if is_last() and not sed.lastnl then sed.missing = true else util.writebyte(sed.delim) end
-end
-
-local function find_delim(s: string): isize
-  for i: usize = 0, < s.size do
-    if s.data[i] == sed.delim then return (@isize)(i) + 1 end
+local function match_an_address_p(a: *Addr, input: *Input): boolean
+  local t = a.atype
+  if t == ADDR_IS_NULL then return true
+  elseif t == ADDR_IS_REGEX then return match_regex(a.re, lp(&line), line.length, 0, 0)
+  elseif t == ADDR_IS_NUM_MOD then
+    return input.line_number >= a.num and (input.line_number - a.num) % a.step == 0
+  elseif t == ADDR_IS_STEP or t == ADDR_IS_STEP_MOD then
+    return a.num <= input.line_number
+  elseif t == ADDR_IS_LAST then return test_eof(input)
+  elseif t == ADDR_IS_NUM then return a.num == input.line_number
   end
-  return 0
+  panic('INTERNAL ERROR: bad address type')
+  return false
 end
 
--- Output of `sh -c cmd` (popen as GNU sed uses it for e and s///e). The
--- command line ends at its first NUL byte, as a C string does.
-local function sh_output(cmd: string): string
-  util.flush()
-  local ccmd = string.copy(cmd)
+local function match_address_p(cmd: *Cmd, input: *Input): boolean
+  if cmd.a1 == nilptr then return true end
+  if cmd.range_state ~= RANGE_ACTIVE then
+    if cmd.a2 == nilptr then return match_an_address_p(cmd.a1, input) end
+    if cmd.a1.atype == ADDR_IS_NUM then
+      if cmd.range_state == RANGE_CLOSED or input.line_number < cmd.a1.num then return false end
+    else
+      if not match_an_address_p(cmd.a1, input) then return false end
+    end
+    cmd.range_state = RANGE_ACTIVE
+    local t = cmd.a2.atype
+    if t == ADDR_IS_REGEX then
+      return true
+    elseif t == ADDR_IS_NUM then
+      if input.line_number >= cmd.a2.num then cmd.range_state = RANGE_CLOSED end
+      return input.line_number <= cmd.a2.num or match_an_address_p(cmd.a1, input)
+    elseif t == ADDR_IS_STEP then
+      cmd.a2.num = input.line_number + cmd.a2.step
+      return true
+    elseif t == ADDR_IS_STEP_MOD then
+      cmd.a2.num = input.line_number + cmd.a2.step - input.line_number % cmd.a2.step
+      return true
+    end
+  end
+  if cmd.a2.atype == ADDR_IS_NUM then
+    if input.line_number >= cmd.a2.num then cmd.range_state = RANGE_CLOSED end
+    return input.line_number <= cmd.a2.num
+  end
+  if match_an_address_p(cmd.a2, input) then cmd.range_state = RANGE_CLOSED end
+  return true
+end
+
+local function do_list(line_len: int32)
+  local p = lp(&line)
+  local len = line.length
+  local width: uint64 = 0
+  local fp = output_file.out
+  output_missing_newline(&output_file)
+  local obuf: [16]byte
+  local bs: [1]byte = {92}
+  local d: [1]byte = {buffer_delimiter}
+  for k: usize = 0, < len do
+    local c = p[k]
+    local o: usize = 0
+    if c < 128 and isprint(c) then
+      obuf[o] = c; o = o + 1
+      if c == 92 then obuf[o] = 92; o = o + 1 end
+    else
+      obuf[o] = 92; o = o + 1
+      local e: byte = 0
+      if c == 7 then e = 97 elseif c == 8 then e = 98 elseif c == 12 then e = 102
+      elseif c == 10 then e = 110 elseif c == 13 then e = 114 elseif c == 9 then e = 116
+      elseif c == 11 then e = 118 end
+      if e ~= 0 then
+        obuf[o] = e; o = o + 1
+      else
+        obuf[o] = (@byte)(48 + (c >> 6)); obuf[o + 1] = (@byte)(48 + ((c >> 3) & 7)); obuf[o + 2] = (@byte)(48 + (c & 7))
+        o = o + 3
+      end
+    end
+    if line_len > 0 and width + o >= (@uint64)(line_len) then
+      ck_fwrite(fp, &bs, 1)
+      ck_fwrite(fp, &d, 1)
+      width = 0
+    end
+    ck_fwrite(fp, &obuf, o)
+    width = width + o
+  end
+  local dollar: [1]byte = {36}
+  ck_fwrite(fp, &dollar, 1)
+  ck_fwrite(fp, &d, 1)
+  flush_output(fp)
+end
+
+-- str_append_modified in the C locale: btowc of a byte above 127 is WEOF,
+-- which towupper/towlower keep and wctob turns into 0xff.
+local function conv(c: byte, upper: boolean): byte
+  if c >= 128 then return 0xff end
+  if upper then return (@byte)(toupper(c)) end
+  return (@byte)(tolower(c))
+end
+
+local function str_append_modified(to: *Line, s: Bytes, n: usize, t: integer)
+  if t == REPL_ASIS then str_append(to, s, n); return end
+  local typ = t
+  local i: usize = 0
+  while i < n do
+    local c = s[i]
+    i = i + 1
+    if (typ & (REPL_UPPERCASE_FIRST | REPL_LOWERCASE_FIRST)) ~= 0 then
+      local up = (typ & REPL_UPPERCASE_FIRST) ~= 0
+      typ = typ & ~(REPL_LOWERCASE_FIRST | REPL_UPPERCASE_FIRST)
+      if typ == REPL_ASIS then
+        str_append1(to, conv(c, up))
+        str_append(to, &s[i], n - i)
+        return
+      end
+      str_append1(to, conv(c, up))
+    elseif (typ & REPL_UPPERCASE) ~= 0 then
+      str_append1(to, conv(c, true))
+    else
+      str_append1(to, conv(c, false))
+    end
+  end
+end
+
+local function append_replacement(buf: *Line, sub: *Subst)
+  local repl_mod: integer = 0
+  for k = 1, #sub.repl do
+    local p = &sub.repl[k]
+    local i = p.subst_id
+    local curr_type: integer
+    if (p.repl_type & REPL_MODIFIERS) ~= 0 then curr_type = p.repl_type else curr_type = p.repl_type | repl_mod end
+    repl_mod = 0
+    if p.prefix.size > 0 then
+      str_append_modified(buf, p.prefix.data, p.prefix.size, curr_type)
+      curr_type = curr_type & ~REPL_MODIFIERS
+    end
+    if i >= 0 and i < regs_num then
+      local s: isize = -1
+      local e: isize = -1
+      if i <= 9 then s = regs_start[i]; e = regs_end[i] end
+      if e == s and (p.repl_type & REPL_MODIFIERS) ~= 0 then
+        repl_mod = curr_type & REPL_MODIFIERS
+      elseif e ~= s then
+        str_append_modified(buf, &line.text[line.active + (@usize)(s)], (@usize)(e - s), curr_type)
+      end
+    end
+  end
+end
+
+-- popen(cmd, "r") with /bin/sh -c; the command ends at its first NUL.
+local function popen_read(cmd: string): (cint, cint)
+  local ccmd = ctmp(cmd, 1)
   local fds: [2]cint = {-1, -1}
-  if sys.pipe(&fds) ~= 0 then util.err('error in subprocess'); sed.quit = true; sed.exitcode = 4; return '' end
+  if sys.pipe(&fds) ~= 0 then return -1, -1 end
   local pid = sys.fork()
   if pid < 0 then
     sys.close(fds[0]); sys.close(fds[1])
-    util.err('error in subprocess'); sed.quit = true; sed.exitcode = 4; return ''
+    return -1, -1
   end
   if pid == 0 then
-    sys.dup2(fds[1], 1); sys.close(fds[0]); sys.close(fds[1])
-    local argv: [4]cstring = {'sh', '-c', (@cstring)(ccmd.data), nilptr}
+    if fds[1] ~= 1 then sys.dup2(fds[1], 1); sys.close(fds[1]) end
+    sys.close(fds[0])
+    local argv: [4]cstring = {'sh', '-c', ccmd, nilptr}
     sys.execve('/bin/sh', &argv, environ)
     sys._exit(127)
   end
   sys.close(fds[1])
-  local out, _ = util.readfd(fds[0])
-  sys.close(fds[0])
+  return pid, fds[0]
+end
+
+local function pclose_wait(pid: cint, fd: cint)
+  sys.close(fd)
   local status: cint = 0
   while sys.waitpid(pid, &status, 0) < 0 and sys.errno() == sys.EINTR do end
-  return out
 end
 
--- e and s///e put the output in the pattern space less one final delimiter.
-local function sh_into_ps(cmd: string)
-  local out = sh_output(cmd)
-  if out.size > 0 and out.data[out.size - 1] == sed.delim then out = out:sub(1, -2) end
-  sed.ps = out
-end
-
-local function flush_append()
-  if #sed.appendq > 0 then out_pending() end
-  for _, t in ipairs(sed.appendq) do util.write(t) end
-  sed.appendq:clear()
-end
-
--- w, s///w and W. Each w file (and /dev/stdout, apart from the main
--- output) has its own missing-delimiter state, as in GNU sed. `chomp`:
--- the text is the whole pattern space, so the input's last line keeps its
--- missing delimiter.
-local function write_to(name: string, s: string, chomp: boolean)
-  local k: integer = 0
-  for i, f in ipairs(sed.wfiles) do if f == name then k = i end end
-  if k == 0 then return end
-  local sb: stringbuilder
-  if sed.wmiss[k] then sb:writebyte(sed.delim); sed.wmiss[k] = false end
-  sb:write(s)
-  if chomp and is_last() and not sed.lastnl then sed.wmiss[k] = true else sb:writebyte(sed.delim) end
-  local out = sb:promote()
-  if name == '/dev/stdout' then util.write(out); return end
-  local fd = sed.wfds[k]
-  if fd >= 0 then sys.write(fd, out.data, out.size) end
-end
-
--- Expand a replacement for one match.
-local function expand_repl(repl: string, text: string, caps: *regex.Caps, sb: *stringbuilder)
-  local i: usize = 1
-  local case_mode: integer = 0   -- 0 none, 1 upper, 2 lower; one-shot: 3 upper-next, 4 lower-next
-  while i <= repl.size do
-    local c = repl:byte(i)
-    local piece: string = ''
-    local literal = true
-    if c == 38 then
-      piece = text:sub(caps.at[0] + 1, caps.at[1]); literal = false
-      i = i + 1
-    elseif c == 92 and i < repl.size then
-      local n = repl:byte(i + 1)
-      i = i + 2
-      if n >= 48 and n <= 57 then
-        local g = n - 48
-        if caps.at[2 * g] >= 0 then piece = text:sub(caps.at[2 * g] + 1, caps.at[2 * g + 1]) end
-        literal = false
-      elseif n == 110 then piece = '\n'
-      elseif n == 116 then piece = '\t'
-      elseif n == 97 then piece = '\a'
-      elseif n == 102 then piece = '\f'
-      elseif n == 114 then piece = '\r'
-      elseif n == 118 then piece = '\v'
-      elseif n == 85 then case_mode = 1; continue
-      elseif n == 76 then case_mode = 2; continue
-      elseif n == 69 then case_mode = 0; continue
-      elseif n == 117 then case_mode = 3; continue
-      elseif n == 108 then case_mode = 4; continue
-      else piece = string.char(n) end
-    else
-      piece = string.char(c)
-      i = i + 1
-    end
-    if case_mode == 0 then
-      sb:write(piece)
-    else
-      for k: usize = 1, piece.size do
-        local b = piece:byte(k)
-        if case_mode == 1 or case_mode == 3 then b = (b >= 97 and b <= 122) and b - 32 or b
-        else b = (b >= 65 and b <= 90) and b + 32 or b end
-        sb:writebyte(b)
-        if case_mode == 3 or case_mode == 4 then case_mode = 0 end
-      end
-    end
+-- fread(buf, 1, 4096, pipe) until end of file: one call per 4096 bytes.
+local function pipe_chunk(fd: cint, buf: Bytes, eof: *boolean): usize
+  local got: usize = 0
+  while got < 4096 do
+    local r = sys.read(fd, &buf[got], 4096 - got)
+    if r < 0 and sys.errno() == sys.EINTR then continue end
+    if r <= 0 then $eof = true; break end
+    got = got + (@usize)(r)
   end
+  return got
 end
 
-local function do_subst(c: *Cmd): boolean
-  local text = sed.ps
-  local caps: regex.Caps
-  local sb: stringbuilder
-  local pos: isize = 0
-  local count: integer = 0
-  local replaced = false
-  local n: isize = (@isize)(text.size)
-  local prev_end: isize = -1
-  while pos <= n do
-    local m = c.re:search(text, pos, &caps)
-    if c.re.toocomplex then
-      util.err('pattern too complex'); sed.quit = true; sed.exitcode = 4
-      return false
-    end
-    if not m then break end
-    local ms, me = caps.at[0], caps.at[1]
-    if ms == me and ms == prev_end then
-      -- GNU sed: an empty match right after the previous match is skipped
-      -- and not counted.
-      if ms < n then sb:writebyte(text.data[ms]) end
-      pos = ms + 1
-      continue
-    end
-    prev_end = me
-    count = count + 1
-    sb:write(text:sub(pos + 1, ms))
-    local take = (c.nth == 0 and (c.allm or count == 1)) or (c.nth > 0 and (count == c.nth or (c.allm and count > c.nth)))
-    if take then
-      expand_repl(c.repl, text, &caps, &sb)
-      replaced = true
-    else
-      sb:write(text:sub(ms + 1, me))
-    end
-    if me == ms then
-      if ms < n then sb:writebyte(text.data[ms]) end
-      pos = ms + 1
-    else
-      pos = me
-    end
-    if take and not c.allm then
-      break
-    end
+local function eval_into_line()
+  line_reset(&s_accum)
+  str_append1(&line, 0)
+  local pid, fd = popen_read(view(lp(&line), line.length))
+  if pid < 0 then panic('error in subprocess') end
+  local buf: [4096]byte
+  local eof = false
+  while not eof do
+    local n = pipe_chunk(fd, &buf, &eof)
+    if n > 0 then str_append(&s_accum, &buf, n) end
   end
-  if not replaced then return false end
-  if pos < n then sb:write(text:sub(pos + 1)) end
-  sed.ps = sb:promote()
-  return true
+  pclose_wait(pid, fd)
+  line_exchange(&line, &s_accum)
 end
 
--- Escape the pattern space the way `l` does.
-local function list_ps(width: integer)
-  local sb: stringbuilder
-  local col: integer = 0
-  local maxw = width
-  if maxw <= 0 then maxw = 1 << 30 end
-  for i: usize = 0, < sed.ps.size do
-    local b = sed.ps.data[i]
-    local piece: string
-    if b == 92 then piece = '\\\\'
-    elseif b == 7 then piece = '\\a' elseif b == 8 then piece = '\\b' elseif b == 12 then piece = '\\f'
-    elseif b == 10 then piece = '\\n' elseif b == 13 then piece = '\\r' elseif b == 9 then piece = '\\t'
-    elseif b == 11 then piece = '\\v'
-    elseif b < 32 or b >= 127 then piece = string.format('\\%03o', b)
-    else piece = string.char(b) end
-    if col + (@integer)(piece.size) > maxw - 1 then
-      sb:writebyte(92); sb:writebyte(sed.delim); col = 0
-    end
-    sb:write(piece); col = col + (@integer)(piece.size)
-  end
-  sb:writebyte(36); sb:writebyte(sed.delim)
-  out_pending()
-  util.write(sb:promote())
-end
-
--- Read the next input line into the pattern space (append when `append`).
--- Returns false at end of input.
-local function next_line(append: boolean): boolean
-  if sed.idx >= sed.total then return false end
-  sed.idx = sed.idx + 1
-  sed.lineno = sed.lineno + 1
-  if append then sed.ps = sed.ps .. string.char(sed.delim) .. sed.lines[sed.idx] else sed.ps = sed.lines[sed.idx] end
-  return true
-end
-
-local function run_cycle()
-  local pc: integer = 1
-  local autoprint = true
-  while pc <= #sed.cmds do
-    local c = &sed.cmds[pc]
-    local name = c.name
-    if name == 58 then pc = pc + 1; continue end
-    if name == 125 then pc = pc + 1; continue end
-    local sel = selected(c)
-    if sed.quit then autoprint = false; break end   -- regex aborted (pattern too complex)
-    if not sel then
-      if name == 123 then pc = c.target + 1 else pc = pc + 1 end
-      continue
-    end
-    if name == 123 then pc = pc + 1
-    elseif name == 115 then
-      if do_subst(c) then
-        sed.tflag = true
-        if c.print == 1 then print_ps(sed.ps) end
-        if c.eval then sh_into_ps(sed.ps) end
-        if c.print == 2 then print_ps(sed.ps) end
-        if c.wfile.size > 0 then write_to(c.wfile, sed.ps, true) end
-      elseif sed.quit then
-        autoprint = false; break
-      end
-      pc = pc + 1
-    elseif name == 121 then
-      local sb: stringbuilder
-      for i: usize = 0, < sed.ps.size do sb:writebyte(c.ymap[sed.ps.data[i]]) end
-      sed.ps = sb:promote()
-      pc = pc + 1
-    elseif name == 112 then print_ps(sed.ps); pc = pc + 1
-    elseif name == 80 then
-      local nl = find_delim(sed.ps)
-      if nl > 0 then emit(sed.ps:sub(1, nl - 1), true) else print_ps(sed.ps) end
-      pc = pc + 1
-    elseif name == 100 then autoprint = false; break
-    elseif name == 68 then
-      local nl = find_delim(sed.ps)
-      if nl <= 0 then autoprint = false; break end
-      sed.ps = sed.ps:sub(nl + 1)
-      flush_append()
-      pc = 1
-      -- restart the cycle without reading input
-      continue
-    elseif name == 110 then
-      if not sed.quiet then print_ps(sed.ps) end
-      flush_append()
-      if not next_line(false) then sed.quit = true; autoprint = false; break end
-      pc = pc + 1
-    elseif name == 78 then
-      if not next_line(true) then
-        -- GNU prints the pattern space when there is no next line
-        sed.quit = true
-        break
-      end
-      pc = pc + 1
-    elseif name == 103 then sed.ps = sed.hs; pc = pc + 1
-    elseif name == 71 then sed.ps = sed.ps .. string.char(sed.delim) .. sed.hs; pc = pc + 1
-    elseif name == 104 then sed.hs = sed.ps; pc = pc + 1
-    elseif name == 72 then sed.hs = sed.hs .. string.char(sed.delim) .. sed.ps; pc = pc + 1
-    elseif name == 120 then local t = sed.ps; sed.ps = sed.hs; sed.hs = t; pc = pc + 1
-    elseif name == 97 then sed.appendq:push(c.text .. '\n'); pc = pc + 1
-    elseif name == 105 then emit(c.text, true); pc = pc + 1
-    elseif name == 99 then
-      -- with a range, print the text once at the end of the range
-      if c.a2.kind == ADDR_NONE or not c.active or c.negate then emit(c.text, true) end
-      autoprint = false
-      break
-    elseif name == 61 then out_pending(); util.writef('%d', sed.lineno); util.writebyte(sed.delim); pc = pc + 1
-    elseif name == 101 then
-      if c.text.size > 0 then
-        local out = sh_output(c.text)
-        out_pending(); util.write(out)
-      else
-        sh_into_ps(sed.ps)
-      end
-      if sed.quit then autoprint = false; break end
-      pc = pc + 1
-    elseif name == 108 then list_ps(c.exitcode > 0 and c.exitcode or 70); pc = pc + 1
-    elseif name == 113 then sed.quit = true; sed.exitcode = c.exitcode; break
-    elseif name == 81 then sed.quit = true; sed.exitcode = c.exitcode; autoprint = false; break
-    elseif name == 114 then
-      local data, ok = util.readfile(c.text)
-      if ok and data.size > 0 then
-        if data.data[data.size - 1] ~= 10 then data = data .. '\n' end
-        sed.appendq:push(data)
-      end
-      pc = pc + 1
-    elseif name == 119 then write_to(c.text, sed.ps, true); pc = pc + 1
-    elseif name == 87 then
-      local nl = find_delim(sed.ps)
-      write_to(c.text, nl > 0 and sed.ps:sub(1, nl - 1) or sed.ps, nl <= 0); pc = pc + 1
-    elseif name == 98 then pc = c.target
-    elseif name == 116 then
-      if sed.tflag then sed.tflag = false; pc = c.target else pc = pc + 1 end
-    elseif name == 84 then
-      if not sed.tflag then pc = c.target else sed.tflag = false; pc = pc + 1 end
-    elseif name == 122 then sed.ps = ''; pc = pc + 1
-    elseif name == 70 then out_pending(); util.writebyte(45); util.writebyte(sed.delim); pc = pc + 1
-    else pc = pc + 1 end
-  end
-  if autoprint and not sed.quiet then print_ps(sed.ps) end
-  flush_append()
-end
-
--- Run the script over one input (all lines of one file, or of all files).
-local function run_input(data: string)
-  sed.lines:clear()
+local function do_subst(sub: *Subst)
   local start: usize = 0
-  for i: usize = 0, < data.size do
-    if data.data[i] == sed.delim then
-      sed.lines:push((@string){data=&data.data[start], size=i - start})
-      start = i + 1
+  local last_end: usize = 0
+  local count: uint64 = 0
+  local again = true
+  line_reset(&s_accum)
+  local regsize = sub.max_id + 1
+  if not match_regex(sub.regx, lp(&line), line.length, start, regsize) then return end
+  if debug then
+    if regs_num > 0 and regs_start[0] ~= -1 then dputs('MATCHED REGEX REGISTERS\n') end
+    for i = 0, < regs_num do
+      if i > 9 or regs_start[i] == -1 then break end
+      dputs(string.format("  regex[%d] = %d-%d '", i, regs_start[i], regs_end[i]))
+      if regs_start[i] ~= regs_end[i] then
+        out_put(D, &line.text[line.active + (@usize)(regs_start[i])], (@usize)(regs_end[i] - regs_start[i]))
+      end
+      dputs("'\n")
     end
   end
-  if start < data.size then sed.lines:push((@string){data=&data.data[start], size=data.size - start}) end
-  sed.total = #sed.lines
-  sed.idx = 0
-  sed.lastnl = data.size == 0 or data.data[data.size - 1] == sed.delim
-  for i = 1, #sed.cmds do sed.cmds[i].active = false; sed.cmds[i].finished = false end
-  while not sed.quit and next_line(false) do
-    sed.tflag = false
-    run_cycle()
+  local done_shortcut = false
+  if #sub.repl == 0 and sub.numb <= 1 then
+    if regs_start[0] == 0 and not sub.isglobal then
+      replaced = true
+      local e = (@usize)(regs_end[0])
+      line.active = line.active + e
+      line.length = line.length - e
+      line.alloc = line.alloc - e
+      done_shortcut = true
+    elseif (@usize)(regs_end[0]) == line.length then
+      replaced = true
+      line.length = (@usize)(regs_start[0])
+      done_shortcut = true
+    end
   end
+  if not done_shortcut then
+    repeat
+      local offset = (@usize)(regs_start[0])
+      local matched = (@usize)(regs_end[0] - regs_start[0])
+      if start < offset then
+        str_append(&s_accum, &line.text[line.active + (@usize)(start)], offset - start)
+        start = offset
+      end
+      local take = false
+      if matched > 0 or count == 0 or offset > last_end then
+        count = count + 1
+        if count >= sub.numb then take = true end
+      end
+      local stop = false
+      if take then
+        replaced = true
+        append_replacement(&s_accum, sub)
+        again = sub.isglobal
+      else
+        if matched == 0 then
+          if start < line.length then matched = 1 else stop = true end
+        end
+        if not stop then str_append(&s_accum, &line.text[line.active + (@usize)(offset)], matched) end
+      end
+      if stop then break end
+      start = offset + matched
+      last_end = (@usize)(regs_end[0])
+    until not (again and start <= line.length and match_regex(sub.regx, lp(&line), line.length, start, regsize))
+    if start < line.length then str_append(&s_accum, &line.text[line.active + (@usize)(start)], line.length - start) end
+    s_accum.chomped = line.chomped
+    line_exchange(&line, &s_accum)
+    if count < sub.numb then return end
+  end
+  if (sub.print & 1) ~= 0 then output_line(lp(&line), line.length, line.chomped, &output_file) end
+  if sub.eval then
+    eval_into_line()
+    if line.length > 0 and lp(&line)[line.length - 1] == buffer_delimiter then line.length = line.length - 1 end
+  end
+  if (sub.print & 2) ~= 0 then output_line(lp(&line), line.length, line.chomped, &output_file) end
+  if sub.outf ~= nilptr then output_line(lp(&line), line.length, line.chomped, sub.outf) end
+end
+
+local function debug_print_end_of_cycle() dputs('END-OF-CYCLE:\n') end
+
+local function debug_print_input(input: *Input)
+  local is_stdin = input.fp ~= nilptr and input.fp.fd == 0
+  dputs(string.format("INPUT:   '%s' line %d\n", is_stdin and 'STDIN' or input.in_file_name, input.line_number))
+end
+
+local function debug_print_line(l: *Line)
+  if l == &hold then dputs('HOLD:    ') else dputs('PATTERN: ') end
+  local p = lp(l)
+  for i: usize = 0, < l.length do debug_print_char(p[i]) end
+  dputc(10)
+end
+
+local function execute_program(input: *Input): integer
+  local ci: integer = 0
+  while ci < v_length do
+    local cur = cmd_at(ci)
+    if debug then
+      dputs('COMMAND: ')
+      debug_print_command(cur)
+    end
+    if match_address_p(cur, input) ~= cur.addr_bang then
+      local c = cur.cmd
+      if c == 97 then
+        local aq: AppendItem = {text = cur.text, has_text = cur.has_text}
+        append_queue:push(aq)
+      elseif c == 123 or c == 98 then
+        ci = cur.jump_index
+        continue
+      elseif c == 125 or c == 35 or c == 58 then
+        -- nothing
+      elseif c == 99 or c == 100 then
+        if c == 99 and cur.range_state ~= RANGE_ACTIVE and cur.has_text then
+          output_line(cur.text.data, cur.text.size - 1, true, &output_file)
+        end
+        if debug then debug_print_end_of_cycle() end
+        return -1
+      elseif c == 68 then
+        local p = lp(&line)
+        local found: isize = -1
+        for i: usize = 0, < line.length do
+          if p[i] == buffer_delimiter then found = (@isize)(i); break end
+        end
+        if found < 0 then return -1 end
+        local k = (@usize)(found) + 1
+        line.alloc = line.alloc - k
+        line.length = line.length - k
+        line.active = line.active + k
+        ci = 0
+        if debug then debug_print_line(&line) end
+        continue
+      elseif c == 101 then
+        local cmd_length = cur.has_text and cur.text.size or 0
+        line_reset(&s_accum)
+        local pid: cint, fd: cint
+        if cmd_length == 0 then
+          str_append1(&line, 0)
+          pid, fd = popen_read(view(lp(&line), line.length))
+        else
+          cur.text.data[cmd_length - 1] = 0
+          pid, fd = popen_read(view(cur.text.data, cmd_length - 1))
+          output_missing_newline(&output_file)
+        end
+        if pid < 0 then panic('error in subprocess') end
+        local buf: [4096]byte
+        local eof = false
+        while not eof do
+          local n = pipe_chunk(fd, &buf, &eof)
+          if n > 0 then
+            if cmd_length == 0 then str_append(&s_accum, &buf, n) else ck_fwrite(output_file.out, &buf, n) end
+          end
+        end
+        pclose_wait(pid, fd)
+        if cmd_length == 0 then
+          if s_accum.length > 0 and lp(&s_accum)[s_accum.length - 1] == buffer_delimiter then
+            s_accum.length = s_accum.length - 1
+          end
+          line_exchange(&line, &s_accum)
+        else
+          flush_output(output_file.out)
+        end
+      elseif c == 103 then
+        line_copy(&hold, &line)
+        if debug then debug_print_line(&hold) end
+      elseif c == 71 then
+        line_append(&hold, &line)
+        if debug then debug_print_line(&line) end
+      elseif c == 104 then
+        line_copy(&line, &hold)
+        if debug then debug_print_line(&hold) end
+      elseif c == 72 then
+        line_append(&line, &hold)
+        if debug then debug_print_line(&hold) end
+      elseif c == 105 then
+        if cur.has_text then output_line(cur.text.data, cur.text.size - 1, true, &output_file) end
+      elseif c == 108 then
+        if cur.int_arg == -1 then
+          do_list((@int32)((@uint32)(lcmd_out_line_len & 0xffffffff)))
+        else
+          do_list(cur.int_arg)
+        end
+      elseif c == 110 then
+        if not no_default_output then output_line(lp(&line), line.length, line.chomped, &output_file) end
+        if test_eof(input) or not read_pattern_space(input, false) then
+          if debug then debug_print_end_of_cycle() end
+          return -1
+        end
+        if debug then debug_print_line(&line) end
+      elseif c == 78 then
+        str_append1(&line, buffer_delimiter)
+        if test_eof(input) or not read_pattern_space(input, true) then
+          if debug then debug_print_end_of_cycle() end
+          line.length = line.length - 1
+          if posixicity == POSIXLY_EXTENDED and not no_default_output then
+            output_line(lp(&line), line.length, line.chomped, &output_file)
+          end
+          return -1
+        end
+        if debug then debug_print_line(&line) end
+      elseif c == 112 then
+        output_line(lp(&line), line.length, line.chomped, &output_file)
+      elseif c == 80 then
+        local p = lp(&line)
+        local found: isize = -1
+        for i: usize = 0, < line.length do
+          if p[i] == buffer_delimiter then found = (@isize)(i); break end
+        end
+        if found >= 0 then
+          output_line(p, (@usize)(found), true, &output_file)
+        else
+          output_line(p, line.length, line.chomped, &output_file)
+        end
+      elseif c == 113 or c == 81 then
+        if c == 113 then
+          if not no_default_output then output_line(lp(&line), line.length, line.chomped, &output_file) end
+          dump_append_queue()
+        end
+        if cur.int_arg == -1 then return 0 end
+        return cur.int_arg
+      elseif c == 114 then
+        if cur.append then
+          local aq: AppendItem = {fname = cur.fname, has_fname = true}
+          append_queue:push(aq)
+        else
+          print_file(cur.fname, output_file.out)
+        end
+      elseif c == 82 then
+        local f = cur.outf.inp
+        if f ~= nilptr and not f.eof then
+          local tb: Buf
+          local result = ck_getdelim(f, buffer_delimiter, &tb)
+          if result >= 0 then
+            local aq: AppendItem = {text = tb:str(), has_text = true}
+            append_queue:push(aq)
+          end
+        end
+      elseif c == 115 then
+        do_subst(cur.subst)
+        if debug then debug_print_line(&line) end
+      elseif c == 116 then
+        if replaced then
+          replaced = false
+          ci = cur.jump_index
+          continue
+        end
+      elseif c == 84 then
+        if not replaced then
+          ci = cur.jump_index
+          continue
+        else
+          replaced = false
+        end
+      elseif c == 119 then
+        if cur.outf.out ~= nilptr then output_line(lp(&line), line.length, line.chomped, cur.outf) end
+      elseif c == 87 then
+        if cur.outf.out ~= nilptr then
+          local p = lp(&line)
+          local found: isize = -1
+          for i: usize = 0, < line.length do
+            if p[i] == buffer_delimiter then found = (@isize)(i); break end
+          end
+          if found >= 0 then
+            output_line(p, (@usize)(found), true, cur.outf)
+          else
+            output_line(p, line.length, line.chomped, cur.outf)
+          end
+        end
+      elseif c == 120 then
+        line_exchange(&line, &hold)
+        if debug then debug_print_line(&line); debug_print_line(&hold) end
+      elseif c == 121 then
+        local p = lp(&line)
+        for i: usize = 0, < line.length do p[i] = cur.translate[p[i]] end
+        if debug then debug_print_line(&line) end
+      elseif c == 122 then
+        line.length = 0
+        if debug then debug_print_line(&line) end
+      elseif c == 61 then
+        output_missing_newline(&output_file)
+        local nb: [24]byte
+        local k: integer = 24
+        local v = input.line_number
+        repeat
+          k = k - 1
+          nb[k] = (@byte)(48 + v % 10)
+          v = v // 10
+        until v == 0
+        out_put(output_file.out, &nb[k], (@usize)(24 - k))
+        out_putc(output_file.out, buffer_delimiter)
+        flush_output(output_file.out)
+      elseif c == 70 then
+        output_missing_newline(&output_file)
+        local nm = input.in_file_name
+        local nn = nm.size
+        for i: usize = 0, < nm.size do if nm.data[i] == 0 then nn = i; break end end
+        out_put(output_file.out, nm.data, nn)
+        out_putc(output_file.out, buffer_delimiter)
+        flush_output(output_file.out)
+      else
+        panic('INTERNAL ERROR: Bad cmd ' .. string.char((@byte)(c & 0xff)))
+      end
+    end
+    ci = ci + 1
+  end
+  if debug then debug_print_end_of_cycle() end
+  if not no_default_output then output_line(lp(&line), line.length, line.chomped, &output_file) end
+  return -1
+end
+
+local function process_files(files: sequence(string)): integer
+  line_init(&line, INITIAL_BUFFER_SIZE)
+  line_init(&hold, 0)
+  local input: Input
+  input.reset_at_next_file = true
+  if #files > 0 then
+    input.file_list = files
+  elseif in_place then
+    panic('no input files')
+  else
+    input.file_list:push('-')
+  end
+  input.next_file = 1
+  input.bad_count = 0
+  input.line_number = 0
+  input.can_read = false
+  input.fp = nilptr
+  output_file.out = &stdout_out
+  local status: integer = 0
+  while read_pattern_space(&input, false) do
+    if debug then
+      debug_print_input(&input)
+      debug_print_line(&line)
+    end
+    status = execute_program(&input)
+    if status == -1 then status = 0 else break end
+  end
+  closedown(&input)
+  if input.bad_count > 0 then status = EXIT_BAD_INPUT end
+  return status
+end
+
+-- Command line (sed.c) --------------------------------------------------------
+
+local USAGE <comptime> = [[
+Usage: sed [OPTION]... {script-only-if-no-other-script} [input-file]...
+
+  -n, --quiet, --silent
+                 suppress automatic printing of pattern space
+      --debug
+                 annotate program execution
+  -e script, --expression=script
+                 add the script to the commands to be executed
+  -f script-file, --file=script-file
+                 add the contents of script-file to the commands to be executed
+  --follow-symlinks
+                 follow symlinks when processing in place
+  -i[SUFFIX], --in-place[=SUFFIX]
+                 edit files in place (makes backup if SUFFIX supplied)
+  -l N, --line-length=N
+                 specify the desired line-wrap length for the `l' command
+  --posix
+                 disable all GNU extensions.
+  -E, -r, --regexp-extended
+                 use extended regular expressions in the script
+                 (for portability use POSIX -E).
+  -s, --separate
+                 consider files as separate rather than as a single,
+                 continuous long stream.
+      --sandbox
+                 operate in sandbox mode (disable e/r/w commands).
+  -u, --unbuffered
+                 load minimal amounts of data from the input files and flush
+                 the output buffers more often
+  -z, --null-data
+                 separate lines by NUL characters
+      --help     display this help and exit
+      --version  output version information and exit
+
+If no -e, --expression, -f, or --file option is given, then the first
+non-option argument is taken as the sed script to interpret.  All
+remaining arguments are names of input files; if no input files are
+specified, then the standard input is read.
+
+GNU sed home page: <https://www.gnu.org/software/sed/>.
+General help using GNU software: <https://www.gnu.org/gethelp/>.
+]]
+
+local function usage(status: integer)
+  if status == 0 then
+    out_puts(&stdout_out, USAGE)
+    out_puts(&stdout_out, 'E-mail bug reports to: <bug-sed@gnu.org>.\n')
+  else
+    local u: string = USAGE
+    raw_write(2, u.data, u.size)
+  end
+  ck_fclose_all()
+  do_exit(status)
+end
+
+-- atoi: strtol's saturation, then the int conversion.
+local function atoi(s: string): int32
+  local i: usize = 0
+  while i < s.size and isspace(s.data[i]) do i = i + 1 end
+  local neg = false
+  if i < s.size and (s.data[i] == 43 or s.data[i] == 45) then neg = s.data[i] == 45; i = i + 1 end
+  local v: uint64 = 0
+  local over = false
+  while i < s.size and isdigit(s.data[i]) do
+    local d = (@uint64)(s.data[i] - 48)
+    if v > (0x7fffffffffffffff - d) // 10 then over = true end
+    if not over then v = v * 10 + d end
+    i = i + 1
+  end
+  local r: int64
+  if over then
+    if neg then r = -0x7fffffffffffffff - 1 else r = 0x7fffffffffffffff end
+  else
+    if neg then r = -(@int64)(v) else r = (@int64)(v) end
+  end
+  return (@int32)((@uint32)((@uint64)(r) & 0xffffffff))
 end
 
 global function applet_sed(args: sequence(string)): integer
-  sed = (@Sed){delim = 10}
-  local scripts: sequence(string)
+  util.applet = 'sed'
+  posix_env = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  if posix_env then posixicity = POSIXLY_CORRECT else posixicity = POSIXLY_EXTENDED end
+  special_stdin.out = &stdin_as_out; special_stdin.inp = &stdin_in
+  special_stdout.out = &stdout_out; special_stdout.inp = &stdout_as_in
+  special_stderr.out = &stderr_out; special_stderr.inp = &stderr_as_in
+  local cols = sys.getenv('COLS')
+  if cols ~= nilptr then
+    local t = (@uint64)((@int64)(atoi((@cstring)(cols))))
+    if t > 1 then lcmd_out_line_len = t - 1 end
+  end
+  local longopts: []util.LongOpt = {
+    {'binary', 0, 98}, {'regexp-extended', 0, 114}, {'debug', 0, 257},
+    {'expression', 1, 101}, {'file', 1, 102}, {'in-place', 2, 105},
+    {'line-length', 1, 108}, {'null-data', 0, 122}, {'zero-terminated', 0, 122},
+    {'quiet', 0, 110}, {'posix', 0, 112}, {'silent', 0, 110},
+    {'sandbox', 0, 256}, {'separate', 0, 115}, {'unbuffered', 0, 117},
+    {'version', 0, 118}, {'help', 0, 104}, {'follow-symlinks', 0, 70},
+  }
+  local g = util.getopt(args, 'bsnrzuEe:f:l:i::V:', &longopts, #longopts)
+  local have_program = false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 110 then no_default_output = true
+    elseif c == 101 then compile_string(g.optarg); have_program = true
+    elseif c == 102 then compile_file(g.optarg); have_program = true
+    elseif c == 122 then buffer_delimiter = 0
+    elseif c == 70 then follow_symlinks = true
+    elseif c == 105 then
+      separate_files = true
+      in_place = true
+      if not g.has_optarg then
+        in_place_extension = '*'
+      elseif g.optarg:find('*', 1, true) > 0 then
+        in_place_extension = g.optarg
+      else
+        in_place_extension = '*' .. g.optarg
+      end
+    elseif c == 108 then lcmd_out_line_len = (@uint64)((@int64)(atoi(g.optarg)))
+    elseif c == 112 then posixicity = POSIXLY_BASIC
+    elseif c == 98 then -- binary: no effect on POSIX systems
+    elseif c == 69 or c == 114 then extended_regexp = true
+    elseif c == 115 then separate_files = true
+    elseif c == 256 then sandbox = true
+    elseif c == 257 then debug = true
+    elseif c == 117 then unbuffered = true
+    elseif c == 118 then
+      out_puts(&stdout_out, 'sed (nebox) after GNU sed 4.9\n')
+      ck_fclose_all()
+      do_exit(0)
+    elseif c == 104 then usage(0)
+    else usage(EXIT_BAD_USAGE) end
+  end
+  local operands = g:operands()
+  local first: integer = 1
+  if not have_program then
+    if #operands >= 1 then
+      compile_string(operands[1])
+      first = 2
+    else
+      usage(EXIT_BAD_USAGE)
+    end
+  end
+  check_final_program()
+  if debug then debug_print_program() end
   local files: sequence(string)
-  local i: integer = 1
-  local have_e = false
-  while i <= #args do
-    local a = args[i]
-    if a == '--' then i = i + 1; break end
-    if a.size < 2 or a:byte(1) ~= 45 then break end
-    if a == '--expression' or a == '--file' or a == '--quiet' or a == '--silent' or a == '--regexp-extended' or a == '--separate' or a == '--in-place' or a == '--null-data' or a == '--zero-terminated' then
-      if a == '--quiet' or a == '--silent' then sed.quiet = true
-      elseif a == '--null-data' or a == '--zero-terminated' then sed.delim = 0
-      elseif a == '--regexp-extended' then sed.ere = true
-      elseif a == '--separate' then sed.separate = true
-      elseif a == '--in-place' then sed.inplace = true; sed.separate = true
-      else
-        i = i + 1
-        if i > #args then return util.die('option requires an argument') end
-        if a == '--expression' then scripts:push(args[i]) else
-          local d, ok = util.readfile(args[i]); if not ok then return 1 end; scripts:push(d)
-        end
-        have_e = true
-      end
-      i = i + 1; continue
-    end
-    local j: usize = 2
-    while j <= a.size do
-      local c = a:byte(j)
-      if c == 110 then sed.quiet = true
-      elseif c == 69 or c == 114 then sed.ere = true
-      elseif c == 115 then sed.separate = true
-      elseif c == 122 then sed.delim = 0
-      elseif c == 105 then
-        sed.inplace = true; sed.separate = true
-        sed.suffix = a:sub(j + 1); break
-      elseif c == 101 or c == 102 then
-        local v: string
-        if j < a.size then v = a:sub(j + 1) else
-          i = i + 1
-          if i > #args then return util.die("option requires an argument -- '" .. string.char(c) .. "'") end
-          v = args[i]
-        end
-        if c == 101 then scripts:push(v) else
-          local d, ok = util.readfile(v); if not ok then return 1 end
-          if d.size > 0 and d.data[d.size - 1] == 10 then d = d:sub(1, -2) end
-          scripts:push(d)
-        end
-        have_e = true
-        break
-      else
-        return util.die("invalid option -- '" .. string.char(c) .. "'")
-      end
-      j = j + 1
-    end
-    i = i + 1
-  end
-  if not have_e then
-    if i > #args then util.err('no script specified'); return 1 end
-    scripts:push(args[i]); i = i + 1
-  end
-  while i <= #args do files:push(args[i]); i = i + 1 end
-  local sb: stringbuilder
-  for k, s in ipairs(scripts) do if k > 1 then sb:write('\n') end; sb:write(s) end
-  if not parse_script(sb:promote()) then util.err('-e expression #1, char 0: ' .. sed.err); return 1 end
-  for _, f in ipairs(sed.wfiles) do
-    local fd: cint = -1
-    if f ~= '/dev/stdout' then
-      fd = sys.open(f, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1B6)
-      if fd < 0 then return util.die("couldn't open file " .. f .. ': ' .. sys.errstr()) end
-    end
-    sed.wfds:push(fd); sed.wmiss:push(false)
-  end
-  if #files == 0 then files:push('-') end
-  if sed.inplace then
-    for _, f in ipairs(files) do
-      if f == '-' then return util.die("couldn't edit -: not a regular file") end
-      local data, ok = util.readfile(f)
-      if not ok then sed.rc = 2; continue end
-      local st: sys.Stat
-      sys.stat(f, &st)
-      local tmp = f .. '.sedtmp'
-      local fd = sys.open(tmp, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, st.st_mode & 0xFFF)
-      if fd < 0 then util.perror(tmp); sed.rc = 4; continue end
-      util.setout(fd)
-      sed.quit = false
-      sed.missing = false
-      run_input(data)
-      util.flush()
-      util.setout(1)
-      sys.close(fd)
-      if sed.suffix.size > 0 then
-        local bak: string
-        if sed.suffix:find('*', 1, true) > 0 then
-          local sbk: stringbuilder
-          for k: usize = 1, sed.suffix.size do
-            if sed.suffix:byte(k) == 42 then sbk:write(util.basename(f)) else sbk:writebyte(sed.suffix:byte(k)) end
-          end
-          bak = util.join(util.dirname(f), sbk:promote())
-          if util.dirname(f) == '.' and f:find('/', 1, true) <= 0 then bak = sbk:promote() end
-        else bak = f .. sed.suffix end
-        sys.rename(f, bak)
-      end
-      if sys.rename(tmp, f) ~= 0 then util.perror(f); sed.rc = 4 end
-      if sed.quit then break end
-    end
-  elseif sed.separate then
-    for _, f in ipairs(files) do
-      local data, ok = util.readfile(f)
-      if not ok then sed.rc = 2; continue end
-      run_input(data)
-      if sed.quit then break end
-    end
-  else
-    local all: stringbuilder
-    for _, f in ipairs(files) do
-      local data, ok = util.readfile(f)
-      if not ok then sed.rc = 2; continue end
-      all:write(data)
-      if data.size > 0 and data.data[data.size - 1] ~= sed.delim and f ~= files[#files] then all:writebyte(sed.delim) end
-    end
-    run_input(all:promote())
-  end
-  for _, fd in ipairs(sed.wfds) do if fd >= 0 then sys.close(fd) end end
-  if sed.exitcode ~= 0 then return sed.exitcode end
-  return sed.rc
+  for i = first, #operands do files:push(operands[i]) end
+  local rc = process_files(files)
+  finish_program()
+  ck_fclose_all()
+  do_exit(rc)
+  return rc
 end

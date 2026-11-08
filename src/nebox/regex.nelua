@@ -11,6 +11,7 @@
 
 require 'string'
 require 'sequence'
+require 'stringbuilder'
 
 global regex = @record{}
 
@@ -35,7 +36,11 @@ global regex.Caps = @record{ at: [20]isize }
 
 -- One VM thread: program counter, progress inside a back-reference being
 -- consumed byte by byte, and the captures gathered so far.
-local Thread = @record{ pc: integer, k: isize, caps: regex.Caps }
+-- `dirty`: the path passed an anchor since it last consumed a byte (only
+-- tracked under glibc_halt, see compile_posix).
+-- `neednl` (glibc_halt only): the path passed a `$` that glibc's matcher
+-- accepts because the next byte, a newline, is consumed by the match.
+local Thread = @record{ pc: integer, k: isize, caps: regex.Caps, dirty: boolean, neednl: boolean }
 
 global regex.Prog = @record{
   code: sequence(regex.Inst),
@@ -46,6 +51,8 @@ global regex.Prog = @record{
   nlanchor: boolean,    -- ^ and $ also match after/before a newline (sed M)
   toocomplex: boolean,  -- last execution exceeded the thread bound
   noteol: boolean,      -- $ does not match at the end of the subject (REG_NOTEOL)
+  glibc_halt: boolean,  -- prefer a match whose path ends without passing an anchor
+  nlquirk: boolean,     -- glibc's newline contexts inside a match (see addthread)
   -- Executor scratch, allocated on first use and kept for the program's life.
   clist: sequence(Thread),
   nlist: sequence(Thread),
@@ -556,6 +563,519 @@ function regex.compile_opts(pat: string, ere: boolean, icase: boolean, newline: 
   return prog, ''
 end
 
+-- glibc regcomp.c's parser for RE_SYNTAX_POSIX_BASIC / RE_SYNTAX_POSIX_EXTENDED
+-- (with RE_NO_EMPTY_RANGES and without RE_DOT_NOT_NULL), as GNU sed builds
+-- its syntax: peek_token/fetch_token, parse_reg_exp, parse_branch,
+-- parse_expression, parse_sub_exp, parse_dup_op with fetch_number,
+-- parse_bracket_exp with C-locale collating symbols and equivalence
+-- classes, and glibc's error codes, in glibc's order. It emits the same
+-- instructions as the parser above, so matching is unchanged. Options:
+-- RPAREN_ORD (RE_UNMATCHED_RIGHT_PAREN_ORD), NO_GNU_OPS (RE_NO_GNU_OPS),
+-- LIMITED_OPS (RE_LIMITED_OPS; BRE only in practice).
+global regex.RPAREN_ORD: integer <comptime> = 1
+global regex.NO_GNU_OPS: integer <comptime> = 2
+global regex.LIMITED_OPS: integer <comptime> = 4
+
+local GT_CHAR: byte <comptime> = 1
+local GT_END: byte <comptime> = 2
+local GT_BACKSLASH: byte <comptime> = 3
+local GT_ALT: byte <comptime> = 4
+local GT_BACKREF: byte <comptime> = 5
+local GT_ANCHOR: byte <comptime> = 6
+local GT_WORD: byte <comptime> = 7
+local GT_NOTWORD: byte <comptime> = 8
+local GT_SPACE: byte <comptime> = 9
+local GT_NOTSPACE: byte <comptime> = 10
+local GT_OPEN: byte <comptime> = 11
+local GT_CLOSE: byte <comptime> = 12
+local GT_STAR: byte <comptime> = 13
+local GT_PLUS: byte <comptime> = 14
+local GT_QUEST: byte <comptime> = 15
+local GT_OPEN_DUP: byte <comptime> = 16
+local GT_CLOSE_DUP: byte <comptime> = 17
+local GT_BRACKET: byte <comptime> = 18
+local GT_PERIOD: byte <comptime> = 19
+-- bracket tokens
+local GT_RANGE: byte <comptime> = 20
+local GT_CLOSE_BRACKET: byte <comptime> = 21
+local GT_NON_MATCH: byte <comptime> = 22
+local GT_OPEN_COLL: byte <comptime> = 23
+local GT_OPEN_EQUIV: byte <comptime> = 24
+local GT_OPEN_CLASS: byte <comptime> = 25
+
+local GTok = @record{ t: byte, c: byte, op: byte, len: integer }
+
+local GParser = @record{
+  pat: string,
+  pos: integer,       -- 0-based
+  ere: boolean,
+  icase: boolean,
+  newline: boolean,   -- REG_NEWLINE: '.' and [^...] do not match newline
+  rparen_ord: boolean,
+  no_gnu_ops: boolean,
+  limited_ops: boolean,
+  nsub: integer,
+  completed: integer,
+  sets: sequence(regex.Set),
+  err: string,
+}
+
+local function g_tr(p: *GParser, c: byte): byte
+  if p.icase then return lower(c) end
+  return c
+end
+
+-- peek_token: the token at p.pos; caret is RE_CARET_ANCHORS_HERE.
+local function g_peek_at(p: *GParser, at: integer, caret: boolean): GTok
+  local tok: GTok
+  local n: integer = (@integer)(p.pat.size)
+  if at >= n then tok.t = GT_END; tok.len = 0; return tok end
+  local c = g_tr(p, p.pat.data[at])
+  tok.c = c
+  if c == 92 then
+    if at + 1 >= n then tok.t = GT_BACKSLASH; tok.len = 1; return tok end
+    local c2 = p.pat.data[at + 1]   -- re_string_peek_byte_case: untranslated
+    tok.c = c2; tok.t = GT_CHAR; tok.len = 2
+    if c2 == 124 then
+      if not p.limited_ops and not p.ere then tok.t = GT_ALT end
+    elseif c2 >= 49 and c2 <= 57 then
+      tok.t = GT_BACKREF; tok.op = c2 - 49; tok.c = 0
+    elseif c2 == 60 or c2 == 62 or c2 == 98 or c2 == 66 or c2 == 96 or c2 == 39 then
+      if not p.no_gnu_ops then tok.t = GT_ANCHOR; tok.op = c2; tok.c = 0 end
+    elseif c2 == 119 then if not p.no_gnu_ops then tok.t = GT_WORD end
+    elseif c2 == 87 then if not p.no_gnu_ops then tok.t = GT_NOTWORD end
+    elseif c2 == 115 then if not p.no_gnu_ops then tok.t = GT_SPACE end
+    elseif c2 == 83 then if not p.no_gnu_ops then tok.t = GT_NOTSPACE end
+    elseif c2 == 40 then if not p.ere then tok.t = GT_OPEN end
+    elseif c2 == 41 then if not p.ere then tok.t = GT_CLOSE end
+    elseif c2 == 43 then if not p.limited_ops and not p.ere then tok.t = GT_PLUS end
+    elseif c2 == 63 then if not p.limited_ops and not p.ere then tok.t = GT_QUEST end
+    elseif c2 == 123 then if not p.ere then tok.t = GT_OPEN_DUP end
+    elseif c2 == 125 then if not p.ere then tok.t = GT_CLOSE_DUP end
+    end
+    return tok
+  end
+  tok.t = GT_CHAR; tok.len = 1
+  if c == 124 then
+    if not p.limited_ops and p.ere then tok.t = GT_ALT end
+  elseif c == 42 then tok.t = GT_STAR
+  elseif c == 43 then if not p.limited_ops and p.ere then tok.t = GT_PLUS end
+  elseif c == 63 then if not p.limited_ops and p.ere then tok.t = GT_QUEST end
+  elseif c == 123 then if p.ere then tok.t = GT_OPEN_DUP end
+  elseif c == 125 then if p.ere then tok.t = GT_CLOSE_DUP end
+  elseif c == 40 then if p.ere then tok.t = GT_OPEN end
+  elseif c == 41 then if p.ere then tok.t = GT_CLOSE end
+  elseif c == 91 then tok.t = GT_BRACKET
+  elseif c == 46 then tok.t = GT_PERIOD
+  elseif c == 94 then
+    if p.ere or caret or at == 0 then tok.t = GT_ANCHOR; tok.op = 94 end
+  elseif c == 36 then
+    if p.ere or at + 1 == n then
+      tok.t = GT_ANCHOR; tok.op = 36
+    else
+      local nx = g_peek_at(p, at + 1, false)
+      if nx.t == GT_ALT or nx.t == GT_CLOSE then tok.t = GT_ANCHOR; tok.op = 36 end
+    end
+  end
+  return tok
+end
+
+local function g_fetch(p: *GParser, caret: boolean): GTok
+  local t = g_peek_at(p, p.pos, caret)
+  p.pos = p.pos + t.len
+  return t
+end
+
+local function g_peek_bracket(p: *GParser): GTok
+  local tok: GTok
+  local n: integer = (@integer)(p.pat.size)
+  if p.pos >= n then tok.t = GT_END; tok.len = 0; return tok end
+  local c = g_tr(p, p.pat.data[p.pos])
+  tok.c = c; tok.len = 1; tok.t = GT_CHAR
+  if c == 91 then
+    local c2: byte = 0
+    if p.pos + 1 < n then c2 = g_tr(p, p.pat.data[p.pos + 1]) end
+    tok.c = c2; tok.len = 2
+    if c2 == 46 then tok.t = GT_OPEN_COLL
+    elseif c2 == 61 then tok.t = GT_OPEN_EQUIV
+    elseif c2 == 58 then tok.t = GT_OPEN_CLASS
+    else tok.t = GT_CHAR; tok.c = c; tok.len = 1 end
+    return tok
+  end
+  if c == 45 then tok.t = GT_RANGE
+  elseif c == 93 then tok.t = GT_CLOSE_BRACKET
+  elseif c == 94 then tok.t = GT_NON_MATCH end
+  return tok
+end
+
+-- A bracket element: kind 1 SB_CHAR, 2 COLL_SYM, 3 EQUIV_CLASS, 4 CHAR_CLASS.
+local GElem = @record{ kind: byte, ch: byte, name: string }
+
+local function g_bracket_symbol(p: *GParser, tok: GTok, e: *GElem): boolean
+  local n: integer = (@integer)(p.pat.size)
+  local delim = tok.c
+  if p.pos >= n then p.err = 'Unmatched [, [^, [:, [., or [='; return false end
+  local start = p.pos
+  local i = 0
+  while true do
+    if i >= 32 then p.err = 'Unmatched [, [^, [:, [., or [='; return false end
+    local ch = p.pat.data[p.pos]
+    if tok.t ~= GT_OPEN_CLASS then ch = g_tr(p, ch) end
+    p.pos = p.pos + 1
+    if p.pos >= n then p.err = 'Unmatched [, [^, [:, [., or [='; return false end
+    if ch == delim and p.pat.data[p.pos] == 93 then break end
+    i = i + 1
+  end
+  local sb: stringbuilder
+  for k = start, start + i - 1 do
+    local ch = p.pat.data[k]
+    if tok.t ~= GT_OPEN_CLASS then ch = g_tr(p, ch) end
+    sb:writebyte(ch)
+  end
+  e.name = sb:promote()
+  p.pos = p.pos + 1
+  if tok.t == GT_OPEN_COLL then e.kind = 2 elseif tok.t == GT_OPEN_EQUIV then e.kind = 3 else e.kind = 4 end
+  return true
+end
+
+local function g_bracket_element(p: *GParser, tok: GTok, accept_hyphen: boolean, e: *GElem): boolean
+  p.pos = p.pos + tok.len
+  if tok.t == GT_OPEN_COLL or tok.t == GT_OPEN_CLASS or tok.t == GT_OPEN_EQUIV then
+    return g_bracket_symbol(p, tok, e)
+  end
+  if tok.t == GT_RANGE and not accept_hyphen then
+    local t2 = g_peek_bracket(p)
+    if t2.t ~= GT_CLOSE_BRACKET then p.err = 'Invalid range end'; return false end
+  end
+  e.kind = 1; e.ch = tok.c
+  return true
+end
+
+-- strlen of a name that may hold a NUL byte from the pattern
+local function g_cstrlen(s: string): integer
+  for i: usize = 0, < s.size do if s.data[i] == 0 then return (@integer)(i) end end
+  return (@integer)(s.size)
+end
+
+local function g_parse_bracket(p: *GParser): Frag
+  local out: Frag
+  local s: regex.Set
+  local non_match = false
+  local tok = g_peek_bracket(p)
+  if tok.t == GT_END then p.err = 'Invalid regular expression'; return out end
+  if tok.t == GT_NON_MATCH then
+    non_match = true
+    if p.newline then s:add(10) end
+    p.pos = p.pos + tok.len
+    tok = g_peek_bracket(p)
+    if tok.t == GT_END then p.err = 'Invalid regular expression'; return out end
+  end
+  if tok.t == GT_CLOSE_BRACKET then tok.t = GT_CHAR end
+  local first = true
+  while true do
+    local st: GElem
+    local en: GElem
+    local is_range = false
+    local tok2: GTok
+    if not g_bracket_element(p, tok, first, &st) then return out end
+    first = false
+    tok = g_peek_bracket(p)
+    if st.kind ~= 4 and st.kind ~= 3 then
+      if tok.t == GT_END then p.err = 'Unmatched [, [^, [:, [., or [='; return out end
+      if tok.t == GT_RANGE then
+        p.pos = p.pos + tok.len
+        tok2 = g_peek_bracket(p)
+        if tok2.t == GT_END then p.err = 'Unmatched [, [^, [:, [., or [='; return out end
+        if tok2.t == GT_CLOSE_BRACKET then
+          p.pos = p.pos - tok.len
+          tok.t = GT_CHAR
+        else
+          is_range = true
+        end
+      end
+    end
+    if is_range then
+      if not g_bracket_element(p, tok2, true, &en) then return out end
+      tok = g_peek_bracket(p)
+      if st.kind == 3 or st.kind == 4 or en.kind == 3 or en.kind == 4 then p.err = 'Invalid range end'; return out end
+      if (st.kind == 2 and g_cstrlen(st.name) > 1) or (en.kind == 2 and g_cstrlen(en.name) > 1) then
+        p.err = 'Invalid collation character'; return out
+      end
+      local lo: integer = st.ch
+      if st.kind == 2 then lo = st.name.size > 0 and st.name.data[0] or 0 end
+      local hi: integer = en.ch
+      if en.kind == 2 then hi = en.name.size > 0 and en.name.data[0] or 0 end
+      if lo > hi then p.err = 'Invalid range end'; return out end
+      for b = lo, hi do s:add((@byte)(b)) end
+    else
+      if st.kind == 1 then
+        s:add(st.ch)
+      elseif st.kind == 2 or st.kind == 3 then
+        if g_cstrlen(st.name) ~= 1 then p.err = 'Invalid collation character'; return out end
+        s:add(st.name.data[0])
+      else
+        local name = st.name
+        if p.icase and (name == 'upper' or name == 'lower') then name = 'alpha' end
+        local cs: regex.Set
+        if g_cstrlen(name) ~= (@integer)(name.size) or not set_named(&cs, name) then
+          p.err = 'Invalid character class name'; return out
+        end
+        for b = 0, 255 do
+          if cs:has((@byte)(b)) then s:add(g_tr(p, (@byte)(b))) end
+        end
+      end
+    end
+    if tok.t == GT_END then p.err = 'Unmatched [, [^, [:, [., or [='; return out end
+    if tok.t == GT_CLOSE_BRACKET then break end
+  end
+  p.pos = p.pos + tok.len
+  if non_match then for i = 0, 31 do s.bits[i] = ~s.bits[i] end end
+  -- matching translates the input: the set holds every byte whose
+  -- translation is in it
+  local f: regex.Set
+  for b = 0, 255 do
+    if s:has(g_tr(p, (@byte)(b))) then f:add((@byte)(b)) end
+  end
+  p.sets:push(f)
+  out:push(inst(OP_CLASS, 0, #p.sets, 0))
+  return out
+end
+
+local function g_class(p: *GParser, name: string, extra: integer, negate: boolean): Frag
+  local s: regex.Set
+  set_named(&s, name)
+  if extra >= 0 then s:add((@byte)(extra)) end
+  if negate then for i = 0, 31 do s.bits[i] = ~s.bits[i] end end
+  local out: Frag
+  p.sets:push(s)
+  out:push(inst(OP_CLASS, 0, #p.sets, 0))
+  return out
+end
+
+local function g_fetch_number(p: *GParser): (integer, GTok)
+  local num: integer = -1
+  local tok: GTok
+  while true do
+    tok = g_fetch(p, false)
+    local c = tok.c
+    if tok.t == GT_END then return -2, tok end
+    if tok.t == GT_CLOSE_DUP or c == 44 then break end
+    if tok.t ~= GT_CHAR or c < 48 or c > 57 or num == -2 then num = -2
+    elseif num == -1 then num = c - 48
+    else
+      num = num * 10 + (c - 48)
+      if num > RE_DUP_MAX + 1 then num = RE_DUP_MAX + 1 end
+    end
+  end
+  return num, tok
+end
+
+local function g_parse_reg_exp(p: *GParser, tok: *GTok, nest: integer): Frag <forwarddecl> end
+
+local function g_parse_sub_exp(p: *GParser, tok: *GTok, nest: integer): Frag
+  local cur = p.nsub
+  p.nsub = p.nsub + 1
+  $tok = g_fetch(p, true)
+  local inner: Frag
+  if tok.t ~= GT_CLOSE then
+    inner = g_parse_reg_exp(p, tok, nest)
+    if p.err.size == 0 and tok.t ~= GT_CLOSE then p.err = 'Unmatched ( or \\(' end
+    if p.err.size > 0 then return inner end
+  end
+  if cur <= 8 then p.completed = p.completed | (1 << cur) end
+  local out: Frag
+  local idx = cur + 1
+  if idx <= 9 then out:push(inst(OP_SAVE, 0, 2 * idx, 0)) end
+  append(&out, inner)
+  if idx <= 9 then out:push(inst(OP_SAVE, 0, 2 * idx + 1, 0)) end
+  return out
+end
+
+-- parse_dup_op: tok is the operator; on return it is the next token.
+local function g_parse_dup(p: *GParser, elem: Frag, tok: *GTok, isgroup: boolean): Frag
+  local start: integer, stop: integer
+  local empty: Frag
+  if tok.t == GT_OPEN_DUP then
+    stop = 0
+    local t: GTok
+    start, t = g_fetch_number(p)
+    $tok = t
+    if start == -1 then
+      if tok.t == GT_CHAR and tok.c == 44 then start = 0
+      else p.err = 'Invalid content of \\{\\}'; return empty end
+    end
+    if start ~= -2 then
+      if tok.t == GT_CLOSE_DUP then stop = start
+      elseif tok.t == GT_CHAR and tok.c == 44 then
+        stop, t = g_fetch_number(p)
+        $tok = t
+      else stop = -2 end
+    end
+    if start == -2 or stop == -2 then
+      if tok.t == GT_END then p.err = 'Unmatched \\{' else p.err = 'Invalid content of \\{\\}' end
+      return empty
+    end
+    if (stop ~= -1 and start > stop) or tok.t ~= GT_CLOSE_DUP then
+      p.err = 'Invalid content of \\{\\}'; return empty
+    end
+    if (stop == -1 and start or stop) > RE_DUP_MAX then p.err = 'Regular expression too big'; return empty end
+  else
+    start = tok.t == GT_PLUS and 1 or 0
+    stop = tok.t == GT_QUEST and 1 or -1
+  end
+  $tok = g_fetch(p, false)
+  if #elem == 0 then return elem end
+  if start == 0 and stop == 0 then return empty end
+  -- glibc records an empty first iteration of a group (update_regs keeps
+  -- it unless an earlier iteration matched): (G)* behaves as ((G)+)?
+  if start == 0 and stop == -1 then
+    if isgroup then return rep_quest(rep_plus(elem)) end
+    return rep_star(elem)
+  end
+  if start == 1 and stop == -1 then return rep_plus(elem) end
+  if start == 0 and stop == 1 then return rep_quest(elem) end
+  return rep_count(elem, start, stop)
+end
+
+local function g_parse_expression(p: *GParser, tok: *GTok, nest: integer): Frag
+  local out: Frag
+  local t = tok.t
+  if t == GT_CHAR or t == GT_CLOSE_DUP then
+    local c = tok.c
+    if p.icase then c = lower(c) end
+    out:push(inst(OP_CHAR, c, 0, 0))
+  elseif t == GT_OPEN then
+    out = g_parse_sub_exp(p, tok, nest + 1)
+    if p.err.size > 0 then return out end
+  elseif t == GT_BRACKET then
+    out = g_parse_bracket(p)
+    if p.err.size > 0 then return out end
+  elseif t == GT_BACKREF then
+    if (p.completed & (1 << tok.op)) == 0 then p.err = 'Invalid back reference'; return out end
+    out:push(inst(OP_BACKREF, 0, tok.op + 1, 0))
+  elseif t == GT_OPEN_DUP or t == GT_STAR or t == GT_PLUS or t == GT_QUEST or t == GT_CLOSE then
+    if t == GT_OPEN_DUP and not p.ere then p.err = 'Invalid preceding regular expression'; return out end
+    if t ~= GT_CLOSE and p.ere then p.err = 'Invalid preceding regular expression'; return out end
+    if t == GT_CLOSE and not p.rparen_ord then p.err = 'Unmatched ) or \\)'; return out end
+    local c = tok.c
+    if p.icase then c = lower(c) end
+    out:push(inst(OP_CHAR, c, 0, 0))
+  elseif t == GT_ANCHOR then
+    local op = tok.op
+    if op == 94 then out:push(inst(OP_BOL, 0, 0, 0))
+    elseif op == 36 then out:push(inst(OP_EOL, 0, 0, 0))
+    elseif op == 96 then out:push(inst(OP_BOL, 1, 0, 0))
+    elseif op == 39 then out:push(inst(OP_EOL, 1, 0, 0))
+    elseif op == 98 then out:push(inst(OP_WORDB, 0, 0, 0))
+    elseif op == 66 then out:push(inst(OP_NWORDB, 0, 0, 0))
+    elseif op == 60 then out:push(inst(OP_WSTART, 0, 0, 0))
+    else out:push(inst(OP_WEND, 0, 0, 0)) end
+    -- an anchor is never the operand of a repetition
+    $tok = g_fetch(p, false)
+    return out
+  elseif t == GT_PERIOD then
+    if p.newline then
+      local s: regex.Set
+      for i = 0, 31 do s.bits[i] = 0xff end
+      s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7))
+      p.sets:push(s)
+      out:push(inst(OP_CLASS, 0, #p.sets, 0))
+    else
+      out:push(inst(OP_ANY, 0, 0, 0))
+    end
+  elseif t == GT_WORD then out = g_class(p, 'alnum', 95, false)
+  elseif t == GT_NOTWORD then out = g_class(p, 'alnum', 95, true)
+  elseif t == GT_SPACE then out = g_class(p, 'space', -1, false)
+  elseif t == GT_NOTSPACE then out = g_class(p, 'space', -1, true)
+  elseif t == GT_ALT or t == GT_END then
+    return out
+  elseif t == GT_BACKSLASH then
+    p.err = 'Trailing backslash'; return out
+  end
+  $tok = g_fetch(p, false)
+  local isgroup = t == GT_OPEN
+  while tok.t == GT_STAR or tok.t == GT_PLUS or tok.t == GT_QUEST or tok.t == GT_OPEN_DUP do
+    out = g_parse_dup(p, out, tok, isgroup)
+    isgroup = false
+    if p.err.size > 0 then return out end
+    -- in a BRE consecutive repetitions are invalid (RE_CONTEXT_INVALID_DUP)
+    if not p.ere and (tok.t == GT_STAR or tok.t == GT_OPEN_DUP) then
+      p.err = 'Invalid preceding regular expression'; return out
+    end
+  end
+  return out
+end
+
+local function g_parse_branch(p: *GParser, tok: *GTok, nest: integer): Frag
+  local out = g_parse_expression(p, tok, nest)
+  if p.err.size > 0 then return out end
+  while tok.t ~= GT_ALT and tok.t ~= GT_END and (nest == 0 or tok.t ~= GT_CLOSE) do
+    local e = g_parse_expression(p, tok, nest)
+    if p.err.size > 0 then return out end
+    append(&out, e)
+  end
+  return out
+end
+
+function g_parse_reg_exp(p: *GParser, tok: *GTok, nest: integer): Frag
+  -- a back-reference may only name a group completed before this
+  -- alternation or earlier in its own branch
+  local initial = p.completed
+  local left = g_parse_branch(p, tok, nest)
+  if p.err.size > 0 then return left end
+  while tok.t == GT_ALT do
+    $tok = g_fetch(p, true)
+    local right: Frag
+    if tok.t ~= GT_ALT and tok.t ~= GT_END and (nest == 0 or tok.t ~= GT_CLOSE) then
+      local accumulated = p.completed
+      p.completed = initial
+      right = g_parse_branch(p, tok, nest)
+      if p.err.size > 0 then return left end
+      p.completed = p.completed | accumulated
+    end
+    local out: Frag
+    out:push(inst(OP_SPLIT, 0, 1, #left + 2))
+    append(&out, left)
+    out:push(inst(OP_JMP, 0, #left + #right + 2, 0))
+    append(&out, right)
+    left = out
+  end
+  return left
+end
+
+-- Compile with glibc's POSIX syntax (see above). `newline` is REG_NEWLINE's
+-- effect on '.' and [^...]; `nlanchor` is re_pattern_buffer.newline_anchor.
+-- Returns the program, an error message ("" on success) and re_nsub.
+function regex.compile_posix(pat: string, ere: boolean, icase: boolean, newline: boolean, nlanchor: boolean,
+                             flags: integer): (regex.Prog, string, integer)
+  local p: GParser = {pat = pat, pos = 0, ere = ere, icase = icase, newline = newline,
+                      rparen_ord = (flags & regex.RPAREN_ORD) ~= 0,
+                      no_gnu_ops = (flags & regex.NO_GNU_OPS) ~= 0,
+                      limited_ops = (flags & regex.LIMITED_OPS) ~= 0}
+  local prog: regex.Prog
+  prog.icase = icase
+  prog.nlanchor = nlanchor
+  -- glibc chooses among equally long matches the path that reaches its
+  -- END_OF_RE node with the lowest index: a path whose last stretch
+  -- after the final byte passes an anchor reaches a constrained copy of
+  -- that node (calc_eclosure's duplicate_node_closure) and loses
+  prog.glibc_halt = true
+  prog.nlquirk = true
+  local tok = g_fetch(&p, true)
+  local body = g_parse_reg_exp(&p, &tok, 0)
+  if p.err.size > 0 then return prog, p.err, 0 end
+  prog.code:push(inst(OP_SAVE, 0, 0, 0))
+  append(&prog.code, body)
+  prog.code:push(inst(OP_SAVE, 0, 1, 0))
+  prog.code:push(inst(OP_MATCH, 0, 0, 0))
+  prog.nsub = p.nsub
+  prog.sets = p.sets
+  for i = 1, #prog.code do
+    if prog.code[i].op == OP_BACKREF then prog.hasref = true end
+  end
+  return prog, '', p.nsub
+end
+
 function regex.compile_nl(pat: string, ere: boolean, icase: boolean, newline: boolean, nlanchor: boolean): (regex.Prog, string)
   return regex.compile_opts(pat, ere, icase, newline, nlanchor, 0)
 end
@@ -698,9 +1218,11 @@ local function zw_ok(prog: *regex.Prog, ins: regex.Inst, text: string, pos: isiz
   return before and not after
 end
 
-local function thread_hash(pc: integer, k: isize, caps: *regex.Caps): usize
+local function thread_hash(pc: integer, k: isize, caps: *regex.Caps, dirty: boolean, neednl: boolean): usize
   local h: usize = 0xcbf29ce484222325
   h = (h ~ (@usize)(pc)) * 0x100000001b3
+  if dirty then h = (h ~ 0x5bd1e995) * 0x100000001b3 end
+  if neednl then h = (h ~ 0x27d4eb2f) * 0x100000001b3 end
   h = (h ~ (@usize)(k)) * 0x100000001b3
   for i = 0, 19 do h = (h ~ (@usize)(caps.at[i])) * 0x100000001b3 end
   return h
@@ -715,13 +1237,13 @@ end
 
 local function ensure_scratch(prog: *regex.Prog)
   local ncode = #prog.code
-  if #prog.mark < ncode then
-    prog.mark:resize(ncode)
+  if #prog.mark < 4 * ncode then
+    prog.mark:resize(4 * ncode)
     prog.clist:reserve(ncode)
     prog.nlist:reserve(ncode)
     if prog.hasref then
-      prog.epsvis:resize(ncode)
-      for i = 1, ncode do prog.epsvis[i] = -1 end
+      prog.epsvis:resize(4 * ncode)
+      for i = 1, 4 * ncode do prog.epsvis[i] = -1 end
       prog.tabgen:resize(TABSIZE)
       prog.tabidx:resize(TABSIZE)
     end
@@ -729,32 +1251,35 @@ local function ensure_scratch(prog: *regex.Prog)
 end
 
 -- Append a thread to `list` unless an identical one is already there.
-local function materialize(prog: *regex.Prog, list: *sequence(Thread), n: *integer, pc: integer, k: isize, caps: *regex.Caps)
+local function materialize(prog: *regex.Prog, list: *sequence(Thread), n: *integer, pc: integer, k: isize, caps: *regex.Caps, dirty: boolean, neednl: boolean)
   if prog.hasref then
-    local slot = (@integer)(thread_hash(pc, k, caps) & (TABSIZE - 1))
+    local slot = (@integer)(thread_hash(pc, k, caps, dirty, neednl) & (TABSIZE - 1))
     while prog.tabgen[slot + 1] == prog.gen do
       local t = &list[prog.tabidx[slot + 1] + 1]
-      if t.pc == pc and t.k == k and caps_equal(&t.caps, caps) then return end
+      if t.pc == pc and t.k == k and t.dirty == dirty and t.neednl == neednl and caps_equal(&t.caps, caps) then return end
       slot = (slot + 1) & (TABSIZE - 1)
     end
     if $n >= MAXTHREADS then prog.toocomplex = true; return end
     prog.tabgen[slot + 1] = (@int32)(prog.gen)
     prog.tabidx[slot + 1] = (@int32)($n)
   end
-  local t: Thread = {pc = pc, k = k, caps = $caps}
+  local t: Thread = {pc = pc, k = k, caps = $caps, dirty = dirty, neednl = neednl}
   if $n < #list then list[$n + 1] = t else list:push(t) end
   $n = $n + 1
 end
 
 -- Follow epsilon transitions from pc at pos and add the resulting consuming
 -- (or MATCH) threads to `list` in priority order.
-local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer, pc: integer, pos: isize, text: string, caps: *regex.Caps)
+local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer, pc: integer, pos: isize, text: string, caps: *regex.Caps, dirty: boolean, neednl: boolean)
   if prog.toocomplex then return end
+  local vi = pc + 1
+  if dirty then vi = vi + #prog.code end
+  if neednl then vi = vi + 2 * #prog.code end
   if prog.hasref then
-    if prog.epsvis[pc + 1] == pos then return end
+    if prog.epsvis[vi] == pos then return end
   else
-    if prog.mark[pc + 1] == prog.gen then return end
-    prog.mark[pc + 1] = prog.gen
+    if prog.mark[vi] == prog.gen then return end
+    prog.mark[vi] = prog.gen
   end
   local ins = prog.code[pc + 1]
   local op = ins.op
@@ -766,27 +1291,37 @@ local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer
     if e == s then epsilon = true end
   end
   if not epsilon then
-    materialize(prog, list, n, pc, 0, caps)
+    materialize(prog, list, n, pc, 0, caps, dirty, neednl)
     return
   end
   local old: isize = 0
-  if prog.hasref then old = prog.epsvis[pc + 1]; prog.epsvis[pc + 1] = pos end
+  if prog.hasref then old = prog.epsvis[vi]; prog.epsvis[vi] = pos end
   if op == OP_JMP then
-    addthread(prog, list, n, ins.x, pos, text, caps)
+    addthread(prog, list, n, ins.x, pos, text, caps, dirty, neednl)
   elseif op == OP_SPLIT then
-    addthread(prog, list, n, ins.x, pos, text, caps)
-    addthread(prog, list, n, ins.y, pos, text, caps)
+    addthread(prog, list, n, ins.x, pos, text, caps, dirty, neednl)
+    addthread(prog, list, n, ins.y, pos, text, caps, dirty, neednl)
   elseif op == OP_SAVE then
     local o = caps.at[ins.x]
     caps.at[ins.x] = pos
-    addthread(prog, list, n, pc + 1, pos, text, caps)
+    addthread(prog, list, n, pc + 1, pos, text, caps, dirty, neednl)
     caps.at[ins.x] = o
   elseif op == OP_BACKREF then
-    addthread(prog, list, n, pc + 1, pos, text, caps)
+    addthread(prog, list, n, pc + 1, pos, text, caps, dirty, neednl)
   else
-    if zw_ok(prog, ins, text, pos) then addthread(prog, list, n, pc + 1, pos, text, caps) end
+    if zw_ok(prog, ins, text, pos) then
+      addthread(prog, list, n, pc + 1, pos, text, caps, dirty or prog.glibc_halt, neednl)
+    elseif prog.nlquirk and ins.c == 0 then
+      -- glibc's matcher enters a newline context after consuming a
+      -- newline, and lets `$` stand before one that the match consumes
+      if op == OP_BOL and pos > 0 and caps.at[0] >= 0 and pos > caps.at[0] and text.data[pos - 1] == 10 then
+        addthread(prog, list, n, pc + 1, pos, text, caps, true, neednl)
+      elseif op == OP_EOL and pos < (@isize)(text.size) and text.data[pos] == 10 then
+        addthread(prog, list, n, pc + 1, pos, text, caps, true, true)
+      end
+    end
   end
-  if prog.hasref then prog.epsvis[pc + 1] = old end
+  if prog.hasref then prog.epsvis[vi] = old end
 end
 
 -- Run the program over text from `start`. With `anchored` only matches that
@@ -801,11 +1336,12 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
   local found = false
   local best: regex.Caps
   local bestend: isize = -1
+  local bestdirty = false
   local pos = start
   local init: regex.Caps
   caps_clear(&init)
   prog.gen = prog.gen + 1
-  addthread(prog, &prog.clist, &cn, 0, pos, text, &init)
+  addthread(prog, &prog.clist, &cn, 0, pos, text, &init, false, false)
   while true do
     prog.gen = prog.gen + 1
     nn = 0
@@ -814,23 +1350,26 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
       if found and t.caps.at[0] > best.at[0] then continue end
       local ins = prog.code[t.pc + 1]
       local op = ins.op
+      if t.neednl and (op == OP_MATCH or pos >= n or text.data[pos] ~= 10) then continue end
       if op == OP_MATCH then
-        if not found or t.caps.at[0] < best.at[0] or pos > bestend then
+        if not found or t.caps.at[0] < best.at[0] or pos > bestend
+           or (bestdirty and not t.dirty and pos == bestend and t.caps.at[0] == best.at[0]) then
           found = true
           best = t.caps
           bestend = pos
+          bestdirty = t.dirty
         end
       elseif pos >= n then
         -- nothing left to consume
       elseif op == OP_CHAR then
         local b = text.data[pos]
         if prog.icase then b = lower(b) end
-        if b == ins.c then addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps) end
+        if b == ins.c then addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false) end
       elseif op == OP_ANY then
-        addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps)
+        addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false)
       elseif op == OP_CLASS then
         if prog.sets[ins.x]:has(text.data[pos]) then
-          addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps)
+          addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false)
         end
       elseif op == OP_BACKREF then
         local s, e = t.caps.at[2 * ins.x], t.caps.at[2 * ins.x + 1]
@@ -838,9 +1377,9 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
         if prog.icase then a, b = lower(a), lower(b) end
         if a == b then
           if t.k + 1 == e - s then
-            addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps)
+            addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false)
           else
-            materialize(prog, &prog.nlist, &nn, t.pc, t.k + 1, &t.caps)
+            materialize(prog, &prog.nlist, &nn, t.pc, t.k + 1, &t.caps, false, false)
           end
         end
       end
@@ -850,7 +1389,7 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
     pos = pos + 1
     if not found and not anchored then
       caps_clear(&init)
-      addthread(prog, &prog.nlist, &nn, 0, pos, text, &init)
+      addthread(prog, &prog.nlist, &nn, 0, pos, text, &init, false, false)
     end
     local tmp = prog.clist
     prog.clist = prog.nlist

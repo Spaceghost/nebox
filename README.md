@@ -550,9 +550,24 @@ Stated here rather than worked around:
   (grep exit 2, sed exit 4, expr exit 2) where GNU keeps searching
   (`re-too-complex*`; `re-pathological-backref` stays within the bound).
   Not implemented: multibyte locales (bytes only; `-i` folds ASCII; the test
-  harness runs in the C locale, so this has no case), and outside grep
-  equivalence classes `[=a=]` and collating symbols `[.a.]` (grep's
-  parsers take single-character ones as glibc does, `grep-equiv`). `\`` and `\'` match only at the ends of
+  harness runs in the C locale, so this has no case), and outside grep and
+  sed equivalence classes `[=a=]` and collating symbols `[.a.]` (grep's
+  parsers take single-character ones as glibc does, `grep-equiv`; sed's
+  through `regex.compile_posix`). sed compiles through
+  `regex.compile_posix`, a port of glibc's regcomp.c parser (peek_token,
+  parse_reg_exp, parse_branch, parse_expression, parse_dup_op,
+  parse_bracket_exp) for RE_SYNTAX_POSIX_BASIC and _EXTENDED with sed's
+  bits (RE_UNMATCHED_RIGHT_PAREN_ORD, RE_NO_GNU_OPS, RE_LIMITED_OPS):
+  glibc's messages in glibc's order (`a**`, `a*\{2\}` and a leading `\{`
+  are invalid in a BRE, a leading `*` `+` `?` `{` or one after an anchor
+  in an ERE; a back-reference must name a group completed before its
+  alternation or earlier in its own branch), C-locale `[.c.]` and `[=c=]`,
+  `\n` and `\t` as the letters, ranges checked after case folding under
+  `I`. Programs built that way also follow three glibc matching rules: an
+  empty first iteration of a repeated group is recorded, a path whose last
+  stretch passes an anchor loses to an equally long one that does not, and
+  in an ERE `^` and `$` inside the pattern match beside a newline the
+  match itself consumes (see `sed` for what is not reproduced). `\`` and `\'` match only at the ends of
   the subject, as in GNU regex (`sed-buffer-anchors`); `.` and `[^...]`
   match a newline unless REG_NEWLINE is in effect (sed's `M` flag).
 - `patch` follows GNU patch 2.7.6 (read from its source): unified,
@@ -693,25 +708,89 @@ Stated here rather than worked around:
     NUL past the first read turns a file binary, and so which lines before
     it are printed (the fixtures with such a NUL agree). From a pipe this
     depends on the writer's timing in both.
-- `sed` covers -n -e -f -E -s -i[SUFFIX] -z, every address form (`I` and
-  `M` after a regex address), and the commands
-  `{ } s y p P d D n N g G h H x a i c = l q Q r w W b t T : z F e`.
-  `s` flags: g p N i/I m/M e w; replacement escapes
-  `& \1..\9 \n \U \L \u \l \E`. Compared with GNU sed 4.9: `M` is
-  REG_NEWLINE, so `.` and `[^...]` stop matching a newline and `^`/`$` also
-  match next to embedded newlines, except under -z where only the first
-  part applies (`sed-M-*`, `sed-z-M`). -z makes NUL the delimiter for input
-  lines, output, N G H D P W, `=`, `l`, `i`, `c`, `w` and `F`; text from `a`
-  still ends with a newline (`sed-z*`). `e COMMAND` writes the output of
-  `/bin/sh -c COMMAND` at once; `e` alone and the `s///e` flag replace the
-  pattern space with the output of running it, less one trailing
-  delimiter; `p` before `e` prints before evaluating, after it prints the
-  result; exit statuses are ignored (`sed-e-*`). A last line printed
-  without its delimiter gets it when more output follows, separately for
-  each `w` file and `/dev/stdout` (`sed-missing-newline`). Not supported:
-  `--posix`, `--sandbox`, `--debug`, `-u`, `-l N`, `--follow-symlinks`,
-  the `v` command, `R` (parsed but does nothing), and the `\dNNN \oNNN
-  \xHH \cX` escapes.
+- `sed` ports GNU sed 4.9 (sed.c, compile.c, execute.c, regexp.c,
+  debug.c and utils.c; `src/nebox/applets/sed.nelua`) for the C locale.
+  The script is read byte by byte as compile.c reads it, so every
+  diagnostic has GNU's wording and its "-e expression #N, char M:" or
+  "file F line L:" position (an unclosed `{` reports where it was opened,
+  run-time errors such as "no previous regular expression" report char 0),
+  and GNU's exit statuses: 1 for usage and script errors, 2 when an input
+  could not be read (it overrides a `q`/`Q` code), 4 for run-time
+  failures, and the `q N`/`Q N` code as exit() truncates it (-1 meaning
+  none). Ported as written: every command, `v` with strverscmp, `L`
+  accepted and then fatal at run time ("INTERNAL ERROR: Bad cmd L"), `e`
+  (popen of `/bin/sh -c`, the command cut at its first NUL, its text
+  then NUL-terminated as `--debug` shows), `F` ("-" for standard input), `z`;
+  every address form with execute.c's range rules (`0,/re/`,
+  `first~step`, `addr,+N`, `addr,~N`, a line-number end that is already
+  past, `$` opening later files to see whether they hold data, `0r`); `s`
+  with setup_replacement's parsing (`& \0-\9 \n \U \L \u \l \E`, a
+  pending `\u` carried past an empty group, case conversion that turns
+  bytes above 127 into 0xff as glibc's C locale does), the empty regex
+  meaning the last regex used, checked when it runs, the numbered and `g`
+  flags with GNU's empty-match rule, `p` before and after `e`, `w`, `I`,
+  `M`; normalize_text's escapes (`\a \f \n \r \t \v`, `\dNNN \oNNN \xHH
+  \cX` with GNU's digit limits, a produced `&` or `\` staying literal in a
+  replacement but keeping its meaning in a regex, `\c\\`, bracket
+  contents left alone under --posix and POSIXLY_CORRECT); `a`, `i`, `c`
+  one-liners and `a\` text (leading blanks kept after `a\`, text continued
+  into the next -e, an unterminated last line kept raw); `#n` on the first
+  line of the first script; the missing-newline rule kept per output;
+  `w /dev/stdout`, `w /dev/stderr` and `R /dev/stdin` using the standard
+  streams (not under POSIXLY_CORRECT), `R` reading a line per execution,
+  w files opened (truncated) at compile time; `-i` with a `*` in the suffix
+  replaced by the operand as given (so `-i'bak/*'` on `d/f` renames to
+  `bak/d/f`), the temporary made by mkstemp beside the file under umask
+  077 and given its mode and owner, non-regular files refused (a
+  terminal is refused too, untested); `--follow-symlinks` (gnulib's follow_symlink, also for `F`), `-s`
+  (hold space and ranges reset per file), `-z`, `-u`, `-l N` and `COLS`
+  (atoi, so `-l 1` breaks before every character and `-l 0` never),
+  `--posix` and POSIXLY_CORRECT (their syntax bits, unknown commands and
+  one-address checks, `N` at end of input not printing), `--sandbox`,
+  `--debug` (debug.c's program dump and trace, with its quirks: `:(null)`
+  for a label compiled before --debug, octal of a sign-extended byte),
+  `-b`, `--help`, and getopt_long's option handling and messages. Input
+  and output go through stdio-like buffers of glibc's size (st_blksize up
+  to 8192, line buffered on a terminal), so a write error is reported by
+  the same call with GNU's message ("couldn't write 3 items to stdout",
+  "couldn't flush stdout", "<unknown>" for a w file flushed at close,
+  "couldn't close stdout" when it was closed) and a seekable standard
+  input is left just after the last line consumed, as glibc's exit leaves
+  it. Regular expressions
+  go through `regex.compile_posix`, a port of glibc's regcomp parser for
+  RE_SYNTAX_POSIX_BASIC/EXTENDED with sed's bits (see the regex entry),
+  and GNU's dfa diagnostic "character class syntax is [[:space:]], not
+  [:space:]" (fatal unless POSIXLY_CORRECT is set) is reproduced.
+  `tests/sed_compare.py` (1389 fixed cases and 3000 random scripts in
+  `make test`) compares stdout, stderr, status and every file left
+  behind against GNU sed: 0 mismatches; six more runs of 8000 random
+  scripts with other seeds also gave 0. Differences:
+  - `--version` prints nebox's line.
+  - GNU's matching is glibc's regexec behind GNU's dfa; nebox runs its
+    Pike VM with the glibc rules that are known (leftmost-longest, the
+    capture choices in the regex entry, an empty first iteration of a
+    repeated group recorded, a path that ends just after an anchor losing
+    to one that does not, so `s/(b)$|(b)/[\1|\2]/` gives `[|b]` in both,
+    and in an ERE a `^` or `$` inside the pattern matching beside a newline
+    the match itself consumes, so `N;s/x$\n/Y/` substitutes in both).
+    Not reproduced: glibc's choice of capture spans through its NFA node
+    numbering when equally long alternatives match in ways not covered
+    above; groups that match only through an anchor under repetition or a
+    back-reference (`s/\(\B\)*\1\+/x/` matches in nebox, never in GNU);
+    back-references to a group under repetition, where glibc's
+    back-reference matcher also tries iterations its final registers drop
+    (`s/,\?\(0\?x*\)*\1/\//` turns `,0` into `/` in GNU, `/0` in nebox);
+    a `^` inside a group repeated by `+`, which makes glibc miss matches
+    when registers are needed (`s/\(^.*\)\+A/x/` does nothing in GNU);
+    the spans glibc reports around a mid-pattern ERE anchor next to a
+    newline; and addresses with `M` and no back-reference, which GNU's dfa
+    decides alone: it accepts a repeated anchor (`/a\B\?$/M` matches `a`
+    in GNU; glibc and nebox read the `\?` as a literal `?`) and takes
+    `` \` `` and `\'` as line anchors there. The random scripts keep
+    anchors out of groups, back-references away from repeated groups and
+    buffer anchors out of `M` addresses for these reasons.
+  - A program with back-references can exceed nebox's thread bound and
+    stops with "pattern too complex" (exit 4), as in the regex entry.
 - `find` has the usual tests and actions (-name -iname -path -regex -type
   -size -empty -newer -mtime -mmin -perm -user -group -links -inum -maxdepth
   -mindepth -depth -prune -print -print0 -delete -exec ; and + -quit), but
