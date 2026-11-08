@@ -228,7 +228,7 @@ Stated here rather than worked around:
   SELinux contexts (`-Z`/`--context` warn as GNU does without SELinux) and
   ACLs beyond copying a source's system.posix_acl_* attribute; `--update`
   compares nanosecond timestamps without gnulib utimecmp's resolution
-  probing. renameat2 comes from a raw syscall until nelibc has a wrapper.
+  probing.
   `tests/cp_compare.py`: 175 cases on tmpfs, 0 mismatches as an ordinary
   user and as root.
 - `mv` ports mv.c over copy.nelua, with remove.c's rm () (exported from the
@@ -258,6 +258,9 @@ Stated here rather than worked around:
   sizes through the new `util.xdectoimax` (gnulib's signed xdectoimax),
   reference sizes, the overflow and division-by-zero checks.
   `tests/truncate_compare.py`: 167 cases, 0 mismatches.
+- `echo` ports echo.c: options only when every character after '-' is e, E
+  or n ("-neE" is options, "--" and "-x" are text), POSIXLY_CORRECT's
+  leading "-n" rule, and its escape table (\c, \e, \xHH, \NNN and \0NNN).
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

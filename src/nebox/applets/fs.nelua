@@ -509,7 +509,7 @@ global function applet_ls(args: sequence(string)): integer
     elseif a == '--' then
       nomore = true
     elseif a:byte(2) == 45 then
-      util.err("unrecognized option '" .. a .. "'"); util.err("Try 'ls --help' for more information."); return 2
+      util.err("unrecognized option '" .. a .. "'"); util.flush(); sys.write(2, ("Try 'ls --help' for more information.\n").data, 38); return 2
     else
       local j: usize = 2
       while j <= a.size do
@@ -520,7 +520,7 @@ global function applet_ls(args: sequence(string)): integer
           elseif i < #args then i = i + 1; v = args[i]
           else
             util.err("option requires an argument -- '" .. string.char(c) .. "'")
-            util.err("Try 'ls --help' for more information."); return 2
+            util.flush(); sys.write(2, ("Try 'ls --help' for more information.\n").data, 38); return 2
           end
           if c == 119 then
             local n, ok, over = ls_number(v)
@@ -566,7 +566,7 @@ global function applet_ls(args: sequence(string)): integer
         elseif c == 78 then                                          -- N: literal names, the default here
         else
           util.err("invalid option -- '" .. string.char(c) .. "'")
-          util.err("Try 'ls --help' for more information."); return 2
+          util.flush(); sys.write(2, ("Try 'ls --help' for more information.\n").data, 38); return 2
         end
         j = j + 1
       end

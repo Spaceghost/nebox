@@ -180,12 +180,8 @@ global sys.Statfs = @record{
   f_flags: clong, f_spare: [4]clong,
 }
 
--- renameat2 (nelibc has no wrapper yet): -1 with errno set on failure.
-local function c_syscall5(n: clong, a: clong, b: clong, c: clong, d: clong, e: clong): clong <cimport 'syscall', cinclude '<nelibc_syscall.h>'> end
-function sys.renameat2(ofd: cint, old: cstring, nfd: cint, new: cstring, flags: cuint): cint
-  return (@cint)(c_syscall5(316, ofd, (@clong)((@usize)(old)), nfd, (@clong)((@usize)(new)), flags))
-end
-
+-- Linux renameat2 (nelibc 6c6c1ae and later).
+function sys.renameat2(ofd: cint, old: cstring, nfd: cint, new: cstring, flags: cuint): cint <cimport 'renameat2', cinclude '<nelibc_syscall.h>'> end
 function sys.statfs(path: cstring, buf: *sys.Statfs): clong
   return sys.sys3(sys.SYS_STATFS, (@culong)((@usize)(path)), (@culong)((@usize)(buf)), 0)
 end

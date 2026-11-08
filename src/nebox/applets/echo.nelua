@@ -1,0 +1,109 @@
+-- echo: a port of GNU coreutils 9.1 src/echo.c. Options only when every
+-- character after the '-' is one of e, E, n (so "-neE" is options and "-x"
+-- or "--" is text); POSIXLY_CORRECT allows only a leading "-n" and always
+-- interprets escapes; \a \b \c \e \f \n \r \t \v \\, \xHH and octal \NNN or
+-- \0NNN, anything else printed with its backslash.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function hextobin(c: byte): byte
+  if c >= 97 and c <= 102 then return c - 87 end
+  if c >= 65 and c <= 70 then return c - 55 end
+  return c - 48
+end
+local function isxdigit(c: byte): boolean
+  return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+end
+local function isodigit(c: byte): boolean return c >= 48 and c <= 55 end
+
+global function applet_echo(args: sequence(string)): integer
+  local display_return = true
+  local posixly_correct = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  local allow_options = not posixly_correct or (#args >= 1 and args[1] == '-n')
+  local do_v9 = false
+  local i = 1
+  if allow_options then
+    while i <= #args and #args[i] > 0 and args[i]:byte(1) == 45 do
+      local a = args[i]
+      local valid = #a > 1
+      for k = 2, #a do
+        local c = a:byte(k)
+        if c ~= 101 and c ~= 69 and c ~= 110 then valid = false; break end
+      end
+      if not valid then break end
+      for k = 2, #a do
+        local c = a:byte(k)
+        if c == 101 then do_v9 = true elseif c == 69 then do_v9 = false else display_return = false end
+      end
+      i = i + 1
+    end
+  end
+  if do_v9 or posixly_correct then
+    while i <= #args do
+      local s = args[i]
+      local p = 1
+      while p <= #s do
+        local c = s:byte(p)
+        p = p + 1
+        if c == 92 and p <= #s then
+          c = s:byte(p)
+          p = p + 1
+          if c == 97 then c = 7
+          elseif c == 98 then c = 8
+          elseif c == 99 then util.flush(); return 0
+          elseif c == 101 then c = 27
+          elseif c == 102 then c = 12
+          elseif c == 110 then c = 10
+          elseif c == 114 then c = 13
+          elseif c == 116 then c = 9
+          elseif c == 118 then c = 11
+          elseif c == 120 then
+            local ch: byte = p <= #s and s:byte(p) or 0
+            if not isxdigit(ch) then
+              util.writebyte(92)
+            else
+              p = p + 1
+              c = hextobin(ch)
+              ch = p <= #s and s:byte(p) or 0
+              if isxdigit(ch) then p = p + 1; c = c * 16 + hextobin(ch) end
+            end
+          elseif c == 48 or (c >= 49 and c <= 55) then
+            local v: integer
+            if c == 48 then
+              if not (p <= #s and isodigit(s:byte(p))) then v = -1
+              else v = s:byte(p) - 48; p = p + 1 end
+            else
+              v = c - 48
+            end
+            if v < 0 then
+              c = 0
+            else
+              if p <= #s and isodigit(s:byte(p)) then v = v * 8 + s:byte(p) - 48; p = p + 1 end
+              if p <= #s and isodigit(s:byte(p)) then v = v * 8 + s:byte(p) - 48; p = p + 1 end
+              c = (@byte)(v & 0xff)
+            end
+          elseif c == 92 then
+          else
+            util.writebyte(92)
+          end
+        end
+        util.writebyte(c)
+      end
+      i = i + 1
+      if i <= #args then util.writebyte(32) end
+    end
+  else
+    while i <= #args do
+      util.write(args[i])
+      i = i + 1
+      if i <= #args then util.writebyte(32) end
+    end
+  end
+  if display_return then util.writebyte(10) end
+  if not util.flush() then util.err('write error: ' .. sys.errstr()); return 1 end
+  return 0
+end

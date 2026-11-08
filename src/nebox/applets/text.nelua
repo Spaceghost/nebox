@@ -9,32 +9,6 @@ require 'nebox.util'
 require 'nebox.longopts'
 require 'nebox.regex'
 
-global function applet_echo(args: sequence(string)): integer
-  local i: integer = 1
-  local newline, escapes = true, false
-  while i <= #args do
-    local a = args[i]
-    if a == '-n' then newline = false
-    elseif a == '-e' then escapes = true
-    elseif a == '-E' then escapes = false
-    elseif a == '-ne' or a == '-en' then newline = false; escapes = true
-    else break end
-    i = i + 1
-  end
-  local stop = false
-  for j: integer = i, #args do
-    if j > i then util.writebyte(32) end
-    if escapes then
-      local s, c = util.unescape(args[j])
-      util.write(s)
-      if c then stop = true; break end
-    else
-      util.write(args[j])
-    end
-  end
-  if newline and not stop then util.writebyte(10) end
-  return 0
-end
 
 -- cat: GNU coreutils 9.1 cat.c. -b -n -s -v -E -T -A -e -t (-u ignored);
 -- line numbers, squeezing and a pending CR carry across files; a regular
@@ -1426,7 +1400,9 @@ end
 
 local function seq_usage_fail(msg: string): integer
   util.err(msg)
-  util.err("Try 'seq --help' for more information.")
+  util.flush()
+  local tm = "Try 'seq --help' for more information.\n"
+  sys.write(2, tm.data, tm.size)
   return 1
 end
 
