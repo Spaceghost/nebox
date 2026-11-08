@@ -1,0 +1,868 @@
+-- gnulib fts.c (the copy GNU findutils 4.9.0 bundles), ported for find:
+-- fts_open, fts_read, fts_set and fts_close with FTS_CWDFD (a virtual
+-- working directory descriptor, advanced with openat/dup and restored
+-- through the four-slot descriptor ring of i-ring.c), FTS_NOCHDIR (forced
+-- by FTS_LOGICAL, paths then accessed whole), FTS_COMFOLLOW, FTS_PHYSICAL
+-- with O_NOFOLLOW directory opens, FTS_NOSTAT with d_type (FTS_NSOK entries
+-- that carry d_ino and the d_type mode bits), FTS_XDEV, FTS_VERBATIM,
+-- FTS_TIGHT_CYCLE_CHECK's table of active directories (FTS_DC with
+-- fts_cycle) and the re-stat after opening a directory, fts_load's
+-- renaming of a root to its last component, readdir batches of 100000
+-- entries, the inode sort past 10000 entries unless fstatfs reports
+-- tmpfs/NFS/CIFS, the shared path buffer (entries know only their length
+-- in it), FTS_DNR/FTS_ERR and FTS_DONTCHDIR. fts_children, FTS_SEEDOT
+-- callers, comparison functions and the cycle_check branch for walks
+-- without FTS_TIGHT_CYCLE_CHECK are not ported: find never uses them.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'allocators.default'
+require 'nebox.sys'
+
+local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+local function c_dirfd(d: *sys.DIR): cint <cimport 'dirfd', cinclude '<dirent.h>'> end
+local function c_fchdir(fd: cint): cint <cimport 'fchdir', cinclude '<unistd.h>'> end
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_realloc(p: pointer, n: csize): pointer <cimport 'realloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+
+local Bytes = @*[0]byte
+
+global gfts = @record{}
+global gfts.COMFOLLOW: integer <comptime> = 0x0001
+global gfts.LOGICAL: integer <comptime> = 0x0002
+global gfts.NOCHDIR: integer <comptime> = 0x0004
+global gfts.NOSTAT: integer <comptime> = 0x0008
+global gfts.PHYSICAL: integer <comptime> = 0x0010
+global gfts.SEEDOT: integer <comptime> = 0x0020
+global gfts.XDEV: integer <comptime> = 0x0040
+global gfts.TIGHT_CYCLE_CHECK: integer <comptime> = 0x0100
+global gfts.CWDFD: integer <comptime> = 0x0200
+global gfts.DEFER_STAT: integer <comptime> = 0x0400
+global gfts.VERBATIM: integer <comptime> = 0x0800
+local OPTIONMASK: integer <comptime> = 0x0fff
+local STOP: integer <comptime> = 0x2000
+
+global gfts.ROOTPARENTLEVEL: integer <comptime> = -1
+global gfts.ROOTLEVEL: integer <comptime> = 0
+
+global gfts.D: integer <comptime> = 1
+global gfts.DC: integer <comptime> = 2
+global gfts.DEFAULT: integer <comptime> = 3
+global gfts.DNR: integer <comptime> = 4
+global gfts.DOT: integer <comptime> = 5
+global gfts.DP: integer <comptime> = 6
+global gfts.ERR: integer <comptime> = 7
+global gfts.F: integer <comptime> = 8
+global gfts.INIT: integer <comptime> = 9
+global gfts.NS: integer <comptime> = 10
+global gfts.NSOK: integer <comptime> = 11
+global gfts.SL: integer <comptime> = 12
+global gfts.SLNONE: integer <comptime> = 13
+global gfts.W: integer <comptime> = 14
+
+global gfts.DONTCHDIR: integer <comptime> = 0x01
+global gfts.SYMFOLLOW: integer <comptime> = 0x02
+
+global gfts.AGAIN: integer <comptime> = 1
+global gfts.FOLLOW: integer <comptime> = 2
+global gfts.NOINSTR: integer <comptime> = 3
+global gfts.SKIP: integer <comptime> = 4
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local O_NOCTTY: cint <comptime> = 0x100
+local O_NONBLOCK: cint <comptime> = 0x800
+local ENOENT: cint <comptime> = 2
+local EINVAL: cint <comptime> = 22
+local ENOMEM: cint <comptime> = 12
+local F_DUPFD_CLOEXEC: cint <comptime> = 1030
+
+local MAX_READDIR_ENTRIES: integer <comptime> = 100000
+local INODE_SORT_DIR_ENTRIES_THRESHOLD: integer <comptime> = 10000
+
+local S_MAGIC_AFS: clong <comptime> = 0x5346414F
+local S_MAGIC_CIFS: clong <comptime> = 0xFF534D42
+local S_MAGIC_NFS: clong <comptime> = 0x6969
+local S_MAGIC_PROC: clong <comptime> = 0x9FA0
+local S_MAGIC_TMPFS: clong <comptime> = 0x1021994
+
+global gfts.Ent = @record{
+  cycle: *gfts.Ent,       -- fts_cycle
+  parent: *gfts.Ent,      -- fts_parent
+  link: *gfts.Ent,        -- fts_link
+  dirp: *sys.DIR,         -- fts_dirp (a directory read in batches)
+  accpath_is_path: boolean, -- fts_accpath is the shared path, else fts_name
+  stat_required: boolean, -- FTS_NSOK: fts_read must stat it
+  pathlen: integer,       -- fts_pathlen
+  err_no: cint,           -- fts_errno
+  symfd: cint,            -- fts_symfd
+  namelen: integer,       -- fts_namelen
+  level: integer,         -- fts_level
+  info: integer,          -- fts_info
+  flags: integer,         -- fts_flags
+  instr: integer,         -- fts_instr
+  number: integer,        -- fts_number
+  st: sys.Stat,           -- *fts_statp
+  name: Bytes,            -- fts_name, NUL-terminated
+}
+
+local Active = @record{dev: culong, ino: culong, ent: *gfts.Ent}
+local DevType = @record{dev: culong, ftype: clong}
+
+global gfts.FTS = @record{
+  cur: *gfts.Ent,         -- fts_cur
+  child: *gfts.Ent,       -- fts_child
+  path: Bytes,            -- fts_path
+  pathcap: integer,       -- fts_pathlen (the allocated size)
+  rfd: cint,
+  cwd_fd: cint,
+  dev: culong,
+  options: integer,
+  ring: [4]cint, ring_front: integer, ring_back: integer, ring_empty: boolean,
+  active: sequence(Active),
+  devtypes: sequence(DevType),
+  havedevtypes: boolean,
+}
+
+local function isset(sp: *gfts.FTS, o: integer): boolean return (sp.options & o) ~= 0 end
+
+local function cstrlen(p: Bytes): integer
+  local n = 0
+  while p[n] ~= 0 do n = n + 1 end
+  return n
+end
+
+local function move(dst: Bytes, src: Bytes, n: integer)
+  if n <= 0 then return end
+  if (@usize)(dst) < (@usize)(src) then
+    for i = 0, n - 1 do dst[i] = src[i] end
+  else
+    for i = n - 1, 0, -1 do dst[i] = src[i] end
+  end
+end
+
+-- i-ring.c
+local function ring_init(sp: *gfts.FTS)
+  sp.ring_empty = true
+  sp.ring_front = 0
+  sp.ring_back = 0
+  for i = 0, 3 do sp.ring[i] = -1 end
+end
+
+local function ring_push(sp: *gfts.FTS, val: cint): cint
+  local dest = (sp.ring_front + (sp.ring_empty and 0 or 1)) % 4
+  local old = sp.ring[dest]
+  sp.ring[dest] = val
+  sp.ring_front = dest
+  if dest == sp.ring_back then sp.ring_back = (sp.ring_back + (sp.ring_empty and 0 or 1)) % 4 end
+  sp.ring_empty = false
+  return old
+end
+
+local function ring_pop(sp: *gfts.FTS): cint
+  local top = sp.ring[sp.ring_front]
+  sp.ring[sp.ring_front] = -1
+  if sp.ring_front == sp.ring_back then sp.ring_empty = true
+  else sp.ring_front = (sp.ring_front + 3) % 4 end
+  return top
+end
+
+local function fd_ring_clear(sp: *gfts.FTS)
+  while not sp.ring_empty do
+    local fd = ring_pop(sp)
+    if fd >= 0 then sys.close(fd) end
+  end
+end
+
+-- The access name of P: fts_accpath.
+function gfts.accpath(sp: *gfts.FTS, p: *gfts.Ent): cstring
+  if p.accpath_is_path then return (@cstring)(sp.path) end
+  return (@cstring)(p.name)
+end
+
+-- fts_path of P as a view of the shared buffer (valid until the next read).
+function gfts.path(sp: *gfts.FTS, p: *gfts.Ent): string
+  return (@string){data = sp.path, size = (@usize)(p.pathlen)}
+end
+
+function gfts.name(p: *gfts.Ent): string
+  return (@string){data = p.name, size = (@usize)(p.namelen)}
+end
+
+local function fts_alloc(sp: *gfts.FTS, name: Bytes, namelen: integer): *gfts.Ent
+  local p = default_allocator:new(@gfts.Ent)
+  p.name = (@Bytes)(c_malloc((@csize)(namelen + 1)))
+  for i = 0, namelen - 1 do p.name[i] = name[i] end
+  p.name[namelen] = 0
+  p.namelen = namelen
+  p.err_no = 0
+  p.dirp = nilptr
+  p.flags = 0
+  p.instr = gfts.NOINSTR
+  p.number = 0
+  p.symfd = -1
+  return p
+end
+
+local function free_ent(p: *gfts.Ent)
+  c_free(p.name)
+  default_allocator:delete(p)
+end
+
+local function fts_lfree(head: *gfts.Ent)
+  while head ~= nilptr do
+    local p = head
+    head = head.link
+    if p.dirp ~= nilptr then sys.closedir(p.dirp) end
+    free_ent(p)
+  end
+end
+
+local function fts_palloc(sp: *gfts.FTS, more: integer): boolean
+  local new_len = sp.pathcap + more + 256
+  local p = (@Bytes)(c_realloc(sp.path, (@csize)(new_len)))
+  if p == nilptr then
+    c_free(sp.path)
+    sp.path = nilptr
+    return false
+  end
+  sp.pathcap = new_len
+  sp.path = p
+  return true
+end
+
+-- Virtual fchdir: advance fts_cwd_fd to FD, pushing the previous value
+-- onto the ring when moving one level down.
+local function cwd_advance_fd(sp: *gfts.FTS, fd: cint, chdir_down_one: boolean)
+  local old = sp.cwd_fd
+  if chdir_down_one then
+    local prev = ring_push(sp, old)
+    if prev >= 0 then sys.close(prev) end
+  elseif not isset(sp, gfts.NOCHDIR) then
+    if old >= 0 then sys.close(old) end
+  end
+  sp.cwd_fd = fd
+end
+
+local function fchdir_(sp: *gfts.FTS, fd: cint): cint
+  if isset(sp, gfts.NOCHDIR) then return 0 end
+  if isset(sp, gfts.CWDFD) then
+    cwd_advance_fd(sp, fd, true)
+    return 0
+  end
+  return c_fchdir(fd)
+end
+
+local function restore_initial_cwd(sp: *gfts.FTS): cint
+  local fail = fchdir_(sp, isset(sp, gfts.CWDFD) and AT_FDCWD or sp.rfd)
+  fd_ring_clear(sp)
+  return fail
+end
+
+local function diropen(sp: *gfts.FTS, dir: cstring): cint
+  local flags = sys.O_RDONLY | sys.O_CLOEXEC | sys.O_DIRECTORY | O_NOCTTY | O_NONBLOCK |
+    (isset(sp, gfts.PHYSICAL) and sys.O_NOFOLLOW or 0)
+  if isset(sp, gfts.CWDFD) then return c_openat(sp.cwd_fd, dir, flags, 0) end
+  return sys.open(dir, flags, 0)
+end
+
+-- fts-cycle.c with FTS_TIGHT_CYCLE_CHECK | FTS_LOGICAL: a table of the
+-- directories being traversed.
+local function enter_dir(sp: *gfts.FTS, ent: *gfts.Ent)
+  if (sp.options & (gfts.TIGHT_CYCLE_CHECK | gfts.LOGICAL)) == 0 then return end
+  for i = 1, #sp.active do
+    local a = &sp.active[i]
+    if a.dev == ent.st.st_dev and a.ino == ent.st.st_ino then
+      ent.cycle = a.ent
+      ent.info = gfts.DC
+      return
+    end
+  end
+  sp.active:push({dev = ent.st.st_dev, ino = ent.st.st_ino, ent = ent})
+end
+
+local function leave_dir(sp: *gfts.FTS, ent: *gfts.Ent)
+  if (sp.options & (gfts.TIGHT_CYCLE_CHECK | gfts.LOGICAL)) == 0 then return end
+  for i = #sp.active, 1, -1 do
+    local a = &sp.active[i]
+    if a.dev == ent.st.st_dev and a.ino == ent.st.st_ino then
+      sp.active:remove(i)
+      return
+    end
+  end
+end
+
+local function free_dir(sp: *gfts.FTS)
+  sp.active:clear()
+end
+
+-- The f_type of P's file system through its descriptor FD (0 when not
+-- known); cached per st_dev, and only in FTS_CWDFD mode.
+local function filesystem_type(sp: *gfts.FTS, p: *gfts.Ent, fd: cint): clong
+  if not isset(sp, gfts.CWDFD) then return 0 end
+  for i = 1, #sp.devtypes do
+    if sp.devtypes[i].dev == p.st.st_dev then return sp.devtypes[i].ftype end
+  end
+  if fd < 0 then return 0 end
+  local fs: sys.Statfs
+  -- nelibc backend operation 103 is fstatfs
+  if sys.sys3(103, (@culong)(fd), (@culong)((@usize)(&fs)), 0) ~= 0 then return 0 end
+  sp.devtypes:push({dev = p.st.st_dev, ftype = fs.f_type})
+  return fs.f_type
+end
+
+local function dirent_inode_sort_may_be_useful(sp: *gfts.FTS, p: *gfts.Ent, fd: cint): boolean
+  local t = filesystem_type(sp, p, fd)
+  return not (t == S_MAGIC_CIFS or t == S_MAGIC_NFS or t == S_MAGIC_TMPFS)
+end
+
+local function leaf_optimization_ok(sp: *gfts.FTS, p: *gfts.Ent, fd: cint): boolean
+  local t = filesystem_type(sp, p, fd)
+  return not (t == 0 or t == S_MAGIC_AFS or t == S_MAGIC_CIFS or t == S_MAGIC_NFS or t == S_MAGIC_PROC)
+end
+
+local function isdot(p: Bytes): boolean
+  return p[0] == 46 and (p[1] == 0 or (p[1] == 46 and p[2] == 0))
+end
+
+local function fts_stat(sp: *gfts.FTS, p: *gfts.Ent, follow: boolean): integer
+  local sbp = &p.st
+  if p.level == gfts.ROOTLEVEL and isset(sp, gfts.COMFOLLOW) then follow = true end
+  local acc = gfts.accpath(sp, p)
+  if isset(sp, gfts.LOGICAL) or follow then
+    if sys.stat(acc, sbp) ~= 0 then
+      if sys.errno() == ENOENT and sys.lstat(acc, sbp) == 0 then
+        sys.seterrno(0)
+        return gfts.SLNONE
+      end
+      p.err_no = sys.errno()
+      $sbp = (@sys.Stat){}
+      return gfts.NS
+    end
+  elseif c_fstatat(sp.cwd_fd, acc, sbp, AT_SYMLINK_NOFOLLOW) ~= 0 then
+    p.err_no = sys.errno()
+    $sbp = (@sys.Stat){}
+    return gfts.NS
+  end
+  local fmt = sbp.st_mode & sys.S_IFMT
+  if fmt == sys.S_IFDIR then
+    if isdot(p.name) then return p.level == gfts.ROOTLEVEL and gfts.D or gfts.DOT end
+    return gfts.D
+  end
+  if fmt == sys.S_IFLNK then return gfts.SL end
+  if fmt == sys.S_IFREG then return gfts.F end
+  return gfts.DEFAULT
+end
+
+local function fts_safe_changedir(sp: *gfts.FTS, p: *gfts.Ent, fd: cint, dir: cstring): cint
+  local is_dotdot = dir ~= nilptr and (@Bytes)(dir)[0] == 46 and (@Bytes)(dir)[1] == 46 and (@Bytes)(dir)[2] == 0
+  if isset(sp, gfts.NOCHDIR) then
+    if isset(sp, gfts.CWDFD) and fd >= 0 then sys.close(fd) end
+    return 0
+  end
+  if fd < 0 and is_dotdot and isset(sp, gfts.CWDFD) then
+    if not sp.ring_empty then
+      local parent_fd = ring_pop(sp)
+      if parent_fd >= 0 then
+        fd = parent_fd
+        dir = nilptr
+      end
+    end
+  end
+  local newfd = fd
+  if fd < 0 then
+    newfd = diropen(sp, dir)
+    if newfd < 0 then return -1 end
+  end
+  local ret: cint = 0
+  local ok = true
+  if isset(sp, gfts.LOGICAL) or (dir ~= nilptr and is_dotdot) then
+    local sb: sys.Stat
+    if sys.fstat(newfd, &sb) ~= 0 then
+      ret = -1; ok = false
+    elseif p.st.st_dev ~= sb.st_dev or p.st.st_ino ~= sb.st_ino then
+      sys.seterrno(ENOENT)
+      ret = -1; ok = false
+    end
+  end
+  if ok then
+    if isset(sp, gfts.CWDFD) then
+      cwd_advance_fd(sp, newfd, not is_dotdot)
+      return 0
+    end
+    ret = c_fchdir(newfd)
+  end
+  if fd < 0 then
+    local e = sys.errno()
+    sys.close(newfd)
+    sys.seterrno(e)
+  end
+  return ret
+end
+
+function gfts.open(args: sequence(string), options: integer): *gfts.FTS
+  if (options & ~OPTIONMASK) ~= 0 or ((options & gfts.NOCHDIR) ~= 0 and (options & gfts.CWDFD) ~= 0)
+      or (options & (gfts.LOGICAL | gfts.PHYSICAL)) == 0 then
+    sys.seterrno(EINVAL)
+    return nilptr
+  end
+  local sp = default_allocator:new(@gfts.FTS)
+  sp.options = options
+  if isset(sp, gfts.LOGICAL) then
+    sp.options = sp.options | gfts.NOCHDIR
+    sp.options = sp.options & ~gfts.CWDFD
+  end
+  sp.cwd_fd = AT_FDCWD
+  sp.rfd = -1
+  local maxarglen = 0
+  for i = 1, #args do
+    if #args[i] > maxarglen then maxarglen = #args[i] end
+  end
+  maxarglen = maxarglen + 1
+  fts_palloc(sp, maxarglen > 4096 and maxarglen or 4096)
+  local parent: *gfts.Ent = nilptr
+  if #args > 0 then
+    parent = fts_alloc(sp, (@Bytes)(nilptr), 0)
+    parent.level = gfts.ROOTPARENTLEVEL
+  end
+  local root: *gfts.Ent = nilptr
+  local tmp: *gfts.Ent = nilptr
+  for i = 1, #args do
+    local v = args[i]
+    local len = #v
+    if (options & gfts.VERBATIM) == 0 then
+      if 2 < len and v.data[len - 1] == 47 then
+        while 1 < len and v.data[len - 2] == 47 do len = len - 1 end
+      end
+    end
+    local p = fts_alloc(sp, (@Bytes)(v.data), len)
+    p.level = gfts.ROOTLEVEL
+    p.parent = parent
+    p.accpath_is_path = false
+    if root ~= nilptr then
+      p.info = gfts.NSOK
+      p.stat_required = true
+    else
+      p.info = fts_stat(sp, p, false)
+    end
+    p.link = nilptr
+    if root == nilptr then root = p; tmp = p else tmp.link = p; tmp = p end
+  end
+  sp.cur = fts_alloc(sp, (@Bytes)(nilptr), 0)
+  sp.cur.link = root
+  sp.cur.parent = parent
+  sp.cur.info = gfts.INIT
+  sp.cur.level = 1
+  if not isset(sp, gfts.NOCHDIR) and not isset(sp, gfts.CWDFD) then
+    sp.rfd = diropen(sp, '.')
+    if sp.rfd < 0 then sp.options = sp.options | gfts.NOCHDIR end
+  end
+  ring_init(sp)
+  return sp
+end
+
+local function fts_load(sp: *gfts.FTS, p: *gfts.Ent)
+  local len = p.namelen
+  p.pathlen = len
+  move(sp.path, p.name, len + 1)
+  local cp = -1
+  for i = 0, len - 1 do if p.name[i] == 47 then cp = i end end
+  if cp >= 0 and (cp ~= 0 or p.name[cp + 1] ~= 0) then
+    cp = cp + 1
+    local l2 = cstrlen(&p.name[cp])
+    move(p.name, &p.name[cp], l2 + 1)
+    p.namelen = l2
+  end
+  p.accpath_is_path = true
+end
+
+function gfts.close(sp: *gfts.FTS): cint
+  local saved_errno: cint = 0
+  if sp.cur ~= nilptr then
+    local p = sp.cur
+    while p.level >= gfts.ROOTLEVEL do
+      local freep = p
+      p = p.link ~= nilptr and p.link or p.parent
+      free_ent(freep)
+    end
+    free_ent(p)
+  end
+  if sp.child ~= nilptr then fts_lfree(sp.child) end
+  c_free(sp.path)
+  if isset(sp, gfts.CWDFD) then
+    if sp.cwd_fd >= 0 then
+      if sys.close(sp.cwd_fd) ~= 0 then saved_errno = sys.errno() end
+    end
+  elseif not isset(sp, gfts.NOCHDIR) then
+    if c_fchdir(sp.rfd) ~= 0 then saved_errno = sys.errno() end
+    if sys.close(sp.rfd) ~= 0 and saved_errno == 0 then saved_errno = sys.errno() end
+  end
+  fd_ring_clear(sp)
+  sp.active:destroy()
+  sp.devtypes:destroy()
+  default_allocator:delete(sp)
+  if saved_errno ~= 0 then
+    sys.seterrno(saved_errno)
+    return -1
+  end
+  return 0
+end
+
+function gfts.set(sp: *gfts.FTS, p: *gfts.Ent, instr: integer)
+  p.instr = instr
+end
+
+local function napppend(sp: *gfts.FTS, p: *gfts.Ent): integer
+  if p.pathlen > 0 and sp.path[p.pathlen - 1] == 47 then return p.pathlen - 1 end
+  return p.pathlen
+end
+
+local function set_stat_type(st: *sys.Stat, dtype: byte)
+  local t: cuint = 0
+  if dtype == 6 then t = sys.S_IFBLK
+  elseif dtype == 2 then t = sys.S_IFCHR
+  elseif dtype == 4 then t = sys.S_IFDIR
+  elseif dtype == 1 then t = sys.S_IFIFO
+  elseif dtype == 10 then t = sys.S_IFLNK
+  elseif dtype == 8 then t = sys.S_IFREG
+  elseif dtype == 12 then t = sys.S_IFSOCK end
+  st.st_mode = t
+end
+
+-- fts_sort with fts_compare_ino: increasing inode numbers.
+local function sort_by_ino(head: *gfts.Ent, nitems: integer): *gfts.Ent
+  local a: sequence(*gfts.Ent)
+  local p = head
+  while p ~= nilptr do a:push(p); p = p.link end
+  local n = #a
+  local tmp: sequence(*gfts.Ent)
+  tmp:resize(n)
+  local width = 1
+  while width < n do
+    local i = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local x, y, k = i, mid, i
+      while x < mid and y < hi do
+        if a[y].st.st_ino < a[x].st.st_ino then tmp[k] = a[y]; y = y + 1 else tmp[k] = a[x]; x = x + 1 end
+        k = k + 1
+      end
+      while x < mid do tmp[k] = a[x]; x = x + 1; k = k + 1 end
+      while y < hi do tmp[k] = a[y]; y = y + 1; k = k + 1 end
+      i = hi
+    end
+    for j = 1, n do a[j] = tmp[j] end
+    width = width * 2
+  end
+  for j = 1, n - 1 do a[j].link = a[j + 1] end
+  a[n].link = nilptr
+  local h = a[1]
+  a:destroy()
+  tmp:destroy()
+  return h
+end
+
+-- fts_build (BREAD): the children of fts_cur, or nilptr.
+local function fts_build(sp: *gfts.FTS): *gfts.Ent
+  local cur = sp.cur
+  local continue_readdir = cur.dirp ~= nilptr
+  local sort_by_inode = false
+  local dir_fd: cint = -1
+  local descend = false
+  if continue_readdir then
+    dir_fd = c_dirfd(cur.dirp)
+    if dir_fd < 0 then
+      local e = sys.errno()
+      sys.closedir(cur.dirp)
+      cur.dirp = nilptr
+      cur.info = gfts.DNR
+      cur.err_no = e
+      return nilptr
+    end
+  else
+    local base: cint = (not isset(sp, gfts.NOCHDIR) and isset(sp, gfts.CWDFD)) and sp.cwd_fd or AT_FDCWD
+    local extra: cint = 0
+    if isset(sp, gfts.PHYSICAL) and not (isset(sp, gfts.COMFOLLOW) and cur.level == gfts.ROOTLEVEL) then
+      extra = sys.O_NOFOLLOW
+    end
+    local fd = c_openat(base, gfts.accpath(sp, cur),
+      sys.O_RDONLY | sys.O_CLOEXEC | sys.O_DIRECTORY | O_NOCTTY | O_NONBLOCK | extra, 0)
+    if fd >= 0 then
+      cur.dirp = c_fdopendir(fd)
+      if cur.dirp == nilptr then
+        local e = sys.errno()
+        sys.close(fd)
+        sys.seterrno(e)
+      else
+        dir_fd = fd
+      end
+    end
+    if cur.dirp == nilptr then
+      cur.info = gfts.DNR
+      cur.err_no = sys.errno()
+      return nilptr
+    end
+    if cur.info == gfts.NSOK then
+      cur.info = fts_stat(sp, cur, false)
+    elseif isset(sp, gfts.TIGHT_CYCLE_CHECK) then
+      leave_dir(sp, cur)
+      fts_stat(sp, cur, false)
+      enter_dir(sp, cur)
+    end
+  end
+  if continue_readdir then
+    descend = true
+  else
+    descend = not (isset(sp, gfts.NOSTAT) and isset(sp, gfts.PHYSICAL) and not isset(sp, gfts.SEEDOT)
+                   and cur.st.st_nlink == 2 and leaf_optimization_ok(sp, cur, dir_fd))
+    if isset(sp, gfts.CWDFD) then dir_fd = sys.fcntl(dir_fd, F_DUPFD_CLOEXEC, 3) end
+    if dir_fd < 0 or fts_safe_changedir(sp, cur, dir_fd, nilptr) ~= 0 then
+      if descend then cur.err_no = sys.errno() end
+      cur.flags = cur.flags | gfts.DONTCHDIR
+      descend = false
+      sys.closedir(cur.dirp)
+      if isset(sp, gfts.CWDFD) and dir_fd >= 0 then sys.close(dir_fd) end
+      cur.dirp = nilptr
+    else
+      descend = true
+    end
+  end
+  local len = napppend(sp, cur)
+  local cp = 0
+  if isset(sp, gfts.NOCHDIR) then
+    cp = len
+    sp.path[cp] = 47
+    cp = cp + 1
+  end
+  len = len + 1
+  local maxlen = sp.pathcap - len
+  local level = cur.level + 1
+  local head: *gfts.Ent = nilptr
+  local tail: *gfts.Ent = nilptr
+  local nitems = 0
+  local keep_open = false
+  while cur.dirp ~= nilptr do
+    sys.seterrno(0)
+    local dp = sys.readdir(cur.dirp)
+    if dp == nilptr then
+      local e = sys.errno()
+      if e ~= 0 then
+        cur.err_no = e
+        cur.info = (continue_readdir or nitems > 0) and gfts.ERR or gfts.DNR
+      end
+      break
+    end
+    local dname = (@Bytes)(&dp.d_name[0])
+    if not isset(sp, gfts.SEEDOT) and isdot(dname) then continue end
+    local d_namelen = cstrlen(dname)
+    local p = fts_alloc(sp, dname, d_namelen)
+    if d_namelen >= maxlen then
+      if not fts_palloc(sp, d_namelen + len + 1) then
+        free_ent(p)
+        fts_lfree(head)
+        sys.closedir(cur.dirp)
+        cur.dirp = nilptr
+        cur.info = gfts.ERR
+        sp.options = sp.options | STOP
+        sys.seterrno(ENOMEM)
+        return nilptr
+      end
+      maxlen = sp.pathcap - len
+    end
+    p.level = level
+    p.parent = sp.cur
+    p.pathlen = len + d_namelen
+    p.st.st_ino = dp.d_ino
+    if isset(sp, gfts.NOCHDIR) then
+      p.accpath_is_path = true
+      move(&sp.path[cp], p.name, p.namelen + 1)
+    else
+      p.accpath_is_path = false
+    end
+    local dt = dp.d_type
+    local skip_stat = isset(sp, gfts.NOSTAT) and dt ~= 0 and dt ~= 4 and (isset(sp, gfts.PHYSICAL) or dt ~= 10)
+    p.info = gfts.NSOK
+    set_stat_type(&p.st, dt)
+    p.stat_required = not skip_stat
+    p.link = nilptr
+    if head == nilptr then head = p; tail = p else tail.link = p; tail = p end
+    if nitems == INODE_SORT_DIR_ENTRIES_THRESHOLD then
+      sort_by_inode = dirent_inode_sort_may_be_useful(sp, cur, dir_fd)
+    end
+    nitems = nitems + 1
+    if MAX_READDIR_ENTRIES <= nitems then keep_open = true; break end
+  end
+  if not keep_open and cur.dirp ~= nilptr then
+    sys.closedir(cur.dirp)
+    cur.dirp = nilptr
+  end
+  if isset(sp, gfts.NOCHDIR) then
+    if len == sp.pathcap or nitems == 0 then cp = cp - 1 end
+    sp.path[cp] = 0
+  end
+  if not continue_readdir and descend and nitems == 0 then
+    local fail: cint
+    if cur.level == gfts.ROOTLEVEL then fail = restore_initial_cwd(sp)
+    else fail = fts_safe_changedir(sp, cur.parent, -1, '..') end
+    if fail ~= 0 then
+      cur.info = gfts.ERR
+      sp.options = sp.options | STOP
+      fts_lfree(head)
+      return nilptr
+    end
+  end
+  if nitems == 0 then
+    if cur.info ~= gfts.DNR and cur.info ~= gfts.ERR then cur.info = gfts.DP end
+    fts_lfree(head)
+    return nilptr
+  end
+  if sort_by_inode then head = sort_by_ino(head, nitems) end
+  return head
+end
+
+local function check_for_dir(sp: *gfts.FTS, p: *gfts.Ent): *gfts.Ent
+  sp.cur = p
+  if p.info == gfts.NSOK then
+    if p.stat_required then p.info = fts_stat(sp, p, false) end
+  end
+  if p.info == gfts.D then
+    if p.level == gfts.ROOTLEVEL then sp.dev = p.st.st_dev end
+    enter_dir(sp, p)
+  end
+  return p
+end
+
+local function name_into_path(sp: *gfts.FTS, p: *gfts.Ent)
+  local t = napppend(sp, p.parent)
+  sp.path[t] = 47
+  move(&sp.path[t + 1], p.name, p.namelen + 1)
+end
+
+local function follow_entry(sp: *gfts.FTS, p: *gfts.Ent)
+  p.info = fts_stat(sp, p, true)
+  if p.info == gfts.D and not isset(sp, gfts.NOCHDIR) then
+    p.symfd = diropen(sp, '.')
+    if p.symfd < 0 then
+      p.err_no = sys.errno()
+      p.info = gfts.ERR
+    else
+      p.flags = p.flags | gfts.SYMFOLLOW
+    end
+  end
+end
+
+function gfts.read(sp: *gfts.FTS): *gfts.Ent
+  if sp.cur == nilptr or isset(sp, STOP) then return nilptr end
+  local p = sp.cur
+  local instr = p.instr
+  p.instr = gfts.NOINSTR
+  if instr == gfts.AGAIN then
+    p.info = fts_stat(sp, p, false)
+    return p
+  end
+  if instr == gfts.FOLLOW and (p.info == gfts.SL or p.info == gfts.SLNONE) then
+    follow_entry(sp, p)
+    return check_for_dir(sp, p)
+  end
+  if p.info == gfts.D then
+    if instr == gfts.SKIP or (isset(sp, gfts.XDEV) and p.st.st_dev ~= sp.dev) then
+      if (p.flags & gfts.SYMFOLLOW) ~= 0 then sys.close(p.symfd) end
+      if sp.child ~= nilptr then
+        fts_lfree(sp.child)
+        sp.child = nilptr
+      end
+      p.info = gfts.DP
+      leave_dir(sp, p)
+      return p
+    end
+    sp.child = fts_build(sp)
+    if sp.child == nilptr then
+      if isset(sp, STOP) then return nilptr end
+      if p.err_no ~= 0 and p.info ~= gfts.DNR then p.info = gfts.ERR end
+      leave_dir(sp, p)
+      return p
+    end
+    p = sp.child
+    sp.child = nilptr
+    name_into_path(sp, p)
+    return check_for_dir(sp, p)
+  end
+  -- next: move to the next node on this level
+  local tmp: *gfts.Ent
+  while true do
+    tmp = p
+    if p.link == nilptr and p.parent.dirp ~= nilptr then
+      p = tmp.parent
+      sp.cur = p
+      sp.path[p.pathlen] = 0
+      p = fts_build(sp)
+      if p == nilptr then
+        if isset(sp, STOP) then return nilptr end
+        break
+      end
+      free_ent(tmp)
+      name_into_path(sp, p)
+      return check_for_dir(sp, p)
+    end
+    p = p.link
+    if p == nilptr then break end
+    sp.cur = p
+    free_ent(tmp)
+    if p.level == gfts.ROOTLEVEL then
+      if restore_initial_cwd(sp) ~= 0 then
+        sp.options = sp.options | STOP
+        return nilptr
+      end
+      free_dir(sp)
+      fts_load(sp, p)
+      return check_for_dir(sp, p)
+    end
+    if p.instr ~= gfts.SKIP then
+      if p.instr == gfts.FOLLOW then
+        follow_entry(sp, p)
+        p.instr = gfts.NOINSTR
+      end
+      name_into_path(sp, p)
+      return check_for_dir(sp, p)
+    end
+  end
+  -- cd_dot_dot: move up to the parent node
+  p = tmp.parent
+  sp.cur = p
+  free_ent(tmp)
+  if p.level == gfts.ROOTPARENTLEVEL then
+    free_ent(p)
+    sys.seterrno(0)
+    sp.cur = nilptr
+    return nilptr
+  end
+  sp.path[p.pathlen] = 0
+  if p.level == gfts.ROOTLEVEL then
+    if restore_initial_cwd(sp) ~= 0 then
+      p.err_no = sys.errno()
+      sp.options = sp.options | STOP
+    end
+  elseif (p.flags & gfts.SYMFOLLOW) ~= 0 then
+    if fchdir_(sp, p.symfd) ~= 0 then
+      p.err_no = sys.errno()
+      sp.options = sp.options | STOP
+    end
+    sys.close(p.symfd)
+  elseif (p.flags & gfts.DONTCHDIR) == 0 and fts_safe_changedir(sp, p.parent, -1, '..') ~= 0 then
+    p.err_no = sys.errno()
+    sp.options = sp.options | STOP
+  end
+  if p.info ~= gfts.DC then
+    p.info = p.err_no ~= 0 and gfts.ERR or gfts.DP
+    if p.err_no == 0 then leave_dir(sp, p) end
+  end
+  if isset(sp, STOP) then return nilptr end
+  return p
+end

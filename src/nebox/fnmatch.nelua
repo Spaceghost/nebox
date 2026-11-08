@@ -1,0 +1,366 @@
+-- glibc 2.36 fnmatch (posix/fnmatch_loop.c, the single-byte internal_fnmatch
+-- as it runs in the C locale: no collation rules, byte-valued ranges and
+-- collating symbols, [=c=] for the character itself, ctype classes) with
+-- FNM_PATHNAME, FNM_NOESCAPE, FNM_PERIOD, FNM_LEADING_DIR and
+-- FNM_CASEFOLD. A '*' hands the rest of the pattern to a recursive call
+-- that returns at the next '*' (glibc's `ends'), so patterns with many
+-- stars stay linear. '^' negates a bracket unless POSIXLY_CORRECT is set.
+-- FNM_EXTMATCH is not ported.
+## pragmas.nogc = true
+
+require 'string'
+require 'nebox.sys'
+
+global fnmatch = @record{}
+global fnmatch.PATHNAME: integer <comptime> = 1
+global fnmatch.NOESCAPE: integer <comptime> = 2
+global fnmatch.PERIOD: integer <comptime> = 4
+global fnmatch.LEADING_DIR: integer <comptime> = 8
+global fnmatch.CASEFOLD: integer <comptime> = 16
+local NOMATCH: integer <comptime> = 1
+
+local posixly_correct: integer = 0
+
+local Ends = @record{pattern: isize, str: isize, nlp: boolean, set: boolean}
+
+local function tolower(c: byte): byte
+  if c >= 65 and c <= 90 then return c + 32 end
+  return c
+end
+
+local function fold(c: byte, flags: integer): byte
+  if (flags & fnmatch.CASEFOLD) ~= 0 then return tolower(c) end
+  return c
+end
+
+-- pattern byte at I, NUL past the end
+local function pb(pat: string, i: isize): byte
+  if i < 0 or i >= (@isize)(pat.size) then return 0 end
+  return pat.data[i]
+end
+
+local function ctype(name: string, c: byte): (boolean, boolean)
+  local upper = c >= 65 and c <= 90
+  local lower = c >= 97 and c <= 122
+  local digit = c >= 48 and c <= 57
+  local alpha = upper or lower
+  local print = c >= 32 and c <= 126
+  if name == 'alnum' then return true, alpha or digit
+  elseif name == 'alpha' then return true, alpha
+  elseif name == 'blank' then return true, c == 32 or c == 9
+  elseif name == 'cntrl' then return true, c < 32 or c == 127
+  elseif name == 'digit' then return true, digit
+  elseif name == 'graph' then return true, print and c ~= 32
+  elseif name == 'lower' then return true, lower
+  elseif name == 'print' then return true, print
+  elseif name == 'punct' then return true, print and c ~= 32 and not alpha and not digit
+  elseif name == 'space' then return true, c == 32 or (c >= 9 and c <= 13)
+  elseif name == 'upper' then return true, upper
+  elseif name == 'xdigit' then return true, digit or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+  end
+  return false, false
+end
+
+local function fct(pat: string, pi: isize, s: string, si: isize, send: isize, nlp: boolean,
+                   flags: integer, ends: *Ends): integer
+  local p = pi
+  local n = si
+  local c: byte
+  while true do
+    c = pb(pat, p); p = p + 1
+    if c == 0 then break end
+    local new_nlp = false
+    c = fold(c, flags)
+    if c == 63 then -- '?'
+      if n == send then return NOMATCH
+      elseif s.data[n] == 47 and (flags & fnmatch.PATHNAME) ~= 0 then return NOMATCH
+      elseif s.data[n] == 46 and nlp then return NOMATCH end
+    elseif c == 92 then -- '\\'
+      if (flags & fnmatch.NOESCAPE) == 0 then
+        c = pb(pat, p); p = p + 1
+        if c == 0 then return NOMATCH end
+        c = fold(c, flags)
+      end
+      if n == send or fold(s.data[n], flags) ~= c then return NOMATCH end
+    elseif c == 42 then -- '*'
+      if ends ~= nilptr then
+        ends.pattern = p - 1
+        ends.str = n
+        ends.nlp = nlp
+        ends.set = true
+        return 0
+      end
+      if n ~= send and s.data[n] == 46 and nlp then return NOMATCH end
+      c = pb(pat, p); p = p + 1
+      while c == 63 or c == 42 do
+        if c == 63 then
+          if n == send then return NOMATCH
+          elseif s.data[n] == 47 and (flags & fnmatch.PATHNAME) ~= 0 then return NOMATCH
+          else n = n + 1 end
+        end
+        c = pb(pat, p); p = p + 1
+      end
+      if c == 0 then
+        local result = (flags & fnmatch.PATHNAME) == 0 and 0 or NOMATCH
+        if (flags & fnmatch.PATHNAME) ~= 0 then
+          if (flags & fnmatch.LEADING_DIR) ~= 0 then
+            result = 0
+          else
+            local slash = false
+            for k = n, send - 1 do if s.data[k] == 47 then slash = true; break end end
+            if not slash then result = 0 end
+          end
+        end
+        return result
+      else
+        local endp = send
+        if (flags & fnmatch.PATHNAME) ~= 0 then
+          for k = n, send - 1 do if s.data[k] == 47 then endp = k; break end end
+        end
+        local e: Ends
+        if c == 91 then -- '['
+          local flags2 = (flags & fnmatch.PATHNAME) ~= 0 and flags or (flags & ~fnmatch.PERIOD)
+          p = p - 1
+          local found = false
+          while n < endp do
+            if fct(pat, p, s, n, send, nlp, flags2, &e) == 0 then found = true; break end
+            n = n + 1
+            nlp = false
+          end
+          if found then
+            if not e.set then return 0 end
+            p = e.pattern; n = e.str; nlp = e.nlp
+            goto next_iter
+          end
+        elseif c == 47 and (flags & fnmatch.PATHNAME) ~= 0 then
+          while n < send and s.data[n] ~= 47 do n = n + 1 end
+          if n < send and s.data[n] == 47 and
+              fct(pat, p, s, n + 1, send, (flags & fnmatch.PERIOD) ~= 0, flags, nilptr) == 0 then
+            return 0
+          end
+        else
+          local flags2 = (flags & fnmatch.PATHNAME) ~= 0 and flags or (flags & ~fnmatch.PERIOD)
+          if c == 92 and (flags & fnmatch.NOESCAPE) == 0 then c = pb(pat, p) end
+          c = fold(c, flags)
+          p = p - 1
+          while n < endp do
+            if fold(s.data[n], flags) == c and fct(pat, p, s, n, send, nlp, flags2, &e) == 0 then
+              if not e.set then return 0 end
+              break
+            end
+            n = n + 1
+            nlp = false
+          end
+          if e.set then
+            p = e.pattern; n = e.str; nlp = e.nlp
+            goto next_iter
+          end
+        end
+      end
+      return NOMATCH
+    elseif c == 91 then -- '['
+      local p_init = p
+      local n_init = n
+      if posixly_correct == 0 then
+        posixly_correct = sys.getenv('POSIXLY_CORRECT') ~= nilptr and 1 or -1
+      end
+      if n == send then return NOMATCH end
+      if s.data[n] == 46 and nlp then return NOMATCH end
+      if s.data[n] == 47 and (flags & fnmatch.PATHNAME) ~= 0 then return NOMATCH end
+      local negate = pb(pat, p) == 33 or (posixly_correct < 0 and pb(pat, p) == 94)
+      if negate then p = p + 1 end
+      local fn = fold(s.data[n], flags)
+      local matched = false
+      local literal = false
+      c = pb(pat, p); p = p + 1
+      while true do
+        local cold: byte = 0
+        local normal = false
+        local have_cold = false
+        if (flags & fnmatch.NOESCAPE) == 0 and c == 92 then
+          if pb(pat, p) == 0 then return NOMATCH end
+          c = fold(pb(pat, p), flags)
+          p = p + 1
+          normal = true
+        elseif c == 91 and pb(pat, p) == 58 then -- [:class:]
+          local startp = p
+          local nm: [257]byte
+          local c1 = 0
+          local isclass = true
+          while true do
+            if c1 == 256 then return NOMATCH end
+            p = p + 1
+            c = pb(pat, p)
+            if c == 58 and pb(pat, p + 1) == 93 then p = p + 2; break end
+            if c < 97 or c >= 122 then
+              p = startp
+              c = 91
+              isclass = false
+              break
+            end
+            nm[c1] = c
+            c1 = c1 + 1
+          end
+          if isclass then
+            local name = (@string){data = &nm[0], size = (@usize)(c1)}
+            local valid, yes = ctype(name, s.data[n])
+            if not valid then return NOMATCH end
+            if yes then matched = true; break end
+            c = pb(pat, p); p = p + 1
+            goto next_elem
+          end
+          normal = true
+        elseif c == 91 and pb(pat, p) == 61 then -- [=c=]
+          local startp = p
+          p = p + 1
+          c = pb(pat, p)
+          if c == 0 then
+            p = startp; c = 91; normal = true
+          else
+            local str = c
+            p = p + 1
+            c = pb(pat, p)
+            if c ~= 61 or pb(pat, p + 1) ~= 93 then
+              p = startp; c = 91; normal = true
+            else
+              p = p + 2
+              if s.data[n] == str then matched = true; break end
+              c = pb(pat, p); p = p + 1
+              goto next_elem
+            end
+          end
+        elseif c == 0 then
+          -- [ unterminated, treat as normal character
+          p = p_init
+          n = n_init
+          c = 91
+          literal = true
+          break
+        elseif c == 91 and pb(pat, p) == 46 then -- [.c.]
+          local startp = p
+          local c1 = 0
+          while true do
+            p = p + 1
+            c = pb(pat, p)
+            if c == 46 and pb(pat, p + 1) == 93 then p = p + 2; break end
+            if c == 0 then return NOMATCH end
+            c1 = c1 + 1
+          end
+          local is_range = pb(pat, p) == 45 and pb(pat, p + 1) ~= 0
+          if c1 ~= 1 then return NOMATCH end
+          if not is_range and s.data[n] == pb(pat, startp + 1) then matched = true; break end
+          cold = pb(pat, startp + 1)
+          have_cold = true
+          c = pb(pat, p); p = p + 1
+        else
+          c = fold(c, flags)
+          normal = true
+        end
+        if normal then
+          local is_range = pb(pat, p) == 45 and pb(pat, p + 1) ~= 0 and pb(pat, p + 1) ~= 93
+          if not is_range and c == fn then matched = true; break end
+          cold = c
+          have_cold = true
+          c = pb(pat, p); p = p + 1
+        end
+        if have_cold and c == 45 and pb(pat, p) ~= 93 then
+          local cend = pb(pat, p); p = p + 1
+          if cend == 91 and pb(pat, p) == 46 then
+            local startp = p
+            local c1 = 0
+            while true do
+              p = p + 1
+              c = pb(pat, p)
+              if c == 46 and pb(pat, p + 1) == 93 then p = p + 2; break end
+              if c == 0 then return NOMATCH end
+              c1 = c1 + 1
+            end
+            if c1 ~= 1 then return NOMATCH end
+            cend = pb(pat, startp + 1)
+          else
+            if (flags & fnmatch.NOESCAPE) == 0 and cend == 92 then
+              cend = pb(pat, p); p = p + 1
+            end
+            if cend == 0 then return NOMATCH end
+            cend = fold(cend, flags)
+          end
+          if cold <= fn and fn <= cend then matched = true; break end
+          c = pb(pat, p); p = p + 1
+        end
+        ::next_elem::
+        if c == 93 then break end
+      end
+      if literal then
+        if n == send or c ~= fold(s.data[n], flags) then return NOMATCH end
+      elseif not matched then
+        if not negate then return NOMATCH end
+      else
+        -- skip the rest of the [...] that already matched
+        while true do
+          c = pb(pat, p); p = p + 1
+          if c == 93 then break end
+          if c == 0 then return NOMATCH end
+          if (flags & fnmatch.NOESCAPE) == 0 and c == 92 then
+            if pb(pat, p) == 0 then return NOMATCH end
+            p = p + 1
+          elseif c == 91 and pb(pat, p) == 58 then
+            local c1 = 0
+            local startp = p
+            while true do
+              p = p + 1
+              c = pb(pat, p)
+              c1 = c1 + 1
+              if c1 == 256 then return NOMATCH end
+              if pb(pat, p) == 58 and pb(pat, p + 1) == 93 then break end
+              if c < 97 or c >= 122 then
+                p = startp - 2
+                break
+              end
+            end
+            p = p + 2
+          elseif c == 91 and pb(pat, p) == 61 then
+            p = p + 1
+            c = pb(pat, p)
+            if c == 0 then return NOMATCH end
+            p = p + 1
+            c = pb(pat, p)
+            if c ~= 61 or pb(pat, p + 1) ~= 93 then return NOMATCH end
+            p = p + 2
+          elseif c == 91 and pb(pat, p) == 46 then
+            while true do
+              p = p + 1
+              c = pb(pat, p)
+              if c == 0 then return NOMATCH end
+              if c == 46 and pb(pat, p + 1) == 93 then break end
+            end
+            p = p + 2
+          end
+        end
+        if negate then return NOMATCH end
+      end
+    elseif c == 47 and (flags & (fnmatch.PATHNAME | fnmatch.PERIOD)) == (fnmatch.PATHNAME | fnmatch.PERIOD) then
+      if n == send or c ~= s.data[n] then return NOMATCH end
+      new_nlp = true
+    else
+      if n == send or c ~= fold(s.data[n], flags) then return NOMATCH end
+    end
+    nlp = new_nlp
+    n = n + 1
+    ::next_iter::
+  end
+  if n == send then return 0 end
+  if (flags & fnmatch.LEADING_DIR) ~= 0 and n ~= send and s.data[n] == 47 then return 0 end
+  return NOMATCH
+end
+
+-- fnmatch (PATTERN, STRING, FLAGS): 0 on a match, FNM_NOMATCH (1) if not.
+-- Both are byte strings; a NUL in PATTERN ends it as in C.
+function fnmatch.match(pattern: string, str: string, flags: integer): integer
+  local plen: usize = 0
+  while plen < pattern.size and pattern.data[plen] ~= 0 do plen = plen + 1 end
+  local slen: usize = 0
+  while slen < str.size and str.data[slen] ~= 0 do slen = slen + 1 end
+  local pat = (@string){data = pattern.data, size = plen}
+  local s = (@string){data = str.data, size = slen}
+  return fct(pat, 0, s, 0, (@isize)(slen), (flags & fnmatch.PERIOD) ~= 0, flags, nilptr)
+end

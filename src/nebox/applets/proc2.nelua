@@ -1,4 +1,4 @@
--- More process applets: whoami groups tty, and spawn_wait for find
+-- More process applets: whoami groups tty, and spawn_wait (run a command, wait for it)
 ## pragmas.nogc = true
 
 require 'string'

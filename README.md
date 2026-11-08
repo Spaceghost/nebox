@@ -412,6 +412,65 @@ Stated here rather than worked around:
     line.
   - nelibc's execvp searches PATH for an empty command name; xargs fails
     that name with ENOENT itself, as glibc's execvp does.
+- `find` ports GNU findutils 4.9.0 find (`src/nebox/applets/find.nelua`,
+  C locale): ftsfind.c's traversal over a port of gnulib fts as find opens
+  it (`src/nebox/gfts.nelua`: FTS_CWDFD's virtual working directory and
+  descriptor ring, FTS_NOSTAT with d_type, FTS_TIGHT_CYCLE_CHECK,
+  FTS_VERBATIM, -H/-L/-P, -xdev, readdir order with the inode sort past
+  10000 entries where fstatfs is not tmpfs/NFS/CIFS (always under -L) and
+  batches of 100000 entries), so output order, paths longer than PATH_MAX,
+  unreadable and unsearchable directories, symlink loops and directory
+  loops come out as in GNU; parser.c with every option, test and action,
+  its argument checks and messages and the warnings (global options after
+  tests, -d, `/` in -name, -path ending in `/`, -perm /000, -warn/-nowarn,
+  enabled when standard input is a terminal); tree.c's precedence parser,
+  the implicit `( ... ) -print`, cost and success-rate estimates, -O0..-O3
+  reordering and arm swaps (so the order of evaluation, and with it stat
+  calls and diagnostics, is GNU's), `-D tree`, `opt`, `search`, `stat`,
+  `rates`, `exec`, `time`, `all` and `help`; pred.c's tests (-amin/-atime/
+  -cmin/-ctime/-mmin/-mtime/-used with fractions and -daystart, -newer,
+  -anewer, -cnewer, -newerXY with parse_datetime dates, -perm through
+  modechange, -size units and rounding, -user/-group/-uid/-gid/-nouser/
+  -nogroup, -readable/-writable/-executable, -fstype from the mount list,
+  -links, -inum, -samefile, -type/-xtype lists, -empty, -lname/-ilname/
+  -name/-iname/-path/-ipath/-wholename/-iwholename through a port of
+  glibc's fnmatch (`src/nebox/fnmatch.nelua`), -regex/-iregex through
+  `regex.compile_syntax`, which reads every glibc syntax bit of the 13
+  -regextype names as re_compile_pattern does, RE_ICASE included); the
+  actions -print, -print0, -printf/-fprintf (every directive, flag, width,
+  escape and warning, format_date's nanosecond insertion, glibc strftime's
+  conversions), -fprint/-fprint0/-fls with sharefile's one stream per file
+  and close order, -ls (listfile.c's growing columns), -exec/-execdir/-ok/
+  -okdir with `;` and `+` through a per-predicate port of buildcmd.c (128
+  KiB batches, the `__GNU_FINDUTILS_EXEC_ARG_*` test variables, execdir
+  batches flushed when the depth changes, PATH safety checks, the -ok
+  prompt and yesno on standard input, -ok/-okdir children started with
+  standard input closed as GNU's open_safer leaves it),
+  -delete with its implied -depth and the -prune conflict, -prune, -quit;
+  -files0-from; the exit status (1 after any diagnostic, -exec `+`
+  failures) and close_stdout at exit. `tests/find_compare.py`: 2686 fixed
+  cases, 18 on a pseudo-terminal, 2000 random expressions and 1487 random
+  -printf formats, regular expressions and patterns against GNU, 0
+  mismatches; as root (other owners, unreadable directories readable)
+  6205 cases, 0 mismatches. Differences:
+  - `--help` omits GNU's bug-report paragraph; `--version` prints nebox's
+    line and GNU's "Features enabled" line.
+  - No SELinux: -context is refused as GNU refuses it with SELinux
+    disabled, and `%Z` reads the `security.selinux` attribute directly.
+    No birth times (glibc's stat has none), as in GNU on Linux.
+  - A backslash before `%` that is not an escape leaves a stray conversion
+    in the text GNU passes to printf with the directive's single argument
+    (undefined behavior); nebox passes the same text to nelibc's snprintf,
+    so such output can differ.
+  - Output files get a 4096-byte buffer; glibc sizes it from st_blksize, so
+    two streams writing to one file (`-fprint /dev/fd/1` beside stdout)
+    can interleave differently.
+  - `src/nebox/fts.nelua` (used by chown and grep) walks whole paths without
+    FTS_CWDFD, and xargs keeps its single-instance buildcmd; find has its
+    own ports of both.
+  - Not exercised by the tests: fts failing to return to a parent
+    directory, readdir errors in mid-directory, the "environment is too
+    large" and fork failures, and -ok on a terminal.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
@@ -532,7 +591,7 @@ Stated here rather than worked around:
   as in dash. `echo` is the XSI echo (escapes always, `-n` only first).
 - `sed`, `expr`, `awk` and `find -regex` use nebox's own regex engine
   (`src/nebox/regex.nelua`; grep runs its own parsers' trees on the same
-  matcher): POSIX BRE and ERE with brackets, named classes,
+  matcher, find's -regextype names go through `regex.compile_syntax`): POSIX BRE and ERE with brackets, named classes,
   intervals, groups, alternation, back-references, and the GNU
   `\w \W \s \S \b \B \< \>` escapes. Matching is a Pike VM with GNU (glibc)
   leftmost-longest semantics: the earliest start wins, then the longest match
@@ -791,11 +850,6 @@ Stated here rather than worked around:
     buffer anchors out of `M` addresses for these reasons.
   - A program with back-references can exceed nebox's thread bound and
     stops with "pattern too complex" (exit 4), as in the regex entry.
-- `find` has the usual tests and actions (-name -iname -path -regex -type
-  -size -empty -newer -mtime -mmin -perm -user -group -links -inum -maxdepth
-  -mindepth -depth -prune -print -print0 -delete -exec ; and + -quit), but
-  walks directories in sorted name order; GNU uses directory order (`du`,
-  a port, follows GNU's). No -L/-H, -printf, or -ls.
 - `hexdump` offers -C -c -b -d -o -x -n -s -v only.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.

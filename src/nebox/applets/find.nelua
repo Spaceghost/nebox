@@ -1,0 +1,5479 @@
+-- find: a port of GNU findutils 4.9.0 find in the C locale: ftsfind.c (the
+-- traversal over gnulib fts with FTS_NOSTAT|FTS_TIGHT_CYCLE_CHECK|FTS_CWDFD|
+-- FTS_VERBATIM, src/nebox/gfts.nelua), parser.c (every option, test and
+-- action with its argument checks, warnings and messages), tree.c (the
+-- precedence parser, the implicit "( ... ) -print", cost estimates,
+-- opt_expr's reordering at -O0..-O3 and the arm swaps, the -D tree/opt
+-- dumps), pred.c (the predicates), print.c (-printf/-fprintf with every
+-- directive, flag, width and escape, format_date's nanosecond insertion),
+-- exec.c and lib/buildcmd.c (-exec/-execdir/-ok/-okdir with ";" and "+",
+-- argument batches of 128 KiB, run_in_dir), util.c (get_statinfo,
+-- digest_mode, the -H/-L/-P stat functions, -D and -O, error reporting
+-- with one stat error per file), fstype.c (-fstype from the mount list),
+-- sharefile.c (-fprint and friends sharing a stream per file), and lib/
+-- listfile.c (-ls/-fls), printquoted.c, regextype.c, safe-atoi.c. Regular
+-- expressions go through regex.compile_syntax (glibc re_compile_pattern
+-- with the -regextype syntax bits), patterns through a port of glibc
+-- fnmatch, dates for -newerXt through util.parse_datetime2. Streams are
+-- buffered as glibc buffers them (4096 bytes, line buffered on a tty,
+-- stderr unbuffered); exit runs GNU's close_stdout.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'allocators.default'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.quotearg'
+require 'nebox.regex'
+require 'nebox.fnmatch'
+require 'nebox.gfts'
+require 'nebox.mountlist'
+require 'nebox.modechange'
+require 'nebox.clock'
+require 'nebox.getdate'
+
+local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+local function c_unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
+local function c_faccessat(fd: cint, path: cstring, mode: cint, flags: cint): cint <cimport 'faccessat', cinclude '<unistd.h>'> end
+local function c_readlinkat(fd: cint, path: cstring, buf: pointer, n: csize): clong <cimport 'readlinkat', cinclude '<unistd.h>'> end
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+local function c_fchdir(fd: cint): cint <cimport 'fchdir', cinclude '<unistd.h>'> end
+local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
+local function c_strtol(s: cstring, e: *cstring, base: cint): clong <cimport 'strtol', cinclude '<stdlib.h>'> end
+local function c_strtoul(s: cstring, e: *cstring, base: cint): culong <cimport 'strtoul', cinclude '<stdlib.h>'> end
+local function c_strtoumax(s: cstring, e: *cstring, base: cint): uint64 <cimport 'strtoumax', cinclude '<inttypes.h>'> end
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_realloc(p: pointer, n: csize): pointer <cimport 'realloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+local function c_modf(x: float64, ip: *float64): float64 <cimport 'modf', cinclude '<math.h>'> end
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint,
+}
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
+local function c_getpwnam(name: cstring): *Passwd <cimport 'getpwnam', cinclude '<pwd.h>'> end
+local function c_getgrnam(name: cstring): *Group <cimport 'getgrnam', cinclude '<grp.h>'> end
+local function c_endpwent() <cimport 'endpwent', cinclude '<pwd.h>'> end
+local function c_endgrent() <cimport 'endgrent', cinclude '<grp.h>'> end
+
+local Bytes = @*[0]byte
+local CStrs = @*[0]cstring
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local AT_REMOVEDIR: cint <comptime> = 0x200
+local ENOENT: cint <comptime> = 2
+local EINTR: cint <comptime> = 4
+local E2BIG: cint <comptime> = 7
+local EBADF: cint <comptime> = 9
+local EACCES: cint <comptime> = 13
+local ENOTDIR: cint <comptime> = 20
+local EISDIR: cint <comptime> = 21
+local ERANGE: cint <comptime> = 34
+local ELOOP: cint <comptime> = 40
+local O_NOCTTY: cint <comptime> = 0x100
+local O_NONBLOCK: cint <comptime> = 0x800
+local DAYSECS: integer <comptime> = 86400
+
+local S_ISUID: cuint <comptime> = 0x800
+local S_ISGID: cuint <comptime> = 0x400
+local S_ISVTX: cuint <comptime> = 0x200
+local MODE_ALL: cuint <comptime> = 0xFFF
+
+local function isdir(m: cuint): boolean return (m & sys.S_IFMT) == sys.S_IFDIR end
+local function islnk(m: cuint): boolean return (m & sys.S_IFMT) == sys.S_IFLNK end
+local function isreg(m: cuint): boolean return (m & sys.S_IFMT) == sys.S_IFREG end
+
+local function cstrlen(p: Bytes): integer
+  local n = 0
+  while p[n] ~= 0 do n = n + 1 end
+  return n
+end
+
+local function view(c: cstring): string
+  if c == nilptr then return '' end
+  return (@string){data = (@Bytes)(c), size = (@usize)(cstrlen((@Bytes)(c)))}
+end
+
+-- A NUL-terminated copy that lives until exit.
+local function cdup(s: string): cstring
+  local p = (@Bytes)(c_malloc((@csize)(#s + 2)))
+  for i = 0, < #s do p[i] = s.data[i] end
+  p[#s] = 0
+  p[#s + 1] = 0
+  return (@cstring)(p)
+end
+
+local function errmsg(e: cint): string return view(sys.strerror(e)) end
+
+-------------------------------------------------------------------------------
+-- stdio streams
+
+local Stream = @record{
+  fd: cint,
+  buf: Bytes,
+  len: integer,
+  cap: integer,
+  err: boolean,
+  unbuffered: boolean,
+  linebuf: boolean,
+  closed: boolean,
+  dev: culong,
+  ino: culong,
+  name: string,
+}
+
+local function stream_new(fd: cint, unbuffered: boolean): *Stream
+  local s = default_allocator:new(@Stream)
+  s.fd = fd
+  s.cap = 4096
+  s.buf = (@Bytes)(c_malloc(4096))
+  s.unbuffered = unbuffered
+  s.linebuf = not unbuffered and sys.isatty(fd) ~= 0
+  return s
+end
+
+local function write_all(fd: cint, p: Bytes, n: integer): boolean
+  local done = 0
+  while done < n do
+    local r = sys.write(fd, &p[done], (@csize)(n - done))
+    if r < 0 then
+      if sys.errno() == EINTR then continue end
+      return false
+    end
+    done = done + r
+  end
+  return true
+end
+
+-- fflush: false (errno set) when the pending bytes cannot be written; the
+-- error indicator then stays set.
+local function sflush(s: *Stream): boolean
+  if s.len == 0 then return true end
+  local ok = write_all(s.fd, s.buf, s.len)
+  s.len = 0
+  if not ok then s.err = true end
+  return ok
+end
+
+local function swrite(s: *Stream, p: Bytes, n: integer)
+  if n <= 0 then return end
+  if s.unbuffered then
+    if not write_all(s.fd, p, n) then s.err = true end
+    return
+  end
+  local i = 0
+  local room = s.cap - s.len
+  if n > room then
+    for k = 0, room - 1 do s.buf[s.len + k] = p[k] end
+    s.len = s.cap
+    i = room
+    sflush(s)
+    local whole = ((n - i) // s.cap) * s.cap
+    if whole > 0 then
+      if not write_all(s.fd, &p[i], whole) then s.err = true end
+      i = i + whole
+    end
+  end
+  for k = i, n - 1 do s.buf[s.len + k - i] = p[k] end
+  s.len = s.len + (n - i)
+  if s.linebuf then
+    for k = i, n - 1 do
+      if p[k] == 10 then sflush(s); break end
+    end
+  end
+end
+
+local function sputs(s: *Stream, str: string)
+  swrite(s, (@Bytes)(str.data), (@integer)(str.size))
+end
+
+local function sputc(s: *Stream, c: byte)
+  local b: [1]byte = {c}
+  swrite(s, &b[0], 1)
+end
+
+local outs: *Stream
+local errs: *Stream
+
+-- Diagnostics: error (0, ERRNUM, ...) flushes stdout first.
+local function eputs(str: string) sputs(errs, str) end
+
+local function error0(msg: string)
+  sflush(outs)
+  local sb: stringbuilder
+  sb:write(util.applet, ': ', msg, '\n')
+  local v = sb:view()
+  write_all(2, (@Bytes)(v.data), (@integer)(v.size))
+  sb:destroy()
+end
+
+local function error_e(e: cint, msg: string)
+  sflush(outs)
+  local sb: stringbuilder
+  sb:write(util.applet, ': ', msg)
+  if e ~= 0 then sb:write(': ', errmsg(e)) end
+  sb:write('\n')
+  local v = sb:view()
+  write_all(2, (@Bytes)(v.data), (@integer)(v.size))
+  sb:destroy()
+end
+
+-- Every stream fopen'ed, in sharefile's hash bucket order at close time.
+local files: sequence(*Stream)
+
+-- exit (): atexit's close_stdout, then stdio flushes the other streams.
+local function xexit(status: integer)
+  local some_pending = outs.len ~= 0
+  local prev_fail = outs.err
+  local fclose_fail = false
+  local e: cint = 0
+  if not sflush(outs) then fclose_fail = true; e = sys.errno() end
+  if not fclose_fail and sys.close(1) ~= 0 then fclose_fail = true; e = sys.errno() end
+  if prev_fail or (fclose_fail and (some_pending or e ~= EBADF)) then
+    if not fclose_fail then e = 0 end
+    error_e(e, 'write error')
+    sys._exit(1)
+  end
+  for i = 1, #files do
+    if not files[i].closed then sflush(files[i]) end
+  end
+  sys._exit((@cint)(status))
+end
+
+local function die(msg: string)
+  error0(msg)
+  xexit(1)
+end
+
+local function die_e(e: cint, msg: string)
+  error_e(e, msg)
+  xexit(1)
+end
+
+local function q(s: string): string return quotearg.style(s, quotearg.LOCALE) end
+
+-------------------------------------------------------------------------------
+-- options and state (defs.h)
+
+local SYMLINK_NEVER_DEREF: integer <comptime> = 0
+local SYMLINK_ALWAYS_DEREF: integer <comptime> = 1
+local SYMLINK_DEREF_ARGSONLY: integer <comptime> = 2
+
+local DebugExpressionTree: integer <comptime> = 1
+local DebugStat: integer <comptime> = 2
+local DebugSearch: integer <comptime> = 4
+local DebugTreeOpt: integer <comptime> = 8
+local DebugHelp: integer <comptime> = 16
+local DebugExec: integer <comptime> = 32
+local DebugSuccessRates: integer <comptime> = 64
+local DebugTime: integer <comptime> = 128
+local DebugAll: integer <comptime> = 0xffffffff & ~16
+
+local XSTAT_P: integer <comptime> = 0
+local XSTAT_L: integer <comptime> = 1
+local XSTAT_H: integer <comptime> = 2
+local XSTAT_DEBUG: integer <comptime> = 3
+
+local Options = @record{
+  do_dir_first: boolean,
+  explicit_depth: boolean,
+  maxdepth: integer,
+  mindepth: integer,
+  no_leaf_check: boolean,
+  stay_on_filesystem: boolean,
+  ignore_readdir_race: boolean,
+  literal_control_chars: boolean,
+  warnings: boolean,
+  posixly_correct: boolean,
+  start_sec: integer, start_nsec: integer,
+  day_sec: integer, day_nsec: integer,
+  full_days: boolean,
+  output_block_size: integer,
+  debug_options: integer,
+  symlink_handling: integer,
+  xstat: integer,
+  open_nofollow_available: boolean,
+  regex_options: uint64,
+  optimisation_level: integer,
+  files0_from: cstring,
+  ok_prompt_stdin: boolean,
+}
+
+local State = @record{
+  curdepth: integer,
+  have_stat: boolean,
+  have_type: boolean,
+  type: cuint,
+  rel_pathname: cstring,
+  cwd_dir_fd: cint,
+  starting_path_length: integer,
+  stop_at_current_level: boolean,
+  exit_status: integer,
+  execdirs_outstanding: boolean,
+  already_issued_stat_error_msg: boolean,
+}
+
+local options: Options
+local state: State
+
+local function should_issue_warnings(): boolean
+  if options.posixly_correct then return false end
+  return options.warnings
+end
+
+-------------------------------------------------------------------------------
+-- util.c: the stat functions
+
+local function fallback_stat(name: cstring, p: *sys.Stat, prev_rv: cint): cint
+  local e = sys.errno()
+  if e == ENOENT or e == ENOTDIR then
+    if (options.debug_options & DebugStat) ~= 0 then
+      eputs('fallback_stat(): stat(' .. view(name) .. ') failed; falling back on lstat()\n')
+    end
+    return c_fstatat(state.cwd_dir_fd, name, p, AT_SYMLINK_NOFOLLOW)
+  end
+  return prev_rv
+end
+
+local function optionh_stat(name: cstring, p: *sys.Stat): cint
+  if state.curdepth == 0 then
+    local rv = c_fstatat(state.cwd_dir_fd, name, p, 0)
+    if rv == 0 then return 0 end
+    return fallback_stat(name, p, rv)
+  end
+  return c_fstatat(state.cwd_dir_fd, name, p, AT_SYMLINK_NOFOLLOW)
+end
+
+local function optionl_stat(name: cstring, p: *sys.Stat): cint
+  local rv = c_fstatat(state.cwd_dir_fd, name, p, 0)
+  if rv == 0 then return 0 end
+  return fallback_stat(name, p, rv)
+end
+
+local function optionp_stat(name: cstring, p: *sys.Stat): cint
+  return c_fstatat(state.cwd_dir_fd, name, p, AT_SYMLINK_NOFOLLOW)
+end
+
+local function debug_stat(file: cstring, p: *sys.Stat): cint
+  eputs('debug_stat (' .. view(file) .. ')\n')
+  if options.symlink_handling == SYMLINK_ALWAYS_DEREF then return optionl_stat(file, p)
+  elseif options.symlink_handling == SYMLINK_DEREF_ARGSONLY then return optionh_stat(file, p) end
+  return optionp_stat(file, p)
+end
+
+local function xstat(name: cstring, p: *sys.Stat): cint
+  local k = options.xstat
+  if k == XSTAT_L then return optionl_stat(name, p)
+  elseif k == XSTAT_H then return optionh_stat(name, p)
+  elseif k == XSTAT_DEBUG then return debug_stat(name, p) end
+  return optionp_stat(name, p)
+end
+
+local function following_links(): boolean
+  if options.symlink_handling == SYMLINK_ALWAYS_DEREF then return true
+  elseif options.symlink_handling == SYMLINK_DEREF_ARGSONLY then return state.curdepth == 0 end
+  return false
+end
+
+local function set_follow_state(opt: integer)
+  if opt == SYMLINK_ALWAYS_DEREF then
+    options.xstat = XSTAT_L
+    options.no_leaf_check = true
+  elseif opt == SYMLINK_NEVER_DEREF then
+    options.xstat = XSTAT_P
+  else
+    options.xstat = XSTAT_H
+    options.no_leaf_check = true
+  end
+  options.symlink_handling = opt
+  if (options.debug_options & DebugStat) ~= 0 then options.xstat = XSTAT_DEBUG end
+end
+
+-------------------------------------------------------------------------------
+-- predicates (defs.h)
+
+local NO_TYPE: integer <comptime> = 0
+local PRIMARY_TYPE: integer <comptime> = 1
+local UNI_OP: integer <comptime> = 2
+local BI_OP: integer <comptime> = 3
+local OPEN_PAREN: integer <comptime> = 4
+local CLOSE_PAREN: integer <comptime> = 5
+
+local NO_PREC: integer <comptime> = 0
+local COMMA_PREC: integer <comptime> = 1
+local OR_PREC: integer <comptime> = 2
+local AND_PREC: integer <comptime> = 3
+local NEGATE_PREC: integer <comptime> = 4
+local MAX_PREC: integer <comptime> = 5
+
+local COMP_GT: integer <comptime> = 0
+local COMP_LT: integer <comptime> = 1
+local COMP_EQ: integer <comptime> = 2
+
+local PERM_AT_LEAST: integer <comptime> = 0
+local PERM_ANY: integer <comptime> = 1
+local PERM_EXACT: integer <comptime> = 2
+
+local FTYPE_BLK: integer <comptime> = 0
+local FTYPE_CHR: integer <comptime> = 1
+local FTYPE_DIR: integer <comptime> = 2
+local FTYPE_REG: integer <comptime> = 3
+local FTYPE_LNK: integer <comptime> = 4
+local FTYPE_FIFO: integer <comptime> = 5
+local FTYPE_SOCK: integer <comptime> = 6
+local FTYPE_COUNT: integer <comptime> = 7
+
+local XVAL_ATIME: integer <comptime> = 0
+local XVAL_BIRTHTIME: integer <comptime> = 1
+local XVAL_CTIME: integer <comptime> = 2
+local XVAL_MTIME: integer <comptime> = 3
+local XVAL_TIME: integer <comptime> = 4
+
+local NeedsNothing: integer <comptime> = 0
+local NeedsInodeNumber: integer <comptime> = 1
+local NeedsType: integer <comptime> = 2
+local NeedsStatInfo: integer <comptime> = 3
+local NeedsLinkName: integer <comptime> = 4
+local NeedsAccessInfo: integer <comptime> = 5
+local NeedsSyncDiskHit: integer <comptime> = 6
+local NeedsEventualExec: integer <comptime> = 7
+local NeedsImmediateExec: integer <comptime> = 8
+local NeedsUserInteraction: integer <comptime> = 9
+local NeedsUnknown: integer <comptime> = 10
+local NumEvaluationCosts: integer <comptime> = 11
+
+-- predicate functions
+local P_NONE: integer <comptime> = 0
+local P_AMIN: integer <comptime> = 1
+local P_AND: integer <comptime> = 2
+local P_ANEWER: integer <comptime> = 3
+local P_ATIME: integer <comptime> = 4
+local P_CLOSEPAREN: integer <comptime> = 5
+local P_CMIN: integer <comptime> = 6
+local P_CNEWER: integer <comptime> = 7
+local P_COMMA: integer <comptime> = 8
+local P_CTIME: integer <comptime> = 9
+local P_DELETE: integer <comptime> = 10
+local P_EMPTY: integer <comptime> = 11
+local P_EXEC: integer <comptime> = 12
+local P_EXECDIR: integer <comptime> = 13
+local P_EXECUTABLE: integer <comptime> = 14
+local P_FALSE: integer <comptime> = 15
+local P_FLS: integer <comptime> = 16
+local P_FPRINT: integer <comptime> = 17
+local P_FPRINT0: integer <comptime> = 18
+local P_FPRINTF: integer <comptime> = 19
+local P_FSTYPE: integer <comptime> = 20
+local P_GID: integer <comptime> = 21
+local P_GROUP: integer <comptime> = 22
+local P_ILNAME: integer <comptime> = 23
+local P_INAME: integer <comptime> = 24
+local P_INUM: integer <comptime> = 25
+local P_IPATH: integer <comptime> = 26
+local P_LINKS: integer <comptime> = 27
+local P_LNAME: integer <comptime> = 28
+local P_LS: integer <comptime> = 29
+local P_MMIN: integer <comptime> = 30
+local P_MTIME: integer <comptime> = 31
+local P_NAME: integer <comptime> = 32
+local P_NEGATE: integer <comptime> = 33
+local P_NEWER: integer <comptime> = 34
+local P_NEWERXY: integer <comptime> = 35
+local P_NOGROUP: integer <comptime> = 36
+local P_NOUSER: integer <comptime> = 37
+local P_OK: integer <comptime> = 38
+local P_OKDIR: integer <comptime> = 39
+local P_OPENPAREN: integer <comptime> = 40
+local P_OR: integer <comptime> = 41
+local P_PATH: integer <comptime> = 42
+local P_PERM: integer <comptime> = 43
+local P_PRINT: integer <comptime> = 44
+local P_PRINT0: integer <comptime> = 45
+local P_PRUNE: integer <comptime> = 46
+local P_QUIT: integer <comptime> = 47
+local P_READABLE: integer <comptime> = 48
+local P_REGEX: integer <comptime> = 49
+local P_SAMEFILE: integer <comptime> = 50
+local P_SIZE: integer <comptime> = 51
+local P_TRUE: integer <comptime> = 52
+local P_TYPE: integer <comptime> = 53
+local P_UID: integer <comptime> = 54
+local P_USED: integer <comptime> = 55
+local P_USER: integer <comptime> = 56
+local P_WRITABLE: integer <comptime> = 57
+local P_XTYPE: integer <comptime> = 58
+local P_CONTEXT: integer <comptime> = 59
+local P_COUNT: integer <comptime> = 60
+
+-- tree.c costlookup
+local costlookup: [P_COUNT]integer = {
+  NeedsUnknown, NeedsStatInfo, NeedsNothing, NeedsStatInfo, NeedsStatInfo, NeedsNothing,
+  NeedsStatInfo, NeedsStatInfo, NeedsNothing, NeedsStatInfo, NeedsSyncDiskHit, NeedsStatInfo,
+  NeedsEventualExec, NeedsEventualExec, NeedsAccessInfo, NeedsNothing, NeedsStatInfo, NeedsNothing,
+  NeedsNothing, NeedsNothing, NeedsStatInfo, NeedsStatInfo, NeedsStatInfo, NeedsLinkName,
+  NeedsNothing, NeedsInodeNumber, NeedsNothing, NeedsStatInfo, NeedsLinkName, NeedsStatInfo,
+  NeedsStatInfo, NeedsStatInfo, NeedsNothing, NeedsNothing, NeedsStatInfo, NeedsStatInfo,
+  NeedsStatInfo, NeedsStatInfo, NeedsUserInteraction, NeedsUserInteraction, NeedsNothing, NeedsNothing,
+  NeedsNothing, NeedsStatInfo, NeedsNothing, NeedsNothing, NeedsNothing, NeedsNothing,
+  NeedsAccessInfo, NeedsNothing, NeedsStatInfo, NeedsStatInfo, NeedsNothing, NeedsType,
+  NeedsStatInfo, NeedsStatInfo, NeedsStatInfo, NeedsAccessInfo, NeedsType, NeedsAccessInfo,
+}
+
+-- print.c segments
+local KIND_PLAIN: integer <comptime> = 0
+local KIND_STOP: integer <comptime> = 1
+local KIND_FORMAT: integer <comptime> = 2
+
+local Segment = @record{
+  kind: integer,
+  fc0: byte,
+  fc1: byte,
+  text: Bytes,      -- NUL-terminated, with room for one more byte
+  text_len: integer,
+}
+
+local FormatVal = @record{
+  segments: sequence(Segment),
+  stream: *Stream,
+  filename: string,
+  dest_is_tty: boolean,
+}
+
+local SavedCwd = @record{desc: cint, name: cstring}
+
+-- struct exec_val with its buildcmd_control and buildcmd_state
+local ExecVal = @record{
+  multiple: boolean,
+  -- control
+  exit_if_size_exceeded: boolean,
+  posix_arg_size_max: integer,
+  posix_arg_size_min: integer,
+  arg_max: integer,
+  max_arg_count: integer,
+  rplen: integer,
+  has_replace: boolean,
+  initial_argc: integer,
+  lines_per_exec: integer,
+  args_per_exec: integer,
+  -- state
+  cmd_argc: integer,
+  cmd_argv: sequence(integer),  -- offsets into argbuf, -1 for the terminator
+  argbuf: Bytes,
+  cmd_argv_chars: integer,
+  cmd_initial_argv_chars: integer,
+  todo: boolean,
+  largest_successful_arg_count: integer,
+  smallest_failed_arg_count: integer,
+  -- exec_val
+  replace_vec: sequence(cstring),
+  num_args: integer,
+  close_stdin: boolean,
+  wd_for_exec: *SavedCwd,
+  last_child_status: cint,
+}
+
+local Pred = @record{
+  func: integer,
+  name: string,           -- p_name
+  ptype: integer,
+  prec: integer,
+  side_effects: boolean,
+  no_default_print: boolean,
+  need_stat: boolean,
+  need_type: boolean,
+  need_inum: boolean,
+  cost: integer,
+  rate: float32,
+  literal_control_chars: boolean,
+  artificial: boolean,
+  arg_text: cstring,
+  entry: integer,         -- parser table index (0: newerXY)
+  -- args
+  str: cstring,
+  re: regex.Prog,
+  num_kind: integer,
+  num_val: uint64,
+  size_kind: integer,
+  size_blocksize: integer,
+  size_size: uint64,
+  uid: cuint,
+  gid: cuint,
+  rt_xval: integer,
+  rt_kind: integer,
+  rt_sec: integer,
+  rt_nsec: integer,
+  perm_kind: integer,
+  perm_val: [2]cuint,
+  same_ino: culong,
+  same_dev: culong,
+  same_fd: cint,
+  types: [7]boolean,
+  fmt: FormatVal,
+  exec: ExecVal,
+  -- links
+  next: integer,
+  left: integer,
+  right: integer,
+  visits: integer,
+  successes: integer,
+}
+
+local preds: sequence(*Pred)   -- every predicate allocated, index = id
+local predicates: integer = 0  -- head of the input list
+local last_pred: integer = 0
+local eval_tree: integer = 0
+
+local function P(i: integer): *Pred return preds[i] end
+
+-------------------------------------------------------------------------------
+-- report_file_err and friends (util.c)
+
+local function report_file_err(exitval: integer, errno_value: cint, is_target_file: boolean, name: string)
+  if not is_target_file or not state.already_issued_stat_error_msg then
+    error_e(errno_value, q(name))
+    state.exit_status = 1
+    if exitval ~= 0 then xexit(exitval) end
+  end
+  if is_target_file then state.already_issued_stat_error_msg = true end
+  if exitval ~= 0 then xexit(exitval) end
+end
+
+local function nonfatal_target_file_error(e: cint, name: string) report_file_err(0, e, true, name) end
+local function fatal_target_file_error(e: cint, name: string) report_file_err(1, e, true, name) end
+local function nonfatal_nontarget_file_error(e: cint, name: string) report_file_err(0, e, false, name) end
+local function fatal_nontarget_file_error(e: cint, name: string)
+  state.already_issued_stat_error_msg = false
+  report_file_err(1, e, false, name)
+end
+
+-- get_statinfo: stat the current file unless that was done already.
+local function get_statinfo(pathname: string, name: cstring, p: *sys.Stat): integer
+  if not state.have_stat then
+    if xstat(name, p) == 0 then
+      if p.st_mode == 0 then
+        error0('WARNING: file ' .. q(view(name)) .. ' appears to have mode 0000')
+        state.exit_status = 1
+      end
+    else
+      local e = sys.errno()
+      if not options.ignore_readdir_race or e ~= ENOENT then
+        nonfatal_target_file_error(e, pathname)
+      end
+      return -1
+    end
+  end
+  state.have_stat = true
+  state.have_type = true
+  state.type = p.st_mode
+  return 0
+end
+
+local function get_info(pathname: string, p: *sys.Stat, pp: *Pred): integer
+  local todo = false
+  if pp.need_stat and not state.have_stat then
+    todo = true
+  elseif pp.need_type and not state.have_type then
+    todo = true
+  elseif pp.need_inum then
+    if p.st_ino == 0 then
+      todo = true
+    elseif not state.have_type or isdir(p.st_mode) then
+      todo = true
+    end
+  end
+  if todo then
+    if get_statinfo(pathname, state.rel_pathname, p) ~= 0 then return -1 end
+  end
+  return 0
+end
+
+local function digest_mode(mode: *cuint, pathname: string, name: cstring, pstat: *sys.Stat, leaf: boolean): boolean
+  if $mode ~= 0 then
+    if islnk($mode) and following_links() then
+      if get_statinfo(pathname, name, pstat) ~= 0 then return false end
+      $mode = pstat.st_mode
+      state.type = pstat.st_mode
+      state.have_type = true
+    else
+      state.have_type = true
+      pstat.st_mode = $mode
+      state.type = $mode
+    end
+  else
+    if leaf then
+      state.have_stat = false
+      state.have_type = false
+      state.type = 0
+    else
+      if get_statinfo(pathname, name, pstat) ~= 0 then return false end
+      $mode = pstat.st_mode
+      state.type = pstat.st_mode
+      state.have_type = true
+    end
+  end
+  return true
+end
+
+-------------------------------------------------------------------------------
+-- gnulib dirname/basename helpers
+
+local function last_component_off(s: string): integer
+  local base = 0
+  local n = (@integer)(s.size)
+  while base < n and s.data[base] == 47 do base = base + 1 end
+  local last_was_slash = false
+  for i = base, n - 1 do
+    if s.data[i] == 47 then last_was_slash = true
+    elseif last_was_slash then base = i; last_was_slash = false end
+  end
+  return base
+end
+
+local function base_len(s: string): integer
+  local len = (@integer)(s.size)
+  while 1 < len and s.data[len - 1] == 47 do len = len - 1 end
+  return len
+end
+
+-- base_name (a view into S)
+local function base_name(s: string): string
+  local b = last_component_off(s)
+  local n = (@integer)(s.size)
+  if b >= n then
+    return (@string){data = s.data, size = (@usize)(base_len(s))}
+  end
+  local rest = (@string){data = &s.data[b], size = (@usize)(n - b)}
+  local length = base_len(rest)
+  if b + length < n and s.data[b + length] == 47 then length = length + 1 end
+  return (@string){data = &s.data[b], size = (@usize)(length)}
+end
+
+-- strip_trailing_slashes on a view
+local function strip_trailing_slashes(s: string): string
+  local b = last_component_off(s)
+  local n = (@integer)(s.size)
+  if b >= n then b = 0 end
+  local rest = (@string){data = &s.data[b], size = (@usize)(n - b)}
+  return (@string){data = s.data, size = (@usize)(b + base_len(rest))}
+end
+
+-- mdir_name (a new string)
+local function mdir_name(s: string): string
+  local prefix = (s.size > 0 and s.data[0] == 47) and 1 or 0
+  local length = last_component_off(s)
+  while prefix < length do
+    if s.data[length - 1] ~= 47 then break end
+    length = length - 1
+  end
+  if length == 0 then return string.copy('.') end
+  return string.copy((@string){data = s.data, size = (@usize)(length)})
+end
+
+-------------------------------------------------------------------------------
+-- fstype.c
+
+local mount_list: sequence(mountlist.Entry)
+local mount_list_read = false
+local mount_list_ok = false
+
+local function get_file_system_list(): boolean
+  if not mount_list_read then
+    mount_list, mount_list_ok = mountlist.read()
+    mount_list_read = true
+  end
+  return mount_list_ok
+end
+
+local fstype_known = false
+local current_fstype: string = ''
+local current_fstype_set = false
+local current_dev: culong = 0
+
+local function file_system_type_uncached(statp: *sys.Stat): (string, boolean)
+  if not get_file_system_list() then die('Cannot read mounted file system list') end
+  local best = 0
+  for i = 1, #mount_list do
+    local e = &mount_list[i]
+    if e.fstype == 'ignore' then continue end
+    if e.dev == statp.st_dev then best = i end
+  end
+  if best > 0 then return mount_list[best].fstype, true end
+  return 'unknown', false
+end
+
+local function filesystem_type(statp: *sys.Stat): string
+  if current_fstype_set then
+    if fstype_known and statp.st_dev == current_dev then return current_fstype end
+  end
+  current_dev = statp.st_dev
+  current_fstype, fstype_known = file_system_type_uncached(statp)
+  current_fstype_set = true
+  return current_fstype
+end
+
+local function is_used_fs_type(name: string): boolean
+  if name == 'afs' then return true end
+  if get_file_system_list() then
+    for i = 1, #mount_list do
+      if mount_list[i].fstype == name then return true end
+    end
+  else
+    return true
+  end
+  return false
+end
+
+-------------------------------------------------------------------------------
+-- sharefile.c and open_output_file (parser.c)
+
+local function sharefile_fopen(filename: cstring): *Stream
+  local fd = sys.open(filename, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC | sys.O_CLOEXEC, 438)
+  if fd < 0 then return nilptr end
+  local st: sys.Stat
+  if sys.fstat(fd, &st) < 0 then
+    local e = sys.errno()
+    sys.close(fd)
+    sys.seterrno(e)
+    return nilptr
+  end
+  for i = 1, #files do
+    if files[i].dev == st.st_dev and files[i].ino == st.st_ino then
+      sys.close(fd)
+      return files[i]
+    end
+  end
+  local s = stream_new(fd, false)
+  s.dev = st.st_dev
+  s.ino = st.st_ino
+  s.name = string.copy(view(filename))
+  files:push(s)
+  return s
+end
+
+local function open_output_file(path: cstring, p: *FormatVal)
+  p.segments = {}
+  local ps = view(path)
+  if ps == '/dev/stderr' then
+    p.stream = errs
+    p.filename = 'standard error'
+  elseif ps == '/dev/stdout' then
+    p.stream = outs
+    p.filename = 'standard output'
+  else
+    p.stream = sharefile_fopen(path)
+    p.filename = ps
+    if p.stream == nilptr then fatal_nontarget_file_error(sys.errno(), ps) end
+  end
+  p.dest_is_tty = sys.isatty(p.stream.fd) ~= 0
+end
+
+local function open_stdout(p: *FormatVal) open_output_file('/dev/stdout', p) end
+
+-- sharefile_destroy: close every file in hash_free's bucket order.
+local function sharefile_destroy()
+  local order: sequence(*Stream)
+  for b = 0, 12 do
+    -- a bucket holds its first entry, then the later ones newest first
+    local first = true
+    for i = 1, #files do
+      local s = files[i]
+      if (@integer)((s.dev ~ s.ino) % 13) == b and first then order:push(s); first = false end
+    end
+    for i = #files, 1, -1 do
+      local s = files[i]
+      if (@integer)((s.dev ~ s.ino) % 13) == b then
+        local already = false
+        for k = 1, #order do if order[k] == s then already = true end end
+        if not already then order:push(s) end
+      end
+    end
+  end
+  for i = 1, #order do
+    local s = order[i]
+    if s.closed then continue end
+    local fail = not sflush(s)
+    local e = sys.errno()
+    if sys.close(s.fd) ~= 0 and not fail then fail = true; e = sys.errno() end
+    s.closed = true
+    if fail then fatal_nontarget_file_error(e, s.name) end
+  end
+  order:destroy()
+end
+
+-------------------------------------------------------------------------------
+-- save-cwd.c
+
+local initial_wd: *SavedCwd = nilptr
+
+local function save_cwd(cwd: *SavedCwd): cint
+  cwd.name = nilptr
+  cwd.desc = sys.open('.', sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if cwd.desc < 0 then
+    local buf: [4096]byte
+    if sys.getcwd((@cstring)(&buf[0]), 4096) == nilptr then return -1 end
+    cwd.name = cdup(view((@cstring)(&buf[0])))
+  end
+  return 0
+end
+
+local function restore_cwd(cwd: *SavedCwd): cint
+  if cwd.desc >= 0 then return c_fchdir(cwd.desc) end
+  return sys.chdir(cwd.name)
+end
+
+local function free_cwd(cwd: *SavedCwd)
+  if cwd.desc >= 0 then sys.close(cwd.desc) end
+end
+
+local function record_initial_cwd()
+  initial_wd = default_allocator:new(@SavedCwd)
+  if save_cwd(initial_wd) ~= 0 then
+    local e = sys.errno()
+    local extra = ''
+    if initial_wd.desc < 0 and initial_wd.name ~= nilptr then extra = ': ' .. view(initial_wd.name) end
+    die_e(e, 'Failed to save initial working directory' .. extra)
+  end
+end
+
+-------------------------------------------------------------------------------
+-- buildcmd.c and exec.c
+
+local insertbuf: Bytes = nilptr
+local launch_first_time = true
+
+local function bc_size_of_environment(): integer
+  local len = 0
+  local i = 0
+  while environ[i] ~= nilptr do
+    len = len + cstrlen((@Bytes)(environ[i])) + 1
+    i = i + 1
+  end
+  return len
+end
+
+local function bc_init_controlinfo(ctl: *ExecVal, headroom: integer): integer
+  local size_of_environment = bc_size_of_environment()
+  ctl.posix_arg_size_min = 4096
+  local v = sys.sysconf(0)
+  ctl.posix_arg_size_max = v > 0 and v or 0x7fffffffffffffff
+  ctl.exit_if_size_exceeded = false
+  if size_of_environment > ctl.posix_arg_size_max then return 1
+  elseif headroom + size_of_environment >= ctl.posix_arg_size_max then return 2 end
+  ctl.posix_arg_size_max = ctl.posix_arg_size_max - size_of_environment - headroom
+  ctl.max_arg_count = (ctl.posix_arg_size_max // 8) - 2
+  ctl.rplen = 0
+  ctl.has_replace = false
+  ctl.initial_argc = 0
+  ctl.lines_per_exec = 0
+  ctl.args_per_exec = 0
+  ctl.arg_max = ctl.posix_arg_size_max
+  return 0
+end
+
+local function bc_use_sensible_arg_max(ctl: *ExecVal)
+  local arg_size = 128 * 1024
+  if arg_size > ctl.posix_arg_size_max then ctl.arg_max = ctl.posix_arg_size_max
+  elseif arg_size < ctl.posix_arg_size_min then ctl.arg_max = ctl.posix_arg_size_min
+  else ctl.arg_max = arg_size end
+end
+
+local function bc_init_state(ctl: *ExecVal)
+  ctl.cmd_argc = 0
+  ctl.cmd_argv_chars = 0
+  ctl.cmd_argv = {}
+  ctl.largest_successful_arg_count = 0
+  ctl.smallest_failed_arg_count = 0
+  ctl.argbuf = (@Bytes)(c_malloc((@csize)(ctl.arg_max + 1)))
+  ctl.cmd_initial_argv_chars = 0
+  ctl.todo = false
+end
+
+local function bc_clear_args(ctl: *ExecVal)
+  ctl.cmd_argc = ctl.initial_argc
+  ctl.cmd_argv_chars = ctl.cmd_initial_argv_chars
+  ctl.todo = false
+end
+
+local function exceeds(name: cstring, quantity: integer): boolean
+  local val = sys.getenv(name)
+  if val == nilptr then return false end
+  local s = (@Bytes)(val)
+  local qq = 0
+  while s[qq] == 32 or (s[qq] >= 9 and s[qq] <= 13) do qq = qq + 1 end
+  local ok = s[qq] ~= 45
+  local limit: culong = 0
+  local e: cint = 0
+  if ok then
+    local endp: cstring
+    sys.seterrno(0)
+    limit = c_strtoul(val, &endp, 10)
+    e = sys.errno()
+    if (@usize)(endp) == (@usize)(val) then ok = false
+    elseif (@Bytes)(endp)[0] ~= 0 then ok = false; e = 0
+    elseif e ~= 0 then ok = false; if e ~= ERANGE then e = 0 end end
+  end
+  if not ok then
+    die_e(e, 'Environment variable ' .. view(name) .. ' is not set to a valid decimal number')
+  end
+  return (@culong)(quantity) > limit
+end
+
+local function bc_args_exceed_testing_limit(argv: CStrs): boolean
+  local chars = 0
+  local args = 0
+  local i = 0
+  while argv[i] ~= nilptr do
+    args = args + 1
+    chars = chars + cstrlen((@Bytes)(argv[i]))
+    i = i + 1
+  end
+  return exceeds('__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT', args) or
+         exceeds('__GNU_FINDUTILS_EXEC_ARG_LENGTH_LIMIT', chars)
+end
+
+local function prep_child_for_exec(close_stdin: boolean, wd: *SavedCwd): boolean
+  local ok = true
+  if close_stdin then
+    if sys.close(0) < 0 then
+      error_e(sys.errno(), 'Cannot close standard input')
+      ok = false
+    else
+      -- GNU opens it through gnulib's open_safer, which moves a
+      -- descriptor 0..2 to the lowest one above 2: standard input stays closed
+      local fd = sys.open('/dev/null', sys.O_RDONLY, 0)
+      if fd >= 0 and fd <= 2 then
+        local f2 = sys.fcntl(fd, sys.F_DUPFD, 3)
+        local e = sys.errno()
+        sys.close(fd)
+        sys.seterrno(e)
+        fd = f2
+      end
+      if fd < 0 then
+        error_e(sys.errno(), q('/dev/null'))
+      end
+    end
+  end
+  if restore_cwd(wd) ~= 0 then
+    local e = sys.errno()
+    local extra = ''
+    if wd.desc < 0 and wd.name ~= nilptr then extra = ': ' .. view(wd.name) end
+    error_e(e, 'Failed to change directory' .. extra)
+    ok = false
+  end
+  return ok
+end
+
+-- launch (): run ARGV and wait for it.
+local function launch(execp: *ExecVal, argv: CStrs): boolean
+  if (options.debug_options & DebugExec) ~= 0 then
+    local sb: stringbuilder
+    sb:write('DebugExec: launching process (argc=', execp.cmd_argc - 1, '):')
+    -- GNU lists the whole pending command line, not just this batch
+    for i = 0, execp.cmd_argc - 2 do
+      local off = execp.cmd_argv[i + 1]
+      if off >= 0 then sb:write(' ', q(view((@cstring)(&execp.argbuf[off])))) end
+    end
+    sb:write('\n')
+    eputs(sb:view())
+    sb:destroy()
+  end
+  sflush(outs)
+  if launch_first_time then
+    launch_first_time = false
+    local sc: sys.Sigaction
+    sc.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+    sys.sigaction(sys.SIGCHLD, &sc, nilptr)
+  end
+  local child = sys.fork()
+  if child == -1 then die_e(sys.errno(), 'cannot fork') end
+  if child == 0 then
+    if not prep_child_for_exec(execp.close_stdin, execp.wd_for_exec) then sys._exit(1) end
+    local e: cint
+    if bc_args_exceed_testing_limit(argv) then
+      e = E2BIG
+    elseif (@Bytes)(argv[0])[0] == 0 then
+      e = ENOENT
+    else
+      sys.execvp(argv[0], argv)
+      e = sys.errno()
+    end
+    error_e(e, q(view(argv[0])))
+    sys._exit(1)
+  end
+  while sys.waitpid(child, &execp.last_child_status, 0) == -1 do
+    local e = sys.errno()
+    if e ~= EINTR then
+      error_e(e, 'error waiting for ' .. q(view(argv[0])))
+      state.exit_status = 1
+      return false
+    end
+  end
+  local st = execp.last_child_status
+  if (st & 0x7f) ~= 0 and (st & 0x7f) ~= 0x7f then
+    error0(q(view(argv[0])) .. ' terminated by signal ' .. tostring(st & 0x7f))
+    if execp.multiple then state.exit_status = 1 end
+    return true
+  end
+  local ex = (st >> 8) & 0xff
+  if (options.debug_options & DebugExec) ~= 0 then
+    eputs('DebugExec: process (PID=' .. tostring(child) .. ') terminated with exit status: ' .. tostring(ex) .. '\n')
+  end
+  if ex ~= 0 and execp.multiple then state.exit_status = 1 end
+  return true
+end
+
+local function bc_push_arg(ctl: *ExecVal, arg: Bytes, len: integer, prefix: Bytes, pfxlen: integer, initial_args: boolean) <forwarddecl> end
+
+local function update_limit(ctl: *ExecVal, success: boolean, limit: integer): integer
+  if success then
+    if limit > ctl.largest_successful_arg_count then ctl.largest_successful_arg_count = limit end
+  else
+    if limit < ctl.smallest_failed_arg_count or ctl.smallest_failed_arg_count == 0 then
+      ctl.smallest_failed_arg_count = limit
+    end
+  end
+  if ctl.largest_successful_arg_count == 0 or ctl.smallest_failed_arg_count <= ctl.largest_successful_arg_count then
+    if success then limit = limit + 1 else limit = limit // 2 end
+  else
+    local shift = (ctl.smallest_failed_arg_count - ctl.largest_successful_arg_count) // 2
+    if success then
+      if shift ~= 0 then limit = limit + shift else limit = limit + 1 end
+    else
+      if shift ~= 0 then limit = limit - shift else limit = limit - 1 end
+    end
+  end
+  if ctl.initial_argc ~= 0 and limit <= ctl.initial_argc + 1 then limit = ctl.initial_argc + 1 end
+  if limit == 0 then limit = 1 end
+  return limit
+end
+
+local function bc_do_exec(ctl: *ExecVal)
+  bc_push_arg(ctl, nilptr, 0, nilptr, 0, false)
+  local working = (@CStrs)(c_malloc((@csize)((1 + ctl.cmd_argc) * 8)))
+  local done = 0
+  local limit = ctl.cmd_argc
+  repeat
+    local dst_pos = 0
+    local src_pos = 0
+    while src_pos < ctl.initial_argc do
+      working[dst_pos] = (@cstring)(&ctl.argbuf[ctl.cmd_argv[src_pos + 1]])
+      dst_pos = dst_pos + 1; src_pos = src_pos + 1
+    end
+    src_pos = src_pos + done
+    while src_pos < ctl.cmd_argc and dst_pos < limit do
+      local off = ctl.cmd_argv[src_pos + 1]
+      working[dst_pos] = off >= 0 and (@cstring)(&ctl.argbuf[off]) or nilptr
+      dst_pos = dst_pos + 1; src_pos = src_pos + 1
+    end
+    working[dst_pos] = nilptr
+    if launch(ctl, working) then
+      limit = update_limit(ctl, true, limit)
+      done = done + (dst_pos - ctl.initial_argc)
+    else
+      if limit <= ctl.initial_argc + 1 then
+        die("can't call exec() due to argument size restrictions")
+      else
+        limit = update_limit(ctl, false, limit)
+      end
+    end
+  until not ((done + 1) < (ctl.cmd_argc - ctl.initial_argc))
+  c_free(working)
+  bc_clear_args(ctl)
+end
+
+local function bc_argc_limit_reached(initial_args: boolean, ctl: *ExecVal): boolean
+  if not initial_args and ctl.args_per_exec ~= 0 and (ctl.cmd_argc - ctl.initial_argc) == ctl.args_per_exec then
+    return true
+  end
+  return ctl.cmd_argc == ctl.max_arg_count
+end
+
+function bc_push_arg(ctl: *ExecVal, arg: Bytes, len: integer, prefix: Bytes, pfxlen: integer, initial_args: boolean)
+  local terminate = arg == nilptr
+  if not terminate then
+    if ctl.cmd_argv_chars + len + pfxlen > ctl.arg_max then
+      if initial_args or ctl.cmd_argc == ctl.initial_argc then
+        die('cannot fit single argument within argument list size limit')
+      end
+      if ctl.has_replace or (ctl.exit_if_size_exceeded and (ctl.lines_per_exec ~= 0 or ctl.args_per_exec ~= 0)) then
+        die('argument list too long')
+      end
+      bc_do_exec(ctl)
+    end
+    if bc_argc_limit_reached(initial_args, ctl) then bc_do_exec(ctl) end
+  end
+  if not initial_args then ctl.todo = true end
+  local slot = ctl.cmd_argc + 1
+  if terminate then
+    if slot <= #ctl.cmd_argv then ctl.cmd_argv[slot] = -1 else ctl.cmd_argv:push(-1) end
+    ctl.cmd_argc = ctl.cmd_argc + 1
+  else
+    local off = ctl.cmd_argv_chars
+    if slot <= #ctl.cmd_argv then ctl.cmd_argv[slot] = off else ctl.cmd_argv:push(off) end
+    ctl.cmd_argc = ctl.cmd_argc + 1
+    if prefix ~= nilptr then
+      for i = 0, pfxlen - 1 do ctl.argbuf[ctl.cmd_argv_chars + i] = prefix[i] end
+      ctl.cmd_argv_chars = ctl.cmd_argv_chars + pfxlen
+    end
+    for i = 0, len - 1 do ctl.argbuf[ctl.cmd_argv_chars + i] = arg[i] end
+    ctl.cmd_argv_chars = ctl.cmd_argv_chars + len
+    if bc_argc_limit_reached(initial_args, ctl) then bc_do_exec(ctl) end
+  end
+  if initial_args then ctl.cmd_initial_argv_chars = ctl.cmd_argv_chars end
+end
+
+-- strstr; -1 when "{}" does not occur at or after FROM.
+local function find_braces(s: Bytes, n: integer, from: integer): integer
+  local i = from
+  while i + 1 < n do
+    if s[i] == 123 and s[i + 1] == 125 then return i end
+    i = i + 1
+  end
+  return -1
+end
+
+local function bc_do_insert(ctl: *ExecVal, arg: Bytes, arglen: integer, prefix: Bytes, pfxlen: integer,
+                            linebuf: Bytes, lblen: integer, initial_args: boolean)
+  local bytes_left = ctl.arg_max - 1
+  if insertbuf == nilptr then insertbuf = (@Bytes)(c_malloc((@csize)(ctl.arg_max + 1))) end
+  local p = 0
+  local a = 0
+  repeat
+    local s = find_braces(arg, arglen, a)
+    local len: integer
+    if s >= 0 then len = s - a else len = arglen - a end
+    if bytes_left <= len then break end
+    bytes_left = bytes_left - len
+    for i = 0, len - 1 do insertbuf[p + i] = arg[a + i] end
+    p = p + len
+    a = a + len
+    if s >= 0 then
+      if bytes_left <= lblen + pfxlen then break end
+      bytes_left = bytes_left - (lblen + pfxlen)
+      if prefix ~= nilptr then
+        for i = 0, pfxlen - 1 do insertbuf[p + i] = prefix[i] end
+        p = p + pfxlen
+      end
+      for i = 0, lblen - 1 do insertbuf[p + i] = linebuf[i] end
+      p = p + lblen
+      a = a + ctl.rplen
+    end
+  until not (a < arglen)
+  if a < arglen then die('command too long') end
+  insertbuf[p] = 0
+  p = p + 1
+  bc_push_arg(ctl, insertbuf, p, nilptr, 0, initial_args)
+end
+
+-- dircallback.c run_in_dir
+local function run_in_dir(there: *SavedCwd, ctl: *ExecVal)
+  local here: SavedCwd
+  if save_cwd(&here) == 0 then
+    if restore_cwd(there) == 0 then
+      bc_do_exec(ctl)
+    else
+      die_e(sys.errno(), 'failed to return to initial working directory')
+    end
+    if restore_cwd(&here) ~= 0 then die_e(sys.errno(), 'failed to return to initial working directory') end
+    free_cwd(&here)
+  else
+    die_e(sys.errno(), 'failed to save working directory')
+  end
+end
+
+local function do_exec(execp: *ExecVal)
+  run_in_dir(execp.wd_for_exec, execp)
+  if execp.wd_for_exec ~= initial_wd then
+    free_cwd(execp.wd_for_exec)
+    default_allocator:delete(execp.wd_for_exec)
+    execp.wd_for_exec = nilptr
+  end
+end
+
+-------------------------------------------------------------------------------
+-- allocating predicates (tree.c, util.c)
+
+-- Parser table entries
+local ARG_OPTION: integer <comptime> = 0
+local ARG_NOOP: integer <comptime> = 1
+local ARG_POSITIONAL_OPTION: integer <comptime> = 2
+local ARG_TEST: integer <comptime> = 3
+local ARG_SPECIAL_PARSE: integer <comptime> = 4
+local ARG_PUNCTUATION: integer <comptime> = 5
+local ARG_ACTION: integer <comptime> = 6
+
+local ParseFn = @function(integer, CStrs, *integer): boolean
+local Entry = @record{type: integer, name: string, parse: ParseFn, pred: integer}
+local parse_table: sequence(Entry)   -- index 1 is -newerXY's special entry
+
+local function get_new_pred(entry: integer): integer
+  local p = default_allocator:new(@Pred)
+  preds:push(p)
+  local id = #preds
+  if predicates == 0 then
+    predicates = id
+    last_pred = id
+  else
+    P(last_pred).next = id
+    last_pred = id
+  end
+  p.entry = entry
+  p.ptype = NO_TYPE
+  p.prec = NO_PREC
+  p.need_stat = true
+  p.need_type = true
+  p.cost = NeedsUnknown
+  p.arg_text = 'ThisShouldBeSetToSomethingElse'
+  p.literal_control_chars = options.literal_control_chars
+  p.rate = 1.0
+  p.same_fd = -1
+  return id
+end
+
+local function get_new_pred_noarg(entry: integer): integer
+  local id = get_new_pred(entry)
+  P(id).arg_text = nilptr
+  return id
+end
+
+local entry_and: integer = 0
+
+local function get_new_pred_chk_op(entry: integer, arg: cstring): integer
+  if last_pred ~= 0 then
+    local t = P(last_pred).ptype
+    if t == NO_TYPE then
+      die('oops -- invalid default insertion of and!')
+    elseif t == PRIMARY_TYPE or t == CLOSE_PAREN then
+      local id = get_new_pred_noarg(entry_and)
+      local np = P(id)
+      np.func = P_AND
+      np.name = '-a'
+      np.ptype = BI_OP
+      np.prec = AND_PREC
+      np.need_stat = false
+      np.need_type = false
+      np.need_inum = false
+      np.arg_text = nilptr
+      np.str = nilptr
+      np.side_effects = false
+      np.no_default_print = false
+    end
+  end
+  local id = get_new_pred(entry)
+  P(id).arg_text = arg
+  P(id).entry = entry
+  return id
+end
+
+local function insert_primary_withpred(entry: integer, func: integer, arg: cstring): *Pred
+  local id = get_new_pred_chk_op(entry, arg)
+  local np = P(id)
+  np.func = func
+  np.name = parse_table[entry].name
+  np.str = nilptr
+  np.ptype = PRIMARY_TYPE
+  np.prec = NO_PREC
+  return np
+end
+
+local function insert_primary(entry: integer, arg: cstring): *Pred
+  return insert_primary_withpred(entry, parse_table[entry].pred, arg)
+end
+
+local function insert_primary_noarg(entry: integer): *Pred
+  return insert_primary(entry, nilptr)
+end
+
+-------------------------------------------------------------------------------
+-- print.c: -printf format parsing
+
+local function make_segment(segs: *sequence(Segment), format: Bytes, len: integer, kind: integer,
+                            format_char: byte, aux_format_char: byte, pred: *Pred)
+  local mycost = NeedsNothing
+  local seg: Segment
+  seg.kind = kind
+  seg.fc0 = format_char
+  seg.fc1 = aux_format_char
+  seg.text_len = len
+  seg.text = (@Bytes)(c_malloc((@csize)(len + 3)))
+  -- strncpy: stop at a NUL, pad with NULs
+  local stopped = false
+  for i = 0, len - 1 do
+    if stopped or format[i] == 0 then stopped = true; seg.text[i] = 0 else seg.text[i] = format[i] end
+  end
+  local fp = len
+  if kind == KIND_PLAIN or kind == KIND_STOP then
+    seg.text[fp] = 0
+    segs:push(seg)
+    return
+  end
+  local c = format_char
+  if c == 37 then seg.text[fp] = 37; fp = fp + 1
+  elseif c == 108 then pred.need_stat = true; mycost = NeedsLinkName; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 121 then pred.need_type = true; mycost = NeedsType; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 105 then pred.need_inum = true; mycost = NeedsInodeNumber; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 97 or c == 65 or c == 66 or c == 99 or c == 67 or c == 70 or c == 103 or c == 77 or c == 115
+      or c == 116 or c == 84 or c == 117 then
+    pred.need_stat = true; mycost = NeedsStatInfo; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 83 then pred.need_stat = true; mycost = NeedsStatInfo; seg.text[fp] = 103; fp = fp + 1
+  elseif c == 89 then pred.need_stat = true; mycost = NeedsType; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 102 or c == 104 or c == 112 or c == 80 then seg.text[fp] = 115; fp = fp + 1
+  elseif c == 90 then mycost = NeedsAccessInfo; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 72 then seg.text[fp] = 115; fp = fp + 1
+  elseif c == 71 or c == 85 or c == 98 or c == 68 or c == 107 or c == 110 then
+    pred.need_stat = true; mycost = NeedsStatInfo; seg.text[fp] = 115; fp = fp + 1
+  elseif c == 100 then seg.text[fp] = 100; fp = fp + 1
+  elseif c == 109 then seg.text[fp] = 111; fp = fp + 1; pred.need_stat = true; mycost = NeedsStatInfo
+  end
+  seg.text[fp] = 0
+  if mycost > pred.cost then pred.cost = mycost end
+  segs:push(seg)
+end
+
+local function is_octal_char(ch: byte): boolean return ch >= 48 and ch <= 55 end
+
+local function parse_escape_char(ch: byte): byte
+  if ch == 97 then return 7 elseif ch == 98 then return 8 elseif ch == 102 then return 12
+  elseif ch == 110 then return 10 elseif ch == 114 then return 13 elseif ch == 116 then return 9
+  elseif ch == 118 then return 11 elseif ch == 92 then return 92 end
+  return 0
+end
+
+local function strchr_set(set: string, c: byte): boolean
+  if c == 0 then return true end
+  for i = 0, < #set do if set.data[i] == c then return true end end
+  return false
+end
+
+local function get_format_flags_length(p: Bytes): integer
+  local n = 0
+  while true do
+    n = n + 1
+    if p[n] == 0 or not strchr_set('-+ #', p[n]) then break end
+  end
+  while p[n] >= 48 and p[n] <= 57 do n = n + 1 end
+  if p[n] == 46 then
+    n = n + 1
+    while p[n] >= 48 and p[n] <= 57 do n = n + 1 end
+  end
+  return n
+end
+
+local function get_format_specifer_length(ch: byte): integer
+  -- strchr finds the terminating NUL too
+  if strchr_set('abcdDfFgGhHiklmMnpPsStuUyYZ%', ch) then return 1
+  elseif strchr_set('ABCT', ch) then return 2 end
+  return 0
+end
+
+local function insert_fprintf(vec: *FormatVal, entry: integer, format: cstring): boolean
+  local fmt = (@Bytes)(format)
+  local segstart = 0
+  local our_pred = insert_primary_withpred(entry, P_FPRINTF, format)
+  our_pred.side_effects = true
+  our_pred.no_default_print = true
+  our_pred.fmt = $vec
+  our_pred.need_type = false
+  our_pred.need_stat = false
+  our_pred.cost = NeedsNothing
+  local segs = &our_pred.fmt.segments
+  local e = 0
+  while fmt[e] ~= 0 do
+    if fmt[e] == 92 and fmt[e + 1] == 99 then
+      make_segment(segs, &fmt[segstart], e - segstart, KIND_STOP, 0, 0, our_pred)
+      if our_pred.need_stat and our_pred.cost < NeedsStatInfo then our_pred.cost = NeedsStatInfo end
+      return true
+    elseif fmt[e] == 92 then
+      local readpos = 1
+      if fmt[e + readpos] == 0 then
+        error0("warning: escape `\\' followed by nothing at all")
+        readpos = readpos - 1
+      elseif is_octal_char(fmt[e + readpos]) then
+        local n = 0
+        local pos = 0
+        local i = 0
+        while i < 3 and is_octal_char(fmt[e + readpos + pos]) do
+          n = 8 * n + (fmt[e + readpos + pos] - 48)
+          i = i + 1; pos = pos + 1
+        end
+        pos = pos - 1
+        fmt[e] = (@byte)(n & 0xff)
+        readpos = readpos + pos
+      else
+        local val = parse_escape_char(fmt[e + readpos])
+        if val ~= 0 then
+          fmt[e] = val
+        else
+          local cc = fmt[e + readpos]
+          local sb: stringbuilder
+          sb:write("warning: unrecognized escape `\\")
+          sb:writebyte(cc)
+          sb:write("'")
+          error0(sb:view())
+          sb:destroy()
+          e = e + readpos
+          e = e + 1
+          goto next_iter
+        end
+      end
+      make_segment(segs, &fmt[segstart], e - segstart + 1, KIND_PLAIN, 0, 0, our_pred)
+      segstart = e + readpos + 1
+      e = e + readpos
+    elseif fmt[e] == 37 then
+      local len: integer
+      if fmt[e + 1] == 0 then
+        die('error: ' .. view((@cstring)(&fmt[e])) .. ' at end of format string')
+      end
+      if fmt[e + 1] == 37 then len = 1 else len = get_format_flags_length(&fmt[e]) end
+      e = e + len
+      len = get_format_specifer_length(fmt[e])
+      if len ~= 0 and fmt[e + len - 1] ~= 0 then
+        local fmt2: byte = len == 2 and fmt[e + 1] or 0
+        make_segment(segs, &fmt[segstart], e - segstart, KIND_FORMAT, fmt[e], fmt2, our_pred)
+        e = e + (len - 1)
+      else
+        local cc = fmt[e]
+        if strchr_set('{[(', cc) then
+          local sb: stringbuilder
+          sb:write("error: the format directive `%")
+          sb:writebyte(cc)
+          sb:write("' is reserved for future use")
+          die(sb:view())
+        end
+        local sb: stringbuilder
+        if len == 2 and fmt[e + 1] == 0 then
+          sb:write("warning: format directive `%")
+          sb:writebyte(cc)
+          sb:write("' should be followed by another character")
+        else
+          sb:write("warning: unrecognized format directive `%")
+          sb:writebyte(cc)
+          sb:write("'")
+        end
+        error0(sb:view())
+        sb:destroy()
+        make_segment(segs, &fmt[segstart], e + 1 - segstart, KIND_PLAIN, 0, 0, our_pred)
+      end
+      segstart = e + 1
+    end
+    e = e + 1
+    ::next_iter::
+  end
+  if e > segstart then
+    make_segment(segs, &fmt[segstart], e - segstart, KIND_PLAIN, 0, 0, our_pred)
+  end
+  return true
+end
+
+-------------------------------------------------------------------------------
+-- parser.c helpers
+
+-- C's truncating integer division
+local function tdiv(a: integer, b: integer): integer
+  local r = a // b
+  if r < 0 and r * b ~= a then r = r + 1 end
+  return r
+end
+
+local function collect_arg(argv: CStrs, arg_ptr: *integer): (boolean, cstring)
+  if argv == nilptr or argv[$arg_ptr] == nilptr then return false, nilptr end
+  local a = argv[$arg_ptr]
+  $arg_ptr = $arg_ptr + 1
+  return true, a
+end
+
+local function collect_arg_stat_info(argv: CStrs, arg_ptr: *integer, p: *sys.Stat): (boolean, cstring)
+  local ok, filename = collect_arg(argv, arg_ptr)
+  if ok then
+    if xstat(filename, p) ~= 0 then fatal_target_file_error(sys.errno(), view(filename)) end
+    return true, filename
+  end
+  return false, nilptr
+end
+
+local function estimate_file_age_success_rate(num_days: float32): float32
+  if num_days < 0.1_f32 then return 0.01_f32
+  elseif num_days < 1.0_f32 then return 0.3_f32
+  elseif num_days > 100.0_f32 then return 0.3_f32 end
+  return 0.39_f32
+end
+
+local function estimate_timestamp_success_rate(when: integer): float32
+  local num_days: cint = (@cint)(tdiv(options.day_sec - when, 86400))
+  return estimate_file_age_success_rate((@float32)(num_days))
+end
+
+local function has_any(s: cstring, set: string): boolean
+  local p = (@Bytes)(s)
+  local i = 0
+  while p[i] ~= 0 do
+    for k = 0, < #set do if p[i] == set.data[k] then return true end end
+    i = i + 1
+  end
+  return false
+end
+
+local function estimate_pattern_match_rate(pattern: cstring, is_regex: boolean): float32
+  if has_any(pattern, '*?[') or (is_regex and has_any(pattern, '.')) then return 0.8_f32 end
+  return 0.1_f32
+end
+
+-- get_comp_type: the kind and the offset past the prefix
+local function get_comp_type(s: cstring): (integer, integer)
+  local c = (@Bytes)(s)[0]
+  if c == 43 then return COMP_GT, 1
+  elseif c == 45 then return COMP_LT, 1 end
+  return COMP_EQ, 0
+end
+
+-- xstrtoumax (s, &end, 10, &n, "") == LONGINT_OK
+local function xstrtoumax_ok(s: cstring): (boolean, uint64)
+  local p = (@Bytes)(s)
+  local i = 0
+  while p[i] == 32 or (p[i] >= 9 and p[i] <= 13) do i = i + 1 end
+  if p[i] == 45 then return false, 0 end
+  local endp: cstring
+  sys.seterrno(0)
+  local v = c_strtoumax(s, &endp, 10)
+  if (@usize)(endp) == (@usize)(s) then return false, 0 end
+  if sys.errno() ~= 0 then return false, 0 end
+  if (@Bytes)(endp)[0] ~= 0 then return false, 0 end
+  return true, v
+end
+
+local function get_num(s: cstring): (boolean, uint64, integer)
+  if s == nilptr then return false, 0, COMP_EQ end
+  local kind, off = get_comp_type(s)
+  local ok, v = xstrtoumax_ok((@cstring)(&(@Bytes)(s)[off]))
+  return ok, v, kind
+end
+
+-- xstrtod (str, NULL, &d, strtod)
+local function xstrtod(s: cstring): (boolean, float64)
+  local endp: cstring
+  sys.seterrno(0)
+  local v = sys.strtod(s, &endp)
+  if (@usize)(endp) == (@usize)(s) or (@Bytes)(endp)[0] ~= 0 then return false, v end
+  if v ~= 0 and sys.errno() == ERANGE then return false, v end
+  return true, v
+end
+
+local TimeVal = @record{xval: integer, kind: integer, sec: integer, nsec: integer}
+
+local function get_relative_timestamp(str: cstring, result: *TimeVal, origin_sec: integer, origin_nsec: integer,
+                                      sec_per_unit: float64, overflowmessage: string): boolean
+  local kind, off = get_comp_type(str)
+  if kind == COMP_LT then kind = COMP_GT elseif kind == COMP_GT then kind = COMP_LT end
+  result.kind = kind
+  local rest = (@cstring)(&(@Bytes)(str)[off])
+  local ok, offset = xstrtod(rest)
+  if not ok then return false end
+  local seconds: float64 = 0
+  local nanosec = c_modf(offset * sec_per_unit, &seconds)
+  nanosec = nanosec * 1.0e9
+  if not (nanosec < 1000000000.0) then
+    eputs(util.applet .. ": parser.c:3149: get_relative_timestamp: Assertion `nanosec < nanosec_per_sec' failed.\n")
+    local sa: sys.Sigaction
+    sa.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+    sys.sigaction(6, &sa, nilptr)
+    sys.kill(sys.getpid(), 6)
+    sys._exit(134)
+  end
+  result.sec = (@integer)((@float64)(origin_sec) - seconds)
+  if (origin_sec < result.sec) ~= (seconds < 0) then
+    local sb: stringbuilder
+    local mp = overflowmessage:find('%s', 1, true)
+    sb:write(overflowmessage:sub(1, mp - 1), view(rest), overflowmessage:sub(mp + 2))
+    die(sb:view())
+  end
+  result.nsec = (@integer)((@float64)(origin_nsec) - nanosec)
+  if (@float64)(origin_nsec) < nanosec then
+    result.nsec = result.nsec + 1000000000
+    result.sec = result.sec - 1
+  end
+  return true
+end
+
+local function ctime_str(t: integer): string
+  local f, ok = util.breaktime(t, 0, false)
+  if not ok then return '?\n' end
+  return util.timestr('%a %b %e %H:%M:%S %Y', &f) .. '\n'
+end
+
+local function safe_atoi(s: cstring): integer
+  local endp: cstring
+  sys.seterrno(0)
+  local lval = c_strtol(s, &endp, 10)
+  local e = sys.errno()
+  if lval == 0x7fffffffffffffff or lval == -0x7fffffffffffffff - 1 then
+    die_e(e, view(s))
+  end
+  if lval > 0x7fffffff or lval < -0x80000000 then
+    die_e(ERANGE, view(s))
+  elseif (@Bytes)(endp)[0] ~= 0 then
+    die_e(e, 'Unexpected suffix ' .. q(view(endp)) .. ' on ' .. q(view(s)))
+  elseif (@usize)(endp) == (@usize)(s) then
+    die_e(e, 'Expected an integer: ' .. q(view(s)))
+  end
+  return lval
+end
+
+local entry_noop: integer = 0
+local entry_false: integer = 0
+
+local function parse_true(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.need_stat = false
+  p.need_type = false
+  p.rate = 1.0_f32
+  return true
+end
+
+local function parse_noop(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return parse_true(entry_noop, argv, arg_ptr)
+end
+
+local function insert_false(): boolean
+  local p = insert_primary_noarg(entry_false)
+  p.need_stat = false
+  p.need_type = false
+  p.side_effects = false
+  p.no_default_print = false
+  p.rate = 0.0_f32
+  return true
+end
+
+local function parse_and(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local id = get_new_pred_noarg(entry)
+  local p = P(id)
+  p.func = P_AND
+  p.ptype = BI_OP
+  p.prec = AND_PREC
+  p.need_stat = false
+  p.need_type = false
+  return true
+end
+
+local function parse_or(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local id = get_new_pred_noarg(entry)
+  local p = P(id)
+  p.func = P_OR
+  p.ptype = BI_OP
+  p.prec = OR_PREC
+  p.need_stat = false
+  p.need_type = false
+  return true
+end
+
+local function parse_comma(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local id = get_new_pred_noarg(entry)
+  local p = P(id)
+  p.func = P_COMMA
+  p.ptype = BI_OP
+  p.prec = COMMA_PREC
+  p.need_stat = false
+  p.need_type = false
+  p.rate = 1.0_f32
+  return true
+end
+
+local function parse_negate(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local id = get_new_pred_chk_op(entry, nilptr)
+  local p = P(id)
+  p.func = P_NEGATE
+  p.ptype = UNI_OP
+  p.prec = NEGATE_PREC
+  p.need_stat = false
+  p.need_type = false
+  return true
+end
+
+local function parse_openparen(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local id = get_new_pred_chk_op(entry, nilptr)
+  local p = P(id)
+  p.func = P_OPENPAREN
+  p.ptype = OPEN_PAREN
+  p.prec = NO_PREC
+  p.need_stat = false
+  p.need_type = false
+  return true
+end
+
+local function parse_closeparen(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local id = get_new_pred_noarg(entry)
+  local p = P(id)
+  p.func = P_CLOSEPAREN
+  p.ptype = CLOSE_PAREN
+  p.prec = NO_PREC
+  p.need_stat = false
+  p.need_type = false
+  return true
+end
+
+local function parse_anewer(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local st: sys.Stat
+  local ok, arg = collect_arg_stat_info(argv, arg_ptr, &st)
+  if ok then
+    local p = insert_primary(entry, arg)
+    p.rt_xval = XVAL_ATIME
+    p.rt_sec = st.st_mtim.tv_sec
+    p.rt_nsec = st.st_mtim.tv_nsec
+    p.rt_kind = COMP_GT
+    p.rate = estimate_timestamp_success_rate(st.st_mtim.tv_sec)
+    return true
+  end
+  return false
+end
+
+local function parse_cnewer(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local st: sys.Stat
+  local ok, arg = collect_arg_stat_info(argv, arg_ptr, &st)
+  if ok then
+    local p = insert_primary(entry, arg)
+    p.rt_xval = XVAL_CTIME
+    p.rt_sec = st.st_mtim.tv_sec
+    p.rt_nsec = st.st_mtim.tv_nsec
+    p.rt_kind = COMP_GT
+    p.rate = estimate_timestamp_success_rate(st.st_mtim.tv_sec)
+    return true
+  end
+  return false
+end
+
+local function parse_newer(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local st: sys.Stat
+  local ok, arg = collect_arg_stat_info(argv, arg_ptr, &st)
+  if ok then
+    local p = insert_primary(entry, arg)
+    p.rt_sec = st.st_mtim.tv_sec
+    p.rt_nsec = st.st_mtim.tv_nsec
+    p.rt_xval = XVAL_MTIME
+    p.rt_kind = COMP_GT
+    p.rate = estimate_timestamp_success_rate(st.st_mtim.tv_sec)
+    return true
+  end
+  return false
+end
+
+local function parse_daystart(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  if not options.full_days then
+    options.day_sec = options.day_sec + DAYSECS
+    options.day_nsec = 0
+    local f, ok = util.breaktime(options.day_sec, 0, false)
+    if ok then
+      options.day_sec = options.day_sec - (f.tm.tm_sec + f.tm.tm_min * 60 + f.tm.tm_hour * 3600)
+    else
+      options.day_sec = options.day_sec - options.day_sec % DAYSECS
+    end
+    options.full_days = true
+  end
+  return true
+end
+
+local function parse_delete(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.side_effects = true
+  p.no_default_print = true
+  options.do_dir_first = false
+  p.need_stat = false
+  p.need_type = false
+  p.rate = 1.0_f32
+  return true
+end
+
+local function parse_depth(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.do_dir_first = false
+  options.explicit_depth = true
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_d(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  if should_issue_warnings() then
+    error0('warning: the -d option is deprecated; please use -depth instead, because the latter is a POSIX-compliant feature.')
+  end
+  return parse_depth(entry, argv, arg_ptr)
+end
+
+local function parse_empty(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.rate = 0.01_f32
+  return true
+end
+
+local function check_path_safety(action: string)
+  local path = sys.getenv('PATH')
+  if path == nilptr then return end
+  local s = (@Bytes)(path)
+  local pos = 0
+  local len = 0
+  local first = true
+  while true do
+    if not first then
+      pos = pos + len
+      if s[pos] ~= 0 then pos = pos + 1 else break end
+    end
+    first = false
+    len = 0
+    while s[pos + len] ~= 0 and s[pos + len] ~= 58 do len = len + 1 end
+    if len == 0 or (len == 1 and s[pos] == 46) then
+      die('The current directory is included in the PATH environment variable, which is insecure in combination with the ' ..
+          action .. ' action of find.  Please remove the current directory from your $PATH (that is, remove ".", doubled colons, or leading or trailing colons)')
+    elseif s[pos] ~= 47 then
+      local rel = (@string){data = &s[pos], size = (@usize)(len)}
+      die('The relative path ' .. q(rel) .. ' is included in the PATH environment variable, which is insecure in combination with the ' ..
+          action .. ' action of find.  Please remove that entry from $PATH')
+    end
+  end
+end
+
+local function has_braces(s: cstring): boolean
+  local p = (@Bytes)(s)
+  local i = 0
+  while p[i] ~= 0 do
+    if p[i] == 123 and p[i + 1] == 125 then return true end
+    i = i + 1
+  end
+  return false
+end
+
+local function insert_exec_ok(action: string, entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local func = parse_table[entry].pred
+  if argv == nilptr or argv[$arg_ptr] == nilptr then return false end
+  local our_pred = insert_primary_withpred(entry, func, '(some -exec* arguments)')
+  our_pred.side_effects = true
+  our_pred.no_default_print = true
+  our_pred.need_type = false
+  our_pred.need_stat = false
+  local execp = &our_pred.exec
+  execp.wd_for_exec = nilptr
+  local allow_plus: boolean
+  if func ~= P_OKDIR and func ~= P_OK then
+    allow_plus = true
+    execp.close_stdin = false
+  else
+    allow_plus = false
+    options.ok_prompt_stdin = true
+    execp.close_stdin = true
+  end
+  if func == P_EXECDIR or func == P_OKDIR then
+    execp.wd_for_exec = nilptr
+    options.ignore_readdir_race = false
+    check_path_safety(action)
+  else
+    execp.wd_for_exec = initial_wd
+  end
+  execp.multiple = false
+  local start = $arg_ptr
+  local e = start
+  local saw_braces = false
+  local brace_count = 0
+  local brace_arg: cstring = nilptr
+  while argv[e] ~= nilptr and not ((@Bytes)(argv[e])[0] == 59 and (@Bytes)(argv[e])[1] == 0) do
+    if allow_plus and (@Bytes)(argv[e])[0] == 43 and (@Bytes)(argv[e])[1] == 0 and saw_braces then
+      execp.multiple = true
+      break
+    end
+    saw_braces = false
+    if has_braces(argv[e]) then
+      saw_braces = true
+      brace_arg = argv[e]
+      brace_count = brace_count + 1
+      -- GNU compares the argv index with 0 here, which never holds
+    end
+    e = e + 1
+  end
+  if e == start or argv[e] == nilptr then
+    $arg_ptr = e
+    return false
+  end
+  if execp.multiple then
+    local suffix = func == P_EXECDIR and 'dir' or ''
+    if brace_count > 1 then
+      die('Only one instance of {} is supported with -exec' .. suffix .. ' ... +')
+    elseif cstrlen((@Bytes)(brace_arg)) ~= 2 then
+      die('In ' .. q('-exec' .. suffix .. ' ... {} +') .. ' the ' .. q('{}') ..
+          ' must appear by itself, but you specified ' .. q(view(brace_arg)))
+    end
+  end
+  local st = bc_init_controlinfo(execp, 2048)
+  if st ~= 0 then die('The environment is too large for exec().') end
+  bc_use_sensible_arg_max(execp)
+  if execp.multiple then
+    execp.has_replace = false
+    execp.rplen = 0
+    execp.lines_per_exec = 0
+    execp.args_per_exec = 0
+    execp.initial_argc = (e - start) - 1
+    bc_init_state(execp)
+    for i = start, e - 2 do
+      bc_push_arg(execp, (@Bytes)(argv[i]), cstrlen((@Bytes)(argv[i])) + 1, nilptr, 0, true)
+    end
+  else
+    execp.num_args = e - start
+    execp.has_replace = true
+    execp.rplen = 2
+    execp.lines_per_exec = 0
+    execp.args_per_exec = 0
+    bc_init_state(execp)
+    for i = 0, execp.num_args - 1 do execp.replace_vec:push(argv[i + start]) end
+  end
+  if argv[e] == nilptr then $arg_ptr = e else $arg_ptr = e + 1 end
+  return true
+end
+
+local function parse_exec(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_exec_ok('-exec', entry, argv, arg_ptr)
+end
+local function parse_execdir(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_exec_ok('-execdir', entry, argv, arg_ptr)
+end
+local function parse_ok(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_exec_ok('-ok', entry, argv, arg_ptr)
+end
+local function parse_okdir(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_exec_ok('-okdir', entry, argv, arg_ptr)
+end
+
+local function parse_false(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_false()
+end
+
+local function parse_files0_from(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, filename = collect_arg(argv, arg_ptr)
+  if ok then
+    options.files0_from = filename
+    return true
+  end
+  return false
+end
+
+local function insert_fls(entry: integer, filename: cstring): boolean
+  local p = insert_primary_noarg(entry)
+  if filename ~= nilptr then open_output_file(filename, &p.fmt) else open_stdout(&p.fmt) end
+  p.side_effects = true
+  p.no_default_print = true
+  p.rate = 1.0_f32
+  return true
+end
+
+local function parse_fls(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, filename = collect_arg(argv, arg_ptr)
+  if ok then
+    if insert_fls(entry, filename) then return true end
+    $arg_ptr = $arg_ptr - 1
+  end
+  return false
+end
+
+local function parse_ls(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_fls(entry, nilptr)
+end
+
+local function parse_follow(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  set_follow_state(SYMLINK_ALWAYS_DEREF)
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_fprint(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, filename = collect_arg(argv, arg_ptr)
+  if ok then
+    local p = insert_primary(entry, filename)
+    open_output_file(filename, &p.fmt)
+    p.side_effects = true
+    p.no_default_print = true
+    p.need_stat = false
+    p.need_type = false
+    p.rate = 1.0_f32
+    return true
+  end
+  return false
+end
+
+local function insert_fprint(entry: integer, filename: cstring): boolean
+  local p = insert_primary(entry, filename)
+  if filename ~= nilptr then open_output_file(filename, &p.fmt) else open_stdout(&p.fmt) end
+  p.side_effects = true
+  p.no_default_print = true
+  p.need_stat = false
+  p.need_type = false
+  p.rate = 1.0_f32
+  return true
+end
+
+local function parse_fprint0(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, filename = collect_arg(argv, arg_ptr)
+  if ok then
+    if insert_fprint(entry, filename) then return true end
+    $arg_ptr = $arg_ptr - 1
+  end
+  return false
+end
+
+local function estimate_fstype_success_rate(fsname: cstring): float32
+  local st: sys.Stat
+  if sys.stat('/', &st) == 0 then
+    local t = filesystem_type(&st)
+    if view(fsname) == t then return 0.7_f32 end
+    return 0.3_f32
+  end
+  return 1.0_f32
+end
+
+local function parse_fstype(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, typename = collect_arg(argv, arg_ptr)
+  if ok then
+    if options.optimisation_level < 2 or is_used_fs_type(view(typename)) then
+      local p = insert_primary(entry, typename)
+      p.str = typename
+      p.rate = estimate_fstype_success_rate(typename)
+      return true
+    end
+    if (options.debug_options & DebugTreeOpt) ~= 0 then
+      eputs('-fstype ' .. view(typename) .. ' can never succeed, substituting -false\n')
+    end
+    return insert_false()
+  end
+  return false
+end
+
+local function insert_num(argv: CStrs, arg_ptr: *integer, entry: integer): *Pred
+  local ok, numstr = collect_arg(argv, arg_ptr)
+  if ok then
+    local nok, num, c_type = get_num(numstr)
+    if nok then
+      local p = insert_primary(entry, numstr)
+      p.num_kind = c_type
+      p.num_val = num
+      if (options.debug_options & DebugExpressionTree) ~= 0 then
+        local sb: stringbuilder
+        sb:write('inserting ', p.name, '\n')
+        sb:write('    type: ', c_type == COMP_GT and 'gt' or (c_type == COMP_LT and 'lt' or 'eq'), '    ',
+                 c_type == COMP_GT and ' >' or (c_type == COMP_LT and ' <' or ' ='), '  ')
+        sb:write(num, '\n')
+        eputs(sb:view())
+        sb:destroy()
+      end
+      return p
+    end
+  end
+  return nilptr
+end
+
+local function parse_gid(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_num(argv, arg_ptr, entry)
+  if p ~= nilptr then
+    p.rate = p.num_val < 100 and 0.99_f32 or 0.2_f32
+    return true
+  end
+  $arg_ptr = $arg_ptr - 1
+  return false
+end
+
+local function parse_uid(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_num(argv, arg_ptr, entry)
+  if p ~= nilptr then
+    p.rate = p.num_val < 100 and 0.99_f32 or 0.2_f32
+    return true
+  end
+  $arg_ptr = $arg_ptr - 1
+  return false
+end
+
+local function parse_inum(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_num(argv, arg_ptr, entry)
+  if p ~= nilptr then
+    p.rate = 1e-6_f32
+    p.need_inum = true
+    p.need_stat = false
+    p.need_type = false
+    return true
+  end
+  $arg_ptr = $arg_ptr - 1
+  return false
+end
+
+local function parse_links(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_num(argv, arg_ptr, entry)
+  if p ~= nilptr then
+    if p.num_val == 1 then p.rate = 0.99_f32
+    elseif p.num_val == 2 then p.rate = 0.01_f32
+    else p.rate = 1e-3_f32 end
+    return true
+  end
+  $arg_ptr = $arg_ptr - 1
+  return false
+end
+
+local function digits_len(s: cstring): integer
+  local p = (@Bytes)(s)
+  local i = 0
+  while p[i] >= 48 and p[i] <= 57 do i = i + 1 end
+  return i
+end
+
+local function parse_group(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local saved = $arg_ptr
+  local ok, groupname = collect_arg(argv, arg_ptr)
+  if ok then
+    local gid: cuint
+    local gr = c_getgrnam(groupname)
+    c_endgrent()
+    if gr ~= nilptr then
+      gid = gr.gr_gid
+    else
+      local gid_len = digits_len(groupname)
+      if gid_len > 0 then
+        if (@Bytes)(groupname)[gid_len] == 0 then
+          gid = (@cuint)(safe_atoi(groupname))
+        else
+          die(q(view(groupname)) .. ' is not the name of an existing group and it does not look like a numeric group ID because it has the unexpected suffix ' ..
+              q(view((@cstring)(&(@Bytes)(groupname)[gid_len]))))
+          $arg_ptr = saved
+          return false
+        end
+      else
+        if (@Bytes)(groupname)[0] ~= 0 then
+          die(q(view(groupname)) .. ' is not the name of an existing group')
+        else
+          die('argument to -group is empty, but should be a group name')
+        end
+        $arg_ptr = saved
+        return false
+      end
+    end
+    local p = insert_primary(entry, groupname)
+    p.gid = gid
+    -- GNU reads the union through numinfo.l_val here
+    p.rate = (@uint64)(gid) < 100 and 0.99_f32 or 0.2_f32
+    return true
+  end
+  return false
+end
+
+local function usage(status: integer) <forwarddecl> end
+
+local function parse_help(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  usage(0)
+  return true
+end
+
+local function parse_ilname(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, name = collect_arg(argv, arg_ptr)
+  if ok then
+    local p = insert_primary(entry, name)
+    p.str = name
+    p.rate = 0.1_f32 * estimate_pattern_match_rate(name, false)
+    return true
+  end
+  return false
+end
+
+local function check_name_arg(pred: string, alt: string, arg: cstring): boolean
+  if should_issue_warnings() and has_any(arg, '/') then
+    error0('warning: ' .. q(pred) .. ' matches against basenames only, but the given pattern contains a directory separator (' ..
+           q('/') .. '), thus the expression will evaluate to false all the time.  Did you mean ' .. q(alt) .. '?')
+  end
+  return true
+end
+
+local function parse_iname(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, name = collect_arg(argv, arg_ptr)
+  if ok then
+    if check_name_arg('-iname', '-iwholename', name) then
+      local p = insert_primary(entry, name)
+      p.need_stat = false
+      p.need_type = false
+      p.str = name
+      p.rate = estimate_pattern_match_rate(name, false)
+      return true
+    end
+  end
+  return false
+end
+
+local function parse_name(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local saved = $arg_ptr
+  local ok, name = collect_arg(argv, arg_ptr)
+  if ok then
+    if check_name_arg('-name', '-wholename', name) then
+      local p = insert_primary(entry, name)
+      p.need_stat = false
+      p.need_type = false
+      p.str = name
+      p.rate = estimate_pattern_match_rate(name, false)
+      return true
+    end
+    $arg_ptr = saved
+  end
+  return false
+end
+
+local function parse_lname(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, name = collect_arg(argv, arg_ptr)
+  if ok then
+    local p = insert_primary(entry, name)
+    p.str = name
+    p.rate = 0.1_f32 * estimate_pattern_match_rate(name, false)
+    return true
+  end
+  return false
+end
+
+local function insert_depthspec(entry: integer, argv: CStrs, arg_ptr: *integer, limitptr: *integer): boolean
+  local predicate = argv[$arg_ptr - 1]
+  local ok, depthstr = collect_arg(argv, arg_ptr)
+  if ok then
+    local depth_len = digits_len(depthstr)
+    if depth_len > 0 and (@Bytes)(depthstr)[depth_len] == 0 then
+      $limitptr = safe_atoi(depthstr)
+      if $limitptr >= 0 then return parse_noop(entry, argv, arg_ptr) end
+    end
+    die('Expected a positive decimal integer argument to ' .. view(predicate) .. ', but got ' .. q(view(depthstr)))
+    return false
+  end
+  return false
+end
+
+local function parse_maxdepth(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_depthspec(entry, argv, arg_ptr, &options.maxdepth)
+end
+
+local function parse_mindepth(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_depthspec(entry, argv, arg_ptr, &options.mindepth)
+end
+
+local function do_parse_xmin(entry: integer, argv: CStrs, arg_ptr: *integer, xv: integer): boolean
+  local saved = $arg_ptr
+  local ok, minutes = collect_arg(argv, arg_ptr)
+  if ok then
+    local tval: TimeVal
+    tval.xval = xv
+    if get_relative_timestamp(minutes, &tval, options.day_sec + DAYSECS, options.day_nsec, 60,
+        'arithmetic overflow while converting %s minutes to a number of seconds') then
+      local p = insert_primary(entry, minutes)
+      p.rt_xval = tval.xval
+      p.rt_kind = tval.kind
+      p.rt_sec = tval.sec
+      p.rt_nsec = tval.nsec
+      p.rate = estimate_timestamp_success_rate(tval.sec)
+      return true
+    end
+    $arg_ptr = saved
+  end
+  return false
+end
+
+local function parse_amin(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return do_parse_xmin(entry, argv, arg_ptr, XVAL_ATIME)
+end
+local function parse_cmin(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return do_parse_xmin(entry, argv, arg_ptr, XVAL_CTIME)
+end
+local function parse_mmin(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return do_parse_xmin(entry, argv, arg_ptr, XVAL_MTIME)
+end
+
+local function parse_newerXY(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  if argv == nilptr or argv[$arg_ptr] == nilptr then return false end
+  local a = (@Bytes)(argv[$arg_ptr])
+  if cstrlen(a) ~= 8 then return false end
+  local x = a[6]
+  local y = a[7]
+  if x == 66 or y == 66 then
+    error0('This system does not provide a way to find the birth time of a file.')
+    return false
+  end
+  if x == 116 or not strchr_set('aBcmt', x) or not strchr_set('aBcmt', y) then return false end
+  if argv[$arg_ptr + 1] == nilptr then
+    die('The ' .. q(view(argv[$arg_ptr])) .. ' test needs an argument')
+  end
+  $arg_ptr = $arg_ptr + 1
+  local p = insert_primary(entry, argv[$arg_ptr])
+  if x == 97 then p.rt_xval = XVAL_ATIME
+  elseif x == 99 then p.rt_xval = XVAL_CTIME
+  else p.rt_xval = XVAL_MTIME end
+  if y == 116 then
+    local ts: sys.Timespec
+    local now: sys.Timespec
+    now.tv_sec = options.start_sec
+    now.tv_nsec = options.start_nsec
+    local tz = util.tzalloc(sys.getenv('TZ'))
+    if not util.parse_datetime2(&ts, view(argv[$arg_ptr]), &now, false, &tz) then
+      die('I cannot figure out how to interpret ' .. q(view(argv[$arg_ptr])) .. ' as a date or time')
+    end
+    p.rt_sec = ts.tv_sec
+    p.rt_nsec = ts.tv_nsec
+  else
+    local st: sys.Stat
+    if xstat(argv[$arg_ptr], &st) ~= 0 then fatal_target_file_error(sys.errno(), view(argv[$arg_ptr])) end
+    if y == 97 then p.rt_sec = st.st_atim.tv_sec; p.rt_nsec = st.st_atim.tv_nsec
+    elseif y == 99 then p.rt_sec = st.st_ctim.tv_sec; p.rt_nsec = st.st_ctim.tv_nsec
+    else p.rt_sec = st.st_mtim.tv_sec; p.rt_nsec = st.st_mtim.tv_nsec end
+  end
+  p.rt_kind = COMP_GT
+  p.rate = estimate_timestamp_success_rate(p.rt_sec)
+  $arg_ptr = $arg_ptr + 1
+  return true
+end
+
+local function parse_noleaf(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.no_leaf_check = true
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_nogroup(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary(entry, nilptr)
+  p.rate = 1e-4_f32
+  return true
+end
+
+local function parse_nouser(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.rate = 1e-3_f32
+  return true
+end
+
+local function parse_nowarn(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.warnings = false
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_warn(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.warnings = true
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local start_points: CStrs = nilptr
+local num_start_points: integer = 0
+
+local function matches_start_point(glob: cstring, foldcase: boolean): boolean
+  local flags = foldcase and fnmatch.CASEFOLD or 0
+  if num_start_points > 0 then
+    for i = 0, num_start_points - 1 do
+      if fnmatch.match(view(glob), view(start_points[i]), flags) == 0 then return true end
+    end
+    return false
+  end
+  return fnmatch.match(view(glob), '.', flags) == 0
+end
+
+local function is_feasible_path_argument(arg: cstring, foldcase: boolean): boolean
+  local s = (@Bytes)(arg)
+  local n = cstrlen(s)
+  local last = -1
+  for i = 0, n - 1 do if s[i] == 47 then last = i end end
+  if last >= 0 and s[last + 1] == 0 then
+    return matches_start_point(arg, foldcase)
+  end
+  return true
+end
+
+local function insert_path_check(entry: integer, argv: CStrs, arg_ptr: *integer, predicate_name: string, pred: integer): boolean
+  local foldcase = pred == P_IPATH
+  local ok, name = collect_arg(argv, arg_ptr)
+  if ok then
+    local p = insert_primary_withpred(entry, pred, name)
+    p.need_stat = false
+    p.need_type = false
+    p.str = name
+    p.rate = estimate_pattern_match_rate(name, false)
+    if not options.posixly_correct and not is_feasible_path_argument(name, foldcase) then
+      error0('warning: -' .. predicate_name .. ' ' .. view(name) .. ' will not match anything because it ends with /.')
+      p.rate = 1.0e-8_f32
+    end
+    return true
+  end
+  return false
+end
+
+local function parse_path(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_path_check(entry, argv, arg_ptr, 'path', P_PATH)
+end
+local function parse_wholename(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_path_check(entry, argv, arg_ptr, 'wholename', P_PATH)
+end
+local function parse_ipath(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_path_check(entry, argv, arg_ptr, 'ipath', P_IPATH)
+end
+local function parse_iwholename(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_path_check(entry, argv, arg_ptr, 'iwholename', P_IPATH)
+end
+
+local function parse_perm(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, perm_expr = collect_arg(argv, arg_ptr)
+  if not ok then return false end
+  local pe = (@Bytes)(perm_expr)
+  local mode_start = 0
+  local kind = PERM_EXACT
+  local rate: float32
+  if pe[0] == 45 then mode_start = 1; kind = PERM_AT_LEAST; rate = 0.2_f32
+  elseif pe[0] == 47 then mode_start = 1; kind = PERM_ANY; rate = 0.3_f32
+  else mode_start = 0; kind = PERM_EXACT; rate = 0.01_f32 end
+  local changes, cok = modechange.compile(view((@cstring)(&pe[mode_start])))
+  if not cok or (pe[0] == 43 and pe[1] >= 48 and pe[1] < 56) then
+    die('invalid mode ' .. q(view(perm_expr)))
+  end
+  local v0 = modechange.adjust(0, false, 0, changes)
+  local v1 = modechange.adjust(0, true, 0, changes)
+  changes:destroy()
+  if pe[0] == 47 and v0 == 0 and v1 == 0 then
+    error0('warning: you have specified a mode pattern ' .. view(perm_expr) ..
+           ' (which is equivalent to /000). The meaning of -perm /000 has now been changed to be consistent with -perm -000; that is, while it used to match no files, it now matches all files.')
+    kind = PERM_AT_LEAST
+    rate = 0.9986_f32
+  end
+  local p = insert_primary(entry, perm_expr)
+  p.rate = rate
+  p.perm_kind = kind
+  p.perm_val[0] = v0
+  p.perm_val[1] = v1
+  return true
+end
+
+local function parse_print(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.side_effects = true
+  p.no_default_print = true
+  p.need_stat = false
+  p.need_type = false
+  open_stdout(&p.fmt)
+  return true
+end
+
+local function parse_print0(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_fprint(entry, nilptr)
+end
+
+local function parse_printf(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local saved = $arg_ptr
+  local ok, format = collect_arg(argv, arg_ptr)
+  if ok then
+    local fmt: FormatVal
+    open_stdout(&fmt)
+    if insert_fprintf(&fmt, entry, format) then return true end
+    $arg_ptr = saved
+    return false
+  end
+  return false
+end
+
+local function parse_fprintf(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local saved = $arg_ptr
+  local ok, filename = collect_arg(argv, arg_ptr)
+  if ok then
+    local ok2, format = collect_arg(argv, arg_ptr)
+    if ok2 then
+      local fmt: FormatVal
+      open_output_file(filename, &fmt)
+      saved = $arg_ptr
+      if insert_fprintf(&fmt, entry, format) then return true end
+    end
+  end
+  $arg_ptr = saved
+  return false
+end
+
+local function parse_prune(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  if not options.do_dir_first then
+    p.need_stat = false
+    p.need_type = false
+  end
+  p.side_effects = true
+  p.no_default_print = false
+  return true
+end
+
+local function parse_quit(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.need_stat = false
+  p.need_type = false
+  p.side_effects = true
+  p.no_default_print = false
+  p.rate = 1.0_f32
+  return true
+end
+
+local regex_names: [13]string = {
+  'findutils-default', 'ed', 'emacs', 'gnu-awk', 'grep', 'posix-awk', 'awk', 'posix-basic',
+  'posix-egrep', 'egrep', 'posix-extended', 'posix-minimal-basic', 'sed',
+}
+
+local function regex_flags(i: integer): uint64
+  local common = regex.RE_CHAR_CLASSES | regex.RE_DOT_NEWLINE | regex.RE_DOT_NOT_NULL | regex.RE_INTERVALS | regex.RE_NO_EMPTY_RANGES
+  local basic = common | regex.RE_BK_PLUS_QM | regex.RE_CONTEXT_INVALID_DUP
+  local extended = common | regex.RE_CONTEXT_INDEP_ANCHORS | regex.RE_CONTEXT_INDEP_OPS | regex.RE_NO_BK_BRACES |
+    regex.RE_NO_BK_PARENS | regex.RE_NO_BK_VBAR | regex.RE_CONTEXT_INVALID_OPS | regex.RE_UNMATCHED_RIGHT_PAREN_ORD
+  local egrep = (extended | regex.RE_INVALID_INTERVAL_ORD | regex.RE_NEWLINE_ALT) & ~(regex.RE_CONTEXT_INVALID_OPS | regex.RE_DOT_NOT_NULL)
+  if i == 0 then return regex.RE_DOT_NEWLINE
+  elseif i == 1 then return basic
+  elseif i == 2 then return 0
+  elseif i == 3 then
+    return (extended | regex.RE_BACKSLASH_ESCAPE_IN_LISTS | regex.RE_INVALID_INTERVAL_ORD) &
+      ~(regex.RE_DOT_NOT_NULL | regex.RE_CONTEXT_INDEP_OPS | regex.RE_CONTEXT_INVALID_OPS)
+  elseif i == 4 then return (basic | regex.RE_NEWLINE_ALT) & ~(regex.RE_CONTEXT_INVALID_DUP | regex.RE_DOT_NOT_NULL)
+  elseif i == 5 then return extended | regex.RE_BACKSLASH_ESCAPE_IN_LISTS | regex.RE_INTERVALS | regex.RE_NO_GNU_OPS | regex.RE_INVALID_INTERVAL_ORD
+  elseif i == 6 then
+    return regex.RE_BACKSLASH_ESCAPE_IN_LISTS | regex.RE_DOT_NOT_NULL | regex.RE_NO_BK_PARENS | regex.RE_NO_BK_REFS |
+      regex.RE_NO_BK_VBAR | regex.RE_NO_EMPTY_RANGES | regex.RE_DOT_NEWLINE | regex.RE_CONTEXT_INDEP_ANCHORS |
+      regex.RE_CHAR_CLASSES | regex.RE_UNMATCHED_RIGHT_PAREN_ORD | regex.RE_NO_GNU_OPS
+  elseif i == 7 then return basic
+  elseif i == 8 or i == 9 then return egrep
+  elseif i == 10 then return extended
+  elseif i == 11 then return common | regex.RE_LIMITED_OPS
+  end
+  return basic
+end
+
+local function parse_regextype(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, type_name = collect_arg(argv, arg_ptr)
+  if ok then
+    local tn = view(type_name)
+    local found = -1
+    for i = 0, 12 do
+      if regex_names[i] == tn then found = i; break end
+    end
+    if found < 0 then
+      local sb: stringbuilder
+      sb:write('Unknown regular expression type ', q(tn), '; valid types are ')
+      for i = 0, 12 do
+        if i > 0 then sb:write(', ') end
+        sb:write(q(regex_names[i]))
+      end
+      sb:write('.')
+      die(sb:view())
+    end
+    options.regex_options = regex_flags(found)
+    return parse_noop(entry, argv, arg_ptr)
+  end
+  return false
+end
+
+local function insert_regex(argv: CStrs, arg_ptr: *integer, entry: integer, regex_options: uint64): boolean
+  local ok, rx = collect_arg(argv, arg_ptr)
+  if ok then
+    local p = insert_primary_withpred(entry, P_REGEX, rx)
+    p.need_stat = false
+    p.need_type = false
+    local prog, err = regex.compile_syntax(view(rx), regex_options)
+    if err.size > 0 then
+      die("failed to compile regular expression '" .. view(rx) .. "': " .. err)
+    end
+    p.re = prog
+    p.rate = estimate_pattern_match_rate(rx, true)
+    return true
+  end
+  return false
+end
+
+local function parse_regex(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_regex(argv, arg_ptr, entry, options.regex_options)
+end
+
+local function parse_iregex(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_regex(argv, arg_ptr, entry, regex.RE_ICASE | options.regex_options)
+end
+
+local function parse_size(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  if argv == nilptr or argv[$arg_ptr] == nilptr then return false end
+  local arg = (@Bytes)(argv[$arg_ptr])
+  local len = cstrlen(arg)
+  if len == 0 then die('invalid null argument to -size') end
+  local suffix = arg[len - 1]
+  local blksize = 512
+  if suffix == 98 then blksize = 512; arg[len - 1] = 0
+  elseif suffix == 99 then blksize = 1; arg[len - 1] = 0
+  elseif suffix == 107 then blksize = 1024; arg[len - 1] = 0
+  elseif suffix == 77 then blksize = 1024 * 1024; arg[len - 1] = 0
+  elseif suffix == 71 then blksize = 1024 * 1024 * 1024; arg[len - 1] = 0
+  elseif suffix == 119 then blksize = 2; arg[len - 1] = 0
+  elseif suffix >= 48 and suffix <= 57 then suffix = 0
+  else
+    local sb: stringbuilder
+    sb:write('invalid -size type `')
+    sb:writebyte(arg[len - 1])
+    sb:write("'")
+    die(sb:view())
+  end
+  local ok, num, c_type = get_num((@cstring)(arg))
+  if not ok then
+    local sb: stringbuilder
+    sb:write('Invalid argument `', view((@cstring)(arg)))
+    if suffix ~= 0 then sb:writebyte(suffix) end
+    sb:write("' to -size")
+    die(sb:view())
+    return false
+  end
+  local p = insert_primary(entry, (@cstring)(arg))
+  p.size_kind = c_type
+  p.size_blocksize = blksize
+  p.size_size = num
+  p.need_stat = true
+  p.need_type = false
+  local prod = num * (@uint64)(blksize)
+  if c_type == COMP_GT then p.rate = prod > 20480 and 0.1_f32 or 0.9_f32
+  elseif c_type == COMP_LT then p.rate = prod > 20480 and 0.9_f32 or 0.1_f32
+  else p.rate = 0.01_f32 end
+  $arg_ptr = $arg_ptr + 1
+  return true
+end
+
+local function parse_samefile(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local st: sys.Stat
+  local fst: sys.Stat
+  local ok, filename = collect_arg_stat_info(argv, arg_ptr, &st)
+  if not ok then return false end
+  local fd: cint = -3
+  local openflags: cint = sys.O_RDONLY
+  if options.symlink_handling == SYMLINK_NEVER_DEREF then
+    if options.open_nofollow_available then
+      openflags = openflags | sys.O_NOFOLLOW
+      fd = -1
+    else
+      if islnk(st.st_mode) then fd = -2 else fd = -1 end
+    end
+  else
+    fd = -1
+  end
+  if fd == -1 then
+    fd = sys.open(filename, openflags | sys.O_CLOEXEC, 0)
+    if fd >= 0 then
+      if sys.fstat(fd, &fst) ~= 0 then
+        fatal_target_file_error(sys.errno(), view(filename))
+      else
+        if xstat(filename, &st) ~= 0 then fatal_target_file_error(sys.errno(), view(filename)) end
+        if options.symlink_handling == SYMLINK_NEVER_DEREF and not options.open_nofollow_available then
+          if islnk(st.st_mode) then
+            sys.close(fd)
+            fd = -1
+          elseif not (st.st_dev == fst.st_dev and st.st_ino == fst.st_ino) then
+            sys.close(fd)
+            fd = -1
+          end
+        else
+          st = fst
+        end
+      end
+    end
+  end
+  local p = insert_primary(entry, filename)
+  p.same_ino = st.st_ino
+  p.same_dev = st.st_dev
+  p.same_fd = fd
+  p.need_type = false
+  p.need_stat = true
+  p.rate = 0.01_f32
+  return true
+end
+
+local function parse_accesscheck(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local p = insert_primary_noarg(entry)
+  p.need_stat = false
+  p.need_type = false
+  p.side_effects = false
+  p.no_default_print = false
+  if p.func == P_EXECUTABLE then p.rate = 0.2_f32 else p.rate = 0.9_f32 end
+  return true
+end
+
+local function insert_type(argv: CStrs, arg_ptr: *integer, entry: integer, which_pred: integer): boolean
+  local pred_string = which_pred == P_XTYPE and '-xtype' or '-type'
+  local ok, typeletter = collect_arg(argv, arg_ptr)
+  if not ok then return false end
+  local t = (@Bytes)(typeletter)
+  if t[0] == 0 then
+    die('Arguments to ' .. pred_string .. ' should contain at least one letter')
+  end
+  local p = insert_primary_withpred(entry, which_pred, typeletter)
+  p.rate = 0.0_f32
+  if which_pred == P_XTYPE then
+    p.need_stat = true
+    p.need_type = false
+  else
+    p.need_stat = false
+    p.need_type = true
+  end
+  local i = 0
+  while t[i] ~= 0 do
+    local type_cell = 0
+    local rate: float32 = 0.01_f32
+    local c = t[i]
+    if c == 98 then type_cell = FTYPE_BLK; rate = 0.000888_f32
+    elseif c == 99 then type_cell = FTYPE_CHR; rate = 0.000443_f32
+    elseif c == 100 then type_cell = FTYPE_DIR; rate = 0.0922_f32
+    elseif c == 102 then type_cell = FTYPE_REG; rate = 0.875_f32
+    elseif c == 108 then type_cell = FTYPE_LNK; rate = 0.0311_f32
+    elseif c == 112 then type_cell = FTYPE_FIFO; rate = 7.554e-6_f32
+    elseif c == 115 then type_cell = FTYPE_SOCK; rate = 1.59e-5_f32
+    elseif c == 68 then
+      local sb: stringbuilder
+      sb:write(pred_string, ' ')
+      sb:writebyte(c)
+      sb:write(' is not supported because Solaris doors are not supported on the platform find was compiled on.')
+      die(sb:view())
+    else
+      local sb: stringbuilder
+      sb:write('Unknown argument to ', pred_string, ': ')
+      sb:writebyte(c)
+      die(sb:view())
+    end
+    if p.types[type_cell] then
+      local sb: stringbuilder
+      sb:write("Duplicate file type '")
+      sb:writebyte(c)
+      sb:write("' in the argument list to ", pred_string, '.')
+      die(sb:view())
+    end
+    p.rate = p.rate + rate
+    p.types[type_cell] = true
+    i = i + 1
+    if t[i] ~= 0 then
+      if t[i] ~= 44 then
+        die('Must separate multiple arguments to ' .. pred_string .. " using: ','")
+      end
+      i = i + 1
+      if t[i] == 0 then
+        die('Last file type in list argument to ' .. pred_string .. " is missing, i.e., list is ending on: ','")
+      end
+    end
+  end
+  return true
+end
+
+local function parse_type(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_type(argv, arg_ptr, entry, P_TYPE)
+end
+
+local function parse_xtype(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  return insert_type(argv, arg_ptr, entry, P_XTYPE)
+end
+
+local function parse_used(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, offset_str = collect_arg(argv, arg_ptr)
+  if ok then
+    local tval: TimeVal
+    if get_relative_timestamp(offset_str, &tval, 0, 0, DAYSECS,
+        'arithmetic overflow while converting %s days to a number of seconds') then
+      local p = insert_primary(entry, offset_str)
+      p.rt_xval = tval.xval
+      p.rt_kind = tval.kind
+      p.rt_sec = tval.sec
+      p.rt_nsec = tval.nsec
+      p.rate = estimate_file_age_success_rate((@float32)(tdiv(tval.sec, DAYSECS)))
+      return true
+    end
+    die('Invalid argument ' .. view(offset_str) .. ' to -used')
+    return false
+  end
+  return false
+end
+
+local function parse_user(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local ok, username = collect_arg(argv, arg_ptr)
+  if ok then
+    local uid: cuint
+    local pw = c_getpwnam(username)
+    c_endpwent()
+    if pw ~= nilptr then
+      uid = pw.pw_uid
+    else
+      local uid_len = digits_len(username)
+      if uid_len > 0 and (@Bytes)(username)[uid_len] == 0 then
+        uid = (@cuint)(safe_atoi(username))
+      else
+        if (@Bytes)(username)[0] ~= 0 then
+          die(q(view(username)) .. ' is not the name of a known user')
+        else
+          die('The argument to -user should not be empty')
+        end
+        return false
+      end
+    end
+    local p = insert_primary(entry, username)
+    p.uid = uid
+    p.rate = uid < 100 and 0.99_f32 or 0.2_f32
+    return true
+  end
+  return false
+end
+
+local function parse_version(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  sputs(outs, util.applet .. ' (nebox) after GNU findutils 4.9.0\n')
+  sputs(outs, 'Features enabled: D_TYPE O_NOFOLLOW(' .. (options.open_nofollow_available and 'enabled' or 'disabled') ..
+        ') LEAF_OPTIMISATION FTS(FTS_CWDFD) CBO(level=' .. tostring(options.optimisation_level) .. ') \n')
+  xexit(0)
+  return true
+end
+
+local function parse_context(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  if argv == nilptr or argv[$arg_ptr] == nilptr then return false end
+  -- is_selinux_enabled () is 0 here: nebox has no SELinux support
+  die('invalid predicate -context: SELinux is not enabled.')
+  return false
+end
+
+local function parse_xdev(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.stay_on_filesystem = true
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_ignore_race(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.ignore_readdir_race = true
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_noignore_race(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  options.ignore_readdir_race = false
+  return parse_noop(entry, argv, arg_ptr)
+end
+
+local function parse_time(entry: integer, argv: CStrs, arg_ptr: *integer): boolean
+  local saved = $arg_ptr
+  local ok, timearg = collect_arg(argv, arg_ptr)
+  if not ok then return false end
+  local origin_sec = options.day_sec
+  local origin_nsec = options.day_nsec
+  local comp = get_comp_type(timearg)
+  if comp == COMP_LT then origin_sec = origin_sec + (DAYSECS - 1) end
+  local tval: TimeVal
+  if not get_relative_timestamp(timearg, &tval, origin_sec, origin_nsec, DAYSECS,
+      'arithmetic overflow while converting %s days to a number of seconds') then
+    $arg_ptr = saved
+    return false
+  end
+  local p = insert_primary(entry, timearg)
+  p.rt_xval = tval.xval
+  p.rt_kind = tval.kind
+  p.rt_sec = tval.sec
+  p.rt_nsec = tval.nsec
+  p.rate = estimate_timestamp_success_rate(tval.sec)
+  if (options.debug_options & DebugExpressionTree) ~= 0 then
+    local k = tval.kind
+    local sb: stringbuilder
+    sb:write('inserting ', p.name, '\n')
+    sb:write('    type: ', k == COMP_GT and 'gt' or (k == COMP_LT and 'lt' or 'eq'), '    ',
+             k == COMP_GT and ' >' or (k == COMP_LT and ' <' or '>='), '  ')
+    sb:write((@uint64)(p.rt_sec), ' ', ctime_str(p.rt_sec))
+    if k == COMP_EQ then
+      sb:write('                 <  ', (@uint64)(p.rt_sec + DAYSECS), ' ', ctime_str(p.rt_sec + DAYSECS))
+    end
+    eputs(sb:view())
+    sb:destroy()
+  end
+  return true
+end
+
+local function add_entry(t: integer, name: string, f: ParseFn, pred: integer)
+  parse_table:push({type = t, name = name, parse = f, pred = pred})
+end
+
+local function init_parse_table()
+  add_entry(ARG_SPECIAL_PARSE, 'newerXY', parse_newerXY, P_NEWERXY)
+  add_entry(ARG_PUNCTUATION, '!', parse_negate, P_NEGATE)
+  add_entry(ARG_PUNCTUATION, 'not', parse_negate, P_NEGATE)
+  add_entry(ARG_PUNCTUATION, '(', parse_openparen, P_OPENPAREN)
+  add_entry(ARG_PUNCTUATION, ')', parse_closeparen, P_CLOSEPAREN)
+  add_entry(ARG_PUNCTUATION, ',', parse_comma, P_COMMA)
+  add_entry(ARG_PUNCTUATION, 'a', parse_and, P_AND)
+  add_entry(ARG_TEST, 'amin', parse_amin, P_AMIN)
+  add_entry(ARG_PUNCTUATION, 'and', parse_and, P_AND)
+  add_entry(ARG_TEST, 'anewer', parse_anewer, P_ANEWER)
+  add_entry(ARG_TEST, 'atime', parse_time, P_ATIME)
+  add_entry(ARG_TEST, 'cmin', parse_cmin, P_CMIN)
+  add_entry(ARG_TEST, 'cnewer', parse_cnewer, P_CNEWER)
+  add_entry(ARG_TEST, 'ctime', parse_time, P_CTIME)
+  add_entry(ARG_TEST, 'context', parse_context, P_CONTEXT)
+  add_entry(ARG_POSITIONAL_OPTION, 'daystart', parse_daystart, P_NONE)
+  add_entry(ARG_ACTION, 'delete', parse_delete, P_DELETE)
+  add_entry(ARG_OPTION, 'd', parse_d, P_NONE)
+  add_entry(ARG_OPTION, 'depth', parse_depth, P_NONE)
+  add_entry(ARG_TEST, 'empty', parse_empty, P_EMPTY)
+  add_entry(ARG_ACTION, 'exec', parse_exec, P_EXEC)
+  add_entry(ARG_TEST, 'executable', parse_accesscheck, P_EXECUTABLE)
+  add_entry(ARG_ACTION, 'execdir', parse_execdir, P_EXECDIR)
+  add_entry(ARG_OPTION, 'files0-from', parse_files0_from, P_NONE)
+  add_entry(ARG_ACTION, 'fls', parse_fls, P_FLS)
+  add_entry(ARG_POSITIONAL_OPTION, 'follow', parse_follow, P_NONE)
+  add_entry(ARG_ACTION, 'fprint', parse_fprint, P_FPRINT)
+  add_entry(ARG_ACTION, 'fprint0', parse_fprint0, P_FPRINT0)
+  add_entry(ARG_ACTION, 'fprintf', parse_fprintf, P_FPRINTF)
+  add_entry(ARG_TEST, 'fstype', parse_fstype, P_FSTYPE)
+  add_entry(ARG_TEST, 'gid', parse_gid, P_GID)
+  add_entry(ARG_TEST, 'group', parse_group, P_GROUP)
+  add_entry(ARG_OPTION, 'ignore_readdir_race', parse_ignore_race, P_NONE)
+  add_entry(ARG_TEST, 'ilname', parse_ilname, P_ILNAME)
+  add_entry(ARG_TEST, 'iname', parse_iname, P_INAME)
+  add_entry(ARG_TEST, 'inum', parse_inum, P_INUM)
+  add_entry(ARG_TEST, 'ipath', parse_ipath, P_IPATH)
+  add_entry(ARG_TEST, 'iregex', parse_iregex, P_NONE)
+  add_entry(ARG_TEST, 'iwholename', parse_iwholename, P_NONE)
+  add_entry(ARG_TEST, 'links', parse_links, P_LINKS)
+  add_entry(ARG_TEST, 'lname', parse_lname, P_LNAME)
+  add_entry(ARG_ACTION, 'ls', parse_ls, P_LS)
+  add_entry(ARG_OPTION, 'maxdepth', parse_maxdepth, P_NONE)
+  add_entry(ARG_OPTION, 'mindepth', parse_mindepth, P_NONE)
+  add_entry(ARG_TEST, 'mmin', parse_mmin, P_MMIN)
+  add_entry(ARG_OPTION, 'mount', parse_xdev, P_NONE)
+  add_entry(ARG_TEST, 'mtime', parse_time, P_MTIME)
+  add_entry(ARG_TEST, 'name', parse_name, P_NAME)
+  add_entry(ARG_TEST, 'newer', parse_newer, P_NEWER)
+  add_entry(ARG_TEST, 'atime', parse_time, P_ATIME)
+  add_entry(ARG_OPTION, 'noleaf', parse_noleaf, P_NONE)
+  add_entry(ARG_TEST, 'nogroup', parse_nogroup, P_NOGROUP)
+  add_entry(ARG_TEST, 'nouser', parse_nouser, P_NOUSER)
+  add_entry(ARG_OPTION, 'noignore_readdir_race', parse_noignore_race, P_NONE)
+  add_entry(ARG_POSITIONAL_OPTION, 'nowarn', parse_nowarn, P_NONE)
+  add_entry(ARG_POSITIONAL_OPTION, 'warn', parse_warn, P_NONE)
+  add_entry(ARG_PUNCTUATION, 'o', parse_or, P_OR)
+  add_entry(ARG_PUNCTUATION, 'or', parse_or, P_OR)
+  add_entry(ARG_ACTION, 'ok', parse_ok, P_OK)
+  add_entry(ARG_ACTION, 'okdir', parse_okdir, P_OKDIR)
+  add_entry(ARG_TEST, 'path', parse_path, P_PATH)
+  add_entry(ARG_TEST, 'perm', parse_perm, P_PERM)
+  add_entry(ARG_ACTION, 'print', parse_print, P_PRINT)
+  add_entry(ARG_ACTION, 'print0', parse_print0, P_PRINT0)
+  add_entry(ARG_ACTION, 'printf', parse_printf, P_NONE)
+  add_entry(ARG_ACTION, 'prune', parse_prune, P_PRUNE)
+  add_entry(ARG_ACTION, 'quit', parse_quit, P_QUIT)
+  add_entry(ARG_TEST, 'readable', parse_accesscheck, P_READABLE)
+  add_entry(ARG_TEST, 'regex', parse_regex, P_REGEX)
+  add_entry(ARG_POSITIONAL_OPTION, 'regextype', parse_regextype, P_NONE)
+  add_entry(ARG_TEST, 'samefile', parse_samefile, P_SAMEFILE)
+  add_entry(ARG_TEST, 'size', parse_size, P_SIZE)
+  add_entry(ARG_TEST, 'type', parse_type, P_TYPE)
+  add_entry(ARG_TEST, 'uid', parse_uid, P_UID)
+  add_entry(ARG_TEST, 'used', parse_used, P_USED)
+  add_entry(ARG_TEST, 'user', parse_user, P_USER)
+  add_entry(ARG_TEST, 'wholename', parse_wholename, P_NONE)
+  add_entry(ARG_TEST, 'writable', parse_accesscheck, P_WRITABLE)
+  add_entry(ARG_OPTION, 'xdev', parse_xdev, P_NONE)
+  add_entry(ARG_TEST, 'xtype', parse_xtype, P_XTYPE)
+  add_entry(ARG_TEST, 'false', parse_false, P_FALSE)
+  add_entry(ARG_TEST, 'true', parse_true, P_TRUE)
+  add_entry(ARG_NOOP, '--noop', nilptr, P_TRUE)
+  add_entry(ARG_TEST, 'help', parse_help, P_NONE)
+  add_entry(ARG_TEST, '-help', parse_help, P_NONE)
+  add_entry(ARG_TEST, 'version', parse_version, P_NONE)
+  add_entry(ARG_TEST, '-version', parse_version, P_NONE)
+end
+
+local first_nonoption_arg: cstring = nilptr
+
+local function found_parser(original_arg: cstring, entry: integer): integer
+  local t = parse_table[entry].type
+  if t ~= ARG_POSITIONAL_OPTION then
+    if t == ARG_NOOP then return 0 end
+    if t == ARG_OPTION then
+      if first_nonoption_arg ~= nilptr and should_issue_warnings() then
+        local oa = view(original_arg)
+        error0('warning: you have specified the global option ' .. oa .. ' after the argument ' ..
+               view(first_nonoption_arg) .. ', but global options are not positional, i.e., ' .. oa ..
+               ' affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.')
+      end
+    else
+      if first_nonoption_arg == nilptr then first_nonoption_arg = original_arg end
+    end
+  end
+  return entry
+end
+
+local function find_parser(search_name: cstring): integer
+  local s = (@Bytes)(search_name)
+  local n = cstrlen(s)
+  if n == 8 and s[0] == 45 and s[1] == 110 and s[2] == 101 and s[3] == 119 and s[4] == 101 and s[5] == 114 then
+    return found_parser(search_name, 1)
+  end
+  local nm = view(search_name)
+  if n > 0 and s[0] == 45 then nm = (@string){data = &s[1], size = (@usize)(n - 1)} end
+  for i = 2, #parse_table do
+    if parse_table[i].name == nm then return found_parser(search_name, i) end
+  end
+  return 0
+end
+
+-------------------------------------------------------------------------------
+-- formatted output helpers
+
+local cbuf: Bytes = nilptr
+local cbuf_cap: integer = 0
+
+-- A NUL-terminated scratch copy of S (valid until the next call).
+local function tmpc(s: string): cstring
+  if cbuf_cap < #s + 1 then
+    cbuf_cap = #s + 64
+    cbuf = (@Bytes)(c_realloc(cbuf, (@csize)(cbuf_cap)))
+  end
+  for i = 0, < #s do cbuf[i] = s.data[i] end
+  cbuf[#s] = 0
+  return (@cstring)(cbuf)
+end
+
+local fbuf: [512]byte
+
+local function out_formatted(s: *Stream, n: cint, big: Bytes)
+  if n < 0 then return end
+  if big ~= nilptr then
+    swrite(s, big, n)
+    c_free(big)
+  else
+    swrite(s, &fbuf[0], n)
+  end
+end
+
+local function fprintf_s(s: *Stream, fmt: Bytes, arg: cstring)
+  local n = c_snprintf((@cstring)(&fbuf[0]), 512, (@cstring)(fmt), arg)
+  local big: Bytes = nilptr
+  if n >= 512 then
+    big = (@Bytes)(c_malloc((@csize)(n + 1)))
+    c_snprintf((@cstring)(big), (@csize)(n + 1), (@cstring)(fmt), arg)
+  end
+  out_formatted(s, n, big)
+end
+
+local function fprintf_d(s: *Stream, fmt: Bytes, arg: cint)
+  local n = c_snprintf((@cstring)(&fbuf[0]), 512, (@cstring)(fmt), arg)
+  local big: Bytes = nilptr
+  if n >= 512 then
+    big = (@Bytes)(c_malloc((@csize)(n + 1)))
+    c_snprintf((@cstring)(big), (@csize)(n + 1), (@cstring)(fmt), arg)
+  end
+  out_formatted(s, n, big)
+end
+
+local function fprintf_o(s: *Stream, fmt: Bytes, arg: cuint)
+  local n = c_snprintf((@cstring)(&fbuf[0]), 512, (@cstring)(fmt), arg)
+  local big: Bytes = nilptr
+  if n >= 512 then
+    big = (@Bytes)(c_malloc((@csize)(n + 1)))
+    c_snprintf((@cstring)(big), (@csize)(n + 1), (@cstring)(fmt), arg)
+  end
+  out_formatted(s, n, big)
+end
+
+local function fprintf_g(s: *Stream, fmt: Bytes, arg: float64)
+  local n = c_snprintf((@cstring)(&fbuf[0]), 512, (@cstring)(fmt), arg)
+  local big: Bytes = nilptr
+  if n >= 512 then
+    big = (@Bytes)(c_malloc((@csize)(n + 1)))
+    c_snprintf((@cstring)(big), (@csize)(n + 1), (@cstring)(fmt), arg)
+  end
+  out_formatted(s, n, big)
+end
+
+-- human_readable (N, human_ceiling, FROM, TO) where one divides the other
+local hrbufs: [4][32]byte
+local hrnext: integer = 0
+local function hr(n: uint64, from: uint64, to: uint64): string
+  local amt: uint64
+  if to <= from then
+    amt = n * (from // to)
+  else
+    local divisor = to // from
+    amt = n // divisor
+    if n % divisor ~= 0 then amt = amt + 1 end
+  end
+  local b = &hrbufs[hrnext]
+  hrnext = (hrnext + 1) % 4
+  local i = 31
+  b[i] = 0
+  repeat
+    i = i - 1
+    b[i] = 48 + (@byte)(amt % 10)
+    amt = amt // 10
+  until amt == 0
+  return (@string){data = &b[i], size = (@usize)(31 - i)}
+end
+
+local function qmark(s: string): string
+  local sb: stringbuilder
+  for i = 0, < #s do
+    local c = s.data[i]
+    if c >= 32 and c < 127 then sb:writebyte(c) else sb:writebyte(63) end
+  end
+  return sb:promote()
+end
+
+-- print_quoted: S through FORMAT, '?' for unprintable bytes on a terminal.
+local function print_quoted(fmt: *FormatVal, format: Bytes, s: string)
+  if fmt.dest_is_tty then
+    local qs = qmark(s)
+    fprintf_s(fmt.stream, format, tmpc(qs))
+    qs:destroy()
+  else
+    fprintf_s(fmt.stream, format, tmpc(s))
+  end
+end
+
+local function areadlinkat(fd: cint, name: cstring): (boolean, string)
+  local size: integer = 128
+  while true do
+    local buf = (@Bytes)(c_malloc((@csize)(size)))
+    local r = c_readlinkat(fd, name, buf, (@csize)(size))
+    if r < 0 then
+      local e = sys.errno()
+      c_free(buf)
+      sys.seterrno(e)
+      return false, ''
+    end
+    if r < size then
+      local s = string.copy((@string){data = buf, size = (@usize)(r)})
+      c_free(buf)
+      return true, s
+    end
+    c_free(buf)
+    size = size * 2
+  end
+  return false, ''
+end
+
+local function strmode(mode: cuint): string
+  local b: [11]byte
+  local t = mode & sys.S_IFMT
+  if t == sys.S_IFREG then b[0] = 45
+  elseif t == sys.S_IFDIR then b[0] = 100
+  elseif t == sys.S_IFBLK then b[0] = 98
+  elseif t == sys.S_IFCHR then b[0] = 99
+  elseif t == sys.S_IFLNK then b[0] = 108
+  elseif t == sys.S_IFIFO then b[0] = 112
+  elseif t == sys.S_IFSOCK then b[0] = 115
+  else b[0] = 63 end
+  b[1] = (mode & 0x100) ~= 0 and 114 or 45
+  b[2] = (mode & 0x80) ~= 0 and 119 or 45
+  if (mode & S_ISUID) ~= 0 then b[3] = (mode & 0x40) ~= 0 and 115 or 83 else b[3] = (mode & 0x40) ~= 0 and 120 or 45 end
+  b[4] = (mode & 0x20) ~= 0 and 114 or 45
+  b[5] = (mode & 0x10) ~= 0 and 119 or 45
+  if (mode & S_ISGID) ~= 0 then b[6] = (mode & 0x8) ~= 0 and 115 or 83 else b[6] = (mode & 0x8) ~= 0 and 120 or 45 end
+  b[7] = (mode & 0x4) ~= 0 and 114 or 45
+  b[8] = (mode & 0x2) ~= 0 and 119 or 45
+  if (mode & S_ISVTX) ~= 0 then b[9] = (mode & 0x1) ~= 0 and 116 or 84 else b[9] = (mode & 0x1) ~= 0 and 120 or 45 end
+  b[10] = 32
+  return string.copy((@string){data = &b[0], size = 11})
+end
+
+-------------------------------------------------------------------------------
+-- listfile.c
+
+local inode_number_width = 9
+local block_size_width = 6
+local nlink_width = 3
+local owner_width = 8
+local group_width = 8
+local major_device_number_width = 3
+local minor_device_number_width = 3
+local file_size_width = 8
+
+local function pad_left(sb: *stringbuilder, s: string, width: integer): integer
+  for _ = #s + 1, width do sb:writebyte(32) end
+  sb:write(s)
+  if #s > width then return #s end
+  return width
+end
+
+local function print_name(sb: *stringbuilder, p: string, literal: boolean)
+  if literal then sb:write(p); return end
+  for i = 0, < #p do
+    local c = p.data[i]
+    if c == 92 then sb:write('\\\\')
+    elseif c == 10 then sb:write('\\n')
+    elseif c == 8 then sb:write('\\b')
+    elseif c == 13 then sb:write('\\r')
+    elseif c == 9 then sb:write('\\t')
+    elseif c == 12 then sb:write('\\f')
+    elseif c == 32 then sb:write('\\ ')
+    elseif c == 34 then sb:write('\\"')
+    elseif c > 32 and c < 127 then sb:writebyte(c)
+    else
+      sb:writebyte(92)
+      sb:writebyte(48 + ((c >> 6) & 7))
+      sb:writebyte(48 + ((c >> 3) & 7))
+      sb:writebyte(48 + (c & 7))
+    end
+  end
+end
+
+local function list_file(name: string, dir_fd: cint, relname: cstring, statp: *sys.Stat, current_time: integer,
+                         output_block_size: integer, literal_control_chars: boolean, stream: *Stream)
+  local sb: stringbuilder
+  local w = pad_left(&sb, hr(statp.st_ino, 1, 1), inode_number_width)
+  if w > inode_number_width then inode_number_width = w end
+  sb:writebyte(32)
+  w = pad_left(&sb, hr((@uint64)(statp.st_blocks), 512, (@uint64)(output_block_size)), block_size_width)
+  if w > block_size_width then block_size_width = w end
+  sb:writebyte(32)
+  local ms = strmode(statp.st_mode)
+  sb:write(ms)
+  ms:destroy()
+  w = pad_left(&sb, hr(statp.st_nlink, 1, 1), nlink_width)
+  if w > nlink_width then nlink_width = w end
+  sb:writebyte(32)
+  local pw = c_getpwuid(statp.st_uid)
+  if pw ~= nilptr then
+    local un = view(pw.pw_name)
+    if #un > owner_width then owner_width = #un end
+    sb:write(un)
+    for _ = #un + 1, owner_width do sb:writebyte(32) end
+    sb:writebyte(32)
+  else
+    local us = hr(statp.st_uid, 1, 1)
+    sb:write(us)
+    for _ = #us + 1, 8 do sb:writebyte(32) end
+    sb:writebyte(32)
+    local chars = (#us > 8 and #us or 8) + 1
+    if chars > owner_width then owner_width = chars end
+  end
+  local gr = c_getgrgid(statp.st_gid)
+  if gr ~= nilptr then
+    local gn = view(gr.gr_name)
+    if #gn > group_width then group_width = #gn end
+    sb:write(gn)
+    for _ = #gn + 1, group_width do sb:writebyte(32) end
+    sb:writebyte(32)
+  else
+    local gs = hr(statp.st_gid, 1, 1)
+    sb:write(gs)
+    for _ = #gs + 1, group_width do sb:writebyte(32) end
+    local chars = #gs > group_width and #gs or group_width
+    if chars > group_width then group_width = chars end
+    sb:writebyte(32)
+  end
+  local t = statp.st_mode & sys.S_IFMT
+  if t == sys.S_IFCHR or t == sys.S_IFBLK then
+    local rdev = statp.st_rdev
+    local major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfff_u64)
+    local minor = (rdev & 0xff) | ((rdev >> 12) & ~0xff_u64)
+    w = pad_left(&sb, hr(major, 1, 1), major_device_number_width)
+    if w > major_device_number_width then major_device_number_width = w end
+    sb:write(', ')
+    w = pad_left(&sb, hr(minor, 1, 1), minor_device_number_width)
+    if w > minor_device_number_width then minor_device_number_width = w end
+  else
+    w = pad_left(&sb, hr((@uint64)(statp.st_size), 1, 1), file_size_width)
+    if w > file_size_width then file_size_width = w end
+  end
+  sb:writebyte(32)
+  local mt = statp.st_mtim.tv_sec
+  local f, ok = util.breaktime(mt, 0, false)
+  if ok then
+    local fmt: string
+    if current_time - 6 * 30 * 24 * 60 * 60 <= mt and mt <= current_time + 60 * 60 then fmt = '%b %e %H:%M'
+    else fmt = '%b %e  %Y' end
+    local ts = util.timestr(fmt, &f)
+    sb:write(ts, ' ')
+    ts:destroy()
+    f.zone:destroy()
+  else
+    if mt < 0 then
+      local num = hr((@uint64)(-mt), 1, 1)
+      for _ = 1, 12 - #num - 1 do sb:writebyte(32) end
+      sb:write('-', num, ' ')
+    else
+      local num = hr((@uint64)(mt), 1, 1)
+      for _ = #num + 1, 12 do sb:writebyte(32) end
+      sb:write(num, ' ')
+    end
+  end
+  print_name(&sb, name, literal_control_chars)
+  if islnk(statp.st_mode) then
+    local lok, linkname = areadlinkat(dir_fd, relname)
+    if lok then
+      sb:write(' -> ')
+      print_name(&sb, linkname, literal_control_chars)
+      linkname:destroy()
+    else
+      local e = sys.errno()
+      sputs(stream, sb:view())
+      sb:clear()
+      error_e(e, name)
+    end
+  end
+  sb:writebyte(10)
+  sputs(stream, sb:view())
+  sb:destroy()
+end
+
+-------------------------------------------------------------------------------
+-- print.c: -printf output
+
+local weekdays: [7]string = {'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'}
+local months: [12]string = {'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'}
+
+local function ns_suffix(nsec: integer): string
+  local b: [40]byte
+  local n = c_snprintf((@cstring)(&b[0]), 40, '.%09ld0', (@clong)(nsec))
+  return string.copy((@string){data = &b[0], size = (@usize)(n)})
+end
+
+-- glibc strftime: the conversions glibc knows, others copied as written
+local function glibc_strftime(fmt: string, f: *util.Time): string
+  local sb: stringbuilder
+  local i = 0
+  local n = #fmt
+  while i < n do
+    local c = fmt.data[i]
+    if c ~= 37 then sb:writebyte(c); i = i + 1; continue end
+    local c2: byte = i + 1 < n and fmt.data[i + 1] or 0
+    if c2 ~= 0 and strchr_set('aAbBcCdDeFgGhHIjklmMnpPrRsStTuUVwWxXyYzZ', c2) then
+      local s = util.timestr((@string){data = &fmt.data[i], size = 2}, f)
+      sb:write(s)
+      s:destroy()
+      i = i + 2
+    elseif c2 == 37 then
+      sb:writebyte(37)
+      i = i + 2
+    else
+      sb:writebyte(37)
+      if c2 ~= 0 then sb:writebyte(c2) end
+      i = i + 2
+    end
+  end
+  return sb:promote()
+end
+
+local function scan_for_digit_differences(p: string, qs: string): (boolean, integer, integer)
+  local seen = false
+  local first = 0
+  local n = 0
+  local i = 0
+  while i < #p and i < #qs do
+    if p.data[i] ~= qs.data[i] then
+      local pd = p.data[i] >= 48 and p.data[i] <= 57
+      local qd = qs.data[i] >= 48 and qs.data[i] <= 57
+      if not pd or not qd then return false, 0, 0 end
+      if not seen then first = i; n = 1; seen = true
+      else
+        if i - first == n then n = n + 1 else return false, 0, 0 end
+      end
+    end
+    i = i + 1
+  end
+  if #p ~= #qs then return false, 0, 0 end
+  return true, first, n
+end
+
+local function format_date(sec: integer, nsec: integer, kind: byte): string
+  local fmt: string
+  local need_ns = false
+  if kind == 43 then
+    fmt = '%Y-%m-%d+%T'
+    need_ns = true
+  else
+    local fb: [2]byte = {37, kind}
+    fmt = string.copy((@string){data = &fb[0], size = 2})
+    need_ns = kind == 83 or kind == 84 or kind == 88 or kind == 64
+  end
+  local ns = need_ns and ns_suffix(nsec) or ''
+  if kind ~= 64 then
+    local f, ok = util.breaktime(sec, nsec, false)
+    if ok then
+      local buf = glibc_strftime(fmt, &f)
+      local alt = f
+      if alt.tm.tm_sec >= 11 then alt.tm.tm_sec = alt.tm.tm_sec - 11; alt.t = alt.t - 11
+      else alt.tm.tm_sec = alt.tm.tm_sec + 11; alt.t = alt.t + 11 end
+      local altbuf = glibc_strftime(fmt, &alt)
+      local same, i, n = scan_for_digit_differences(buf, altbuf)
+      altbuf:destroy()
+      f.zone:destroy()
+      if same and n == 2 and not (i + n < #buf and buf.data[i + n] >= 48 and buf.data[i + n] <= 57) then
+        local sb: stringbuilder
+        sb:write((@string){data = buf.data, size = (@usize)(i + n)}, ns,
+                 (@string){data = &buf.data[i + n], size = (@usize)(#buf - i - n)})
+        buf:destroy()
+        buf = sb:promote()
+      end
+      if need_ns then ns:destroy() end
+      if kind ~= 43 then fmt:destroy() end
+      return buf
+    end
+  end
+  local w: uint64 = (@uint64)(sec)
+  local num = hr(sec < 0 and (0 - w) or w, 1, 1)
+  local sb: stringbuilder
+  if sec < 0 then sb:write('-') end
+  sb:write(num)
+  if need_ns then sb:write(ns) end
+  return sb:promote()
+end
+
+local function ctime_format(sec: integer, nsec: integer): string
+  local f, ok = util.breaktime(sec, nsec, false)
+  if ok then
+    local b: [256]byte
+    local tm = &f.tm
+    local n = c_snprintf((@cstring)(&b[0]), 256, '%3s %3s %2d %02d:%02d:%02d.%09ld0 %04d',
+      (@cstring)(weekdays[tm.tm_wday].data), (@cstring)(months[tm.tm_mon].data), tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+      (@clong)(nsec), 1900 + tm.tm_year)
+    f.zone:destroy()
+    return string.copy((@string){data = &b[0], size = (@usize)(n)})
+  end
+  return format_date(sec, nsec, 64)
+end
+
+local function file_sparseness(p: *sys.Stat): float64
+  if p.st_size == 0 then
+    if p.st_blocks == 0 then return 1.0 end
+    local zero: float64 = 0.0
+    if p.st_blocks < 0 then return -1.0 / zero end
+    return 1.0 / zero
+  end
+  local blklen = 512.0 * (@float64)(p.st_blocks)
+  return blklen / (@float64)(p.st_size)
+end
+
+local function mode_to_filetype(m: cuint): cstring
+  if m == sys.S_IFREG then return 'f'
+  elseif m == sys.S_IFDIR then return 'd'
+  elseif m == sys.S_IFLNK then return 'l'
+  elseif m == sys.S_IFSOCK then return 's'
+  elseif m == sys.S_IFBLK then return 'b'
+  elseif m == sys.S_IFCHR then return 'c'
+  elseif m == sys.S_IFIFO then return 'p' end
+  return 'U'
+end
+
+local function c_lgetxattr(p: cstring, name: cstring, buf: pointer, n: csize): clong <cimport 'lgetxattr', cinclude '<sys/xattr.h>'> end
+local function c_getxattr(p: cstring, name: cstring, buf: pointer, n: csize): clong <cimport 'getxattr', cinclude '<sys/xattr.h>'> end
+
+-- getfilecon through the -P/-L/-H rules (libselinux reads security.selinux)
+local function x_getfilecon(fd: cint, name: cstring): (boolean, string)
+  local path: string
+  local n = view(name)
+  if fd == AT_FDCWD or (#n > 0 and n.data[0] == 47) then path = string.copy(n)
+  else path = '/proc/self/fd/' .. tostring(fd) .. '/' .. n end
+  local buf: [256]byte
+  local follow = options.symlink_handling == SYMLINK_ALWAYS_DEREF or
+    (options.symlink_handling == SYMLINK_DEREF_ARGSONLY and state.curdepth == 0)
+  local r: clong
+  if follow then
+    r = c_getxattr(path, 'security.selinux', &buf[0], 255)
+    if r < 0 and (sys.errno() == ENOENT or sys.errno() == ENOTDIR) then
+      r = c_lgetxattr(path, 'security.selinux', &buf[0], 255)
+    end
+  else
+    r = c_lgetxattr(path, 'security.selinux', &buf[0], 255)
+  end
+  local e = sys.errno()
+  path:destroy()
+  if r < 0 then sys.seterrno(e); return false, '' end
+  local len = 0
+  while len < r and buf[len] ~= 0 do len = len + 1 end
+  return true, string.copy((@string){data = &buf[0], size = (@usize)(len)})
+end
+
+local function do_fprintf(dest: *FormatVal, seg: *Segment, pathname: string, st: *sys.Stat)
+  local stream = dest.stream
+  if seg.kind == KIND_PLAIN then
+    swrite(stream, seg.text, seg.text_len)
+    return
+  elseif seg.kind == KIND_STOP then
+    swrite(stream, seg.text, seg.text_len)
+    if not sflush(stream) then nonfatal_nontarget_file_error(sys.errno(), dest.filename) end
+    return
+  end
+  local c = seg.fc0
+  local text = seg.text
+  if c == 97 then
+    local s = ctime_format(st.st_atim.tv_sec, st.st_atim.tv_nsec)
+    fprintf_s(stream, text, tmpc(s)); s:destroy()
+  elseif c == 98 then
+    fprintf_s(stream, text, tmpc(hr((@uint64)(st.st_blocks), 512, 512)))
+  elseif c == 99 then
+    local s = ctime_format(st.st_ctim.tv_sec, st.st_ctim.tv_nsec)
+    fprintf_s(stream, text, tmpc(s)); s:destroy()
+  elseif c == 100 then
+    fprintf_d(stream, text, (@cint)(state.curdepth))
+  elseif c == 68 then
+    fprintf_s(stream, text, tmpc(hr(st.st_dev, 1, 1)))
+  elseif c == 102 then
+    print_quoted(dest, text, base_name(pathname))
+  elseif c == 70 then
+    print_quoted(dest, text, filesystem_type(st))
+  elseif c == 103 or c == 71 then
+    local g: *Group = nilptr
+    if c == 103 then g = c_getgrgid(st.st_gid) end
+    if g ~= nilptr then
+      text[seg.text_len] = 115
+      fprintf_s(stream, text, g.gr_name)
+    else
+      fprintf_s(stream, text, tmpc(hr(st.st_gid, 1, 1)))
+    end
+  elseif c == 104 then
+    local n = (@integer)(pathname.size)
+    local s = n - 1
+    while s >= 0 do
+      if pathname.data[s] ~= 47 then break end
+      s = s - 1
+    end
+    local len = n
+    if 0 < s and s + 1 < n and pathname.data[s + 1] == 47 then len = s + 1 end
+    local slash = -1
+    for i = 0, len - 1 do if pathname.data[i] == 47 then slash = i end end
+    if slash < 0 then print_quoted(dest, text, '.')
+    else print_quoted(dest, text, (@string){data = pathname.data, size = (@usize)(slash)}) end
+  elseif c == 72 then
+    local l = state.starting_path_length
+    if l > #pathname then l = #pathname end
+    fprintf_s(stream, text, tmpc((@string){data = pathname.data, size = (@usize)(l)}))
+  elseif c == 105 then
+    fprintf_s(stream, text, tmpc(hr(st.st_ino, 1, 1)))
+  elseif c == 107 then
+    fprintf_s(stream, text, tmpc(hr((@uint64)(st.st_blocks), 512, 1024)))
+  elseif c == 108 then
+    local have = false
+    local linkname: string = ''
+    if islnk(st.st_mode) then
+      have, linkname = areadlinkat(state.cwd_dir_fd, state.rel_pathname)
+      if not have then
+        nonfatal_target_file_error(sys.errno(), pathname)
+        state.exit_status = 1
+      end
+    end
+    if have then
+      print_quoted(dest, text, linkname)
+      linkname:destroy()
+    else
+      print_quoted(dest, text, '')
+    end
+  elseif c == 77 then
+    local ms = strmode(st.st_mode)
+    ms.data[10] = 0
+    fprintf_s(stream, text, (@cstring)(ms.data))
+    ms:destroy()
+  elseif c == 109 then
+    fprintf_o(stream, text, st.st_mode & MODE_ALL)
+  elseif c == 110 then
+    fprintf_s(stream, text, tmpc(hr(st.st_nlink, 1, 1)))
+  elseif c == 112 then
+    print_quoted(dest, text, pathname)
+  elseif c == 80 then
+    local cp: string = ''
+    if state.curdepth > 0 then
+      local off = state.starting_path_length
+      if off < #pathname and pathname.data[off] == 47 then off = off + 1 end
+      cp = (@string){data = &pathname.data[off], size = (@usize)(#pathname - off)}
+    end
+    print_quoted(dest, text, cp)
+  elseif c == 115 then
+    fprintf_s(stream, text, tmpc(hr((@uint64)(st.st_size), 1, 1)))
+  elseif c == 83 then
+    fprintf_g(stream, text, file_sparseness(st))
+  elseif c == 116 then
+    local s = ctime_format(st.st_mtim.tv_sec, st.st_mtim.tv_nsec)
+    fprintf_s(stream, text, tmpc(s)); s:destroy()
+  elseif c == 117 or c == 85 then
+    local pw: *Passwd = nilptr
+    if c == 117 then pw = c_getpwuid(st.st_uid) end
+    if pw ~= nilptr then
+      text[seg.text_len] = 115
+      fprintf_s(stream, text, pw.pw_name)
+    else
+      fprintf_s(stream, text, tmpc(hr(st.st_uid, 1, 1)))
+    end
+  elseif c == 89 then
+    if islnk(st.st_mode) then
+      local sbuf: sys.Stat
+      if c_fstatat(state.cwd_dir_fd, state.rel_pathname, &sbuf, 0) ~= 0 then
+        local e = sys.errno()
+        if e == ENOENT or e == ENOTDIR then fprintf_s(stream, text, 'N')
+        elseif e == ELOOP then fprintf_s(stream, text, 'L')
+        else
+          fprintf_s(stream, text, '?')
+          error_e(e, q(pathname))
+        end
+      else
+        fprintf_s(stream, text, mode_to_filetype(sbuf.st_mode & sys.S_IFMT))
+      end
+    else
+      fprintf_s(stream, text, mode_to_filetype(st.st_mode & sys.S_IFMT))
+    end
+  elseif c == 121 then
+    fprintf_s(stream, text, mode_to_filetype(st.st_mode & sys.S_IFMT))
+  elseif c == 90 then
+    local ok, con = x_getfilecon(state.cwd_dir_fd, state.rel_pathname)
+    if not ok then
+      local e = sys.errno()
+      fprintf_s(stream, text, '')
+      error_e(e, 'getfilecon failed: ' .. q(pathname))
+      state.exit_status = 1
+    else
+      fprintf_s(stream, text, tmpc(con))
+      con:destroy()
+    end
+  elseif c == 37 then
+    swrite(stream, text, seg.text_len)
+  elseif c == 0 then
+    die('error: % at end of format string')
+  end
+end
+
+local function pred_fprintf(pathname: string, st: *sys.Stat, p: *Pred): boolean
+  local dest = &p.fmt
+  for i = 1, #dest.segments do
+    local seg = &dest.segments[i]
+    if seg.kind == KIND_FORMAT and seg.fc1 ~= 0 then
+      local sec: integer
+      local nsec: integer
+      local valid = false
+      local c = seg.fc0
+      if c == 65 then sec = st.st_atim.tv_sec; nsec = st.st_atim.tv_nsec; valid = true
+      elseif c == 66 then
+        sec = -1; nsec = -1
+        valid = seg.fc1 == 64
+      elseif c == 67 then sec = st.st_ctim.tv_sec; nsec = st.st_ctim.tv_nsec; valid = true
+      else sec = st.st_mtim.tv_sec; nsec = st.st_mtim.tv_nsec; valid = true end
+      if valid then
+        local s = format_date(sec, nsec, seg.fc1)
+        fprintf_s(dest.stream, seg.text, tmpc(s))
+        s:destroy()
+      else
+        fprintf_s(dest.stream, seg.text, '')
+      end
+    else
+      do_fprintf(dest, seg, pathname, st)
+    end
+  end
+  return true
+end
+
+-------------------------------------------------------------------------------
+-- pred.c
+
+local function apply_predicate(pathname: string, st: *sys.Stat, id: integer): boolean <forwarddecl> end
+local function cleanup() <forwarddecl> end
+
+local function ts_difference(s1: integer, n1: integer, s2: integer, n2: integer): float64
+  return ((@float64)(s1) - (@float64)(s2)) + 1.0e-9 * (@float64)(n1 - n2)
+end
+
+local function compare_ts(s1: integer, n1: integer, s2: integer, n2: integer): integer
+  if s1 == s2 and n1 == n2 then return 0 end
+  local diff = ts_difference(s1, n1, s2, n2)
+  return diff < 0.0 and -1 or 1
+end
+
+local function pred_timewindow(sec: integer, nsec: integer, p: *Pred, window: integer): boolean
+  if p.rt_kind == COMP_GT then return compare_ts(sec, nsec, p.rt_sec, p.rt_nsec) > 0
+  elseif p.rt_kind == COMP_LT then return compare_ts(sec, nsec, p.rt_sec, p.rt_nsec) < 0 end
+  local delta = ts_difference(sec, nsec, p.rt_sec, p.rt_nsec)
+  return delta > 0.0 and delta <= (@float64)(window)
+end
+
+local function numcmp(v: uint64, p: *Pred): boolean
+  if p.num_kind == COMP_GT then return v > p.num_val
+  elseif p.num_kind == COMP_LT then return v < p.num_val end
+  return v == p.num_val
+end
+
+local function pred_type(pathname: string, st: *sys.Stat, p: *Pred): boolean
+  if state.type == 0 then return false end
+  local mode: cuint
+  if state.have_stat then mode = st.st_mode else mode = state.type end
+  local t = mode & sys.S_IFMT
+  local ty = FTYPE_COUNT
+  if t == sys.S_IFREG then ty = FTYPE_REG
+  elseif t == sys.S_IFDIR then ty = FTYPE_DIR
+  elseif t == sys.S_IFLNK then ty = FTYPE_LNK
+  elseif t == sys.S_IFBLK then ty = FTYPE_BLK
+  elseif t == sys.S_IFCHR then ty = FTYPE_CHR
+  elseif t == sys.S_IFSOCK then ty = FTYPE_SOCK
+  elseif t == sys.S_IFIFO then ty = FTYPE_FIFO end
+  return ty ~= FTYPE_COUNT and p.types[ty]
+end
+
+local function match_lname(pathname: string, st: *sys.Stat, p: *Pred, ignore_case: boolean): boolean
+  local ret = false
+  if islnk(st.st_mode) then
+    local ok, linkname = areadlinkat(state.cwd_dir_fd, state.rel_pathname)
+    if ok then
+      if fnmatch.match(view(p.str), linkname, ignore_case and fnmatch.CASEFOLD or 0) == 0 then ret = true end
+      linkname:destroy()
+    else
+      nonfatal_target_file_error(sys.errno(), pathname)
+      state.exit_status = 1
+    end
+  end
+  return ret
+end
+
+local function pred_name_common(pathname: string, str: cstring, flags: integer): boolean
+  local base = strip_trailing_slashes(base_name(pathname))
+  return fnmatch.match(view(str), base, flags) == 0
+end
+
+-- -ok/-okdir: the prompt on stderr and gnulib yesno on standard input
+local inbuf: [4096]byte
+local inpos: integer = 0
+local inlen: integer = 0
+local ineof = false
+
+local function in_getc(): integer
+  if inpos < inlen then
+    local c = inbuf[inpos]
+    inpos = inpos + 1
+    return c
+  end
+  if ineof then return -1 end
+  local r: clong
+  repeat r = sys.read(0, &inbuf[0], 4096) until not (r < 0 and sys.errno() == EINTR)
+  if r <= 0 then ineof = true; return -1 end
+  inlen = r
+  inpos = 1
+  return inbuf[0]
+end
+
+local function yesno(): boolean
+  local c = in_getc()
+  if c < 0 then return false end
+  local first = c
+  while c >= 0 and c ~= 10 do c = in_getc() end
+  return first == 121 or first == 89
+end
+
+local function is_ok(program: cstring, arg: string): boolean
+  sflush(outs)
+  eputs('< ' .. view(program) .. ' ... ' .. arg .. ' > ? ')
+  return yesno()
+end
+
+local tbuf: sequence(byte)
+
+local function record_exec_dir(execp: *ExecVal): boolean
+  if not execp.todo then
+    local rel = view(state.rel_pathname)
+    local has_slash = false
+    for i = 0, < #rel do if rel.data[i] == 47 then has_slash = true; break end end
+    local dir: string
+    if has_slash then dir = mdir_name(rel) else dir = string.copy('.') end
+    execp.wd_for_exec = default_allocator:new(@SavedCwd)
+    execp.wd_for_exec.name = nilptr
+    execp.wd_for_exec.desc = c_openat(state.cwd_dir_fd, dir, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+    dir:destroy()
+    if execp.wd_for_exec.desc < 0 then return false end
+  end
+  return true
+end
+
+local function impl_pred_exec(pathname: string, st: *sys.Stat, p: *Pred): boolean
+  local execp = &p.exec
+  local islocal = p.func == P_EXECDIR or p.func == P_OKDIR
+  local target: string
+  local prefix: Bytes = nilptr
+  local pfxlen = 0
+  local result = false
+  if islocal then
+    if not record_exec_dir(execp) then
+      die_e(sys.errno(), 'Failed to save working directory in order to run a command on ' .. q(pathname))
+    end
+    target = base_name(view(state.rel_pathname))
+    if #target > 0 and target.data[0] == 47 then
+      prefix = nilptr
+      pfxlen = 0
+    else
+      prefix = (@Bytes)(('./').data)
+      pfxlen = 2
+    end
+  else
+    target = pathname
+  end
+  tbuf:clear()
+  for i = 0, < #target do tbuf:push(target.data[i]) end
+  tbuf:push(0)
+  local tb = (@Bytes)(&tbuf[1])
+  local tlen = #target
+  if execp.multiple then
+    bc_push_arg(execp, tb, tlen + 1, prefix, pfxlen, false)
+    if execp.todo then state.execdirs_outstanding = true end
+    result = true
+  else
+    for i = 1, execp.num_args do
+      local a = execp.replace_vec[i]
+      bc_do_insert(execp, (@Bytes)(a), cstrlen((@Bytes)(a)), prefix, pfxlen, tb, tlen, false)
+    end
+    bc_do_exec(execp)
+    local stt = execp.last_child_status
+    result = (stt & 0x7f) == 0 and ((stt >> 8) & 0xff) == 0
+    if islocal then
+      free_cwd(execp.wd_for_exec)
+      default_allocator:delete(execp.wd_for_exec)
+      execp.wd_for_exec = nilptr
+    end
+  end
+  return result
+end
+
+local function pred_delete(pathname: string, st: *sys.Stat): boolean
+  local rel = view(state.rel_pathname)
+  if rel ~= '.' then
+    local flags: cint = 0
+    if state.have_stat and isdir(st.st_mode) then flags = flags | AT_REMOVEDIR end
+    if c_unlinkat(state.cwd_dir_fd, state.rel_pathname, flags) == 0 then return true end
+    if sys.errno() == ENOENT and options.ignore_readdir_race then
+      sys.seterrno(0)
+      return true
+    end
+    if sys.errno() == EISDIR then
+      if (flags & AT_REMOVEDIR) == 0 then
+        flags = flags | AT_REMOVEDIR
+        if c_unlinkat(state.cwd_dir_fd, state.rel_pathname, flags) == 0 then return true end
+      end
+    end
+    error_e(sys.errno(), 'cannot delete ' .. q(pathname))
+    state.exit_status = 1
+    return false
+  end
+  return true
+end
+
+local function pred_empty(pathname: string, st: *sys.Stat): boolean
+  if isdir(st.st_mode) then
+    sys.seterrno(0)
+    local fd = c_openat(state.cwd_dir_fd, state.rel_pathname,
+      sys.O_RDONLY | sys.O_CLOEXEC | sys.O_DIRECTORY | O_NOCTTY | O_NONBLOCK, 0)
+    if fd < 0 then
+      error_e(sys.errno(), q(pathname))
+      state.exit_status = 1
+      return false
+    end
+    local d = c_fdopendir(fd)
+    if d == nilptr then
+      error_e(sys.errno(), q(pathname))
+      state.exit_status = 1
+      sys.close(fd)
+      return false
+    end
+    local empty = true
+    sys.seterrno(0)
+    while true do
+      local dp = sys.readdir(d)
+      if dp == nilptr then break end
+      local nm = (@Bytes)(&dp.d_name[0])
+      if nm[0] ~= 46 or (nm[1] ~= 0 and (nm[1] ~= 46 or nm[2] ~= 0)) then
+        empty = false
+        break
+      end
+    end
+    if sys.errno() ~= 0 then
+      error_e(sys.errno(), q(pathname))
+      state.exit_status = 1
+      sys.closedir(d)
+      return false
+    end
+    if sys.closedir(d) ~= 0 then
+      error_e(sys.errno(), q(pathname))
+      state.exit_status = 1
+      return false
+    end
+    return empty
+  elseif isreg(st.st_mode) then
+    return st.st_size == 0
+  end
+  return false
+end
+
+local function pred_xtype(pathname: string, st: *sys.Stat, p: *Pred): boolean
+  local sbuf: sys.Stat
+  local r: cint
+  if following_links() then r = optionp_stat(state.rel_pathname, &sbuf)
+  else r = optionl_stat(state.rel_pathname, &sbuf) end
+  if r ~= 0 then
+    local e = sys.errno()
+    if following_links() and e == ENOENT then
+      return pred_type(pathname, st, p)
+    else
+      error_e(e, q(pathname))
+      state.exit_status = 1
+    end
+    return false
+  end
+  return pred_type(pathname, &sbuf, p)
+end
+
+local function eval_pred(pathname: string, st: *sys.Stat, id: integer): boolean
+  local p = P(id)
+  local f = p.func
+  if f == P_AND then
+    if p.left == 0 or apply_predicate(pathname, st, p.left) then return apply_predicate(pathname, st, p.right) end
+    return false
+  elseif f == P_OR then
+    if p.left == 0 or not apply_predicate(pathname, st, p.left) then return apply_predicate(pathname, st, p.right) end
+    return true
+  elseif f == P_NEGATE then
+    return not apply_predicate(pathname, st, p.right)
+  elseif f == P_COMMA then
+    if p.left ~= 0 then apply_predicate(pathname, st, p.left) end
+    return apply_predicate(pathname, st, p.right)
+  elseif f == P_TRUE or f == P_OPENPAREN or f == P_CLOSEPAREN then
+    return true
+  elseif f == P_FALSE then
+    return false
+  elseif f == P_AMIN then return pred_timewindow(st.st_atim.tv_sec, st.st_atim.tv_nsec, p, 60)
+  elseif f == P_ATIME then return pred_timewindow(st.st_atim.tv_sec, st.st_atim.tv_nsec, p, DAYSECS)
+  elseif f == P_CMIN then return pred_timewindow(st.st_ctim.tv_sec, st.st_ctim.tv_nsec, p, 60)
+  elseif f == P_CTIME then return pred_timewindow(st.st_ctim.tv_sec, st.st_ctim.tv_nsec, p, DAYSECS)
+  elseif f == P_MMIN then return pred_timewindow(st.st_mtim.tv_sec, st.st_mtim.tv_nsec, p, 60)
+  elseif f == P_MTIME then return pred_timewindow(st.st_mtim.tv_sec, st.st_mtim.tv_nsec, p, DAYSECS)
+  elseif f == P_ANEWER then return compare_ts(st.st_atim.tv_sec, st.st_atim.tv_nsec, p.rt_sec, p.rt_nsec) > 0
+  elseif f == P_CNEWER then return compare_ts(st.st_ctim.tv_sec, st.st_ctim.tv_nsec, p.rt_sec, p.rt_nsec) > 0
+  elseif f == P_NEWER then return compare_ts(st.st_mtim.tv_sec, st.st_mtim.tv_nsec, p.rt_sec, p.rt_nsec) > 0
+  elseif f == P_NEWERXY then
+    local s: integer, n: integer
+    if p.rt_xval == XVAL_ATIME then s = st.st_atim.tv_sec; n = st.st_atim.tv_nsec
+    elseif p.rt_xval == XVAL_CTIME then s = st.st_ctim.tv_sec; n = st.st_ctim.tv_nsec
+    else s = st.st_mtim.tv_sec; n = st.st_mtim.tv_nsec end
+    return compare_ts(s, n, p.rt_sec, p.rt_nsec) > 0
+  elseif f == P_USED then
+    local as, an = st.st_atim.tv_sec, st.st_atim.tv_nsec
+    local cs, cn = st.st_ctim.tv_sec, st.st_ctim.tv_nsec
+    if compare_ts(as, an, cs, cn) < 0 then return false end
+    local ds = cs - as
+    local dn = cn - an
+    if dn < 0 then dn = dn + 1000000000; ds = ds - 1 end
+    return pred_timewindow(ds, dn, p, DAYSECS)
+  elseif f == P_DELETE then return pred_delete(pathname, st)
+  elseif f == P_EMPTY then return pred_empty(pathname, st)
+  elseif f == P_EXEC then return impl_pred_exec(pathname, st, p)
+  elseif f == P_EXECDIR then return impl_pred_exec(view(state.rel_pathname), st, p)
+  elseif f == P_OK then
+    if is_ok(p.exec.replace_vec[1], pathname) then return impl_pred_exec(pathname, st, p) end
+    return false
+  elseif f == P_OKDIR then
+    if is_ok(p.exec.replace_vec[1], pathname) then return impl_pred_exec(view(state.rel_pathname), st, p) end
+    return false
+  elseif f == P_EXECUTABLE then return c_faccessat(state.cwd_dir_fd, state.rel_pathname, sys.X_OK, 0) == 0
+  elseif f == P_READABLE then return c_faccessat(state.cwd_dir_fd, state.rel_pathname, sys.R_OK, 0) == 0
+  elseif f == P_WRITABLE then return c_faccessat(state.cwd_dir_fd, state.rel_pathname, sys.W_OK, 0) == 0
+  elseif f == P_FLS or f == P_LS then
+    list_file(pathname, state.cwd_dir_fd, state.rel_pathname, st, options.start_sec, options.output_block_size,
+              p.literal_control_chars, p.fmt.stream)
+    return true
+  elseif f == P_FPRINT or f == P_PRINT then
+    print_quoted(&p.fmt, (@Bytes)(('%s\n').data), pathname)
+    return true
+  elseif f == P_FPRINT0 or f == P_PRINT0 then
+    swrite(p.fmt.stream, (@Bytes)(pathname.data), (@integer)(pathname.size))
+    sputc(p.fmt.stream, 0)
+    return true
+  elseif f == P_FPRINTF then return pred_fprintf(pathname, st, p)
+  elseif f == P_FSTYPE then return filesystem_type(st) == view(p.str)
+  elseif f == P_GID then return numcmp(st.st_gid, p)
+  elseif f == P_UID then return numcmp(st.st_uid, p)
+  elseif f == P_INUM then return numcmp(st.st_ino, p)
+  elseif f == P_LINKS then return numcmp(st.st_nlink, p)
+  elseif f == P_GROUP then return p.gid == st.st_gid
+  elseif f == P_USER then return p.uid == st.st_uid
+  elseif f == P_ILNAME then return match_lname(pathname, st, p, true)
+  elseif f == P_LNAME then return match_lname(pathname, st, p, false)
+  elseif f == P_NAME then return pred_name_common(pathname, p.str, 0)
+  elseif f == P_INAME then return pred_name_common(pathname, p.str, fnmatch.CASEFOLD)
+  elseif f == P_PATH then return fnmatch.match(view(p.str), pathname, 0) == 0
+  elseif f == P_IPATH then return fnmatch.match(view(p.str), pathname, fnmatch.CASEFOLD) == 0
+  elseif f == P_NOGROUP then return c_getgrgid(st.st_gid) == nilptr
+  elseif f == P_NOUSER then return c_getpwuid(st.st_uid) == nilptr
+  elseif f == P_PERM then
+    local mode = st.st_mode
+    local perm_val = p.perm_val[isdir(mode) and 1 or 0]
+    if p.perm_kind == PERM_AT_LEAST then return (mode & perm_val) == perm_val
+    elseif p.perm_kind == PERM_ANY then
+      if perm_val == 0 then return true end
+      return (mode & perm_val) ~= 0
+    end
+    return (mode & MODE_ALL) == perm_val
+  elseif f == P_PRUNE then
+    if options.do_dir_first then
+      if st ~= nilptr and isdir(st.st_mode) then state.stop_at_current_level = true end
+    end
+    return true
+  elseif f == P_QUIT then
+    cleanup()
+    xexit(state.exit_status)
+    return true
+  elseif f == P_REGEX then
+    local caps: regex.Caps
+    if p.re:matchat(pathname, 0, &caps) and caps.at[1] == (@isize)(pathname.size) then return true end
+    return false
+  elseif f == P_SAMEFILE then
+    if st.st_ino ~= 0 then
+      if st.st_ino ~= p.same_ino then return false end
+    end
+    if get_statinfo(pathname, state.rel_pathname, st) == 0 then
+      return st.st_ino == p.same_ino and st.st_dev == p.same_dev
+    end
+    return false
+  elseif f == P_SIZE then
+    local bs = (@uint64)(p.size_blocksize)
+    local sz = (@uint64)(st.st_size)
+    local f_val = sz // bs + ((sz % bs ~= 0) and 1 or 0)
+    if p.size_kind == COMP_GT then return f_val > p.size_size
+    elseif p.size_kind == COMP_LT then return f_val < p.size_size end
+    return f_val == p.size_size
+  elseif f == P_TYPE then return pred_type(pathname, st, p)
+  elseif f == P_XTYPE then return pred_xtype(pathname, st, p)
+  end
+  return false
+end
+
+function apply_predicate(pathname: string, st: *sys.Stat, id: integer): boolean
+  local p = P(id)
+  p.visits = p.visits + 1
+  if p.need_stat or p.need_type or p.need_inum then
+    if get_info(pathname, st, p) ~= 0 then return false end
+  end
+  if eval_pred(pathname, st, id) then
+    p.successes = p.successes + 1
+    return true
+  end
+  return false
+end
+
+-------------------------------------------------------------------------------
+-- tree.c
+
+local function cost_name(c: integer): string
+  if c == NeedsNothing then return 'Nothing'
+  elseif c == NeedsInodeNumber then return 'InodeNumber'
+  elseif c == NeedsType then return 'Type'
+  elseif c == NeedsStatInfo then return 'StatInfo'
+  elseif c == NeedsLinkName then return 'LinkName'
+  elseif c == NeedsAccessInfo then return 'AccessInfo'
+  elseif c == NeedsSyncDiskHit then return 'SyncDiskHit'
+  elseif c == NeedsEventualExec then return 'EventualExec'
+  elseif c == NeedsImmediateExec then return 'ImmediateExec'
+  elseif c == NeedsUserInteraction then return 'UserInteraction'
+  elseif c == NeedsUnknown then return 'Unknown' end
+  return 'unknown'
+end
+
+local function type_name(t: integer): string
+  if t == NO_TYPE then return 'no' elseif t == PRIMARY_TYPE then return 'primary'
+  elseif t == UNI_OP then return 'uni_op' elseif t == BI_OP then return 'bi_op'
+  elseif t == OPEN_PAREN then return 'open_paren  ' elseif t == CLOSE_PAREN then return 'close_paren ' end
+  return 'unknown'
+end
+
+local function prec_name(t: integer): string
+  if t == NO_PREC then return 'no' elseif t == COMMA_PREC then return 'comma'
+  elseif t == OR_PREC then return 'or' elseif t == AND_PREC then return 'and'
+  elseif t == NEGATE_PREC then return 'negate' elseif t == MAX_PREC then return 'max' end
+  return 'unknown '
+end
+
+local function fmt_float(fmt: cstring, v: float64): string
+  local b: [64]byte
+  local n = c_snprintf((@cstring)(&b[0]), 64, fmt, v)
+  return string.copy((@string){data = &b[0], size = (@usize)(n)})
+end
+
+local function print_predicate(sb: *stringbuilder, p: *Pred)
+  if p.arg_text ~= nilptr then sb:write(p.name, ' ', view(p.arg_text))
+  else sb:write(p.name) end
+end
+
+local function print_tree(sb: *stringbuilder, node: integer, indent: integer)
+  if node == 0 then return end
+  local p = P(node)
+  for _ = 1, indent do sb:write('    ') end
+  sb:write('pred=[')
+  print_predicate(sb, p)
+  sb:write('] type=', type_name(p.ptype), ' prec=', prec_name(p.prec))
+  local r = fmt_float('%#.4g', (@float64)(p.rate))
+  sb:write(' cost=', cost_name(p.cost), ' est_success_rate=', r, ' ', p.side_effects and '' or 'no ', 'side effects ')
+  r:destroy()
+  if p.need_stat or p.need_type or p.need_inum then
+    local comma = false
+    sb:write('Needs ')
+    if p.need_stat then sb:write('stat'); comma = true end
+    if p.need_inum then sb:write(comma and ',' or '', 'inode'); comma = true end
+    if p.need_type then sb:write(comma and ',' or '', 'type') end
+  end
+  sb:write('\n')
+  for _ = 1, indent do sb:write('    ') end
+  if p.left == 0 and p.right == 0 then
+    sb:write('no children.\n')
+  else
+    if p.left ~= 0 then
+      sb:write('left:\n')
+      print_tree(sb, p.left, indent + 1)
+    else
+      sb:write('no left.\n')
+    end
+    for _ = 1, indent do sb:write('    ') end
+    if p.right ~= 0 then
+      sb:write('right:\n')
+      print_tree(sb, p.right, indent + 1)
+    else
+      sb:write('no right.\n')
+    end
+  end
+end
+
+local function eprint_tree(title: string, node: integer, indent: integer)
+  local sb: stringbuilder
+  sb:write(title)
+  print_tree(&sb, node, indent)
+  eputs(sb:view())
+  sb:destroy()
+end
+
+local function print_list(sb: *stringbuilder, node: integer)
+  local cur = node
+  while cur ~= 0 do
+    local nm = P(cur).name
+    local n = #nm
+    while n > 0 and (nm.data[n - 1] == 32 or nm.data[n - 1] == 9) do n = n - 1 end
+    sb:write('[', (@string){data = nm.data, size = (@usize)(n)}, '] ')
+    cur = P(cur).next
+  end
+  sb:write('\n')
+end
+
+local function print_optlist(sb: *stringbuilder, id: integer) <forwarddecl> end
+
+local function print_parenthesised(sb: *stringbuilder, id: integer)
+  if id ~= 0 then
+    local p = P(id)
+    if (p.func == P_OR or p.func == P_AND) and p.left == 0 then
+      print_parenthesised(sb, p.right)
+    else
+      local parens = p.left ~= 0 or p.right ~= 0
+      if parens then sb:write(' ( ') end
+      print_optlist(sb, id)
+      if parens then sb:write(' ) ') end
+    end
+  end
+end
+
+function print_optlist(sb: *stringbuilder, id: integer)
+  if id ~= 0 then
+    local p = P(id)
+    print_parenthesised(sb, p.left)
+    sb:write(p.need_stat and '[call stat] ' or '', p.need_type and '[need type] ' or '', p.need_inum and '[need inum] ' or '')
+    print_predicate(sb, p)
+    local r = fmt_float('%.4g', (@float64)(p.rate))
+    sb:write(' [est success rate ', r, '] ')
+    r:destroy()
+    if (options.debug_options & DebugSuccessRates) ~= 0 then
+      sb:write('[real success rate ', p.successes, '/', p.visits)
+      if p.visits ~= 0 then
+        local rr = fmt_float('%.4g', (@float64)(p.successes) / (@float64)(p.visits))
+        sb:write('=', rr, '] ')
+        rr:destroy()
+      else
+        sb:write('=_] ')
+      end
+    end
+    print_parenthesised(sb, p.right)
+  end
+end
+
+local function invalid_expr(msg: string) die(msg) end
+
+local function scan_rest(input: *integer, head: integer, prev_prec: integer): integer <forwarddecl> end
+
+local function get_expr(input: *integer, prev_prec: integer, prev_pred: integer): integer
+  local nxt = 0
+  local this_pred = $input
+  if $input == 0 then die('invalid expression') end
+  local ip = P($input)
+  local t = ip.ptype
+  if t == NO_TYPE then
+    die('invalid expression')
+  elseif t == BI_OP then
+    die("invalid expression; you have used a binary operator '" .. P(this_pred).name .. "' with nothing before it.")
+  elseif t == CLOSE_PAREN then
+    if prev_pred == 0 then
+      die("invalid expression: expected expression before closing parentheses '" .. P(this_pred).name .. "'.")
+    end
+    local pp = P(prev_pred)
+    if (pp.ptype == UNI_OP or pp.ptype == BI_OP) and not P(this_pred).artificial then
+      die("expected an expression between '" .. pp.name .. "' and ')'")
+    elseif ip.artificial then
+      die("expected an expression after '" .. pp.name .. "'")
+    else
+      die("invalid expression; you have too many ')'")
+    end
+  elseif t == PRIMARY_TYPE then
+    nxt = $input
+    $input = ip.next
+  elseif t == UNI_OP then
+    nxt = $input
+    $input = ip.next
+    P(nxt).right = get_expr(input, NEGATE_PREC, nxt)
+  elseif t == OPEN_PAREN then
+    if ip.next == 0 or P(ip.next).artificial then
+      die("invalid expression; expected to find a ')' but didn't see one. Perhaps you need an extra predicate after '" ..
+          P(this_pred).name .. "'")
+    end
+    prev_pred = $input
+    $input = ip.next
+    if P($input).ptype == CLOSE_PAREN then
+      if P(prev_pred).artificial then
+        die("invalid expression: expected expression before closing parentheses '" .. P($input).name .. "'.")
+      end
+      die('invalid expression; empty parentheses are not allowed.')
+    end
+    nxt = get_expr(input, NO_PREC, prev_pred)
+    if $input == 0 or P($input).ptype ~= CLOSE_PAREN then
+      die("invalid expression; I was expecting to find a ')' somewhere but did not see one.")
+    end
+    $input = P($input).next
+  else
+    die('oops -- invalid expression type!')
+  end
+  if $input == 0 then return nxt end
+  if P($input).prec > prev_prec then
+    nxt = scan_rest(input, nxt, prev_prec)
+    if nxt == 0 then die('invalid expression') end
+  end
+  return nxt
+end
+
+function scan_rest(input: *integer, head: integer, prev_prec: integer): integer
+  if $input == 0 or P($input).ptype == CLOSE_PAREN then return 0 end
+  local tree = head
+  while $input ~= 0 and P($input).prec > prev_prec do
+    local t = P($input).ptype
+    if t == NO_TYPE or t == PRIMARY_TYPE or t == UNI_OP or t == OPEN_PAREN then
+      die('invalid expression')
+    elseif t == BI_OP then
+      local prev = $input
+      P($input).left = tree
+      tree = $input
+      $input = P($input).next
+      P(tree).right = get_expr(input, P(tree).prec, prev)
+    elseif t == CLOSE_PAREN then
+      return tree
+    else
+      die('oops -- invalid expression type (' .. tostring(t) .. ')!')
+    end
+  end
+  return tree
+end
+
+local function predicate_is_cost_free(id: integer): boolean
+  local p = P(id)
+  if p.func == P_NAME or p.func == P_PATH or p.func == P_INAME or p.func == P_IPATH then return true end
+  if options.optimisation_level > 0 then
+    if p.func == P_AND or p.func == P_NEGATE or p.func == P_COMMA or p.func == P_OR then return false end
+    return p.cost == NeedsNothing
+  end
+  return false
+end
+
+-- a pointer to a link: 0 the root, 1 a node's left, 2 a node's right
+local Slot = @record{kind: integer, id: integer}
+
+local function sget(s: Slot): integer
+  if s.kind == 0 then return eval_tree end
+  if s.kind == 1 then return P(s.id).left end
+  return P(s.id).right
+end
+
+local function sset(s: Slot, v: integer)
+  if s.kind == 0 then eval_tree = v
+  elseif s.kind == 1 then P(s.id).left = v
+  else P(s.id).right = v end
+end
+
+local PredList = @record{head: integer, tail: integer}
+
+local function predlist_insert(list: *PredList, curr: integer, pprev: Slot)
+  sset(pprev, P(curr).left)
+  P(curr).left = list.head
+  list.head = curr
+  if list.tail == 0 then list.tail = list.head end
+end
+
+local function pred_cost_compare(p1: integer, p2: integer, wantfailure: boolean): integer
+  local a = P(p1)
+  local b = P(p2)
+  if a.cost == b.cost then
+    if a.rate == b.rate then return 0
+    elseif wantfailure then return a.rate < b.rate and -1 or 1
+    else return a.rate < b.rate and 1 or -1 end
+  end
+  return a.cost < b.cost and -1 or 1
+end
+
+local function constrain_rate(rate: float32): float32
+  if rate > 1.0_f32 then return 1.0_f32
+  elseif rate < 0.0 then return 0.0_f32 end
+  return rate
+end
+
+local function getrate(id: integer): float32
+  if id ~= 0 then return P(id).rate end
+  return 1.0_f32
+end
+
+local function calculate_derived_rates(id: integer): float32
+  local p = P(id)
+  if p.right ~= 0 then calculate_derived_rates(p.right) end
+  if p.left ~= 0 then calculate_derived_rates(p.left) end
+  local t = p.ptype
+  if t == NO_TYPE or t == PRIMARY_TYPE then
+    return p.rate
+  elseif t == UNI_OP then
+    p.rate = (@float32)(1.0 - (@float64)(P(p.right).rate))
+    return p.rate
+  elseif t == BI_OP then
+    local rate: float32
+    if p.func == P_AND then rate = getrate(p.right) * getrate(p.left)
+    elseif p.func == P_COMMA then rate = 1.0_f32
+    else rate = getrate(p.right) + getrate(p.left) end
+    p.rate = constrain_rate(rate)
+    return p.rate
+  end
+  p.rate = 1.0_f32
+  return p.rate
+end
+
+local function merge_pred(beg_list: integer, end_list: integer, last_p: Slot)
+  P(end_list).left = sget(last_p)
+  sset(last_p, beg_list)
+end
+
+local function predlist_merge_sort(list: *PredList, last: Slot)
+  if list.head == 0 then return end
+  if (options.debug_options & DebugTreeOpt) ~= 0 then eprint_tree('predlist before merge sort:\n', list.head, 2) end
+  calculate_derived_rates(list.head)
+  local new_list: PredList
+  while list.head ~= 0 do
+    local qq = list.head
+    list.head = P(list.head).left
+    P(qq).left = 0
+    local p = new_list.head
+    while p ~= 0 do
+      local wantfailure = P(p).prec ~= OR_PREC
+      if pred_cost_compare(P(p).right, P(qq).right, wantfailure) >= 0 then break end
+      p = P(p).left
+    end
+    if p ~= 0 then
+      P(qq).left = P(p).left
+      if P(qq).left == 0 then new_list.tail = qq end
+      P(p).left = qq
+    else
+      P(qq).left = new_list.head
+      new_list.head = qq
+      if new_list.tail == 0 then new_list.tail = qq end
+    end
+  end
+  if (options.debug_options & DebugTreeOpt) ~= 0 then eprint_tree('predlist after merge sort:\n', new_list.head, 2) end
+  calculate_derived_rates(new_list.head)
+  merge_pred(new_list.head, new_list.tail, last)
+  list.head = 0
+  list.tail = 0
+end
+
+local function merge_lists(lists: *[11]PredList, name_list: *PredList, regex_list: *PredList, last: Slot)
+  predlist_merge_sort(name_list, last)
+  predlist_merge_sort(regex_list, last)
+  for i = 0, 10 do predlist_merge_sort(&lists[i], last) end
+end
+
+local function subtree_has_side_effects(id: integer): boolean
+  if id ~= 0 then
+    local p = P(id)
+    return p.side_effects or subtree_has_side_effects(p.left) or subtree_has_side_effects(p.right)
+  end
+  return false
+end
+
+local function worst_cost(id: integer): integer
+  if id ~= 0 then
+    local p = P(id)
+    local cl = worst_cost(p.left)
+    local cr = worst_cost(p.right)
+    local worst = cl > cr and cl or cr
+    if worst < p.cost then worst = p.cost end
+    return worst
+  end
+  return 0
+end
+
+local function perform_arm_swap(id: integer)
+  local p = P(id)
+  local tmp = P(p.left).right
+  P(p.left).right = p.right
+  p.right = tmp
+end
+
+local function consider_arm_swap(id: integer): boolean
+  local p = P(id)
+  local reason: string = ''
+  local left_cost = 0
+  local right_cost = 0
+  if p.ptype ~= BI_OP then reason = 'Not a binary operation' end
+  if #reason == 0 then
+    if p.left == 0 or p.right == 0 then reason = "Doesn't have two arms" end
+  end
+  if #reason == 0 then
+    if P(p.left).right == 0 then reason = 'Left arm has no child on RHS' end
+  end
+  local pl = 0
+  local pr = p.right
+  if p.left ~= 0 then pl = P(p.left).right end
+  if #reason == 0 then
+    if subtree_has_side_effects(pl) then reason = 'Left subtree has side-effects' end
+  end
+  if #reason == 0 then
+    if subtree_has_side_effects(pr) then reason = 'Right subtree has side-effects' end
+  end
+  if #reason == 0 then
+    left_cost = worst_cost(pl)
+    right_cost = worst_cost(pr)
+    if left_cost < right_cost then reason = 'efficient as-is' end
+  end
+  if #reason == 0 then
+    local want_swap = false
+    if left_cost == right_cost then
+      local l = P(pl).rate
+      local r = P(pr).rate
+      if (options.debug_options & DebugTreeOpt) ~= 0 then
+        local a = fmt_float('%f', (@float64)(l))
+        local b = fmt_float('%f', (@float64)(r))
+        eputs('Success rates: l=' .. a .. ', r=' .. b .. '\n')
+        a:destroy(); b:destroy()
+      end
+      if p.func == P_OR then
+        want_swap = r < l
+        if not want_swap then reason = 'Operation is OR; right success rate >= left' end
+      elseif p.func == P_AND then
+        want_swap = r > l
+        if not want_swap then reason = 'Operation is AND; right success rate <= left' end
+      else
+        want_swap = false
+        reason = "Not 'AND' or 'OR'"
+      end
+    else
+      want_swap = true
+    end
+    if want_swap then
+      if (options.debug_options & DebugTreeOpt) ~= 0 then eprint_tree('Performing arm swap on:\n', id, 0) end
+      perform_arm_swap(id)
+      return true
+    end
+  end
+  if (options.debug_options & DebugTreeOpt) ~= 0 then
+    eprint_tree('Not an arm swap candidate (' .. reason .. '):\n', id, 0)
+  end
+  return false
+end
+
+local function do_arm_swaps(id: integer): boolean
+  if id ~= 0 then
+    local swapped: boolean
+    repeat
+      swapped = false
+      if consider_arm_swap(id) or do_arm_swaps(P(id).left) or do_arm_swaps(P(id).right) then
+        swapped = true
+      end
+    until not swapped
+    return swapped
+  end
+  return false
+end
+
+local function new_bare_pred(): integer
+  local p = default_allocator:new(@Pred)
+  p.same_fd = -1
+  preds:push(p)
+  return #preds
+end
+
+local function set_new_parent(curr: integer, high_prec: integer, prevp: Slot): integer
+  local id = new_bare_pred()
+  local np = P(id)
+  np.ptype = BI_OP
+  np.prec = high_prec
+  np.cost = NeedsNothing
+  if high_prec == COMMA_PREC then
+    np.func = P_COMMA
+    np.name = ','
+    np.rate = 1.0_f32
+  elseif high_prec == OR_PREC then
+    np.func = P_OR
+    np.name = '-o'
+    np.rate = constrain_rate(P(curr).rate)
+  elseif high_prec == AND_PREC then
+    np.func = P_AND
+    np.name = '-a'
+    np.rate = constrain_rate(P(curr).rate)
+  end
+  np.right = curr
+  sset(prevp, id)
+  return id
+end
+
+local function opt_expr(eval_treep: Slot): boolean
+  local regex_list: PredList
+  local name_list: PredList
+  local cbo_list: [11]PredList
+  local has_side_effects = false
+  if sget(eval_treep) == 0 then return false end
+  local prevp = eval_treep
+  local prev_prec = AND_PREC
+  local curr = sget(prevp)
+  while P(curr).left ~= 0 do
+    prevp = (@Slot){kind = 1, id = curr}
+    prev_prec = P(curr).prec
+    curr = P(curr).left
+  end
+  if P(curr).ptype ~= BI_OP then set_new_parent(curr, prev_prec, prevp) end
+  if (options.debug_options & (DebugExpressionTree | DebugTreeOpt)) ~= 0 then
+    eprint_tree('Normalized Eval Tree:\n', sget(eval_treep), 0)
+  end
+  prevp = eval_treep
+  local biop_prec = NO_PREC
+  if sget(prevp) ~= 0 and P(sget(prevp)).ptype == BI_OP then biop_prec = P(sget(prevp)).prec end
+  while true do
+    curr = sget(prevp)
+    if curr == 0 then break end
+    if P(curr).ptype == BI_OP then
+      if P(curr).prec ~= biop_prec then curr = set_new_parent(curr, biop_prec, prevp) end
+    end
+    local r = P(curr).right
+    local p_type = P(r).ptype
+    local pred_func = P(r).func
+    if p_type == NO_TYPE or p_type == PRIMARY_TYPE then
+      if biop_prec ~= COMMA_PREC and not P(r).side_effects then
+        if predicate_is_cost_free(r) then
+          if (options.debug_options & DebugTreeOpt) ~= 0 then
+            local sb: stringbuilder
+            sb:write('-O', options.optimisation_level, ': promoting cheap predicate ')
+            print_predicate(&sb, P(r))
+            sb:write(' into name_list\n')
+            eputs(sb:view())
+            sb:destroy()
+          end
+          predlist_insert(&name_list, curr, prevp)
+          continue
+        end
+        if pred_func == P_REGEX then
+          predlist_insert(&regex_list, curr, prevp)
+          continue
+        end
+        local reorder = (options.optimisation_level > 1 and (P(r).cost == NeedsType or P(r).cost == NeedsInodeNumber)
+                         and not P(r).need_stat) or options.optimisation_level > 2
+        if reorder then
+          if (options.debug_options & DebugTreeOpt) ~= 0 then
+            local sb: stringbuilder
+            sb:write('-O', options.optimisation_level, ': categorising predicate ')
+            print_predicate(&sb, P(r))
+            sb:write(' by cost (', cost_name(P(r).cost), ')\n')
+            eputs(sb:view())
+            sb:destroy()
+          end
+          predlist_insert(&cbo_list[P(r).cost], curr, prevp)
+          continue
+        end
+      end
+    elseif p_type == UNI_OP then
+      local v = opt_expr((@Slot){kind = 2, id = r})
+      P(r).side_effects = v
+    elseif p_type == BI_OP then
+      local v = opt_expr((@Slot){kind = 2, id = curr})
+      P(P(curr).right).side_effects = v
+    else
+      die('oops -- invalid expression type!')
+    end
+    if P(P(curr).right).side_effects then
+      merge_lists(&cbo_list, &name_list, &regex_list, prevp)
+      has_side_effects = true
+    end
+    prevp = (@Slot){kind = 1, id = curr}
+  end
+  merge_lists(&cbo_list, &name_list, &regex_list, prevp)
+  return has_side_effects
+end
+
+local function get_pred_cost(p: *Pred): integer
+  local data_requirement_cost = NeedsNothing
+  local inherent_cost = NeedsUnknown
+  if p.need_stat then data_requirement_cost = NeedsStatInfo
+  elseif p.need_inum then data_requirement_cost = NeedsInodeNumber
+  elseif p.need_type then data_requirement_cost = NeedsType end
+  if p.func == P_EXEC or p.func == P_EXECDIR then
+    inherent_cost = p.exec.multiple and NeedsEventualExec or NeedsImmediateExec
+  elseif p.func == P_FPRINTF then
+    inherent_cost = p.cost
+  else
+    inherent_cost = costlookup[p.func]
+  end
+  if inherent_cost > data_requirement_cost then return inherent_cost end
+  return data_requirement_cost
+end
+
+local function estimate_costs(id: integer)
+  if id ~= 0 then
+    estimate_costs(P(id).right)
+    estimate_costs(P(id).left)
+    P(id).cost = get_pred_cost(P(id))
+  end
+end
+
+local function check_option_combinations(id: integer)
+  local seen_delete = false
+  local seen_prune = false
+  local p = id
+  while p ~= 0 do
+    if P(p).func == P_DELETE then seen_delete = true
+    elseif P(p).func == P_PRUNE then seen_prune = true end
+    p = P(p).next
+  end
+  if seen_prune and seen_delete and not options.explicit_depth then
+    die('The -delete action automatically turns on -depth, but -prune does nothing when -depth is in effect.  If you want to carry on anyway, just explicitly use the -depth option.')
+  end
+end
+
+local function default_prints(id: integer): boolean
+  local p = id
+  while p ~= 0 do
+    if P(p).no_default_print then return false end
+    p = P(p).next
+  end
+  return true
+end
+
+local function looks_like_expression(arg: cstring, leading: boolean): boolean
+  local a = (@Bytes)(arg)
+  local c = a[0]
+  if c == 45 then return a[1] ~= 0
+  elseif c == 41 or c == 44 then
+    if a[1] ~= 0 then return false end
+    return not leading
+  elseif c == 33 or c == 40 then
+    return a[1] == 0
+  end
+  return false
+end
+
+local function build_expression_tree(argc: integer, argv: CStrs, end_of_leading_options: integer): integer
+  predicates = 0
+  start_points = (@CStrs)(&argv[end_of_leading_options])
+  local i = end_of_leading_options
+  while i < argc and not looks_like_expression(argv[i], true) do
+    num_start_points = num_start_points + 1
+    i = i + 1
+  end
+  local entry_open = find_parser('(')
+  local entry_close = find_parser(')')
+  local entry_print = find_parser('print')
+  local argc_v = argc
+  parse_openparen(entry_open, argv, &argc_v)
+  P(last_pred).name = '('
+  P(predicates).artificial = true
+  first_nonoption_arg = nilptr
+  while i < argc do
+    state.already_issued_stat_error_msg = false
+    if not looks_like_expression(argv[i], false) then
+      error0('paths must precede expression: `' .. view(argv[i]) .. "'")
+      if sys.access(argv[i], sys.F_OK) == 0 then
+        error0("possible unquoted pattern after predicate `" .. P(last_pred).name .. "'?")
+      end
+      xexit(1)
+    end
+    local predicate_name = argv[i]
+    local entry = find_parser(predicate_name)
+    if entry == 0 then die("unknown predicate `" .. view(predicate_name) .. "'") end
+    if parse_table[entry].type ~= ARG_SPECIAL_PARSE then i = i + 1 end
+    local oldi = i
+    if not parse_table[entry].parse(entry, argv, &i) then
+      if argv[i] ~= nilptr then
+        if parse_table[entry].type == ARG_SPECIAL_PARSE and i == oldi then
+          die("invalid predicate `" .. view(predicate_name) .. "'")
+        else
+          die("invalid argument `" .. view(argv[i]) .. "' to `" .. view(predicate_name) .. "'")
+        end
+      else
+        die("missing argument to `" .. view(predicate_name) .. "'")
+      end
+    else
+      P(last_pred).name = view(predicate_name)
+      if i ~= oldi then P(last_pred).arg_text = argv[oldi] else P(last_pred).arg_text = nilptr end
+    end
+  end
+  if P(predicates).next == 0 then
+    predicates = P(predicates).next
+    last_pred = predicates
+    parse_print(entry_print, argv, &argc_v)
+    P(last_pred).name = '-print'
+  elseif not default_prints(P(predicates).next) then
+    predicates = P(predicates).next
+  else
+    parse_closeparen(entry_close, argv, &argc_v)
+    P(last_pred).name = ')'
+    P(last_pred).artificial = true
+    parse_print(entry_print, argv, &argc_v)
+    P(last_pred).name = '-print'
+    P(last_pred).artificial = true
+  end
+  if (options.debug_options & (DebugExpressionTree | DebugTreeOpt)) ~= 0 then
+    local sb: stringbuilder
+    sb:write('Predicate List:\n')
+    print_list(&sb, predicates)
+    eputs(sb:view())
+    sb:destroy()
+  end
+  check_option_combinations(predicates)
+  local cur_pred = predicates
+  eval_tree = get_expr(&cur_pred, NO_PREC, 0)
+  calculate_derived_rates(eval_tree)
+  if cur_pred ~= 0 then
+    if P(cur_pred).func == P_CLOSEPAREN then
+      die("you have too many ')'")
+    else
+      if #P(cur_pred).name > 0 then die("unexpected extra predicate '" .. P(cur_pred).name .. "'")
+      else die('unexpected extra predicate') end
+    end
+  end
+  if (options.debug_options & (DebugExpressionTree | DebugTreeOpt)) ~= 0 then
+    eprint_tree('Eval Tree:\n', eval_tree, 0)
+  end
+  estimate_costs(eval_tree)
+  opt_expr((@Slot){kind = 0, id = 0})
+  do_arm_swaps(eval_tree)
+  if (options.debug_options & (DebugExpressionTree | DebugTreeOpt)) ~= 0 then
+    local sb: stringbuilder
+    sb:write('Optimized Eval Tree:\n')
+    print_tree(&sb, eval_tree, 0)
+    sb:write('Optimized command line:\n')
+    print_optlist(&sb, eval_tree)
+    sb:write('\n')
+    eputs(sb:view())
+    sb:destroy()
+  end
+  return eval_tree
+end
+
+-------------------------------------------------------------------------------
+-- util.c: cleanup
+
+local function complete_pending_execs(id: integer)
+  if id == 0 then return end
+  complete_pending_execs(P(id).left)
+  local p = P(id)
+  if p.func == P_EXEC and p.exec.multiple then
+    if p.exec.todo then bc_do_exec(&p.exec) end
+  end
+  complete_pending_execs(P(id).right)
+end
+
+local function do_complete_pending_execdirs(id: integer)
+  if id == 0 then return end
+  do_complete_pending_execdirs(P(id).left)
+  local p = P(id)
+  if p.func == P_EXECDIR or p.func == P_OKDIR then
+    if p.exec.multiple then
+      if p.exec.todo then do_exec(&p.exec) end
+    end
+  end
+  do_complete_pending_execdirs(P(id).right)
+end
+
+local function complete_pending_execdirs()
+  if state.execdirs_outstanding then
+    do_complete_pending_execdirs(eval_tree)
+    state.execdirs_outstanding = false
+  end
+end
+
+local function traverse_tree(id: integer)
+  if P(id).left ~= 0 then traverse_tree(P(id).left) end
+  complete_pending_execs(id)
+  if P(id).right ~= 0 then traverse_tree(P(id).right) end
+end
+
+function cleanup()
+  if eval_tree ~= 0 then
+    traverse_tree(eval_tree)
+    complete_pending_execdirs()
+  end
+  sharefile_destroy()
+  if restore_cwd(initial_wd) == 0 then
+    free_cwd(initial_wd)
+  else
+    local e = sys.errno()
+    local extra = ''
+    if initial_wd.desc < 0 and initial_wd.name ~= nilptr then extra = ': ' .. view(initial_wd.name) end
+    error_e(e, 'Failed to restore initial working directory' .. extra)
+    sys._exit(1)
+  end
+  if not sflush(outs) then nonfatal_nontarget_file_error(sys.errno(), 'standard output') end
+end
+
+local function show_success_rates(id: integer)
+  if (options.debug_options & DebugSuccessRates) ~= 0 then
+    local sb: stringbuilder
+    sb:write('Predicate success rates after completion:\n')
+    print_optlist(&sb, id)
+    sb:write('\n')
+    eputs(sb:view())
+    sb:destroy()
+  end
+end
+
+-------------------------------------------------------------------------------
+-- ftsfind.c
+
+local ftsoptions: integer = gfts.NOSTAT | gfts.TIGHT_CYCLE_CHECK | gfts.CWDFD | gfts.VERBATIM
+local prev_depth: integer = -2147483648
+
+local function get_fts_info_name(info: integer): string
+  if info == gfts.D then return 'FTS_D'
+  elseif info == gfts.DC then return 'FTS_DC'
+  elseif info == gfts.DEFAULT then return 'FTS_DEFAULT'
+  elseif info == gfts.DNR then return 'FTS_DNR'
+  elseif info == gfts.DOT then return 'FTS_DOT'
+  elseif info == gfts.DP then return 'FTS_DP'
+  elseif info == gfts.ERR then return 'FTS_ERR'
+  elseif info == gfts.F then return 'FTS_F'
+  elseif info == gfts.INIT then return 'FTS_INIT'
+  elseif info == gfts.NS then return 'FTS_NS'
+  elseif info == gfts.NSOK then return 'FTS_NSOK'
+  elseif info == gfts.SL then return 'FTS_SL'
+  elseif info == gfts.SLNONE then return 'FTS_SLNONE'
+  elseif info == gfts.W then return 'FTS_W' end
+  return '[' .. tostring(info) .. ']'
+end
+
+local function visit(p: *gfts.FTS, ent: *gfts.Ent, pstat: *sys.Stat)
+  state.have_stat = ent.info ~= gfts.NS and ent.info ~= gfts.NSOK
+  state.rel_pathname = gfts.accpath(p, ent)
+  state.cwd_dir_fd = p.cwd_fd
+  apply_predicate(gfts.path(p, ent), pstat, eval_tree)
+  if state.stop_at_current_level then gfts.set(p, ent, gfts.SKIP) end
+end
+
+local function symlink_loop(name: cstring): boolean
+  local st: sys.Stat
+  local rv = xstat(name, &st)
+  return rv ~= 0 and sys.errno() == ELOOP
+end
+
+local function pad6(s: string): string
+  if #s >= 6 then return s end
+  local sb: stringbuilder
+  sb:write(s)
+  for _ = #s + 1, 6 do sb:writebyte(32) end
+  return sb:promote()
+end
+
+local function pad2d(v: integer): string
+  local s = tostring(v)
+  if #s >= 2 then return s end
+  return ' ' .. s
+end
+
+local function issue_loop_warning(p: *gfts.FTS, ent: *gfts.Ent)
+  local path = gfts.path(p, ent)
+  if islnk(ent.st.st_mode) then
+    error0('Symbolic link ' .. q(path) .. ' is part of a loop in the directory hierarchy; we have already visited the directory to which it points.')
+  else
+    local cyc = (@string){data = p.path, size = (@usize)(ent.cycle.pathlen)}
+    error0('File system loop detected; ' .. q(path) .. ' is part of the same file system loop as ' .. q(cyc) .. '.')
+  end
+end
+
+local function consider_visiting(p: *gfts.FTS, ent: *gfts.Ent)
+  local statbuf: sys.Stat
+  local mode: cuint
+  local path = gfts.path(p, ent)
+  if (options.debug_options & DebugSearch) ~= 0 then
+    eputs('consider_visiting (early): ' .. q(path) .. ': fts_info=' .. pad6(get_fts_info_name(ent.info)) ..
+          ', fts_level=' .. pad2d(ent.level) .. ', prev_depth=' .. tostring(prev_depth) ..
+          ' fts_path=' .. q(path) .. ', fts_accpath=' .. q(view(gfts.accpath(p, ent))) .. '\n')
+  end
+  state.cwd_dir_fd = p.cwd_fd
+  prev_depth = ent.level
+  statbuf.st_ino = ent.st.st_ino
+  if ent.info == gfts.ERR then
+    nonfatal_target_file_error(ent.err_no, path)
+    return
+  end
+  if ent.info == gfts.DNR then
+    nonfatal_target_file_error(ent.err_no, path)
+    if options.do_dir_first then return end
+  elseif ent.info == gfts.DC then
+    issue_loop_warning(p, ent)
+    state.exit_status = 1
+    return
+  elseif ent.info == gfts.SLNONE then
+    if symlink_loop(gfts.accpath(p, ent)) then
+      nonfatal_target_file_error(ELOOP, path)
+      return
+    end
+  elseif ent.info == gfts.NS then
+    if ent.level == 0 then
+      nonfatal_target_file_error(ent.err_no, path)
+      return
+    else
+      if symlink_loop(gfts.accpath(p, ent)) then
+        nonfatal_target_file_error(ELOOP, path)
+        return
+      else
+        nonfatal_target_file_error(ent.err_no, path)
+      end
+    end
+  end
+  if ent.info == gfts.NSOK or ent.info == gfts.NS then
+    mode = state.type
+  else
+    state.have_stat = true
+    state.have_type = true
+    statbuf = ent.st
+    mode = statbuf.st_mode
+    state.type = mode
+    if mode == 0 then
+      error0('WARNING: file ' .. q(path) .. ' appears to have mode 0000')
+    end
+  end
+  state.curdepth = ent.level
+  if mode ~= 0 then
+    if not digest_mode(&mode, path, (@cstring)(ent.name), &statbuf, false) then return end
+  end
+  local ignore = false
+  local isdir_ = isdir(mode) or ent.info == gfts.D or ent.info == gfts.DP or ent.info == gfts.DC
+  if isdir_ and ent.info == gfts.NSOK then
+    gfts.set(p, ent, gfts.AGAIN)
+    return
+  end
+  if options.maxdepth >= 0 then
+    if ent.level >= options.maxdepth then
+      gfts.set(p, ent, gfts.SKIP)
+      if ent.level > options.maxdepth then ignore = true end
+    end
+  end
+  if ent.info == gfts.D and not options.do_dir_first then
+    ignore = true
+  elseif ent.info == gfts.DP and options.do_dir_first then
+    ignore = true
+  elseif ent.level < options.mindepth then
+    ignore = true
+  end
+  if (options.debug_options & DebugSearch) ~= 0 then
+    eputs('consider_visiting (late): ' .. q(path) .. ': fts_info=' .. pad6(get_fts_info_name(ent.info)) ..
+          ', isdir=' .. (isdir_ and '1' or '0') .. ' ignore=' .. (ignore and '1' or '0') ..
+          ' have_stat=' .. (state.have_stat and '1' or '0') .. ' have_type=' .. (state.have_type and '1' or '0') .. ' \n')
+  end
+  if not ignore then visit(p, ent, &statbuf) end
+  if ent.info == gfts.DP then state.stop_at_current_level = false end
+end
+
+local function find(arg: cstring): boolean
+  state.starting_path_length = cstrlen((@Bytes)(arg))
+  state.cwd_dir_fd = AT_FDCWD
+  if options.symlink_handling == SYMLINK_ALWAYS_DEREF then
+    ftsoptions = ftsoptions | gfts.COMFOLLOW | gfts.LOGICAL
+  elseif options.symlink_handling == SYMLINK_DEREF_ARGSONLY then
+    ftsoptions = ftsoptions | gfts.COMFOLLOW | gfts.PHYSICAL
+  else
+    ftsoptions = ftsoptions | gfts.PHYSICAL
+  end
+  if options.stay_on_filesystem then ftsoptions = ftsoptions | gfts.XDEV end
+  local arglist: sequence(string)
+  arglist:push(view(arg))
+  local p = gfts.open(arglist, ftsoptions)
+  arglist:destroy()
+  if p == nilptr then
+    error_e(sys.errno(), 'cannot search ' .. q(view(arg)))
+    state.exit_status = 1
+  else
+    local level: integer = -2147483648
+    while true do
+      sys.seterrno(0)
+      local ent = gfts.read(p)
+      if ent == nilptr then break end
+      if state.execdirs_outstanding and ent.level ~= level then complete_pending_execdirs() end
+      level = ent.level
+      state.already_issued_stat_error_msg = false
+      state.have_stat = false
+      state.have_type = ent.st.st_mode ~= 0
+      state.type = state.have_type and ent.st.st_mode or 0
+      consider_visiting(p, ent)
+    end
+    local e = sys.errno()
+    if e ~= 0 then
+      error_e(e, 'failed to read file names from file system at or below ' .. q(view(arg)))
+      state.exit_status = 1
+      return false
+    end
+    if gfts.close(p) ~= 0 then
+      error_e(sys.errno(), 'failed to restore working directory after searching ' .. view(arg))
+      state.exit_status = 1
+      return false
+    end
+  end
+  return true
+end
+
+-- argv-iter.c over a stream of NUL-terminated names
+local Files0 = @record{fd: cint, buf: [4096]byte, pos: integer, len: integer, eof: boolean, err: boolean, err_no: cint, n: integer}
+
+local function f0_getc(r: *Files0): integer
+  if r.pos < r.len then
+    local c = r.buf[r.pos]
+    r.pos = r.pos + 1
+    return c
+  end
+  if r.eof or r.err then return -1 end
+  local n: clong
+  repeat n = sys.read(r.fd, &r.buf[0], 4096) until not (n < 0 and sys.errno() == EINTR)
+  if n > 0 then
+    r.len = n
+    r.pos = 1
+    return r.buf[0]
+  end
+  if n == 0 then r.eof = true else r.err = true; r.err_no = sys.errno() end
+  return -1
+end
+
+-- getdelim (..., '\0', ...): false at end of input or on an error
+local function f0_next(r: *Files0, tok: *sequence(byte)): boolean
+  tok:clear()
+  local got = false
+  while true do
+    local c = f0_getc(r)
+    if c < 0 then break end
+    got = true
+    tok:push((@byte)(c))
+    if c == 0 then break end
+  end
+  if not got then return false end
+  if #tok == 0 or tok[#tok] ~= 0 then tok:push(0) end
+  r.n = r.n + 1
+  return true
+end
+
+local function process_all_startpoints(argc: integer, argv: CStrs): boolean
+  local argv_starting_points = 0 < argc and not looks_like_expression(argv[0], true)
+  local files0_quoted: string = ''
+  local f0: *Files0 = nilptr
+  if options.files0_from ~= nilptr then
+    if argv_starting_points then
+      error0('extra operand ' .. q(view(argv[0])))
+      die('file operands cannot be combined with -files0-from')
+    end
+    f0 = default_allocator:new(@Files0)
+    if view(options.files0_from) == '-' then
+      if options.ok_prompt_stdin then
+        die('option -files0-from reading from standard input cannot be combined with -ok, -okdir\n')
+      end
+      files0_quoted = q('(standard input)')
+      f0.fd = 0
+    else
+      files0_quoted = q(view(options.files0_from))
+      f0.fd = sys.open(options.files0_from, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+      if f0.fd < 0 then die_e(sys.errno(), 'cannot open ' .. files0_quoted .. ' for reading') end
+      if options.ok_prompt_stdin then
+        local sb1: sys.Stat
+        local sb2: sys.Stat
+        if sys.fstat(f0.fd, &sb1) == 0 and sys.fstat(0, &sb2) == 0 and sb1.st_ino == sb2.st_ino and sb1.st_dev == sb2.st_dev then
+          die('option -files0-from: standard input must not refer to the same file when combined with -ok, -okdir: ' ..
+              files0_quoted .. '\n')
+        end
+      end
+    end
+  else
+    if not argv_starting_points then
+      return find('.')
+    end
+  end
+  local ok = true
+  local ai = 0
+  local tok: sequence(byte)
+  while true do
+    local file_name: cstring
+    if f0 ~= nilptr then
+      if not f0_next(f0, &tok) then
+        if f0.err then
+          error_e(f0.err_no, files0_quoted .. ': read error')
+          state.exit_status = 1
+          ok = false
+        end
+        break
+      end
+      file_name = (@cstring)(&tok[1])
+    else
+      if ai >= argc then break end
+      file_name = argv[ai]
+      ai = ai + 1
+    end
+    if (@Bytes)(file_name)[0] == 0 then
+      if f0 == nilptr then
+        error_e(ENOENT, q(''))
+      else
+        error0(files0_quoted .. ':' .. tostring(f0.n) .. ': invalid zero-length file name')
+      end
+      state.exit_status = 1
+      ok = false
+      continue
+    end
+    if f0 == nilptr and looks_like_expression(file_name, true) then break end
+    state.starting_path_length = cstrlen((@Bytes)(file_name))
+    if not find(file_name) then
+      ok = false
+      break
+    end
+  end
+  if ok and f0 ~= nilptr then
+    local bad = f0.err
+    if f0.fd ~= 0 and sys.close(f0.fd) ~= 0 then bad = true end
+    if bad then die('error reading ' .. files0_quoted) end
+  end
+  return ok
+end
+
+-------------------------------------------------------------------------------
+-- util.c: leading options, -D, -O, usage
+
+local debug_names: [9]string = {'exec', 'opt', 'rates', 'search', 'stat', 'time', 'tree', 'all', 'help'}
+local debug_vals: [9]integer = {DebugExec, DebugExpressionTree | DebugTreeOpt, DebugSuccessRates, DebugSearch,
+  DebugStat, DebugTime, DebugExpressionTree, DebugAll, DebugHelp}
+local debug_docs: [9]string = {
+  'Show diagnostic information relating to -exec, -execdir, -ok and -okdir',
+  'Show diagnostic information relating to optimisation',
+  'Indicate how often each predicate succeeded',
+  'Navigate the directory tree verbosely',
+  'Trace calls to stat(2) and lstat(2)',
+  'Show diagnostic information relating to time-of-day and timestamp comparisons',
+  'Display the expression tree',
+  'Set all of the debug flags (but help)',
+  'Explain the various -D options',
+}
+
+local function show_valid_debug_options(full: boolean)
+  sputs(outs, 'Valid arguments for -D:\n')
+  if full then
+    for i = 0, 8 do
+      local nm = debug_names[i]
+      local sb: stringbuilder
+      sb:write(nm)
+      for _ = #nm + 1, 10 do sb:writebyte(32) end
+      sb:write(' ', debug_docs[i], '\n')
+      sputs(outs, sb:view())
+      sb:destroy()
+    end
+  else
+    for i = 0, 8 do
+      if i > 0 then sputs(outs, ', ') end
+      sputs(outs, debug_names[i])
+    end
+  end
+end
+
+function usage(status: integer)
+  if status ~= 0 then
+    eputs("Try '" .. util.applet .. " --help' for more information.\n")
+    xexit(status)
+  end
+  sputs(outs, 'Usage: ' .. util.applet .. [[ [-H] [-L] [-P] [-Olevel] [-D debugopts] [path...] [expression]
+
+Default path is the current directory; default expression is -print.
+Expression may consist of: operators, options, tests, and actions.
+
+Operators (decreasing precedence; -and is implicit where no others are given):
+      ( EXPR )   ! EXPR   -not EXPR   EXPR1 -a EXPR2   EXPR1 -and EXPR2
+      EXPR1 -o EXPR2   EXPR1 -or EXPR2   EXPR1 , EXPR2
+
+Positional options (always true):
+      -daystart -follow -nowarn -regextype -warn
+
+Normal options (always true, specified before other expressions):
+      -depth -files0-from FILE -maxdepth LEVELS -mindepth LEVELS
+       -mount -noleaf -xdev -ignore_readdir_race -noignore_readdir_race
+
+Tests (N can be +N or -N or N):
+      -amin N -anewer FILE -atime N -cmin N -cnewer FILE -context CONTEXT
+      -ctime N -empty -false -fstype TYPE -gid N -group NAME -ilname PATTERN
+      -iname PATTERN -inum N -iwholename PATTERN -iregex PATTERN
+      -links N -lname PATTERN -mmin N -mtime N -name PATTERN -newer FILE
+      -nouser -nogroup -path PATTERN -perm [-/]MODE -regex PATTERN
+      -readable -writable -executable
+      -wholename PATTERN -size N[bcwkMG] -true -type [bcdpflsD] -uid N
+      -used N -user NAME -xtype [bcdpfls]
+
+Actions:
+      -delete -print0 -printf FORMAT -fprintf FILE FORMAT -print 
+      -fprint0 FILE -fprint FILE -ls -fls FILE -prune -quit
+      -exec COMMAND ; -exec COMMAND {} + -ok COMMAND ;
+      -execdir COMMAND ; -execdir COMMAND {} + -okdir COMMAND ;
+
+Other common options:
+      --help                   display this help and exit
+      --version                output version information and exit
+
+]])
+  show_valid_debug_options(false)
+  sputs(outs, "\nUse '-D help' for a description of the options, or see find(1)\n\n")
+  xexit(status)
+end
+
+local function process_debug_options(arg: cstring)
+  local s = (@Bytes)(arg)
+  local n = cstrlen(s)
+  local empty = true
+  local i = 0
+  while i < n do
+    while i < n and s[i] == 44 do i = i + 1 end
+    if i >= n then break end
+    local st = i
+    while i < n and s[i] ~= 44 do i = i + 1 end
+    local tokn = (@string){data = &s[st], size = (@usize)(i - st)}
+    -- strtok_r ends the token in place: later messages quote ARG as cut there
+    if i < n then
+      s[i] = 0
+      i = i + 1
+    end
+    empty = false
+    local found = false
+    for k = 0, 8 do
+      if debug_names[k] == tokn then
+        options.debug_options = options.debug_options | debug_vals[k]
+        found = true
+        break
+      end
+    end
+    if not found then
+      error0('Ignoring unrecognised debug flag ' .. q(view(arg)))
+    end
+  end
+  if empty then
+    error0('Empty argument to the -D option.')
+    usage(1)
+  elseif (options.debug_options & DebugHelp) ~= 0 then
+    show_valid_debug_options(true)
+    xexit(0)
+  end
+end
+
+local function process_optimisation_option(arg: cstring)
+  local a = (@Bytes)(arg)
+  if a[0] == 0 then
+    die('The -O option must be immediately followed by a decimal integer')
+  end
+  if not (a[0] >= 48 and a[0] <= 57) then
+    die('Please specify a decimal number immediately after -O')
+  end
+  local endp: cstring
+  sys.seterrno(0)
+  local opt_level = c_strtoul(arg, &endp, 10)
+  local e = sys.errno()
+  if opt_level == 0 and (@usize)(endp) == (@usize)(arg) then
+    die('Please specify a decimal number immediately after -O')
+  elseif (@Bytes)(endp)[0] ~= 0 then
+    die('Invalid optimisation level ' .. view(arg))
+  elseif opt_level == 0xffffffffffffffff and e ~= 0 then
+    die_e(e, 'Invalid optimisation level ' .. view(arg))
+  elseif opt_level > 65535 then
+    die('Optimisation level ' .. tostring(opt_level) .. ' is too high.  If you want to find files very quickly, consider using GNU locate.')
+  end
+  options.optimisation_level = opt_level
+end
+
+local function process_leading_options(argc: integer, argv: CStrs): integer
+  local i = 1
+  local end_of_leading_options = 1
+  while true do
+    end_of_leading_options = i
+    if i >= argc then break end
+    local a = view(argv[i])
+    if a == '-H' then set_follow_state(SYMLINK_DEREF_ARGSONLY)
+    elseif a == '-L' then set_follow_state(SYMLINK_ALWAYS_DEREF)
+    elseif a == '-P' then set_follow_state(SYMLINK_NEVER_DEREF)
+    elseif a == '--' then
+      end_of_leading_options = i + 1
+      break
+    elseif a == '-D' then
+      if argc <= i + 1 then
+        error0('Missing argument after the -D option.')
+        usage(1)
+      end
+      process_debug_options(argv[i + 1])
+      i = i + 1
+    elseif #a >= 2 and a.data[0] == 45 and a.data[1] == 79 then
+      process_optimisation_option((@cstring)(&a.data[2]))
+    else
+      end_of_leading_options = i
+      break
+    end
+    i = i + 1
+  end
+  return end_of_leading_options
+end
+
+local function set_option_defaults()
+  options.posixly_correct = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  options.open_nofollow_available = true
+  options.regex_options = 0
+  options.warnings = sys.isatty(0) ~= 0
+  options.literal_control_chars = false
+  if options.posixly_correct then options.warnings = false end
+  options.do_dir_first = true
+  options.explicit_depth = false
+  options.maxdepth = -1
+  options.mindepth = -1
+  local ts: sys.Timespec
+  sys.clock_gettime(sys.CLOCK_REALTIME, &ts)
+  options.start_sec = ts.tv_sec
+  options.start_nsec = (ts.tv_nsec // 1000) * 1000
+  options.day_sec = options.start_sec - DAYSECS
+  options.day_nsec = options.start_nsec
+  options.full_days = false
+  options.stay_on_filesystem = false
+  options.ignore_readdir_race = false
+  options.output_block_size = options.posixly_correct and 512 or 1024
+  options.debug_options = 0
+  options.optimisation_level = 2
+  if sys.getenv('FIND_BLOCK_SIZE') ~= nilptr then
+    die('The environment variable FIND_BLOCK_SIZE is not supported, the only thing that affects the block size is the POSIXLY_CORRECT environment variable')
+  end
+  options.no_leaf_check = false
+  set_follow_state(SYMLINK_NEVER_DEREF)
+  options.files0_from = nilptr
+  options.ok_prompt_stdin = false
+end
+
+local function lookup_entry(name: string): integer
+  for i = 2, #parse_table do
+    if parse_table[i].name == name then return i end
+  end
+  return 0
+end
+
+global function applet_find(args: sequence(string)): integer
+  outs = stream_new(1, false)
+  errs = stream_new(2, true)
+  init_parse_table()
+  entry_and = lookup_entry('and')
+  entry_noop = lookup_entry('--noop')
+  entry_false = lookup_entry('false')
+  local argc = #args + 1
+  local argv = (@CStrs)(c_malloc((@csize)((argc + 1) * 8)))
+  argv[0] = cdup(util.applet)
+  for i = 1, #args do argv[i] = cdup(args[i]) end
+  argv[argc] = nilptr
+  record_initial_cwd()
+  state.already_issued_stat_error_msg = false
+  state.exit_status = 0
+  state.execdirs_outstanding = false
+  state.cwd_dir_fd = AT_FDCWD
+  set_option_defaults()
+  local end_of_leading_options = process_leading_options(argc, argv)
+  if (options.debug_options & DebugStat) ~= 0 then options.xstat = XSTAT_DEBUG end
+  if (options.debug_options & DebugTime) ~= 0 then
+    eputs('cur_day_start = ' .. ctime_str(options.day_sec))
+  end
+  build_expression_tree(argc, argv, end_of_leading_options)
+  if process_all_startpoints(argc - end_of_leading_options, (@CStrs)(&argv[end_of_leading_options])) then
+    show_success_rates(eval_tree)
+    cleanup()
+  end
+  xexit(state.exit_status)
+  return state.exit_status
+end
