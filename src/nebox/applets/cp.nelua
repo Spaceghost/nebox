@@ -1,0 +1,397 @@
+-- cp: a port of GNU coreutils 9.1 src/cp.c over src/nebox/copy.nelua.
+-- Every option: -a -b -d -f -H -i -l -L -n -p -P -r/-R -s -S -t -T -u -v -x,
+-- --attributes-only, --copy-contents, --no-preserve, --parents (with
+-- make_dir_parents_private and re_protect), --preserve[=LIST],
+-- --remove-destination, --sparse, --reflink, --strip-trailing-slashes,
+-- -Z/--context (warned about and ignored: no SELinux), the target
+-- directory logic and the "cp --force --backup f f" shortcut.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.backup'
+require 'nebox.copy'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+local function c_mkdirat(fd: cint, path: cstring, mode: cuint): cint <cimport 'mkdirat', cinclude '<sys/stat.h>'> end
+local function c_fchmodat(fd: cint, path: cstring, mode: cuint, flags: cint): cint <cimport 'fchmodat', cinclude '<sys/stat.h>'> end
+local function c_fchownat(fd: cint, path: cstring, uid: cuint, gid: cuint, flags: cint): cint <cimport 'fchownat', cinclude '<unistd.h>'> end
+local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local S_IRWXU: cuint <comptime> = 0x1C0
+local S_IRWXG: cuint <comptime> = 0x38
+local S_IRWXO: cuint <comptime> = 0x7
+local S_IWGRP: cuint <comptime> = 0x10
+local S_IWOTH: cuint <comptime> = 0x2
+local S_IRWXUGO: cuint <comptime> = 0x1FF
+local CHMOD_MODE_BITS: cuint <comptime> = 0xFFF
+
+local parents_option = false
+local remove_trailing_slashes = false
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function die(msg: string) util.err(msg); util.flush(); c_exit(1) end
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'cp --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local DirAttr = @record{ st: sys.Stat, slash_offset: integer, restore_mode: boolean }
+
+local function lchmodat(dirfd: cint, name: string, mode: cuint): cint
+  local st: sys.Stat
+  if c_fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 and (st.st_mode & 0xF000) == 0xA000 then
+    sys.seterrno(95)
+    return -1
+  end
+  return c_fchmodat(dirfd, name, mode, 0)
+end
+
+-- re_protect: the --parents directories get their attributes from the
+-- source directories, innermost first.
+local function re_protect(dst_name: string, dst_dirfd: cint, dst_reloff: integer, attrs: *sequence(DirAttr), x: *copy.Options): boolean
+  for i = #attrs, 1, -1 do
+    local p = &attrs[i]
+    local name = dst_name:sub(1, p.slash_offset)
+    local rel = name:sub(dst_reloff + 1)
+    if x.preserve_timestamps then
+      local ts: [2]sys.Timespec = {p.st.st_atim, p.st.st_mtim}
+      if c_utimensat(dst_dirfd, rel, &ts, 0) ~= 0 then
+        util.err(errno_msg('failed to preserve times for ' .. util.quoteaf(name), sys.errno()))
+        return false
+      end
+    end
+    if x.preserve_ownership then
+      if c_fchownat(dst_dirfd, rel, p.st.st_uid, p.st.st_gid, AT_SYMLINK_NOFOLLOW) ~= 0 then
+        if not copy.chown_failure_ok(x) then
+          util.err(errno_msg('failed to preserve ownership for ' .. util.quoteaf(name), sys.errno()))
+          return false
+        end
+        c_fchownat(dst_dirfd, rel, 0xffffffff, p.st.st_gid, AT_SYMLINK_NOFOLLOW)
+      end
+    end
+    if x.preserve_mode then
+      if copy.copy_acl(rel, -1, name, -1, p.st.st_mode) ~= 0 then return false end
+    elseif p.restore_mode then
+      if lchmodat(dst_dirfd, rel, p.st.st_mode) ~= 0 then
+        util.err(errno_msg('failed to preserve permissions for ' .. util.quoteaf(name), sys.errno()))
+        return false
+      end
+    end
+  end
+  return true
+end
+
+-- dir_len: the length of DIR's directory part (gnulib).
+local function dir_len(s: string): integer
+  local base_off = #s - #copy.last_component(s)
+  local prefix = (#s > 0 and s:byte(1) == 47) and 1 or 0
+  local len = base_off
+  while len > prefix and s:byte(len) == 47 do len = len - 1 end
+  return len
+end
+
+local function make_dir_parents_private(const_dir: string, src_offset: integer, dst_dirfd: cint, verbose: boolean,
+    attrs: *sequence(DirAttr), new_dst: *boolean, x: *copy.Options): boolean
+  local stats: sys.Stat
+  local dirlen = dir_len(const_dir)
+  attrs:clear()
+  if dirlen <= src_offset then return true end
+  local dir = const_dir
+  local dst_dir = dir:sub(1, dirlen)
+  local r = src_offset + 1
+  while r <= #dst_dir and dst_dir:byte(r) == 47 do r = r + 1 end
+  local dst_reldir = dst_dir:sub(r)
+  if c_fstatat(dst_dirfd, dst_reldir, &stats, 0) ~= 0 then
+    local slash = src_offset + 1
+    while slash <= #dir and dir:byte(slash) == 47 do slash = slash + 1 end
+    local rel_start = slash
+    while true do
+      local nxt = dir:find('/', slash, true)
+      if nxt == 0 then break end
+      local prefix = dir:sub(1, nxt - 1)
+      local src = prefix:sub(src_offset + 1)
+      local reldir = prefix:sub(rel_start)
+      local missing_dir = c_fstatat(dst_dirfd, reldir, &stats, 0) ~= 0
+      local new_index = 0
+      if missing_dir or x.preserve_ownership or x.preserve_mode or x.preserve_timestamps then
+        local src_st: sys.Stat
+        local src_errno: cint = 0
+        if sys.stat(src, &src_st) ~= 0 then src_errno = sys.errno()
+        elseif (src_st.st_mode & 0xF000) ~= 0x4000 then src_errno = 20 end
+        if src_errno ~= 0 then
+          util.err(errno_msg('failed to get attributes of ' .. util.quoteaf(src), src_errno))
+          return false
+        end
+        attrs:push({st = src_st, slash_offset = nxt - 1, restore_mode = false})
+        new_index = #attrs
+      end
+      if missing_dir then
+        $new_dst = true
+        local src_mode = attrs[new_index].st.st_mode
+        local omitted = src_mode & (x.preserve_ownership and (S_IRWXG | S_IRWXO) or (x.preserve_mode and (S_IWGRP | S_IWOTH) or 0))
+        local mkdir_mode = x.explicit_no_preserve_mode and S_IRWXUGO or src_mode
+        mkdir_mode = mkdir_mode & CHMOD_MODE_BITS & ~omitted
+        if c_mkdirat(dst_dirfd, reldir, mkdir_mode) ~= 0 then
+          util.err(errno_msg('cannot make directory ' .. util.quoteaf(prefix), sys.errno()))
+          return false
+        elseif verbose then
+          util.write(src .. ' -> ' .. prefix .. '\n')
+        end
+        if c_fstatat(dst_dirfd, reldir, &stats, AT_SYMLINK_NOFOLLOW) ~= 0 then
+          util.err(errno_msg('failed to get attributes of ' .. util.quoteaf(prefix), sys.errno()))
+          return false
+        end
+        if not x.preserve_mode then
+          if (omitted & ~stats.st_mode) ~= 0 then omitted = omitted & ~copy.cached_umask() end
+          if (omitted & ~stats.st_mode) ~= 0 or (stats.st_mode & S_IRWXU) ~= S_IRWXU then
+            attrs[new_index].st.st_mode = stats.st_mode | omitted
+            attrs[new_index].restore_mode = true
+          end
+        end
+        local accessible = stats.st_mode | S_IRWXU
+        if stats.st_mode ~= accessible then
+          if lchmodat(dst_dirfd, reldir, accessible & 0xFFF) ~= 0 then
+            util.err(errno_msg('setting permissions for ' .. util.quoteaf(prefix), sys.errno()))
+            return false
+          end
+        end
+      elseif (stats.st_mode & 0xF000) ~= 0x4000 then
+        util.err(util.quoteaf(prefix) .. ' exists but is not a directory')
+        return false
+      else
+        $new_dst = false
+      end
+      slash = nxt + 1
+      while slash <= #dir and dir:byte(slash) == 47 do slash = slash + 1 end
+    end
+  elseif (stats.st_mode & 0xF000) ~= 0x4000 then
+    util.err(util.quoteaf(dst_dir) .. ' exists but is not a directory')
+    return false
+  else
+    $new_dst = false
+  end
+  return true
+end
+
+local function do_copy(files: sequence(string), target_directory: string, have_target: boolean,
+    no_target_directory: boolean, x: *copy.Options): boolean
+  local n_files = #files
+  local new_dst = false
+  local ok = true
+  if n_files <= (have_target and 0 or 1) then
+    if n_files <= 0 then usage_fail('missing file operand') end
+    usage_fail('missing destination file operand after ' .. util.quoteaf(files[1]))
+  end
+  local sb_mode: cuint = 0
+  local target_dirfd: cint = AT_FDCWD
+  if no_target_directory then
+    if have_target then die('cannot combine --target-directory (-t) and --no-target-directory (-T)') end
+    if 2 < n_files then usage_fail('extra operand ' .. util.quoteaf(files[3])) end
+  elseif have_target then
+    target_dirfd = copy.target_directory_operand(target_directory)
+    if target_dirfd == -1 then die(errno_msg('target directory ' .. util.quoteaf(target_directory), sys.errno())) end
+  else
+    local lastfile = files[n_files]
+    local fd = copy.target_directory_operand(lastfile)
+    if fd ~= -1 then
+      target_dirfd = fd
+      target_directory = lastfile; have_target = true
+      n_files = n_files - 1
+    else
+      local e = sys.errno()
+      if e == 2 then new_dst = true end
+      if 2 < n_files then die(errno_msg('target ' .. util.quoteaf(lastfile), e)) end
+    end
+  end
+  if have_target then
+    if 2 <= n_files then x.dest_info = true; x.src_info = true end
+    for i = 1, n_files do
+      local arg = files[i]
+      local parent_exists = true
+      local attrs: sequence(DirAttr)
+      local dst_name: string
+      local arg_in_concat: integer
+      if remove_trailing_slashes then arg = copy.strip_trailing_slashes(arg) end
+      if parents_option then
+        local arg_no_trailing_slash = copy.strip_trailing_slashes(arg)
+        dst_name, arg_in_concat = copy.file_name_concat(target_directory, arg_no_trailing_slash)
+        parent_exists = make_dir_parents_private(dst_name, arg_in_concat - 1, target_dirfd, x.verbose, &attrs, &new_dst, x)
+        while arg_in_concat <= #dst_name and dst_name:byte(arg_in_concat) == 47 do arg_in_concat = arg_in_concat + 1 end
+      else
+        local arg_base = copy.strip_trailing_slashes(copy.last_component(arg))
+        if arg_base == '..' then arg_base = '.' end
+        dst_name, arg_in_concat = copy.file_name_concat(target_directory, arg_base)
+      end
+      if not parent_exists then
+        ok = false
+      else
+        local copy_into_self = false
+        ok = copy.copy(arg, dst_name, target_dirfd, dst_name:sub(arg_in_concat), new_dst and 1 or 0, x, &copy_into_self, nilptr) and ok
+        if parents_option then ok = re_protect(dst_name, target_dirfd, arg_in_concat - 1, &attrs, x) and ok end
+      end
+    end
+  else
+    local source = files[1]
+    local dest = files[2]
+    if parents_option then usage_fail('with --parents, the destination must be a directory') end
+    local xp = x
+    local x_tmp: copy.Options
+    if x.unlink_dest_after_failed_open and x.backup_type ~= backup.NONE and source == dest and not new_dst then
+      local st: sys.Stat
+      if sys.stat(dest, &st) == 0 and (st.st_mode & 0xF000) == 0x8000 then
+        dest = backup.find_name(AT_FDCWD, dest, x.backup_type)
+        x_tmp = $x
+        x_tmp.backup_type = backup.NONE
+        xp = &x_tmp
+      end
+    end
+    local unused = false
+    ok = copy.copy(source, dest, AT_FDCWD, dest, new_dst and -1 or 0, xp, &unused, nilptr)
+  end
+  return ok
+end
+
+local function decode_preserve_arg(arg: string, x: *copy.Options, on_off: boolean)
+  local s = arg
+  while true do
+    local comma = s:find(',', 1, true)
+    local item = comma > 0 and s:sub(1, comma - 1) or s
+    local names: []string = {'mode', 'timestamps', 'ownership', 'links', 'context', 'xattr', 'all'}
+    local values: []integer = {0, 1, 2, 3, 4, 5, 6}
+    local v = util.argmatch(on_off and '--preserve' or '--no-preserve', item, &names, &values, 7)
+    if v < 0 then usage_fail('') end
+    if v == 0 then x.preserve_mode = on_off; x.explicit_no_preserve_mode = not on_off
+    elseif v == 1 then x.preserve_timestamps = on_off
+    elseif v == 2 then x.preserve_ownership = on_off
+    elseif v == 3 then x.preserve_links = on_off
+    elseif v == 4 then x.require_preserve_context = on_off; x.preserve_security_context = on_off
+    elseif v == 5 then x.preserve_xattr = on_off; x.require_preserve_xattr = on_off
+    else
+      x.preserve_mode = on_off; x.preserve_timestamps = on_off; x.preserve_ownership = on_off
+      x.preserve_links = on_off; x.explicit_no_preserve_mode = not on_off; x.preserve_xattr = on_off
+    end
+    if comma == 0 then break end
+    s = s:sub(comma + 1)
+  end
+end
+
+global function applet_cp(args: sequence(string)): integer
+  local make_backups = false
+  local backup_suffix = ''
+  local have_suffix = false
+  local version_control = ''
+  local have_vc = false
+  local copy_contents = false
+  local target_directory = ''
+  local have_target = false
+  local no_target_directory = false
+  local x: copy.Options
+  copy.default_options(&x)
+  x.copy_as_regular = true
+  x.dereference = copy.DEREF_UNDEFINED
+  x.interactive = copy.I_UNSPECIFIED
+  x.reflink_mode = copy.REFLINK_AUTO
+  x.data_copy_required = true
+  x.sparse_mode = copy.SPARSE_AUTO
+  x.open_dangling_dest_symlink = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  local longs: []util.LongOpt = {
+    {'archive', 0, 97}, {'attributes-only', 0, 256}, {'backup', 2, 98}, {'copy-contents', 0, 257},
+    {'dereference', 0, 76}, {'force', 0, 102}, {'interactive', 0, 105}, {'link', 0, 108},
+    {'no-clobber', 0, 110}, {'no-dereference', 0, 80}, {'no-preserve', 1, 258},
+    {'no-target-directory', 0, 84}, {'one-file-system', 0, 120}, {'parents', 0, 259}, {'path', 0, 259},
+    {'preserve', 2, 260}, {'recursive', 0, 82}, {'remove-destination', 0, 261}, {'sparse', 1, 262},
+    {'reflink', 2, 263}, {'strip-trailing-slashes', 0, 264}, {'suffix', 1, 83}, {'symbolic-link', 0, 115},
+    {'target-directory', 1, 116}, {'update', 0, 117}, {'verbose', 0, 118}, {'context', 2, 90},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'abdfHilLnprst:uvxPRS:TZ', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 262 then
+      local names: []string = {'never', 'auto', 'always'}
+      local values: []integer = {copy.SPARSE_NEVER, copy.SPARSE_AUTO, copy.SPARSE_ALWAYS}
+      local v = util.argmatch('--sparse', g.optarg, &names, &values, 3)
+      if v < 0 then usage_fail('') end
+      x.sparse_mode = v
+    elseif c == 263 then
+      if not g.has_optarg then x.reflink_mode = copy.REFLINK_ALWAYS
+      else
+        local names: []string = {'auto', 'always', 'never'}
+        local values: []integer = {copy.REFLINK_AUTO, copy.REFLINK_ALWAYS, copy.REFLINK_NEVER}
+        local v = util.argmatch('--reflink', g.optarg, &names, &values, 3)
+        if v < 0 then usage_fail('') end
+        x.reflink_mode = v
+      end
+    elseif c == 97 then
+      x.dereference = copy.DEREF_NEVER
+      x.preserve_links = true; x.preserve_ownership = true; x.preserve_mode = true
+      x.preserve_timestamps = true; x.require_preserve = true
+      x.preserve_xattr = true; x.reduce_diagnostics = true; x.recursive = true
+    elseif c == 98 then
+      make_backups = true
+      if g.has_optarg then version_control = g.optarg; have_vc = true end
+    elseif c == 256 then x.data_copy_required = false
+    elseif c == 257 then copy_contents = true
+    elseif c == 100 then x.preserve_links = true; x.dereference = copy.DEREF_NEVER
+    elseif c == 102 then x.unlink_dest_after_failed_open = true
+    elseif c == 72 then x.dereference = copy.DEREF_COMMAND_LINE_ARGUMENTS
+    elseif c == 105 then x.interactive = copy.I_ASK_USER
+    elseif c == 108 then x.hard_link = true
+    elseif c == 76 then x.dereference = copy.DEREF_ALWAYS
+    elseif c == 110 then x.interactive = copy.I_ALWAYS_NO
+    elseif c == 80 then x.dereference = copy.DEREF_NEVER
+    elseif c == 258 then decode_preserve_arg(g.optarg, &x, false)
+    elseif c == 260 and g.has_optarg then
+      decode_preserve_arg(g.optarg, &x, true)
+      x.require_preserve = true
+    elseif c == 260 or c == 112 then
+      x.preserve_ownership = true; x.preserve_mode = true; x.preserve_timestamps = true; x.require_preserve = true
+    elseif c == 259 then parents_option = true
+    elseif c == 114 or c == 82 then x.recursive = true
+    elseif c == 261 then x.unlink_dest_before_opening = true
+    elseif c == 264 then remove_trailing_slashes = true
+    elseif c == 115 then x.symbolic_link = true
+    elseif c == 116 then
+      if have_target then die('multiple target directories specified') end
+      target_directory = g.optarg; have_target = true
+    elseif c == 84 then no_target_directory = true
+    elseif c == 117 then x.update = true
+    elseif c == 118 then x.verbose = true
+    elseif c == 120 then x.one_file_system = true
+    elseif c == 90 then
+      if g.has_optarg then util.err('warning: ignoring --context; it requires an SELinux-enabled kernel') end
+    elseif c == 83 then make_backups = true; backup_suffix = g.optarg; have_suffix = true
+    end
+  end
+  if x.hard_link and x.symbolic_link then usage_fail('cannot make both hard and symbolic links') end
+  if x.interactive == copy.I_ALWAYS_NO then x.update = false end
+  if make_backups and x.interactive == copy.I_ALWAYS_NO then usage_fail('options --backup and --no-clobber are mutually exclusive') end
+  if x.reflink_mode == copy.REFLINK_ALWAYS and x.sparse_mode ~= copy.SPARSE_AUTO then usage_fail('--reflink can be used only with --sparse=auto') end
+  x.backup_type = make_backups and backup.xget_version('backup type', version_control, have_vc) or backup.NONE
+  backup.set_simple_suffix(backup_suffix, have_suffix)
+  if x.dereference == copy.DEREF_UNDEFINED then
+    if x.recursive and not x.hard_link then x.dereference = copy.DEREF_NEVER else x.dereference = copy.DEREF_ALWAYS end
+  end
+  if x.recursive then x.copy_as_regular = copy_contents end
+  if x.require_preserve_context then die('cannot preserve security context without an SELinux-enabled kernel') end
+  local ok = do_copy(g:operands(), target_directory, have_target, no_target_directory, &x)
+  copy.close_stdin()
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end

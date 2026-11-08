@@ -1,0 +1,1655 @@
+-- GNU coreutils 9.1 src/copy.c and src/cp-hash.c, shared by cp, mv and
+-- install: copy_internal with its same_file_ok, overwrite and backup
+-- rules, copy_reg (copy_file_range, FICLONE reflinks, SEEK_DATA/SEEK_HOLE
+-- extent copies and hole punching for --sparse, the u+w window for xattrs,
+-- dangling-symlink refusal), copy_dir over names in inode order (gnulib
+-- savedir SAVEDIR_SORT_FASTREAD), hard-link preservation through the
+-- source dev/ino map, special files, symlinks (including --update's
+-- identical-target shortcut), ownership/mode/timestamp preservation with
+-- the restrictive temporary modes, xattrs as libattr copies them under
+-- /etc/xattr.conf's defaults, and un-backup on failure. ACLs: the mode is
+-- applied and a source system.posix_acl_* attribute copied as is. SELinux
+-- contexts are not supported (the build has no libselinux).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'hashmap'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.backup'
+require 'nebox.canonicalize'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+local function c_mkdirat(fd: cint, path: cstring, mode: cuint): cint <cimport 'mkdirat', cinclude '<sys/stat.h>'> end
+local function c_mknodat(fd: cint, path: cstring, mode: cuint, dev: culong): cint <cimport 'mknodat', cinclude '<sys/stat.h>'> end
+local function c_mkfifoat(fd: cint, path: cstring, mode: cuint): cint <cimport 'mkfifoat', cinclude '<sys/stat.h>'> end
+local function c_unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
+local function c_renameat(ofd: cint, old: cstring, nfd: cint, new: cstring): cint <cimport 'renameat', cinclude '<stdio.h>'> end
+local c_renameat2 = sys.renameat2
+local function c_symlinkat(target: cstring, nfd: cint, new: cstring): cint <cimport 'symlinkat', cinclude '<unistd.h>'> end
+local function c_linkat(ofd: cint, old: cstring, nfd: cint, new: cstring, flags: cint): cint <cimport 'linkat', cinclude '<unistd.h>'> end
+local function c_readlinkat(fd: cint, path: cstring, buf: pointer, n: csize): clong <cimport 'readlinkat', cinclude '<unistd.h>'> end
+local function c_fchmodat(fd: cint, path: cstring, mode: cuint, flags: cint): cint <cimport 'fchmodat', cinclude '<sys/stat.h>'> end
+local function c_fchownat(fd: cint, path: cstring, uid: cuint, gid: cuint, flags: cint): cint <cimport 'fchownat', cinclude '<unistd.h>'> end
+local function c_fchown(fd: cint, uid: cuint, gid: cuint): cint <cimport 'fchown', cinclude '<unistd.h>'> end
+local function c_fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
+local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
+local function c_futimens(fd: cint, ts: *[2]sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
+local function c_faccessat(fd: cint, path: cstring, mode: cint, flags: cint): cint <cimport 'faccessat', cinclude '<unistd.h>'> end
+local function c_ioctl(fd: cint, req: culong, arg: clong): cint <cimport 'ioctl', cinclude '<sys/ioctl.h>'> end
+local function c_copy_file_range(i: cint, io: pointer, o: cint, oo: pointer, n: csize, flags: cuint): clong <cimport 'copy_file_range', cinclude '<unistd.h>'> end
+local function c_fallocate(fd: cint, mode: cint, off: clong, len: clong): cint <cimport 'fallocate', cinclude '<fcntl.h>'> end
+local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
+local function c_umask(m: cuint): cuint <cimport 'umask', cinclude '<sys/stat.h>'> end
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+local function c_flistxattr(fd: cint, buf: pointer, n: csize): clong <cimport 'flistxattr', cinclude '<sys/xattr.h>'> end
+local function c_llistxattr(p: cstring, buf: pointer, n: csize): clong <cimport 'llistxattr', cinclude '<sys/xattr.h>'> end
+local function c_fgetxattr(fd: cint, name: cstring, buf: pointer, n: csize): clong <cimport 'fgetxattr', cinclude '<sys/xattr.h>'> end
+local function c_lgetxattr(p: cstring, name: cstring, buf: pointer, n: csize): clong <cimport 'lgetxattr', cinclude '<sys/xattr.h>'> end
+local function c_getxattr(p: cstring, name: cstring, buf: pointer, n: csize): clong <cimport 'getxattr', cinclude '<sys/xattr.h>'> end
+local function c_fsetxattr(fd: cint, name: cstring, buf: pointer, n: csize, flags: cint): cint <cimport 'fsetxattr', cinclude '<sys/xattr.h>'> end
+local function c_lsetxattr(p: cstring, name: cstring, buf: pointer, n: csize, flags: cint): cint <cimport 'lsetxattr', cinclude '<sys/xattr.h>'> end
+local function c_setxattr(p: cstring, name: cstring, buf: pointer, n: csize, flags: cint): cint <cimport 'setxattr', cinclude '<sys/xattr.h>'> end
+
+global copy = @record{}
+global copy.AT_FDCWD: cint <comptime> = -100
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local AT_REMOVEDIR: cint <comptime> = 0x200
+local AT_SYMLINK_FOLLOW: cint <comptime> = 0x400
+local AT_EACCESS: cint <comptime> = 0x200
+local O_CREAT: cint <comptime> = 0x40
+local O_EXCL: cint <comptime> = 0x80
+local O_TRUNC: cint <comptime> = 0x200
+local O_NOFOLLOW: cint <comptime> = 0x20000
+local O_PATH: cint <comptime> = 0x200000
+local O_DIRECTORY: cint <comptime> = 0x10000
+local ENOENT: cint <comptime> = 2
+local EINTR: cint <comptime> = 4
+local EBADF: cint <comptime> = 9
+local EACCES: cint <comptime> = 13
+local EPERM: cint <comptime> = 1
+local EEXIST: cint <comptime> = 17
+local EXDEV: cint <comptime> = 18
+local ENOTDIR: cint <comptime> = 20
+local EISDIR: cint <comptime> = 21
+local EINVAL: cint <comptime> = 22
+local ETXTBSY: cint <comptime> = 26
+local EROFS: cint <comptime> = 30
+local ENOSYS: cint <comptime> = 38
+local ELOOP: cint <comptime> = 40
+local ENODATA: cint <comptime> = 61
+local ENOTSUP: cint <comptime> = 95
+local ENXIO: cint <comptime> = 6
+local SEEK_SET: cint <comptime> = 0
+local SEEK_CUR: cint <comptime> = 1
+local SEEK_END: cint <comptime> = 2
+local SEEK_DATA: cint <comptime> = 3
+local SEEK_HOLE: cint <comptime> = 4
+local FICLONE: culong <comptime> = 0x40049409
+
+local S_IFMT: cuint <comptime> = 0xF000
+local S_IFREG: cuint <comptime> = 0x8000
+local S_IFDIR: cuint <comptime> = 0x4000
+local S_IFLNK: cuint <comptime> = 0xA000
+local S_IFIFO: cuint <comptime> = 0x1000
+local S_IFCHR: cuint <comptime> = 0x2000
+local S_IFBLK: cuint <comptime> = 0x6000
+local S_IFSOCK: cuint <comptime> = 0xC000
+local S_ISUID: cuint <comptime> = 0x800
+local S_ISGID: cuint <comptime> = 0x400
+local S_ISVTX: cuint <comptime> = 0x200
+local S_IRWXU: cuint <comptime> = 0x1C0
+local S_IRWXG: cuint <comptime> = 0x38
+local S_IRWXO: cuint <comptime> = 0x7
+local S_IWUSR: cuint <comptime> = 0x80
+local S_IWGRP: cuint <comptime> = 0x10
+local S_IWOTH: cuint <comptime> = 0x2
+local S_IRWXUGO: cuint <comptime> = 0x1FF
+local CHMOD_MODE_BITS: cuint <comptime> = 0xFFF
+local MODE_RW_UGO: cuint <comptime> = 0x1B6
+
+global copy.SPARSE_UNUSED: integer <comptime> = 0
+global copy.SPARSE_NEVER: integer <comptime> = 1
+global copy.SPARSE_AUTO: integer <comptime> = 2
+global copy.SPARSE_ALWAYS: integer <comptime> = 3
+global copy.REFLINK_NEVER: integer <comptime> = 0
+global copy.REFLINK_AUTO: integer <comptime> = 1
+global copy.REFLINK_ALWAYS: integer <comptime> = 2
+global copy.I_ALWAYS_YES: integer <comptime> = 1
+global copy.I_ALWAYS_NO: integer <comptime> = 2
+global copy.I_ASK_USER: integer <comptime> = 3
+global copy.I_UNSPECIFIED: integer <comptime> = 4
+global copy.DEREF_UNDEFINED: integer <comptime> = 1
+global copy.DEREF_NEVER: integer <comptime> = 2
+global copy.DEREF_COMMAND_LINE_ARGUMENTS: integer <comptime> = 3
+global copy.DEREF_ALWAYS: integer <comptime> = 4
+
+global copy.Options = @record{
+  backup_type: integer,
+  copy_as_regular: boolean,
+  dereference: integer,
+  unlink_dest_before_opening: boolean,
+  unlink_dest_after_failed_open: boolean,
+  hard_link: boolean,
+  interactive: integer,
+  move_mode: boolean,
+  install_mode: boolean,
+  chown_privileges: boolean,
+  owner_privileges: boolean,
+  one_file_system: boolean,
+  preserve_ownership: boolean,
+  preserve_mode: boolean,
+  preserve_timestamps: boolean,
+  explicit_no_preserve_mode: boolean,
+  preserve_security_context: boolean,
+  require_preserve_context: boolean,
+  preserve_xattr: boolean,
+  require_preserve_xattr: boolean,
+  reduce_diagnostics: boolean,
+  data_copy_required: boolean,
+  require_preserve: boolean,
+  recursive: boolean,
+  set_mode: boolean,
+  mode: cuint,
+  symbolic_link: boolean,
+  update: boolean,
+  verbose: boolean,
+  stdin_tty: boolean,
+  open_dangling_dest_symlink: boolean,
+  last_file: boolean,
+  rename_errno: cint,
+  sparse_mode: integer,
+  reflink_mode: integer,
+  preserve_links: boolean,
+  dest_info: boolean,
+  src_info: boolean,
+}
+
+function copy.default_options(x: *copy.Options)
+  $x = {}
+  x.chown_privileges = sys.geteuid() == 0
+  x.owner_privileges = x.chown_privileges
+  x.rename_errno = -1
+end
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function err(msg: string, e: cint) util.err(errno_msg(msg, e)) end
+
+local function isreg(m: cuint): boolean return (m & S_IFMT) == S_IFREG end
+local function isdir(m: cuint): boolean return (m & S_IFMT) == S_IFDIR end
+local function islnk(m: cuint): boolean return (m & S_IFMT) == S_IFLNK end
+local function same_inode(a: *sys.Stat, b: *sys.Stat): boolean return a.st_dev == b.st_dev and a.st_ino == b.st_ino end
+
+local umask_cache: cuint = 0xffffffff
+function copy.cached_umask(): cuint
+  if umask_cache == 0xffffffff then
+    umask_cache = c_umask(0)
+    c_umask(umask_cache)
+  end
+  return umask_cache
+end
+
+function copy.chown_failure_ok(x: *copy.Options): boolean
+  local e = sys.errno()
+  return (e == EPERM or e == EINVAL) and not x.chown_privileges
+end
+local function owner_failure_ok(x: *copy.Options): boolean
+  local e = sys.errno()
+  return (e == EPERM or e == EINVAL) and not x.owner_privileges
+end
+
+-- gnulib last_component / base_len / dir_name.
+function copy.last_component(s: string): string
+  local i = 1
+  while i <= #s and s:byte(i) == 47 do i = i + 1 end
+  local base = i
+  local saw = false
+  while i <= #s do
+    if s:byte(i) == 47 then saw = true
+    elseif saw then base = i; saw = false end
+    i = i + 1
+  end
+  return s:sub(base)
+end
+local function base_len(s: string): integer
+  local n = #s
+  while n > 1 and s:byte(n) == 47 do n = n - 1 end
+  return n
+end
+function copy.dir_name(s: string): string
+  local base_off = #s - #copy.last_component(s)
+  local len = base_off
+  while len > 1 and s:byte(len) == 47 do len = len - 1 end
+  if len == 0 then return (#s > 0 and s:byte(1) == 47) and '/' or '.' end
+  return s:sub(1, len)
+end
+function copy.strip_trailing_slashes(s: string): string
+  local b = #s - #copy.last_component(s)
+  local n = #s
+  while n > b + 1 and s:byte(n) == 47 do n = n - 1 end
+  return s:sub(1, n)
+end
+-- gnulib file_name_concat: the result and the 1-based offset of BASE in it.
+function copy.file_name_concat(dir: string, base: string): (string, integer)
+  local dirbase = copy.last_component(dir)
+  local dirbase_off = #dir - #dirbase
+  local dirbaselen = #dirbase > 0 and base_len(dirbase) or 0
+  local dirlen = dirbase_off + dirbaselen
+  local sep = ''
+  if dirbaselen > 0 then
+    if dir:byte(dirlen) ~= 47 and not (#base > 0 and base:byte(1) == 47) then sep = '/' end
+  elseif #base > 0 and base:byte(1) == 47 then
+    sep = '.'
+  end
+  local head = dir:sub(1, dirlen) .. sep
+  return head .. base, #head + 1
+end
+
+-- gnulib same_nameat.
+function copy.same_nameat(sfd: cint, source: string, dfd: cint, dest: string): boolean
+  local sb = copy.last_component(source)
+  local db = copy.last_component(dest)
+  if sb:sub(1, base_len(sb)) ~= db:sub(1, base_len(db)) then return false end
+  local a: sys.Stat
+  local b: sys.Stat
+  local sd = copy.dir_name(source)
+  local dd = copy.dir_name(dest)
+  if c_fstatat(sfd, sd, &a, AT_SYMLINK_NOFOLLOW) ~= 0 then
+    util.err(errno_msg(sd, sys.errno())); util.flush(); c_exit(1)
+  end
+  if c_fstatat(dfd, dd, &b, AT_SYMLINK_NOFOLLOW) ~= 0 then
+    util.err(errno_msg(dd, sys.errno())); util.flush(); c_exit(1)
+  end
+  return same_inode(&a, &b)
+end
+
+-- yesno over a stdio-like stdin buffer; copy.close_stdin gives unread
+-- input back to a seekable stdin.
+local inbuf: [4096]byte
+local inlen: integer = 0
+local inpos: integer = 0
+local ineof = false
+function copy.yesno(): boolean
+  local first: integer = -1
+  local got = false
+  while true do
+    if inpos == inlen then
+      if ineof then break end
+      local r = sys.read(0, &inbuf[0], #inbuf)
+      if r < 0 and sys.errno() == EINTR then continue end
+      if r <= 0 then ineof = true; break end
+      inlen = r; inpos = 0
+    end
+    local c = inbuf[inpos]
+    inpos = inpos + 1
+    if not got then first = c; got = true end
+    if c == 10 then break end
+  end
+  return first == 121 or first == 89
+end
+function copy.close_stdin()
+  if inpos < inlen then sys.lseek(0, -(inlen - inpos), sys.SEEK_CUR) end
+end
+local function prompt(s: string)
+  util.flush()
+  local m = util.applet .. ': ' .. s
+  sys.write(2, m.data, m.size)
+end
+
+-- cp-hash.c: source dev/ino -> destination name.
+local src_to_dest: hashmap(string, string)
+local function di_key(ino: uint64, dev: uint64): string return tostring(dev) .. ':' .. tostring(ino) end
+local function remember_copied(name: string, ino: uint64, dev: uint64): (boolean, string)
+  local k = di_key(ino, dev)
+  local p = src_to_dest:peek(k)
+  if p ~= nilptr then return true, $p end
+  src_to_dest[k] = string.copy(name)
+  return false, ''
+end
+local function src_to_dest_lookup(ino: uint64, dev: uint64): (boolean, string)
+  local p = src_to_dest:peek(di_key(ino, dev))
+  if p ~= nilptr then return true, $p end
+  return false, ''
+end
+local function forget_created(ino: uint64, dev: uint64)
+  src_to_dest:remove(di_key(ino, dev))
+end
+
+-- dest_info / src_info: (name, ino, dev) triples; names compare by same_nameat.
+local Triple = @record{ name: string, ino: uint64, dev: uint64 }
+local dest_set: sequence(Triple)
+local src_set: sequence(Triple)
+local function seen_file(set: *sequence(Triple), name: string, st: *sys.Stat): boolean
+  for i = 1, #set do
+    local t = &set[i]
+    if t.ino == st.st_ino and t.dev == st.st_dev and copy.same_nameat(AT_FDCWD, t.name, AT_FDCWD, name) then return true end
+  end
+  return false
+end
+local function record_file(set: *sequence(Triple), name: string, st: *sys.Stat)
+  set:push({name = string.copy(name), ino = st.st_ino, dev = st.st_dev})
+end
+
+function copy.emit_verbose(src: string, dst: string, backup_name: string, have_backup: boolean)
+  util.write(util.quoteaf(src) .. ' -> ' .. util.quoteaf(dst))
+  if have_backup then util.write(' (backup: ' .. util.quoteaf(backup_name) .. ')') end
+  util.writebyte(10)
+end
+
+local function lchmodat(dirfd: cint, name: string, mode: cuint): cint
+  local st: sys.Stat
+  if c_fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 and islnk(st.st_mode) then
+    sys.seterrno(ENOTSUP)
+    return -1
+  end
+  return c_fchmodat(dirfd, name, mode, 0)
+end
+local function fchmod_or_lchmod(desc: cint, dirfd: cint, name: string, mode: cuint): cint
+  if desc >= 0 then return c_fchmod(desc, mode) end
+  return lchmodat(dirfd, name, mode)
+end
+
+-- gnulib copy_acl / set_acl: the mode, plus the source's POSIX ACL
+-- attributes when it has any.
+local function copy_acl_attr(src_name: string, sfd: cint, dst_name: string, dfd: cint, attr: string)
+  local buf: [4096]byte
+  local n: clong
+  if sfd >= 0 then n = c_fgetxattr(sfd, attr, &buf, #buf) else n = c_getxattr(src_name, attr, &buf, #buf) end
+  if n > 0 then
+    if dfd >= 0 then c_fsetxattr(dfd, attr, &buf, (@csize)(n), 0) else c_setxattr(dst_name, attr, &buf, (@csize)(n), 0) end
+  end
+end
+function copy.copy_acl(src_name: string, sfd: cint, dst_name: string, dfd: cint, mode: cuint): integer
+  local r: cint
+  if dfd >= 0 then r = c_fchmod(dfd, mode) else r = sys.chmod(dst_name, mode) end
+  if r ~= 0 then
+    util.err(errno_msg('preserving permissions for ' .. util.quote(dst_name), sys.errno()))
+    return -1
+  end
+  copy_acl_attr(src_name, sfd, dst_name, dfd, 'system.posix_acl_access')
+  if isdir(mode) then copy_acl_attr(src_name, sfd, dst_name, dfd, 'system.posix_acl_default') end
+  return 0
+end
+function copy.set_acl(name: string, desc: cint, mode: cuint): integer
+  local r: cint
+  if desc >= 0 then r = c_fchmod(desc, mode) else r = sys.chmod(name, mode) end
+  if r ~= 0 then
+    util.err(errno_msg('setting permissions for ' .. util.quote(name), sys.errno()))
+    return -1
+  end
+  return 0
+end
+
+-- libattr attr_copy_fd / attr_copy_file with attr_copy_check_permissions
+-- (the "permissions" and "skip" entries of /etc/xattr.conf's defaults).
+local function xattr_skip(name: string, skip_selinux: boolean): boolean
+  if skip_selinux and name:sub(1, 16) == 'security.selinux' then return true end
+  local exact: []string = {'system.nfs4_acl', 'system.nfs4acl', 'system.posix_acl_access', 'system.posix_acl_default',
+    'trusted.SGI_ACL_DEFAULT', 'trusted.SGI_ACL_FILE', 'trusted.SGI_CAP_FILE', 'trusted.SGI_MAC_FILE', 'security.evm'}
+  for i = 0, #exact - 1 do if name == exact[i] then return true end end
+  local prefixes: []string = {'trusted.SGI_DMI_', 'xfsroot.', 'user.Beagle.', 'afs.'}
+  for i = 0, #prefixes - 1 do if name:sub(1, #prefixes[i]) == prefixes[i] then return true end end
+  return false
+end
+
+local function copy_attr(src_path: string, sfd: cint, dst_path: string, dfd: cint, x: *copy.Options): boolean
+  local all_errors = not x.data_copy_required or x.require_preserve_xattr
+  local some_errors = not all_errors and not x.reduce_diagnostics
+  local list: [65536]byte
+  local n: clong
+  if sfd >= 0 and dfd >= 0 then n = c_flistxattr(sfd, &list, #list) else n = c_llistxattr(src_path, &list, #list) end
+  if n < 0 then
+    local e = sys.errno()
+    if e == ENOTSUP or e == ENOSYS then return true end
+    if all_errors or some_errors then
+      util.err(errno_msg('listing attributes of ' .. util.quoteaf(src_path), e))
+    end
+    return false
+  end
+  local ok = true
+  local i: clong = 0
+  while i < n do
+    local j = i
+    while j < n and list[j] ~= 0 do j = j + 1 end
+    local name = string.copy((@string){data = &list[i], size = (@usize)(j - i)})
+    i = j + 1
+    if xattr_skip(name, x.preserve_security_context) then continue end
+    local val: [65536]byte
+    local vn: clong
+    if sfd >= 0 and dfd >= 0 then vn = c_fgetxattr(sfd, name, &val, #val) else vn = c_lgetxattr(src_path, name, &val, #val) end
+    if vn < 0 then
+      local e = sys.errno()
+      if all_errors or (some_errors and not (e == ENOTSUP or e == ENODATA)) then
+        util.err(errno_msg('getting attribute ' .. util.quoteaf(name) .. ' of ' .. util.quoteaf(src_path), e))
+      end
+      ok = false
+      continue
+    end
+    local r: cint
+    if sfd >= 0 and dfd >= 0 then r = c_fsetxattr(dfd, name, &val, (@csize)(vn), 0)
+    else r = c_lsetxattr(dst_path, name, &val, (@csize)(vn), 0) end
+    if r ~= 0 then
+      local e = sys.errno()
+      if all_errors or (some_errors and not (e == ENOTSUP or e == ENODATA)) then
+        util.err(errno_msg('setting attribute ' .. util.quoteaf(name) .. ' for ' .. util.quoteaf(dst_path), e))
+      end
+      ok = false
+    end
+  end
+  return ok
+end
+
+local function set_owner(x: *copy.Options, dst_name: string, dst_dirfd: cint, dst_relname: string, dest_desc: cint,
+    src_sb: *sys.Stat, new_dst: boolean, dst_sb: *sys.Stat): integer
+  local uid = src_sb.st_uid
+  local gid = src_sb.st_gid
+  if not new_dst and (x.preserve_mode or x.move_mode or x.set_mode) then
+    local old_mode = dst_sb.st_mode
+    local new_mode = (x.preserve_mode or x.move_mode) and src_sb.st_mode or x.mode
+    local restrictive = old_mode & new_mode & S_IRWXU
+    if (old_mode & CHMOD_MODE_BITS & (~new_mode | S_ISUID | S_ISGID | S_ISVTX)) ~= 0 then
+      local r: cint
+      if dest_desc >= 0 then r = c_fchmod(dest_desc, restrictive) else r = sys.chmod(dst_name, restrictive) end
+      if r ~= 0 then
+        if not owner_failure_ok(x) then util.err(errno_msg('clearing permissions for ' .. util.quoteaf(dst_name), sys.errno())) end
+        return x.require_preserve and -1 or 0
+      end
+    end
+  end
+  if dest_desc ~= -1 then
+    if c_fchown(dest_desc, uid, gid) == 0 then return 1 end
+    local e = sys.errno()
+    if e == EPERM or e == EINVAL then
+      c_fchown(dest_desc, 0xffffffff, gid)
+      sys.seterrno(e)
+    end
+  else
+    if c_fchownat(dst_dirfd, dst_relname, uid, gid, AT_SYMLINK_NOFOLLOW) == 0 then return 1 end
+    local e = sys.errno()
+    if e == EPERM or e == EINVAL then
+      c_fchownat(dst_dirfd, dst_relname, 0xffffffff, gid, AT_SYMLINK_NOFOLLOW)
+      sys.seterrno(e)
+    end
+  end
+  if not copy.chown_failure_ok(x) then
+    util.err(errno_msg('failed to preserve ownership for ' .. util.quoteaf(dst_name), sys.errno()))
+    if x.require_preserve then return -1 end
+  end
+  return 0
+end
+
+-- Data copying ------------------------------------------------------------------
+local function full_write(fd: cint, p: *[0]byte, n: int64): int64
+  local off: int64 = 0
+  while off < n do
+    local w = sys.write(fd, &p[off], (@csize)(n - off))
+    if w < 0 then
+      if sys.errno() == EINTR then continue end
+      return off
+    end
+    if w == 0 then sys.seterrno(28); return off end
+    off = off + w
+  end
+  return off
+end
+
+local function punch_hole(fd: cint, offset: int64, length: int64): cint
+  local r = c_fallocate(fd, 2 | 1, offset, length)
+  if r < 0 then
+    local e = sys.errno()
+    if e == ENOTSUP or e == 95 or e == ENOSYS then r = 0 end
+  end
+  return r
+end
+
+local function create_hole(fd: cint, name: string, punch_holes: boolean, size: int64): boolean
+  local file_end = sys.lseek(fd, size, SEEK_CUR)
+  if file_end < 0 then err('cannot lseek ' .. util.quoteaf(name), sys.errno()); return false end
+  if punch_holes and punch_hole(fd, file_end - size, size) < 0 then
+    err('error deallocating ' .. util.quoteaf(name), sys.errno())
+    return false
+  end
+  return true
+end
+
+local function is_nul(p: *[0]byte, n: int64): boolean
+  for i = 0, n - 1 do if p[i] ~= 0 then return false end end
+  return true
+end
+
+local CopyBuf = @record{ data: sequence(byte) }
+
+local function sparse_copy(src_fd: cint, dest_fd: cint, abuf: *CopyBuf, buf_size: int64, hole_size: int64,
+    punch_holes: boolean, allow_reflink: boolean, src_name: string, dst_name: string,
+    max_n_read: uint64, total_n_read: *int64, last_write_made_hole: *boolean): boolean
+  $last_write_made_hole = false
+  $total_n_read = 0
+  if hole_size == 0 and allow_reflink then
+    while max_n_read ~= 0 do
+      local copy_max: uint64 = 0x7fffffffc0000000
+      local want: uint64 = max_n_read < copy_max and max_n_read or copy_max
+      local n_copied = c_copy_file_range(src_fd, nilptr, dest_fd, nilptr, (@csize)(want), 0)
+      if n_copied == 0 then
+        if $total_n_read == 0 then break end
+        return true
+      end
+      if n_copied < 0 then
+        local e = sys.errno()
+        if e == ENOSYS or e == ENOTSUP or e == EINVAL or e == EBADF or e == EXDEV or e == ETXTBSY then break end
+        if e == EPERM and $total_n_read == 0 then break end
+        if e == EINTR then n_copied = 0
+        else
+          err('error copying ' .. util.quoteaf(src_name) .. ' to ' .. util.quoteaf(dst_name), e)
+          return false
+        end
+      end
+      max_n_read = max_n_read - (@uint64)(n_copied)
+      $total_n_read = $total_n_read + n_copied
+    end
+  end
+  local make_hole = false
+  local psize: int64 = 0
+  while max_n_read ~= 0 do
+    if #abuf.data < buf_size then abuf.data:resize(buf_size) end
+    local buf: *[0]byte = &abuf.data[1]
+    local want: int64 = (max_n_read < (@uint64)(buf_size)) and (@int64)(max_n_read) or buf_size
+    local n_read = sys.read(src_fd, buf, (@csize)(want))
+    if n_read < 0 then
+      if sys.errno() == EINTR then continue end
+      err('error reading ' .. util.quoteaf(src_name), sys.errno())
+      return false
+    end
+    if n_read == 0 then break end
+    max_n_read = max_n_read - (@uint64)(n_read)
+    $total_n_read = $total_n_read + n_read
+    local csize: int64 = hole_size ~= 0 and hole_size or buf_size
+    local cbuf: int64 = 0
+    local pbuf: int64 = 0
+    local nr: int64 = n_read
+    while nr ~= 0 do
+      local prev_hole = make_hole
+      if nr < csize then csize = nr end
+      if hole_size ~= 0 and csize ~= 0 then make_hole = is_nul(&buf[cbuf], csize) end
+      local transition = make_hole ~= prev_hole and psize ~= 0
+      local last_chunk = (nr == csize and not make_hole) or csize == 0
+      if transition or last_chunk then
+        if not transition then psize = psize + csize end
+        if not prev_hole then
+          if full_write(dest_fd, &buf[pbuf], psize) ~= psize then
+            err('error writing ' .. util.quoteaf(dst_name), sys.errno())
+            return false
+          end
+        else
+          if not create_hole(dest_fd, dst_name, punch_holes, psize) then return false end
+        end
+        pbuf = cbuf
+        psize = csize
+        if last_chunk then
+          if csize == 0 then nr = 0 end
+          if transition then csize = 0 else psize = 0 end
+        end
+      else
+        psize = psize + csize
+      end
+      nr = nr - csize
+      cbuf = cbuf + csize
+    end
+    $last_write_made_hole = make_hole
+  end
+  if make_hole and not create_hole(dest_fd, dst_name, punch_holes, psize) then return false end
+  return true
+end
+
+local zeros: sequence(byte)
+local function write_zeros(fd: cint, n_bytes: int64): boolean
+  if #zeros == 0 then zeros:resize(128 * 1024) end
+  while n_bytes > 0 do
+    local n: int64 = n_bytes < #zeros and n_bytes or #zeros
+    if full_write(fd, &zeros[1], n) ~= n then return false end
+    n_bytes = n_bytes - n
+  end
+  return true
+end
+
+local function lseek_copy(src_fd: cint, dest_fd: cint, abuf: *CopyBuf, buf_size: int64, hole_size: int64,
+    ext_start: int64, src_total_size: int64, sparse_mode: integer, allow_reflink: boolean,
+    src_name: string, dst_name: string): boolean
+  local last_ext_start: int64 = 0
+  local last_ext_len: int64 = 0
+  local dest_pos: int64 = 0
+  local wrote_hole_at_eof = true
+  while 0 <= ext_start do
+    local ext_end = sys.lseek(src_fd, ext_start, SEEK_HOLE)
+    if ext_end < 0 then
+      if sys.errno() ~= ENXIO then goto cannot_lseek end
+      ext_end = src_total_size
+      if ext_end <= ext_start then
+        src_total_size = sys.lseek(src_fd, 0, SEEK_END)
+        if src_total_size < 0 then goto cannot_lseek end
+        if src_total_size <= ext_start then break end
+        ext_end = src_total_size
+      end
+    end
+    if src_total_size < ext_end then src_total_size = ext_end end
+    if sys.lseek(src_fd, ext_start, SEEK_SET) < 0 then goto cannot_lseek end
+    wrote_hole_at_eof = false
+    do
+      local ext_hole_size = ext_start - last_ext_start - last_ext_len
+      if ext_hole_size ~= 0 then
+        if sparse_mode ~= copy.SPARSE_NEVER then
+          if not create_hole(dest_fd, dst_name, sparse_mode == copy.SPARSE_ALWAYS, ext_hole_size) then return false end
+          wrote_hole_at_eof = true
+        else
+          if not write_zeros(dest_fd, ext_hole_size) then
+            err(util.quotef(dst_name) .. ': write failed', sys.errno())
+            return false
+          end
+        end
+      end
+      local ext_len = ext_end - ext_start
+      last_ext_start = ext_start
+      last_ext_len = ext_len
+      local n_read: int64 = 0
+      local read_hole = false
+      if not sparse_copy(src_fd, dest_fd, abuf, buf_size, sparse_mode == copy.SPARSE_NEVER and 0 or hole_size,
+          true, allow_reflink, src_name, dst_name, (@uint64)(ext_len), &n_read, &read_hole) then
+        return false
+      end
+      dest_pos = ext_start + n_read
+      if n_read ~= 0 then wrote_hole_at_eof = read_hole end
+      if n_read < ext_len then
+        src_total_size = dest_pos
+        break
+      end
+      ext_start = sys.lseek(src_fd, dest_pos, SEEK_DATA)
+      if ext_start < 0 and sys.errno() ~= ENXIO then goto cannot_lseek end
+    end
+  end
+  if dest_pos < src_total_size or wrote_hole_at_eof then
+    local okx: boolean
+    if sparse_mode == copy.SPARSE_NEVER then okx = write_zeros(dest_fd, src_total_size - dest_pos)
+    else okx = c_ftruncate(dest_fd, src_total_size) == 0 end
+    if not okx then err('failed to extend ' .. util.quoteaf(dst_name), sys.errno()); return false end
+  end
+  if sparse_mode == copy.SPARSE_ALWAYS and dest_pos < src_total_size
+      and punch_hole(dest_fd, dest_pos, src_total_size - dest_pos) < 0 then
+    err('error deallocating ' .. util.quoteaf(dst_name), sys.errno())
+    return false
+  end
+  do return true end
+::cannot_lseek::
+  err('cannot lseek ' .. util.quoteaf(src_name), sys.errno())
+  return false
+end
+
+local function io_blksize(st: *sys.Stat): int64
+  local b: int64 = st.st_blksize
+  if b <= 0 or b > 0x2000000000000000 then b = 512 end
+  return b > 128 * 1024 and b or 128 * 1024
+end
+local function st_blksize(st: *sys.Stat): int64
+  local b: int64 = st.st_blksize
+  if b <= 0 or b > 0x2000000000000000 then b = 512 end
+  return b
+end
+local function buffer_lcm(a: int64, b: int64, lcm_max: int64): int64
+  local size: int64
+  if a == 0 then size = b ~= 0 and b or 8 * 1024
+  else
+    if b ~= 0 then
+      local m, n = a, b
+      while m % n ~= 0 do m, n = n, m % n end
+      local q = a // n
+      local lcm = q * b
+      if lcm <= lcm_max and lcm // b == q then return lcm end
+    end
+    size = a
+  end
+  return size <= lcm_max and size or lcm_max
+end
+
+local ERROR_SCANTYPE <comptime> = 0
+local PLAIN_SCANTYPE <comptime> = 1
+local ZERO_SCANTYPE <comptime> = 2
+local LSEEK_SCANTYPE <comptime> = 3
+
+local function infer_scantype(fd: cint, sb: *sys.Stat): (integer, int64)
+  if not (isreg(sb.st_mode) and sb.st_blocks < sb.st_size // 512) then return PLAIN_SCANTYPE, 0 end
+  local ext_start = sys.lseek(fd, 0, SEEK_DATA)
+  if 0 <= ext_start or sys.errno() == ENXIO then return LSEEK_SCANTYPE, ext_start end
+  local e = sys.errno()
+  if e ~= EINVAL and e ~= ENOTSUP then return ERROR_SCANTYPE, 0 end
+  return ZERO_SCANTYPE, 0
+end
+
+local function copy_reg(src_name: string, dst_name: string, dst_dirfd: cint, dst_relname: string, x: *copy.Options,
+    dst_mode: cuint, omitted_permissions: cuint, new_dst: *boolean, src_sb: *sys.Stat): boolean
+  local abuf: CopyBuf
+  local dest_desc: cint = -1
+  local dest_errno: cint = 0
+  local src_mode = src_sb.st_mode
+  local extra_permissions: cuint = 0
+  local sb: sys.Stat
+  local src_open_sb: sys.Stat
+  local return_val = true
+  local data_copy_required = x.data_copy_required
+  local preserve_xattr = x.preserve_xattr
+  local source_desc = sys.open(src_name, sys.O_RDONLY | (x.dereference == copy.DEREF_NEVER and O_NOFOLLOW or 0), 0)
+  if source_desc < 0 then
+    err('cannot open ' .. util.quoteaf(src_name) .. ' for reading', sys.errno())
+    return false
+  end
+  if sys.fstat(source_desc, &src_open_sb) ~= 0 then
+    err('cannot fstat ' .. util.quoteaf(src_name), sys.errno())
+    return_val = false
+    goto close_src_desc
+  end
+  if not same_inode(src_sb, &src_open_sb) then
+    util.err('skipping file ' .. util.quoteaf(src_name) .. ', as it was replaced while being copied')
+    return_val = false
+    goto close_src_desc
+  end
+  if not $new_dst then
+    dest_desc = c_openat(dst_dirfd, dst_relname, sys.O_WRONLY | (data_copy_required and O_TRUNC or 0), 0)
+    dest_errno = sys.errno()
+    if dest_desc < 0 and dest_errno ~= ENOENT and x.unlink_dest_after_failed_open then
+      if c_unlinkat(dst_dirfd, dst_relname, 0) == 0 then
+        if x.verbose then util.write('removed ' .. util.quoteaf(dst_name) .. '\n') end
+      elseif sys.errno() ~= ENOENT then
+        err('cannot remove ' .. util.quoteaf(dst_name), sys.errno())
+        return_val = false
+        goto close_src_desc
+      end
+      dest_errno = ENOENT
+    end
+    if dest_desc < 0 and dest_errno == ENOENT then $new_dst = true end
+  end
+  if $new_dst then
+    local open_mode = (dst_mode & ~omitted_permissions) | ((preserve_xattr and not x.owner_privileges) and S_IWUSR or 0)
+    extra_permissions = open_mode & ~dst_mode
+    local open_flags = sys.O_WRONLY | O_CREAT
+    dest_desc = c_openat(dst_dirfd, dst_relname, open_flags | O_EXCL, open_mode)
+    dest_errno = sys.errno()
+    if dest_desc < 0 and dest_errno == EEXIST and not x.move_mode then
+      local dummy: [1]byte
+      if c_readlinkat(dst_dirfd, dst_relname, &dummy, 1) >= 0 then
+        if x.open_dangling_dest_symlink then
+          dest_desc = c_openat(dst_dirfd, dst_relname, open_flags, open_mode)
+          dest_errno = sys.errno()
+        else
+          util.err('not writing through dangling symlink ' .. util.quoteaf(dst_name))
+          return_val = false
+          goto close_src_desc
+        end
+      end
+    end
+    if dest_desc < 0 and dest_errno == EISDIR and #dst_name > 0 and dst_name:byte(#dst_name) == 47 then
+      dest_errno = ENOTDIR
+    end
+  else
+    omitted_permissions = 0
+    extra_permissions = 0
+  end
+  if dest_desc < 0 then
+    err('cannot create regular file ' .. util.quoteaf(dst_name), dest_errno)
+    return_val = false
+    goto close_src_desc
+  end
+  if data_copy_required and x.reflink_mode ~= copy.REFLINK_NEVER then
+    if c_ioctl(dest_desc, FICLONE, source_desc) == 0 then
+      data_copy_required = false
+    elseif x.reflink_mode == copy.REFLINK_ALWAYS then
+      err('failed to clone ' .. util.quoteaf(dst_name) .. ' from ' .. util.quoteaf(src_name), sys.errno())
+      return_val = false
+      goto close_src_and_dst_desc
+    end
+  end
+  if not (data_copy_required or x.preserve_ownership or extra_permissions ~= 0) then
+    sb.st_mode = 0
+  elseif sys.fstat(dest_desc, &sb) ~= 0 then
+    err('cannot fstat ' .. util.quoteaf(dst_name), sys.errno())
+    return_val = false
+    goto close_src_and_dst_desc
+  end
+  do
+    local temporary_mode = sb.st_mode | extra_permissions
+    if temporary_mode ~= sb.st_mode and fchmod_or_lchmod(dest_desc, dst_dirfd, dst_relname, temporary_mode) ~= 0 then
+      extra_permissions = 0
+    end
+  end
+  if data_copy_required then
+    local buf_size = io_blksize(&sb)
+    local hole_size = st_blksize(&sb)
+    local scantype, ext_start = infer_scantype(source_desc, &src_open_sb)
+    if scantype == ERROR_SCANTYPE then
+      err('cannot lseek ' .. util.quoteaf(src_name), sys.errno())
+      return_val = false
+      goto close_src_and_dst_desc
+    end
+    local make_holes = isreg(sb.st_mode) and (x.sparse_mode == copy.SPARSE_ALWAYS
+      or (x.sparse_mode == copy.SPARSE_AUTO and scantype ~= PLAIN_SCANTYPE))
+    if not make_holes then
+      local blcm_max: int64 = 0x7fffffffffffffff
+      local blcm = buffer_lcm(io_blksize(&src_open_sb), buf_size, blcm_max)
+      if isreg(src_open_sb.st_mode) and src_open_sb.st_size < buf_size then buf_size = src_open_sb.st_size + 1 end
+      buf_size = buf_size + blcm - 1
+      buf_size = buf_size - buf_size % blcm
+      if buf_size == 0 or blcm_max < buf_size then buf_size = blcm end
+    end
+    local n_read: int64 = 0
+    local wrote_hole_at_eof = false
+    local okc: boolean
+    if scantype == LSEEK_SCANTYPE then
+      okc = lseek_copy(source_desc, dest_desc, &abuf, buf_size, hole_size, ext_start, src_open_sb.st_size,
+        make_holes and x.sparse_mode or copy.SPARSE_NEVER, x.reflink_mode ~= copy.REFLINK_NEVER, src_name, dst_name)
+    else
+      okc = sparse_copy(source_desc, dest_desc, &abuf, buf_size, make_holes and hole_size or 0,
+        x.sparse_mode == copy.SPARSE_ALWAYS, x.reflink_mode ~= copy.REFLINK_NEVER, src_name, dst_name,
+        0xffffffffffffffff, &n_read, &wrote_hole_at_eof)
+    end
+    if not okc then
+      return_val = false
+      goto close_src_and_dst_desc
+    elseif wrote_hole_at_eof and c_ftruncate(dest_desc, n_read) < 0 then
+      err('failed to extend ' .. util.quoteaf(dst_name), sys.errno())
+      return_val = false
+      goto close_src_and_dst_desc
+    end
+  end
+  if x.preserve_timestamps then
+    local ts: [2]sys.Timespec = {src_sb.st_atim, src_sb.st_mtim}
+    if c_futimens(dest_desc, &ts) ~= 0 then
+      err('preserving times for ' .. util.quoteaf(dst_name), sys.errno())
+      if x.require_preserve then
+        return_val = false
+        goto close_src_and_dst_desc
+      end
+    end
+  end
+  if x.preserve_ownership and not (src_sb.st_uid == sb.st_uid and src_sb.st_gid == sb.st_gid) then
+    local r = set_owner(x, dst_name, dst_dirfd, dst_relname, dest_desc, src_sb, $new_dst, &sb)
+    if r == -1 then
+      return_val = false
+      goto close_src_and_dst_desc
+    elseif r == 0 then
+      src_mode = src_mode & ~(S_ISUID | S_ISGID | S_ISVTX)
+    end
+  end
+  if preserve_xattr then
+    if not copy_attr(src_name, source_desc, dst_name, dest_desc, x) and x.require_preserve_xattr then return_val = false end
+  end
+  if x.preserve_mode or x.move_mode then
+    if copy.copy_acl(src_name, source_desc, dst_name, dest_desc, src_mode) ~= 0 and x.require_preserve then return_val = false end
+  elseif x.set_mode then
+    if copy.set_acl(dst_name, dest_desc, x.mode) ~= 0 then return_val = false end
+  elseif x.explicit_no_preserve_mode and $new_dst then
+    if copy.set_acl(dst_name, dest_desc, MODE_RW_UGO & ~copy.cached_umask()) ~= 0 then return_val = false end
+  elseif (omitted_permissions | extra_permissions) ~= 0 then
+    omitted_permissions = omitted_permissions & ~copy.cached_umask()
+    if (omitted_permissions | extra_permissions) ~= 0
+        and fchmod_or_lchmod(dest_desc, dst_dirfd, dst_relname, dst_mode & ~copy.cached_umask()) ~= 0 then
+      err('preserving permissions for ' .. util.quoteaf(dst_name), sys.errno())
+      if x.require_preserve then return_val = false end
+    end
+  end
+::close_src_and_dst_desc::
+  if sys.close(dest_desc) < 0 then
+    err('failed to close ' .. util.quoteaf(dst_name), sys.errno())
+    return_val = false
+  end
+::close_src_desc::
+  if sys.close(source_desc) < 0 then
+    err('failed to close ' .. util.quoteaf(src_name), sys.errno())
+    return_val = false
+  end
+  abuf.data:destroy()
+  return return_val
+end
+
+-- force_linkat / force_symlinkat (gnulib force-link.c): -1 when the link
+-- replaced an existing DSTNAME through a temporary name.
+local tmpcounter: uint64 = 0
+local function temp_beside(dstname: string): string
+  local dir = dstname:sub(1, #dstname - #copy.last_component(dstname))
+  local letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  local r: [8]byte
+  sys.getrandom(&r, 8, 0)
+  local v: uint64 = 0
+  for i = 0, 7 do v = (v << 8) | r[i] end
+  tmpcounter = tmpcounter + 1
+  v = v + tmpcounter
+  local sb: stringbuilder
+  sb:write(dir); sb:write('Cu')
+  for _ = 1, 6 do sb:writebyte(letters:byte((@integer)(v % 62) + 1)); v = v // 62 end
+  return sb:promote()
+end
+
+function copy.force_link(symlink: boolean, srcdir: cint, srcname: string, dstdir: cint, dstname: string,
+    flags: cint, force: boolean, e: cint): cint
+  if e < 0 then
+    local r: cint
+    if symlink then r = c_symlinkat(srcname, dstdir, dstname) else r = c_linkat(srcdir, srcname, dstdir, dstname, flags) end
+    e = r == 0 and 0 or sys.errno()
+  end
+  if not force or e ~= EEXIST then return e end
+  local tmp = ''
+  local made = false
+  for _ = 1, 100 do
+    tmp = temp_beside(dstname)
+    local r: cint
+    if symlink then r = c_symlinkat(srcname, dstdir, tmp) else r = c_linkat(srcdir, srcname, dstdir, tmp, flags) end
+    if r == 0 then made = true; break end
+    if sys.errno() ~= EEXIST then return sys.errno() end
+  end
+  if not made then return EEXIST end
+  local res: cint = c_renameat(dstdir, tmp, dstdir, dstname) == 0 and -1 or sys.errno()
+  c_unlinkat(dstdir, tmp, 0)
+  return res
+end
+
+local function subst_suffix(str: string, suffix: string, newsuffix: string): string
+  return str:sub(1, #str - #suffix) .. newsuffix
+end
+
+local function create_hard_link(src_name: string, have_src: boolean, src_dirfd: cint, src_relname: string,
+    dst_name: string, dst_dirfd: cint, dst_relname: string, replace: boolean, verbose: boolean, dereference: boolean): boolean
+  local e = copy.force_link(false, src_dirfd, src_relname, dst_dirfd, dst_relname,
+    dereference and AT_SYMLINK_FOLLOW or 0, replace, -1)
+  if 0 < e then
+    if not have_src then src_name = subst_suffix(dst_name, dst_relname, src_relname) end
+    err('cannot create hard link ' .. util.quoteaf(dst_name) .. ' to ' .. util.quoteaf(src_name), e)
+    return false
+  end
+  if e < 0 and verbose then util.write('removed ' .. util.quoteaf(dst_name) .. '\n') end
+  return true
+end
+
+local function should_dereference(x: *copy.Options, command_line_arg: boolean): boolean
+  return x.dereference == copy.DEREF_ALWAYS or (x.dereference == copy.DEREF_COMMAND_LINE_ARGUMENTS and command_line_arg)
+end
+
+local function source_is_dst_backup(srcbase: string, src_st: *sys.Stat, dst_dirfd: cint, dst_relname: string): boolean
+  local dstbase = copy.last_component(dst_relname)
+  local suffix = backup.simple_suffix()
+  if not (#srcbase == #dstbase + #suffix and srcbase:sub(1, #dstbase) == dstbase and srcbase:sub(#dstbase + 1) == suffix) then
+    return false
+  end
+  local dst_back = dst_relname .. suffix
+  local st: sys.Stat
+  return c_fstatat(dst_dirfd, dst_back, &st, 0) == 0 and same_inode(src_st, &st)
+end
+
+local function writable_destination(dst_dirfd: cint, dst_relname: string, mode: cuint): boolean
+  return islnk(mode) or sys.geteuid() == 0 or c_faccessat(dst_dirfd, dst_relname, 2, AT_EACCESS) == 0
+end
+
+local function overwrite_ok(x: *copy.Options, dst_name: string, dst_dirfd: cint, dst_relname: string, dst_sb: *sys.Stat): boolean
+  if not writable_destination(dst_dirfd, dst_relname, dst_sb.st_mode) then
+    local perms = util.modestr(dst_sb.st_mode):sub(2)
+    local m = string.format('%04o', dst_sb.st_mode & CHMOD_MODE_BITS)
+    if x.move_mode or x.unlink_dest_before_opening or x.unlink_dest_after_failed_open then
+      prompt('replace ' .. util.quoteaf(dst_name) .. ', overriding mode ' .. m .. ' (' .. perms .. ')? ')
+    else
+      prompt('unwritable ' .. util.quoteaf(dst_name) .. ' (mode ' .. m .. ', ' .. perms .. '); try anyway? ')
+    end
+  else
+    prompt('overwrite ' .. util.quoteaf(dst_name) .. '? ')
+  end
+  return copy.yesno()
+end
+
+local function abandon_move(x: *copy.Options, dst_name: string, dst_dirfd: cint, dst_relname: string, dst_sb: *sys.Stat): boolean
+  return x.interactive == copy.I_ALWAYS_NO
+    or ((x.interactive == copy.I_ASK_USER
+         or (x.interactive == copy.I_UNSPECIFIED and x.stdin_tty
+             and not writable_destination(dst_dirfd, dst_relname, dst_sb.st_mode)))
+        and not overwrite_ok(x, dst_name, dst_dirfd, dst_relname, dst_sb))
+end
+
+local function same_file_ok(src_name: string, src_sb: *sys.Stat, dst_dirfd: cint, dst_relname: string,
+    dst_sb: *sys.Stat, x: *copy.Options, return_now: *boolean): boolean
+  local src_sb_link: *sys.Stat
+  local dst_sb_link: *sys.Stat
+  local tmp_dst_sb: sys.Stat
+  local tmp_src_sb: sys.Stat
+  local same_link: boolean
+  local same = same_inode(src_sb, dst_sb)
+  $return_now = false
+  if same and x.hard_link then
+    $return_now = true
+    return true
+  end
+  if x.dereference == copy.DEREF_NEVER then
+    same_link = same
+    if islnk(src_sb.st_mode) and islnk(dst_sb.st_mode) then
+      local sn = copy.same_nameat(AT_FDCWD, src_name, dst_dirfd, dst_relname)
+      if not sn then
+        if x.backup_type ~= backup.NONE then return true end
+        if same_link then
+          $return_now = true
+          return not x.move_mode
+        end
+      end
+      return not sn
+    end
+    src_sb_link = src_sb
+    dst_sb_link = dst_sb
+  else
+    if not same then return true end
+    if c_fstatat(dst_dirfd, dst_relname, &tmp_dst_sb, AT_SYMLINK_NOFOLLOW) ~= 0 or sys.lstat(src_name, &tmp_src_sb) ~= 0 then
+      return true
+    end
+    src_sb_link = &tmp_src_sb
+    dst_sb_link = &tmp_dst_sb
+    same_link = same_inode(src_sb_link, dst_sb_link)
+    if islnk(src_sb_link.st_mode) and islnk(dst_sb_link.st_mode) and x.unlink_dest_before_opening then return true end
+  end
+  if x.backup_type ~= backup.NONE then
+    if not same_link then
+      if not x.move_mode and x.dereference ~= copy.DEREF_NEVER and islnk(src_sb_link.st_mode)
+          and not islnk(dst_sb_link.st_mode) then
+        return false
+      end
+      return true
+    end
+    return not copy.same_nameat(AT_FDCWD, src_name, dst_dirfd, dst_relname)
+  end
+  if x.move_mode or x.unlink_dest_before_opening then
+    if islnk(dst_sb_link.st_mode) then return true end
+    if same_link and 1 < dst_sb_link.st_nlink and not copy.same_nameat(AT_FDCWD, src_name, dst_dirfd, dst_relname) then
+      return not x.move_mode
+    end
+  end
+  if not islnk(src_sb_link.st_mode) and not islnk(dst_sb_link.st_mode) then
+    if not same_inode(src_sb_link, dst_sb_link) then return true end
+    if x.hard_link then $return_now = true; return true end
+  end
+  if x.move_mode and islnk(src_sb.st_mode) and 1 < dst_sb_link.st_nlink then
+    local abs_src = canon.canonicalize(src_name, canon.CAN_EXISTING)
+    if #abs_src > 0 then return not copy.same_nameat(AT_FDCWD, abs_src, dst_dirfd, dst_relname) end
+  end
+  if x.symbolic_link and islnk(dst_sb_link.st_mode) then return true end
+  if x.dereference == copy.DEREF_NEVER then
+    if not islnk(src_sb_link.st_mode) then tmp_src_sb = $src_sb_link
+    elseif sys.stat(src_name, &tmp_src_sb) ~= 0 then return true end
+    if not islnk(dst_sb_link.st_mode) then tmp_dst_sb = $dst_sb_link
+    elseif c_fstatat(dst_dirfd, dst_relname, &tmp_dst_sb, 0) ~= 0 then return true end
+    if not same_inode(&tmp_src_sb, &tmp_dst_sb) then return true end
+    if x.hard_link then
+      $return_now = not islnk(dst_sb_link.st_mode)
+      return true
+    end
+  end
+  return false
+end
+
+local function readlink_at(dirfd: cint, path: string): (boolean, string)
+  local size = 256
+  while true do
+    local buf: sequence(byte)
+    buf:resize(size)
+    local n = c_readlinkat(dirfd, path, &buf[1], (@csize)(size))
+    if n < 0 then return false, '' end
+    if n < size then return true, string.copy((@string){data = &buf[1], size = (@usize)(n)}) end
+    size = size * 2
+  end
+  return false, ''
+end
+
+local Ancestor = @record{ ino: uint64, dev: uint64 }
+
+local top_level_src_name = ''
+local top_level_dst_name = ''
+
+local copy_internal: function(string, string, cint, string, integer, *sys.Stat, *sequence(Ancestor),
+  *copy.Options, boolean, *boolean, *boolean, *boolean): boolean
+
+-- gnulib savedir with SAVEDIR_SORT_FASTREAD: names in inode order.
+local Name = @record{ name: string, ino: uint64 }
+local function savedir(dir: string): (boolean, sequence(string))
+  local names: sequence(string)
+  local fd = sys.open(dir, sys.O_RDONLY | O_DIRECTORY | 0x80000, 0)
+  if fd < 0 then return false, names end
+  local d = c_fdopendir(fd)
+  if d == nilptr then sys.close(fd); return false, names end
+  local v: sequence(Name)
+  sys.seterrno(0)
+  while true do
+    local e = sys.readdir(d)
+    if e == nilptr then break end
+    local n = sys.cstr(&e.d_name)
+    if n ~= '.' and n ~= '..' then v:push({name = string.copy(n), ino = e.d_ino}) end
+    sys.seterrno(0)
+  end
+  local rerr = sys.errno()
+  sys.closedir(d)
+  if rerr ~= 0 then sys.seterrno(rerr); return false, names end
+  -- stable merge sort by inode
+  local n = #v
+  local tmp: sequence(Name)
+  tmp:resize(n)
+  local width = 1
+  while width < n do
+    local i = 1
+    while i <= n do
+      local mid = i + width
+      local hi = i + 2 * width
+      if mid > n + 1 then mid = n + 1 end
+      if hi > n + 1 then hi = n + 1 end
+      local a, b, k = i, mid, i
+      while a < mid and b < hi do
+        if v[b].ino < v[a].ino then tmp[k] = v[b]; b = b + 1 else tmp[k] = v[a]; a = a + 1 end
+        k = k + 1
+      end
+      while a < mid do tmp[k] = v[a]; a = a + 1; k = k + 1 end
+      while b < hi do tmp[k] = v[b]; b = b + 1; k = k + 1 end
+      i = hi
+    end
+    for j = 1, n do v[j] = tmp[j] end
+    width = width * 2
+  end
+  for i = 1, n do names:push(v[i].name) end
+  return true, names
+end
+
+local function copy_dir(src_name_in: string, dst_name_in: string, dst_dirfd: cint, dst_relname_in: string, new_dst: boolean,
+    src_sb: *sys.Stat, ancestors: *sequence(Ancestor), x: *copy.Options, first_dir_created: *boolean, copy_into_self: *boolean): boolean
+  local ok = true
+  local okd, names = savedir(src_name_in)
+  if not okd then
+    err('cannot access ' .. util.quoteaf(src_name_in), sys.errno())
+    return false
+  end
+  local nx: copy.Options = $x
+  if x.dereference == copy.DEREF_COMMAND_LINE_ARGUMENTS then nx.dereference = copy.DEREF_NEVER end
+  local new_first_dir_created = false
+  local reloff = #dst_name_in - #dst_relname_in
+  for i = 1, #names do
+    local local_copy_into_self = false
+    local src_name = copy.file_name_concat(src_name_in, names[i])
+    local dst_name = copy.file_name_concat(dst_name_in, names[i])
+    local fdc = $first_dir_created
+    local rename_succeeded = false
+    ok = copy_internal(src_name, dst_name, dst_dirfd, dst_name:sub(reloff + 1), new_dst and 1 or 0, src_sb,
+      ancestors, &nx, false, &fdc, &local_copy_into_self, &rename_succeeded) and ok
+    if local_copy_into_self then $copy_into_self = true end
+    if local_copy_into_self then break end
+    if fdc then new_first_dir_created = true end
+  end
+  $first_dir_created = new_first_dir_created
+  return ok
+end
+
+local function un_backup(x: *copy.Options, have_earlier: boolean, src_sb: *sys.Stat, dst_backup: string, have_backup: boolean,
+    dst_name: string, dst_dirfd: cint, dst_relname: string): boolean
+  if not have_earlier then forget_created(src_sb.st_ino, src_sb.st_dev) end
+  if have_backup then
+    local dst_relbackup = dst_backup:sub(#dst_name - #dst_relname + 1)
+    if c_renameat(dst_dirfd, dst_relbackup, dst_dirfd, dst_relname) ~= 0 then
+      err('cannot un-backup ' .. util.quoteaf(dst_name), sys.errno())
+    elseif x.verbose then
+      util.write(util.quoteaf(dst_backup) .. ' -> ' .. util.quoteaf(dst_name) .. ' (unbackup)\n')
+    end
+  end
+  return false
+end
+
+local function dot_or_dotdot(s: string): boolean
+  if #s == 0 or s:byte(1) ~= 46 then return false end
+  local k = (#s >= 2 and s:byte(2) == 46) and 3 or 2
+  return k > #s or s:byte(k) == 47
+end
+
+copy_internal = function(src_name: string, dst_name: string, dst_dirfd: cint, dst_relname: string,
+    nonexistent_dst: integer, parent: *sys.Stat, ancestors: *sequence(Ancestor), x: *copy.Options,
+    command_line_arg: boolean, first_dir_created: *boolean, copy_into_self: *boolean, rename_succeeded: *boolean): boolean
+  local src_sb: sys.Stat
+  local dst_sb: sys.Stat
+  local src_mode: cuint = 0
+  local dst_mode: cuint = 0
+  local restore_dst_mode = false
+  local earlier_file = ''
+  local have_earlier = false
+  local dst_backup = ''
+  local have_backup = false
+  local delayed_ok = true
+  local copied_as_regular = false
+  local dest_is_symlink = false
+  local have_dst_lstat = false
+  local new_dst = 0 < nonexistent_dst
+  $copy_into_self = false
+  local rename_errno = x.rename_errno
+  if x.move_mode then
+    if rename_errno < 0 then
+      rename_errno = c_renameat2(AT_FDCWD, src_name, dst_dirfd, dst_relname, 1) ~= 0 and sys.errno() or 0
+    end
+    new_dst = rename_errno == 0
+    nonexistent_dst = new_dst and 1 or 0
+    if rename_succeeded ~= nilptr then $rename_succeeded = new_dst end
+  end
+  local stat_src: boolean
+  if rename_errno == 0 then stat_src = not x.last_file
+  else stat_src = rename_errno ~= EEXIST or x.interactive ~= copy.I_ALWAYS_NO end
+  if stat_src then
+    local name = rename_errno == 0 and dst_name or src_name
+    local dirfd = rename_errno == 0 and dst_dirfd or AT_FDCWD
+    local relname = rename_errno == 0 and dst_relname or src_name
+    local flags = x.dereference == copy.DEREF_NEVER and AT_SYMLINK_NOFOLLOW or 0
+    if c_fstatat(dirfd, relname, &src_sb, flags) ~= 0 then
+      err('cannot stat ' .. util.quoteaf(name), sys.errno())
+      return false
+    end
+    src_mode = src_sb.st_mode
+    if isdir(src_mode) and not x.recursive then
+      util.err((not x.install_mode and '-r not specified; omitting directory ' or 'omitting directory ') .. util.quoteaf(src_name))
+      return false
+    end
+  else
+    src_sb = {}
+  end
+  if command_line_arg and x.src_info then
+    if not isdir(src_mode) and x.backup_type == backup.NONE and seen_file(&src_set, src_name, &src_sb) then
+      util.err('warning: source file ' .. util.quoteaf(src_name) .. ' specified more than once')
+      return true
+    end
+    record_file(&src_set, src_name, &src_sb)
+  end
+  local dereference = should_dereference(x, command_line_arg)
+  if nonexistent_dst <= 0 then
+    if not (rename_errno == EEXIST and x.interactive == copy.I_ALWAYS_NO) then
+      local use_lstat = (not isreg(src_mode) and (not x.copy_as_regular or isdir(src_mode) or islnk(src_mode)))
+        or x.move_mode or x.symbolic_link or x.hard_link or x.backup_type ~= backup.NONE or x.unlink_dest_before_opening
+      local flags = use_lstat and AT_SYMLINK_NOFOLLOW or 0
+      if not use_lstat and nonexistent_dst < 0 then
+        new_dst = true
+      elseif c_fstatat(dst_dirfd, dst_relname, &dst_sb, flags) == 0 then
+        have_dst_lstat = use_lstat
+        rename_errno = EEXIST
+      else
+        local e = sys.errno()
+        if e == ELOOP and x.unlink_dest_after_failed_open then
+        elseif e ~= ENOENT then
+          err('cannot stat ' .. util.quoteaf(dst_name), e)
+          return false
+        else
+          new_dst = true
+        end
+      end
+    end
+    if rename_errno == EEXIST then
+      local return_now = false
+      if x.interactive ~= copy.I_ALWAYS_NO and not same_file_ok(src_name, &src_sb, dst_dirfd, dst_relname, &dst_sb, x, &return_now) then
+        util.err(util.quoteaf(src_name) .. ' and ' .. util.quoteaf(dst_name) .. ' are the same file')
+        return false
+      end
+      if x.update and not isdir(src_mode) then
+        -- utimecmpat: dst not older than src means skip
+        local truncate = x.preserve_timestamps and not (x.move_mode and dst_sb.st_dev == src_sb.st_dev)
+        local ds, dn = dst_sb.st_mtim.tv_sec, dst_sb.st_mtim.tv_nsec
+        local ss, sn = src_sb.st_mtim.tv_sec, src_sb.st_mtim.tv_nsec
+        if truncate then
+          -- gnulib truncates the source time to the destination's apparent
+          -- resolution; nanosecond file systems leave it unchanged.
+        end
+        if ds > ss or (ds == ss and dn >= sn) then
+          if rename_succeeded ~= nilptr then $rename_succeeded = true end
+          have_earlier, earlier_file = remember_copied(dst_relname, src_sb.st_ino, src_sb.st_dev)
+          if have_earlier then
+            if not create_hard_link('', false, dst_dirfd, earlier_file, dst_name, dst_dirfd, dst_relname, true, x.verbose, dereference) then
+              return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+            end
+          end
+          return true
+        end
+      end
+      if x.move_mode then
+        if abandon_move(x, dst_name, dst_dirfd, dst_relname, &dst_sb) then
+          if rename_succeeded ~= nilptr then $rename_succeeded = true end
+          return true
+        end
+      else
+        if not isdir(src_mode) and (x.interactive == copy.I_ALWAYS_NO
+            or (x.interactive == copy.I_ASK_USER and not overwrite_ok(x, dst_name, dst_dirfd, dst_relname, &dst_sb))) then
+          return true
+        end
+      end
+      if return_now then return true end
+      if not isdir(dst_sb.st_mode) then
+        if isdir(src_mode) then
+          if x.move_mode and x.backup_type ~= backup.NONE then
+          else
+            util.err('cannot overwrite non-directory ' .. util.quoteaf(dst_name) .. ' with directory ' .. util.quoteaf(src_name))
+            return false
+          end
+        end
+        if command_line_arg and x.backup_type ~= backup.NUMBERED and x.dest_info and seen_file(&dest_set, dst_relname, &dst_sb) then
+          util.err('will not overwrite just-created ' .. util.quoteaf(dst_name) .. ' with ' .. util.quoteaf(src_name))
+          return false
+        end
+      end
+      if not isdir(src_mode) then
+        if isdir(dst_sb.st_mode) then
+          if x.move_mode and x.backup_type ~= backup.NONE then
+          else
+            util.err('cannot overwrite directory ' .. util.quoteaf(dst_name) .. ' with non-directory')
+            return false
+          end
+        end
+      end
+      if x.move_mode then
+        if isdir(src_sb.st_mode) and not isdir(dst_sb.st_mode) and x.backup_type == backup.NONE then
+          util.err('cannot move directory onto non-directory: ' .. util.quotef(src_name) .. ' -> ' .. util.quotef(dst_name))
+          return false
+        end
+      end
+      local srcbase = copy.last_component(src_name)
+      if x.backup_type ~= backup.NONE and not dot_or_dotdot(srcbase) and (x.move_mode or not isdir(dst_sb.st_mode)) then
+        if x.backup_type ~= backup.NUMBERED and source_is_dst_backup(srcbase, &src_sb, dst_dirfd, dst_relname) then
+          util.err('backing up ' .. util.quoteaf(dst_name) .. ' might destroy source;  ' .. util.quoteaf(src_name)
+            .. (x.move_mode and ' not moved' or ' not copied'))
+          return false
+        end
+        local tmp_backup, be = backup.rename(dst_dirfd, dst_relname, x.backup_type)
+        if #tmp_backup > 0 then
+          dst_backup = dst_name:sub(1, #dst_name - #dst_relname) .. tmp_backup
+          have_backup = true
+        elseif be ~= ENOENT then
+          err('cannot backup ' .. util.quoteaf(dst_name), be)
+          return false
+        end
+        new_dst = true
+      elseif not isdir(dst_sb.st_mode) and not x.move_mode
+          and (x.unlink_dest_before_opening
+               or (x.data_copy_required and ((x.preserve_links and 1 < dst_sb.st_nlink)
+                   or (x.dereference == copy.DEREF_NEVER and not isreg(src_sb.st_mode))))) then
+        if c_unlinkat(dst_dirfd, dst_relname, 0) ~= 0 and sys.errno() ~= ENOENT then
+          err('cannot remove ' .. util.quoteaf(dst_name), sys.errno())
+          return false
+        end
+        new_dst = true
+        if x.verbose then util.write('removed ' .. util.quoteaf(dst_name) .. '\n') end
+      end
+    end
+  end
+  if command_line_arg and x.dest_info and not x.move_mode and x.backup_type == backup.NONE then
+    local lstat_ok = true
+    local tmp_buf: sys.Stat
+    local dl: *sys.Stat
+    if have_dst_lstat then dl = &dst_sb
+    else
+      if c_fstatat(dst_dirfd, dst_relname, &tmp_buf, AT_SYMLINK_NOFOLLOW) == 0 then dl = &tmp_buf
+      else lstat_ok = false end
+    end
+    if lstat_ok and islnk(dl.st_mode) and seen_file(&dest_set, dst_relname, dl) then
+      util.err('will not copy ' .. util.quoteaf(src_name) .. ' through just-created symlink ' .. util.quoteaf(dst_name))
+      return false
+    end
+  end
+  if x.verbose and not x.move_mode and not isdir(src_mode) then copy.emit_verbose(src_name, dst_name, dst_backup, have_backup) end
+  if rename_errno == 0 then
+    have_earlier = false
+  elseif x.recursive and isdir(src_mode) then
+    if command_line_arg then have_earlier, earlier_file = remember_copied(dst_relname, src_sb.st_ino, src_sb.st_dev)
+    else have_earlier, earlier_file = src_to_dest_lookup(src_sb.st_ino, src_sb.st_dev) end
+  elseif x.move_mode and src_sb.st_nlink == 1 then
+    have_earlier, earlier_file = src_to_dest_lookup(src_sb.st_ino, src_sb.st_dev)
+  elseif x.preserve_links and not x.hard_link and (1 < src_sb.st_nlink
+      or (command_line_arg and x.dereference == copy.DEREF_COMMAND_LINE_ARGUMENTS)
+      or x.dereference == copy.DEREF_ALWAYS) then
+    have_earlier, earlier_file = remember_copied(dst_relname, src_sb.st_ino, src_sb.st_dev)
+  end
+  if have_earlier then
+    if isdir(src_mode) then
+      if copy.same_nameat(AT_FDCWD, src_name, dst_dirfd, earlier_file) then
+        util.err('cannot copy a directory, ' .. util.quoteaf(top_level_src_name) .. ', into itself, ' .. util.quoteaf(top_level_dst_name))
+        $copy_into_self = true
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      elseif copy.same_nameat(dst_dirfd, dst_relname, dst_dirfd, earlier_file) then
+        util.err('warning: source directory ' .. util.quoteaf(top_level_src_name) .. ' specified more than once')
+        if x.move_mode and rename_succeeded ~= nilptr then $rename_succeeded = true end
+        return true
+      elseif x.dereference == copy.DEREF_ALWAYS or (command_line_arg and x.dereference == copy.DEREF_COMMAND_LINE_ARGUMENTS) then
+      else
+        local earlier = subst_suffix(dst_name, dst_relname, earlier_file)
+        util.err('will not create hard link ' .. util.quoteaf(dst_name) .. ' to directory ' .. util.quoteaf(earlier))
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      end
+    else
+      if not create_hard_link('', false, dst_dirfd, earlier_file, dst_name, dst_dirfd, dst_relname, true, x.verbose, dereference) then
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      end
+      return true
+    end
+  end
+  if x.move_mode then
+    if rename_errno == EEXIST then
+      rename_errno = c_renameat(AT_FDCWD, src_name, dst_dirfd, dst_relname) == 0 and 0 or sys.errno()
+    end
+    if rename_errno == 0 then
+      if x.verbose then
+        util.write('renamed ')
+        copy.emit_verbose(src_name, dst_name, dst_backup, have_backup)
+      end
+      if rename_succeeded ~= nilptr then $rename_succeeded = true end
+      if command_line_arg and not x.last_file and x.dest_info then record_file(&dest_set, dst_relname, &src_sb) end
+      return true
+    end
+    if rename_errno == EINVAL then
+      util.err('cannot move ' .. util.quoteaf(top_level_src_name) .. ' to a subdirectory of itself, ' .. util.quoteaf(top_level_dst_name))
+      $copy_into_self = true
+      return true
+    end
+    if rename_errno ~= EXDEV then
+      err('cannot move ' .. util.quoteaf(src_name) .. ' to ' .. util.quoteaf(dst_name), rename_errno)
+      forget_created(src_sb.st_ino, src_sb.st_dev)
+      return false
+    end
+    if c_unlinkat(dst_dirfd, dst_relname, isdir(src_mode) and AT_REMOVEDIR or 0) ~= 0 and sys.errno() ~= ENOENT then
+      err('inter-device move failed: ' .. util.quoteaf(src_name) .. ' to ' .. util.quoteaf(dst_name) .. '; unable to remove target', sys.errno())
+      forget_created(src_sb.st_ino, src_sb.st_dev)
+      return false
+    end
+    if x.verbose and not isdir(src_mode) then
+      util.write('copied ')
+      copy.emit_verbose(src_name, dst_name, dst_backup, have_backup)
+    end
+    new_dst = true
+  end
+  local dst_mode_bits = (x.set_mode and x.mode or src_mode) & CHMOD_MODE_BITS
+  local omitted_permissions = dst_mode_bits & (x.preserve_ownership and (S_IRWXG | S_IRWXO)
+    or (isdir(src_mode) and (S_IWGRP | S_IWOTH) or 0))
+  delayed_ok = true
+  if isdir(src_mode) then
+    for i = 1, #ancestors do
+      if ancestors[i].ino == src_sb.st_ino and ancestors[i].dev == src_sb.st_dev then
+        util.err('cannot copy cyclic symbolic link ' .. util.quoteaf(src_name))
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      end
+    end
+    if new_dst or not isdir(dst_sb.st_mode) then
+      local mode = dst_mode_bits & ~omitted_permissions
+      if c_mkdirat(dst_dirfd, dst_relname, mode) ~= 0 then
+        err('cannot create directory ' .. util.quoteaf(dst_name), sys.errno())
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      end
+      if c_fstatat(dst_dirfd, dst_relname, &dst_sb, AT_SYMLINK_NOFOLLOW) ~= 0 then
+        err('cannot stat ' .. util.quoteaf(dst_name), sys.errno())
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      elseif (dst_sb.st_mode & S_IRWXU) ~= S_IRWXU then
+        dst_mode = dst_sb.st_mode
+        restore_dst_mode = true
+        if lchmodat(dst_dirfd, dst_relname, dst_mode | S_IRWXU) ~= 0 then
+          err('setting permissions for ' .. util.quoteaf(dst_name), sys.errno())
+          return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+        end
+      end
+      if not $first_dir_created then
+        remember_copied(dst_relname, dst_sb.st_ino, dst_sb.st_dev)
+        $first_dir_created = true
+      end
+      if x.verbose then
+        if x.move_mode then util.write('created directory ' .. util.quoteaf(dst_name) .. '\n')
+        else copy.emit_verbose(src_name, dst_name, '', false) end
+      end
+    else
+      omitted_permissions = 0
+    end
+    if x.one_file_system and parent ~= nilptr and parent.st_dev ~= src_sb.st_dev then
+    else
+      ancestors:push({ino = src_sb.st_ino, dev = src_sb.st_dev})
+      delayed_ok = copy_dir(src_name, dst_name, dst_dirfd, dst_relname, new_dst, &src_sb, ancestors, x, first_dir_created, copy_into_self)
+      ancestors:pop()
+    end
+  elseif x.symbolic_link then
+    dest_is_symlink = true
+    if src_name:byte(1) ~= 47 then
+      local dot_sb: sys.Stat
+      local dp_sb: sys.Stat
+      local dst_parent = copy.dir_name(dst_relname)
+      local in_current_dir = (dst_dirfd == AT_FDCWD and dst_parent == '.') or sys.stat('.', &dot_sb) ~= 0
+        or c_fstatat(dst_dirfd, dst_parent, &dp_sb, 0) ~= 0 or same_inode(&dot_sb, &dp_sb)
+      if not in_current_dir then
+        util.err(util.quotef(dst_name) .. ': can make relative symbolic links only in current directory')
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      end
+    end
+    local e = copy.force_link(true, AT_FDCWD, src_name, dst_dirfd, dst_relname, 0, x.unlink_dest_after_failed_open, -1)
+    if 0 < e then
+      err('cannot create symbolic link ' .. util.quoteaf(dst_name) .. ' to ' .. util.quoteaf(src_name), e)
+      return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+    end
+  elseif x.hard_link then
+    local replace = x.unlink_dest_after_failed_open or x.interactive == copy.I_ASK_USER
+    if not create_hard_link(src_name, true, AT_FDCWD, src_name, dst_name, dst_dirfd, dst_relname, replace, false, dereference) then
+      return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+    end
+  elseif isreg(src_mode) or (x.copy_as_regular and not islnk(src_mode)) then
+    copied_as_regular = true
+    if not copy_reg(src_name, dst_name, dst_dirfd, dst_relname, x, dst_mode_bits & S_IRWXUGO, omitted_permissions, &new_dst, &src_sb) then
+      return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+    end
+  elseif (src_mode & S_IFMT) == S_IFIFO then
+    local mode = src_mode & ~omitted_permissions
+    if c_mknodat(dst_dirfd, dst_relname, mode, 0) ~= 0 then
+      if c_mkfifoat(dst_dirfd, dst_relname, mode & ~S_IFIFO) ~= 0 then
+        err('cannot create fifo ' .. util.quoteaf(dst_name), sys.errno())
+        return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+      end
+    end
+  elseif (src_mode & S_IFMT) == S_IFBLK or (src_mode & S_IFMT) == S_IFCHR or (src_mode & S_IFMT) == S_IFSOCK then
+    local mode = src_mode & ~omitted_permissions
+    if c_mknodat(dst_dirfd, dst_relname, mode, src_sb.st_rdev) ~= 0 then
+      err('cannot create special file ' .. util.quoteaf(dst_name), sys.errno())
+      return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+    end
+  elseif islnk(src_mode) then
+    local okl, src_link_val = readlink_at(AT_FDCWD, src_name)
+    dest_is_symlink = true
+    if not okl then
+      err('cannot read symbolic link ' .. util.quoteaf(src_name), sys.errno())
+      return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+    end
+    local symlink_err = copy.force_link(true, AT_FDCWD, src_link_val, dst_dirfd, dst_relname, 0, x.unlink_dest_after_failed_open, -1)
+    if 0 < symlink_err and x.update and not new_dst and islnk(dst_sb.st_mode) and dst_sb.st_size == #src_link_val then
+      local okd, dest_link_val = readlink_at(dst_dirfd, dst_relname)
+      if okd and dest_link_val == src_link_val then symlink_err = 0 end
+    end
+    if 0 < symlink_err then
+      err('cannot create symbolic link ' .. util.quoteaf(dst_name), symlink_err)
+      return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+    end
+    if x.preserve_ownership then
+      if c_fchownat(dst_dirfd, dst_relname, src_sb.st_uid, src_sb.st_gid, AT_SYMLINK_NOFOLLOW) ~= 0 and not copy.chown_failure_ok(x) then
+        err('failed to preserve ownership for ' .. dst_name, sys.errno())
+        if x.require_preserve then
+          return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+        end
+      end
+    end
+  else
+    util.err(util.quoteaf(src_name) .. ' has unknown file type')
+    return un_backup(x, have_earlier, &src_sb, dst_backup, have_backup, dst_name, dst_dirfd, dst_relname)
+  end
+  if command_line_arg and x.dest_info then
+    local sb: sys.Stat
+    if c_fstatat(dst_dirfd, dst_relname, &sb, AT_SYMLINK_NOFOLLOW) == 0 then record_file(&dest_set, dst_relname, &sb) end
+  end
+  if x.hard_link and not isdir(src_mode) then return delayed_ok end
+  if copied_as_regular then return delayed_ok end
+  if x.preserve_timestamps then
+    local ts: [2]sys.Timespec = {src_sb.st_atim, src_sb.st_mtim}
+    if c_utimensat(dst_dirfd, dst_relname, &ts, dest_is_symlink and AT_SYMLINK_NOFOLLOW or 0) ~= 0 then
+      err('preserving times for ' .. util.quoteaf(dst_name), sys.errno())
+      if x.require_preserve then return false end
+    end
+  end
+  if not dest_is_symlink and x.preserve_ownership
+      and (new_dst or not (src_sb.st_uid == dst_sb.st_uid and src_sb.st_gid == dst_sb.st_gid)) then
+    local r = set_owner(x, dst_name, dst_dirfd, dst_relname, -1, &src_sb, new_dst, &dst_sb)
+    if r == -1 then return false
+    elseif r == 0 then src_mode = src_mode & ~(S_ISUID | S_ISGID | S_ISVTX) end
+  end
+  if x.preserve_xattr and not copy_attr(src_name, -1, dst_name, -1, x) and x.require_preserve_xattr then return false end
+  if dest_is_symlink then return delayed_ok end
+  if x.preserve_mode or x.move_mode then
+    if copy.copy_acl(src_name, -1, dst_name, -1, src_mode) ~= 0 and x.require_preserve then return false end
+  elseif x.set_mode then
+    if copy.set_acl(dst_name, -1, x.mode) ~= 0 then return false end
+  elseif x.explicit_no_preserve_mode and new_dst then
+    local default_permissions = (isdir(src_mode) or (src_mode & S_IFMT) == S_IFSOCK) and S_IRWXUGO or MODE_RW_UGO
+    if copy.set_acl(dst_name, -1, default_permissions & ~copy.cached_umask()) ~= 0 then return false end
+  else
+    if omitted_permissions ~= 0 then
+      omitted_permissions = omitted_permissions & ~copy.cached_umask()
+      if omitted_permissions ~= 0 and not restore_dst_mode then
+        if new_dst and c_fstatat(dst_dirfd, dst_relname, &dst_sb, AT_SYMLINK_NOFOLLOW) ~= 0 then
+          err('cannot stat ' .. util.quoteaf(dst_name), sys.errno())
+          return false
+        end
+        dst_mode = dst_sb.st_mode
+        if (omitted_permissions & ~dst_mode) ~= 0 then restore_dst_mode = true end
+      end
+    end
+    if restore_dst_mode then
+      if lchmodat(dst_dirfd, dst_relname, dst_mode | omitted_permissions) ~= 0 then
+        err('preserving permissions for ' .. util.quoteaf(dst_name), sys.errno())
+        if x.require_preserve then return false end
+      end
+    end
+  end
+  return delayed_ok
+end
+
+-- copy (): one command-line argument.
+function copy.copy(src_name: string, dst_name: string, dst_dirfd: cint, dst_relname: string, nonexistent_dst: integer,
+    x: *copy.Options, copy_into_self: *boolean, rename_succeeded: *boolean): boolean
+  top_level_src_name = src_name
+  top_level_dst_name = dst_name
+  local first_dir_created = false
+  local ancestors: sequence(Ancestor)
+  return copy_internal(src_name, dst_name, dst_dirfd, dst_relname, nonexistent_dst, nilptr, &ancestors, x, true,
+    &first_dir_created, copy_into_self, rename_succeeded)
+end
+
+-- target_directory_operand: an O_PATH descriptor for FILE as a directory,
+-- AT_FDCWD for "." spellings, or -1 with errno.
+function copy.target_directory_operand(file: string): cint
+  local i = 1
+  local is_wd = false
+  while i <= #file and file:byte(i) == 46 do
+    i = i + 1
+    if i > #file then is_wd = true; break end
+    if file:byte(i) ~= 47 then break end
+    while i <= #file and file:byte(i) == 47 do i = i + 1 end
+    if i > #file then is_wd = true; break end
+  end
+  if is_wd then return AT_FDCWD end
+  return sys.open(file, O_PATH | O_DIRECTORY, 0)
+end

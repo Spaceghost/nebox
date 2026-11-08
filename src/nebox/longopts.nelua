@@ -17,20 +17,6 @@ global longopts.mkdir: []util.LongOpt = {
   {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.cp: []util.LongOpt = {
-  {'archive', 0, 97}, {'attributes-only', 0, util.UNSUPPORTED}, {'backup', 2, util.UNSUPPORTED},
-  {'copy-contents', 0, util.UNSUPPORTED}, {'dereference', 0, util.UNSUPPORTED}, {'force', 0, 102},
-  {'interactive', 0, 105}, {'link', 0, util.UNSUPPORTED}, {'no-clobber', 0, 110},
-  {'no-dereference', 0, util.UNSUPPORTED}, {'no-preserve', 1, util.UNSUPPORTED},
-  {'no-target-directory', 0, util.UNSUPPORTED}, {'one-file-system', 0, util.UNSUPPORTED},
-  {'parents', 0, util.UNSUPPORTED}, {'path', 0, util.UNSUPPORTED},
-  {'preserve', 2, util.UNSUPPORTED}, {'recursive', 0, 82},
-  {'remove-destination', 0, util.UNSUPPORTED}, {'sparse', 1, util.UNSUPPORTED},
-  {'reflink', 2, util.UNSUPPORTED}, {'strip-trailing-slashes', 0, util.UNSUPPORTED},
-  {'suffix', 1, util.UNSUPPORTED}, {'symbolic-link', 0, util.UNSUPPORTED},
-  {'target-directory', 1, util.UNSUPPORTED}, {'update', 0, util.UNSUPPORTED}, {'verbose', 0, 118},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.mv: []util.LongOpt = {
   {'backup', 2, util.UNSUPPORTED}, {'context', 0, util.UNSUPPORTED}, {'force', 0, 102},
   {'interactive', 0, 105}, {'no-clobber', 0, 110}, {'no-target-directory', 0, util.UNSUPPORTED},

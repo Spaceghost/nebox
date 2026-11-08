@@ -213,6 +213,24 @@ Stated here rather than worked around:
   an uninitialized stat buffer; nebox shows the link's own owner.
   `tests/chown_compare.py`: 273 cases, 0 mismatches, run both as an
   ordinary user and as root.
+- `cp` ports cp.c over `src/nebox/copy.nelua`, a port of copy.c and
+  cp-hash.c that mv and install will share: copy_internal's same-file,
+  overwrite, update and backup rules (backup.rename for numbered names),
+  copy_reg with copy_file_range, FICLONE reflinks, SEEK_DATA/SEEK_HOLE
+  extent copies and hole punching for `--sparse`, the dangling-symlink
+  refusal, directories copied in inode order as gnulib savedir sorts them,
+  hard links preserved through the dev/ino map, special files, ownership,
+  mode and timestamp preservation with GNU's temporary restrictive modes,
+  and user/trusted xattrs copied as libattr does under /etc/xattr.conf's
+  defaults. Every cp option, including `--parents` (make_dir_parents_private
+  and re_protect), `--attributes-only`, `--copy-contents`, `--no-preserve`,
+  `--remove-destination` and `--strip-trailing-slashes`. Not supported:
+  SELinux contexts (`-Z`/`--context` warn as GNU does without SELinux) and
+  ACLs beyond copying a source's system.posix_acl_* attribute; `--update`
+  compares nanosecond timestamps without gnulib utimecmp's resolution
+  probing. renameat2 comes from a raw syscall until nelibc has a wrapper.
+  `tests/cp_compare.py`: 175 cases on tmpfs, 0 mismatches as an ordinary
+  user and as root.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

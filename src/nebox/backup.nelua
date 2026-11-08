@@ -19,7 +19,7 @@ global backup.NUMBERED: integer <comptime> = 3
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
 local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
-local function c_renameat2(ofd: cint, old: cstring, nfd: cint, new: cstring, flags: cuint): cint <cimport 'renameat2', cinclude '<stdio.h>'> end
+local c_renameat2 = sys.renameat2
 local function c_fpathconf(fd: cint, name: cint): clong <cimport 'fpathconf', cinclude '<unistd.h>'> end
 local function c_pathconf(path: cstring, name: cint): clong <cimport 'pathconf', cinclude '<unistd.h>'> end
 
@@ -177,26 +177,55 @@ local function check_extension(buf: *sequence(byte), filelen: integer, e: byte, 
   return false
 end
 
--- backupfile_internal without the rename: the backup name, relative to DIR_FD.
-function backup.find_name(dir_fd: cint, file: string, btype: integer): string
+-- One pass of backupfile_internal: the name, the backup type after an
+-- "existing" request fell back to simple, and whether the name was not cut
+-- to fit NAME_MAX (gnulib's "extended").
+local function compute(dir_fd: cint, file: string, btype: integer): (string, integer, boolean)
   if not have_simple_suffix then backup.set_simple_suffix('', false) end
   local base_offset = last_component_off(file) - 1
   local filelen = base_offset + base_len(file, base_offset + 1)
   local buf: sequence(byte)
   for i = 1, filelen do buf:push(file:byte(i)) end
+  local extended = true
   if btype == backup.SIMPLE then
     for i = 1, #simple_suffix do buf:push(simple_suffix:byte(i)) end
   else
     local r, _ = numbered_backup(dir_fd, &buf, filelen, base_offset)
     if r == BACKUP_IS_NEW and btype == backup.EXISTING then
+      btype = backup.SIMPLE
       buf:resize(filelen)
       for i = 1, #simple_suffix do buf:push(simple_suffix:byte(i)) end
     end
     if r == BACKUP_IS_NEW or r == BACKUP_IS_LONGER then
-      check_extension(&buf, filelen, 126, dir_fd, false)
+      extended = check_extension(&buf, filelen, 126, dir_fd, false)
     end
   end
   local sb: stringbuilder
   for i = 1, #buf do sb:writebyte(buf[i]) end
-  return sb:promote()
+  return sb:promote(), btype, extended
+end
+
+-- find_backup_file_name: the backup name, relative to DIR_FD.
+function backup.find_name(dir_fd: cint, file: string, btype: integer): string
+  local name = compute(dir_fd, file, btype)
+  return name
+end
+
+-- backup_file_rename: rename FILE to its backup name (RENAME_NOREPLACE for
+-- numbered names, retried on EEXIST) and return that name; "" and errno on
+-- failure.
+function backup.rename(dir_fd: cint, file: string, btype: integer): (string, cint)
+  while true do
+    local name, bt, extended = compute(dir_fd, file, btype)
+    local flags: cuint = bt == backup.SIMPLE and 0 or 1
+    if c_renameat2(dir_fd, file, dir_fd, name, flags) == 0 then return name, 0 end
+    local e = sys.errno()
+    if not (e == 17 and extended) then return '', e end
+  end
+  return '', 0
+end
+
+function backup.simple_suffix(): string
+  if not have_simple_suffix then backup.set_simple_suffix('', false) end
+  return simple_suffix
 end

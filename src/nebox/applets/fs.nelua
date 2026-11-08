@@ -1034,27 +1034,6 @@ local function copy_tree(src: string, dst: string, recursive: boolean, preserve:
   return ok
 end
 
-global function applet_cp(args: sequence(string)): integer
-  local o = util.parsel(args, 'rRfpvaint', &longopts.cp, #longopts.cp)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands < 2 then return util.die(#o.operands == 0 and 'missing file operand' or "missing destination file operand after '" .. o.operands[1] .. "'") end
-  local recursive = o:has('r') or o:has('R') or o:has('a')
-  local preserve = o:has('p') or o:has('a')
-  local dst = o.operands[#o.operands]
-  local nsrc = #o.operands - 1
-  local dstdir = util.isdir(dst)
-  if nsrc > 1 and not dstdir then return util.die("target '" .. dst .. "' is not a directory") end
-  local rc: integer = 0
-  for i: integer = 1, nsrc do
-    local src = o.operands[i]
-    local target = dstdir and util.join(dst, util.basename(src)) or dst
-    if o:has('n') and util.exists(target) then continue end
-    if o:has('f') and not util.isdir(target) then sys.unlink(target) end
-    if not copy_tree(src, target, recursive, preserve) then rc = 1
-    elseif o:has('v') then util.line("'" .. src .. "' -> '" .. target .. "'") end
-  end
-  return rc
-end
 
 global function applet_mv(args: sequence(string)): integer
   local o = util.parsel(args, 'fivn', &longopts.mv, #longopts.mv)
