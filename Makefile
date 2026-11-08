@@ -70,6 +70,7 @@ test: $(OUT)/nebox
 	python3 tests/install_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/touch_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/truncate_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/smallcore_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400

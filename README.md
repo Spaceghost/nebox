@@ -261,6 +261,11 @@ Stated here rather than worked around:
 - `echo` ports echo.c: options only when every character after '-' is e, E
   or n ("-neE" is options, "--" and "-x" are text), POSIXLY_CORRECT's
   leading "-n" rule, and its escape table (\c, \e, \xHH, \NNN and \0NNN).
+- `nproc`, `sleep` and `printenv` port nproc.c (gnulib's OMP_NUM_THREADS
+  and OMP_THREAD_LIMIT rules, the affinity mask, /sys/devices/system/cpu for
+  `--all`), sleep.c (C-locale strtod numbers including inf and hex floats,
+  one s/m/h/d suffix, endless sleep for infinity) and printenv.c (-0, "a=b"
+  operands skipped). `tests/smallcore_compare.py`: 68 cases, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

@@ -50,21 +50,6 @@ global function parse_duration(s: string, ts: *sys.Timespec): boolean
   return true
 end
 
-global function applet_sleep(args: sequence(string)): integer
-  if #args == 0 then return util.die('missing operand') end
-  local total: sys.Timespec
-  for _, a in ipairs(args) do
-    local ts: sys.Timespec
-    if not parse_duration(a, &ts) then return util.die("invalid time interval '" .. a .. "'") end
-    total.tv_sec = total.tv_sec + ts.tv_sec
-    total.tv_nsec = total.tv_nsec + ts.tv_nsec
-    if total.tv_nsec >= 1000000000 then total.tv_sec = total.tv_sec + 1; total.tv_nsec = total.tv_nsec - 1000000000 end
-  end
-  while sys.nanosleep(&total, &total) ~= 0 do
-    if sys.errno() ~= sys.EINTR then return util.die('nanosleep: ' .. sys.errstr()) end
-  end
-  return 0
-end
 
 local function print_environ()
   local i: usize = 0
@@ -74,15 +59,6 @@ local function print_environ()
   end
 end
 
-global function applet_printenv(args: sequence(string)): integer
-  if #args == 0 then print_environ(); return 0 end
-  local rc: integer = 0
-  for _, name in ipairs(args) do
-    local v = sys.getenv(name)
-    if v == nilptr then rc = 1 else util.line(v) end
-  end
-  return rc
-end
 
 global function applet_env(args: sequence(string)): integer
   local i: integer = 1
@@ -286,9 +262,3 @@ global function applet_date(args: sequence(string)): integer
   return 0
 end
 
-global function applet_nproc(args: sequence(string)): integer
-  local n = util.cpucount()
-  if n == 0 then return util.die('sched_getaffinity: ' .. sys.errstr()) end
-  util.writef('%d\n', n)
-  return 0
-end
