@@ -84,6 +84,7 @@ test: $(OUT)/nebox
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400
 	python3 tests/expand_compare.py $(abspath $(OUT)/nebox) 500
+	python3 tests/xargs_compare.py $(abspath $(OUT)/nebox) 300
 
 clean:
 	rm -rf $(OUT)

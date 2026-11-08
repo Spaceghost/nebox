@@ -381,6 +381,39 @@ Stated here rather than worked around:
   but one known case: a pseudo-denormal long double (exponent 0 with the
   integer bit set) prints as the FPU reads it, where glibc's printf drops
   the integer bit.
+- `xargs` ports GNU findutils 4.9.0 xargs.c and buildcmd.c
+  (`src/nebox/applets/xargs.nelua`, C locale): read_line's quote,
+  backslash, blank-line and trailing-blank (-L/-l continuation) rules, the
+  NUL warning and the unmatched-quote errors, read_string for -0 and -d
+  (with GNU's `\a`..`\v`, `\\`, octal and hex escapes and their messages;
+  a delimiter byte above 127 never matches, as in GNU where it is a
+  negative char), -E/-e, the command line built in an ARG_MAX-derived
+  buffer exactly as buildcmd.c builds it (the default 128 KiB, -s with its
+  range messages, -n, -L/-l, -x, the argument-count limit, -I/-i insertion
+  and "command too long", the "cannot fit single argument" and "argument
+  list too long" errors), the mutual-exclusion warnings, --show-limits from
+  sysconf(_SC_ARG_MAX) and the environment size (and "environment is too
+  large for exec"), E2BIG retries with update_limit's bisection (also
+  driven by the `__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT`/`_LENGTH_LIMIT` test
+  variables), -r, -t and -p with quotearg's shell-escape quoting (including
+  its quirk of starting a re-scanned argument inside `$'...'`), the
+  /dev/tty prompt, -a, -o, -P with slots, --process-slot-var and
+  SIGUSR1/SIGUSR2, and exit statuses 123/124/125/126/127 with GNU's
+  messages. GNU's two exit handlers run on every exit path: waiting for
+  all children may replace the status (an earlier failure turns a later
+  127 or 124 into 123), a child that exits 255 while they run exits
+  through the nested handler, a seekable standard input is left just
+  after the last byte xargs consumed, and read errors on it are reported
+  as "error closing file". A child that fails before exec (-o without a
+  terminal, an invalid test variable) trips the same `getpid () ==
+  parent` assertion and SIGABRT that GNU's does. `tests/xargs_compare.py`:
+  359 fixed cases, 14 through a pseudo-terminal (-p answers, -o) and 300
+  random inputs with random options, 0 mismatches (5 more runs of 1500
+  random cases with other seeds also gave 0). Differences:
+  - `--help` omits GNU's bug-report paragraph; `--version` prints nebox's
+    line.
+  - nelibc's execvp searches PATH for an empty command name; xargs fails
+    that name with ENOENT itself, as glibc's execvp does.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
@@ -655,7 +688,6 @@ Stated here rather than worked around:
 - `hexdump` offers -C -c -b -d -o -x -n -s -v only.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
-- `xargs` runs commands with `fork`+`execvp`; no `-P`, `-L`, or `-s` limits.
 - `groups`/`whoami` know only the
   current process.
 - Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)

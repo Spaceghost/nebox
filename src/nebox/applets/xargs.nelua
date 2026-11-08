@@ -1,0 +1,1247 @@
+-- xargs: a port of GNU findutils 4.9.0 xargs/xargs.c and lib/buildcmd.c
+-- (C locale). Input is read with read_line's state machine (quotes,
+-- backslashes, blank-line skipping, trailing-blank line continuation for
+-- -L/-l, the logical EOF string, the NUL warning) or read_string's single
+-- delimiter (-0, -d with its escape syntax); the command line is built in
+-- an ARG_MAX-derived buffer exactly as buildcmd.c builds it (-n, -L, -s,
+-- -x, the argument-count limit, -I/-i insertion with "command too long"),
+-- and an E2BIG from exec (or the __GNU_FINDUTILS_EXEC_ARG_*_LIMIT test
+-- variables) shrinks the argument count with update_limit's bisection.
+-- Children run through fork, a close-on-exec errno pipe and execvp, with
+-- -P slots, --process-slot-var, SIGUSR1/SIGUSR2 adjusting the limit, -o,
+-- -t and -p (shell-escape quoting, the /dev/tty prompt), and the exit
+-- statuses 123/124/125/126/127. The two atexit handlers GNU registers
+-- (wait for every child and possibly replace the status; close standard
+-- input, restoring a seekable input's offset) run on every exit path,
+-- including the nested exit GNU performs when a child exits 255 while
+-- they run.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_realloc(p: pointer, n: csize): pointer <cimport 'realloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+local function c_strtol(s: cstring, e: *cstring, base: cint): clong <cimport 'strtol', cinclude '<stdlib.h>'> end
+local function c_strtoul(s: cstring, e: *cstring, base: cint): culong <cimport 'strtoul', cinclude '<stdlib.h>'> end
+
+local Bytes = @*[0]byte
+local CStrs = @*[0]cstring
+
+local XARGS_EXIT_CLIENT_EXIT_NONZERO: cint <comptime> = 123
+local XARGS_EXIT_CLIENT_EXIT_255: cint <comptime> = 124
+local XARGS_EXIT_CLIENT_FATAL_SIG: cint <comptime> = 125
+local XARGS_EXIT_COMMAND_CANNOT_BE_RUN: cint <comptime> = 126
+local XARGS_EXIT_COMMAND_NOT_FOUND: cint <comptime> = 127
+local XARGS_POSIX_HEADROOM: integer <comptime> = 2048
+local MAX_PROC_MAX: integer <comptime> = 2147483647
+local LONG_MAX: integer <comptime> = 9223372036854775807
+local E2BIG: cint <comptime> = 7
+local EAGAIN: cint <comptime> = 11
+local ERANGE: cint <comptime> = 34
+local SIGABRT: cint <comptime> = 6
+local SIGUSR1: cint <comptime> = 10
+local SIGUSR2: cint <comptime> = 12
+
+-- read_line states
+local NORM: integer <comptime> = 0
+local SPACE: integer <comptime> = 1
+local QUOTE: integer <comptime> = 2
+local BACKSLASH: integer <comptime> = 3
+
+-- A stdio-like input stream on a descriptor: EOF and errors are sticky, and
+-- an interrupted read counts as an error, as glibc's getc treats it.
+local Reader = @record{fd: cint, pos: integer, len: integer, eof: boolean, err: boolean, buf: [4096]byte}
+
+local function rgetc(r: *Reader): integer
+  if r.pos < r.len then
+    local c = r.buf[r.pos]
+    r.pos = r.pos + 1
+    return c
+  end
+  if r.eof or r.err then return -1 end
+  local n = sys.read(r.fd, &r.buf[0], 4096)
+  if n > 0 then
+    r.len = n; r.pos = 1
+    return r.buf[0]
+  end
+  if n == 0 then r.eof = true else r.err = true end
+  return -1
+end
+
+-- struct buildcmd_control
+local exit_if_size_exceeded = false
+local posix_arg_size_max: integer = 0
+local posix_arg_size_min: integer = 0
+local arg_max: integer = 0
+local max_arg_count: integer = 0
+local rplen: integer = 0
+local replace_pat: Bytes = nilptr
+local initial_argc: integer = 0
+local lines_per_exec: integer = 0
+local args_per_exec: integer = 0
+-- struct buildcmd_state
+local cmd_argc: integer = 0
+local cmd_argv: CStrs = nilptr
+local cmd_argv_alloc: integer = 0
+local argbuf: Bytes = nilptr
+local cmd_argv_chars: integer = 0
+local cmd_initial_argv_chars: integer = 0
+local largest_successful_arg_count: integer = 0
+local smallest_failed_arg_count: integer = 0
+local insertbuf: Bytes = nilptr
+
+-- xargs.c globals
+local stdin_rd: Reader
+local file_rd: Reader
+local input: *Reader = &stdin_rd
+local tty_rd: Reader
+local tty_open = false
+local linebuf: Bytes = nilptr
+local keep_stdin = false
+local lineno: integer = 0
+local nullwarning_given = false
+local eof_str: Bytes = nilptr
+local initial_args = true
+local proc_max: cint <volatile> = 1
+local procs_executed = false
+local procs_executing: integer = 0
+local pids: *[0]cint = nilptr
+local pids_alloc: integer = 0
+local parent: cint = 0
+local stop_waiting: cint <volatile> = 0
+local child_error: cint = 0
+local original_exit_value: cint = 0
+local open_tty = false
+local print_command = false
+local query_before_executing = false
+local use_read_string = false
+local input_delimiter: integer = 0
+local slot_var_name: cstring = nilptr
+local rl_eof = false
+local rs_eof = false
+local exit_stage: integer = 0
+
+-- A growable byte buffer for the -t/-p command lines.
+local ebuf: Bytes = nilptr
+local ebuf_cap: integer = 0
+local ebuf_len: integer = 0
+
+local function eput(c: byte)
+  if ebuf_len >= ebuf_cap then
+    ebuf_cap = ebuf_cap == 0 and 256 or ebuf_cap * 2
+    ebuf = (@Bytes)(c_realloc(ebuf, (@csize)(ebuf_cap)))
+  end
+  ebuf[ebuf_len] = c
+  ebuf_len = ebuf_len + 1
+end
+
+local function eputs(s: string)
+  for i = 0, < (@integer)(s.size) do eput(s.data[i]) end
+end
+
+local function c_strlen(p: Bytes): integer
+  local n: integer = 0
+  while p[n] ~= 0 do n = n + 1 end
+  return n
+end
+
+local function c_strcmp_eq(a: Bytes, b: Bytes): boolean
+  local i: integer = 0
+  while a[i] ~= 0 and a[i] == b[i] do i = i + 1 end
+  return a[i] == b[i]
+end
+
+-- strcpy: copy SRC up to and including its NUL.
+local function c_strcpy(dst: Bytes, src: Bytes)
+  local i: integer = 0
+  while src[i] ~= 0 do dst[i] = src[i]; i = i + 1 end
+  dst[i] = 0
+end
+
+-- strstr; -1 when NEEDLE does not occur in HAY.
+local function c_strstr(hay: Bytes, needle: Bytes): integer
+  local i: integer = 0
+  while true do
+    local j: integer = 0
+    while needle[j] ~= 0 and hay[i + j] == needle[j] do j = j + 1 end
+    if needle[j] == 0 then return i end
+    if hay[i] == 0 then return -1 end
+    i = i + 1
+  end
+  return -1
+end
+
+-- A NUL-terminated copy that is never freed.
+local function cdup(s: string): Bytes
+  local p = (@Bytes)(c_malloc((@csize)(s.size + 1)))
+  for i = 0, < (@integer)(s.size) do p[i] = s.data[i] end
+  p[s.size] = 0
+  return p
+end
+
+local function view(p: Bytes): string
+  return (@string){data = p, size = (@usize)(c_strlen(p))}
+end
+
+local function errmsg(e: cint): string
+  return (@string)(sys.strerror(e))
+end
+
+-- error (0, 0, ...) and fprintf (stderr, ...)
+local function errout(s: string)
+  util.flush()
+  sys.write(2, s.data, s.size)
+end
+
+local function xexit(status: cint) <forwarddecl> end
+
+-- die (EXIT_FAILURE, ...): the message, then exit () with its handlers.
+local function die(msg: string)
+  util.err(msg)
+  xexit(1)
+end
+
+local function die_errno(msg: string, e: cint)
+  if e ~= 0 then util.err(msg .. ': ' .. errmsg(e)) else util.err(msg) end
+  xexit(1)
+end
+
+local function usage_fail()
+  errout("Try '" .. util.applet .. " --help' for more information.\n")
+  xexit(1)
+end
+
+local function bc_size_of_environment(): integer
+  local len: integer = 0
+  local i = 0
+  while environ[i] ~= nilptr do
+    len = len + c_strlen((@Bytes)(environ[i])) + 1
+    i = i + 1
+  end
+  return len
+end
+
+-- bc_get_arg_max: sysconf (_SC_ARG_MAX), or LONG_MAX without a limit.
+local function bc_get_arg_max(): integer
+  local v = sys.sysconf(0)
+  if v > 0 then return v end
+  return LONG_MAX
+end
+
+-- update_limit: the next argument count to try after a success or E2BIG.
+local function update_limit(success: boolean, limit: integer): integer
+  if success then
+    if limit > largest_successful_arg_count then largest_successful_arg_count = limit end
+  else
+    if limit < smallest_failed_arg_count or smallest_failed_arg_count == 0 then
+      smallest_failed_arg_count = limit
+    end
+  end
+  if largest_successful_arg_count == 0 or smallest_failed_arg_count <= largest_successful_arg_count then
+    if success then limit = limit + 1 else limit = limit // 2 end
+  else
+    local shift = (smallest_failed_arg_count - largest_successful_arg_count) // 2
+    if success then
+      if shift ~= 0 then limit = limit + shift else limit = limit + 1 end
+    else
+      if shift ~= 0 then limit = limit - shift else limit = limit - 1 end
+    end
+  end
+  if initial_argc ~= 0 and limit <= initial_argc + 1 then limit = initial_argc + 1 end
+  if limit == 0 then limit = 1 end
+  return limit
+end
+
+local function copy_args(working: CStrs, limit: integer, done: integer): integer
+  local dst_pos: integer = 0
+  local src_pos: integer = 0
+  while src_pos < initial_argc do
+    working[dst_pos] = cmd_argv[src_pos]
+    dst_pos = dst_pos + 1; src_pos = src_pos + 1
+  end
+  src_pos = src_pos + done
+  while src_pos < cmd_argc and dst_pos < limit do
+    working[dst_pos] = cmd_argv[src_pos]
+    dst_pos = dst_pos + 1; src_pos = src_pos + 1
+  end
+  working[dst_pos] = nilptr
+  return dst_pos
+end
+
+local function bc_clear_args()
+  cmd_argc = initial_argc
+  cmd_argv_chars = cmd_initial_argv_chars
+end
+
+-- add_proc: the first free slot gets PID.
+local function add_proc(pid: cint): integer
+  local i: integer = 0
+  while i < pids_alloc and pids[i] ~= 0 do i = i + 1 end
+  if i == pids_alloc then
+    local n = pids_alloc == 0 and 32 or pids_alloc + pids_alloc // 2 + 1
+    pids = (@*[0]cint)(c_realloc(pids, (@csize)(n * 4)))
+    for j = i, < n do pids[j] = 0 end
+    pids_alloc = n
+  end
+  pids[i] = pid
+  procs_executing = procs_executing + 1
+  procs_executed = true
+  return i
+end
+
+-- wait_for_proc: reap children (all of them, or at least MINREAP, then any
+-- that are already dead), mapping their statuses to GNU's.
+local function wait_for_proc(all: boolean, minreap: integer)
+  local reaped: integer = 0
+  while procs_executing > 0 do
+    local status: cint = 0
+    local pid: cint = 0
+    local wflags: cint = 0
+    local i: integer = 0
+    if not all and reaped >= minreap then wflags = sys.WNOHANG end
+    stop_waiting = 0
+    repeat
+      while true do
+        pid = sys.waitpid(-1, &status, wflags)
+        if pid ~= -1 then break end
+        local e = sys.errno()
+        if e ~= sys.EINTR then die_errno('error waiting for child process', e) end
+        if stop_waiting ~= 0 and not all then wflags = sys.WNOHANG end
+      end
+      if pid ~= 0 then
+        i = 0
+        while i < pids_alloc and pid ~= pids[i] do i = i + 1 end
+      end
+    until not (pid ~= 0 and i == pids_alloc)
+    if pid == 0 then
+      if (wflags & sys.WNOHANG) == 0 then
+        util.err('WARNING: Lost track of ' .. tostring(procs_executing) .. ' child processes')
+      end
+      break
+    end
+    pids[i] = 0
+    procs_executing = procs_executing - 1
+    reaped = reaped + 1
+    local name = view((@Bytes)(cmd_argv[0]))
+    local code = (status >> 8) & 0xff
+    local low = status & 0x7f
+    if code == 255 then
+      util.err(name .. ': exited with status 255; aborting')
+      xexit(XARGS_EXIT_CLIENT_EXIT_255)
+    end
+    if (status & 0xff) == 0x7f then
+      util.err(name .. ': stopped by signal ' .. tostring(code))
+      xexit(XARGS_EXIT_CLIENT_FATAL_SIG)
+    end
+    if low ~= 0 and low ~= 0x7f then
+      util.err(name .. ': terminated by signal ' .. tostring(low))
+      xexit(XARGS_EXIT_CLIENT_FATAL_SIG)
+    end
+    if code ~= 0 then child_error = XARGS_EXIT_CLIENT_EXIT_NONZERO end
+  end
+end
+
+-- closein's close_stdin and close_stdout.
+local function close_stdin()
+  local fail = false
+  local fe: cint = 0
+  local unread = stdin_rd.len - stdin_rd.pos
+  if unread > 0 and sys.lseek(0, 0, sys.SEEK_CUR) >= 0 then
+    if sys.lseek(0, -unread, sys.SEEK_CUR) < 0 then fail = true; fe = sys.errno() end
+  end
+  local prev_fail = stdin_rd.err
+  local r = sys.close(0)
+  local ce = sys.errno()
+  if prev_fail or (r ~= 0 and ce ~= sys.EBADF) then
+    fail = true
+    fe = r ~= 0 and ce or 0
+  end
+  if fail then
+    if fe ~= 0 then util.err('error closing file: ' .. errmsg(fe)) else util.err('error closing file') end
+  end
+  if not util.flush() then
+    local e = sys.errno()
+    util.err('write error: ' .. errmsg(e))
+    sys._exit(1)
+  end
+  if fail then sys._exit(1) end
+end
+
+-- exit (): GNU's atexit handlers run in reverse order of registration,
+-- wait_for_proc_all first, then close_stdin. One that is already running
+-- or done is skipped by a nested exit (glibc pops each before calling it).
+function xexit(status: cint)
+  if exit_stage < 1 then
+    exit_stage = 1
+    if sys.getpid() ~= parent then
+      -- a child that called exit () trips wait_for_proc_all's assertion
+      util.err("xargs.c:1605: wait_for_proc_all: Assertion `getpid () == parent' failed.")
+      local sa: sys.Sigaction
+      sa.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+      sys.sigaction(SIGABRT, &sa, nilptr)
+      sys.kill(sys.getpid(), SIGABRT)
+      sys._exit(127)
+    end
+    wait_for_proc(true, 0)
+    if original_exit_value ~= child_error then
+      util.flush()
+      sys._exit(child_error)
+    end
+  end
+  if exit_stage < 2 then
+    exit_stage = 2
+    close_stdin()
+  end
+  sys._exit(status)
+end
+
+-- One pass of quotearg's shell_escape_always loop over P; returns the
+-- final pending_shell_escape_end. Output only when EMIT.
+local function shell_escape_pass(p: Bytes, n: integer, pending: boolean, emit: boolean): boolean
+  for i = 0, < n do
+    local c = p[i]
+    if c < 32 or c >= 127 then
+      if not pending then
+        if emit then eputs("'$'") end
+        pending = true
+      end
+      if emit then
+        eput(92)
+        if c == 7 then eput(97) elseif c == 8 then eput(98) elseif c == 12 then eput(102)
+        elseif c == 10 then eput(110) elseif c == 13 then eput(114) elseif c == 9 then eput(116)
+        elseif c == 11 then eput(118)
+        else
+          eput(48 + (c >> 6)); eput(48 + ((c >> 3) & 7)); eput(48 + (c & 7))
+        end
+      end
+    elseif c == 39 then
+      if emit then eputs("'\\''") end
+      pending = false
+    else
+      if pending then
+        if emit then eputs("''") end
+        pending = false
+      end
+      if emit then eput(c) end
+    end
+  end
+  return pending
+end
+
+-- quotearg's shell_escape_quoting_style in the C locale.
+local function quote_shell_escape(p: Bytes)
+  local n = c_strlen(p)
+  local need = n == 0
+  local squote = false
+  local compat = true
+  for i = 0, < n do
+    local c = p[i]
+    if c < 32 or c >= 127 then need = true; compat = false
+    elseif c == 39 then need = true; squote = true
+    elseif c == 32 then need = true
+    elseif c == 33 or c == 34 or c == 36 or c == 38 or c == 40 or c == 41 or c == 42 or c == 59
+        or c == 60 or c == 61 or c == 62 or c == 63 or c == 91 or c == 92 or c == 94 or c == 96
+        or c == 124 then
+      need = true; compat = false
+    elseif c == 35 or c == 126 then
+      if i == 0 then need = true else compat = false end
+    elseif c == 123 or c == 125 then
+      if n == 1 then need = true else compat = false end
+    end
+  end
+  if not need then
+    for i = 0, < n do eput(p[i]) end
+    return
+  end
+  if squote and compat then
+    eput(34)
+    for i = 0, < n do eput(p[i]) end
+    eput(34)
+    return
+  end
+  -- A single quote makes quotearg scan the whole argument first (to try
+  -- the double-quoted form) and then output it again without resetting
+  -- pending_shell_escape_end, so an argument that ends inside $'...'
+  -- starts with that state.
+  local pending = false
+  if squote then pending = shell_escape_pass(p, n, false, false) end
+  eput(39)
+  shell_escape_pass(p, n, pending, true)
+  eput(39)
+end
+
+-- print_args: the command line on stderr; with ASK, the /dev/tty prompt.
+local function print_args(ask: boolean): boolean
+  ebuf_len = 0
+  for i = 0, < cmd_argc - 1 do
+    if i > 0 then eput(32) end
+    quote_shell_escape((@Bytes)(cmd_argv[i]))
+  end
+  util.flush()
+  if ebuf_len > 0 and sys.write(2, ebuf, (@csize)(ebuf_len)) < 0 then
+    die_errno('Failed to write to stderr', sys.errno())
+  end
+  if ask then
+    if not tty_open then
+      local fd = sys.open('/dev/tty', sys.O_RDONLY | sys.O_CLOEXEC, 0)
+      if fd < 0 then die_errno('failed to open /dev/tty for reading', sys.errno()) end
+      tty_rd.fd = fd
+      tty_open = true
+    end
+    local prompt: string = '?...'
+    if sys.write(2, prompt.data, 4) < 0 then die_errno('Failed to write to stderr', sys.errno()) end
+    local c = rgetc(&tty_rd)
+    local savec = c
+    while c ~= -1 and c ~= 10 do c = rgetc(&tty_rd) end
+    if c == -1 then die_errno('Failed to read from stdin', tty_rd.err and sys.errno() or 0) end
+    if savec == 121 or savec == 89 then return true end
+  else
+    local nl: string = '\n'
+    sys.write(2, nl.data, 1)
+  end
+  return false
+end
+
+local function set_slot_var(n: integer)
+  if slot_var_name ~= nilptr then
+    local v = tostring(n)
+    if sys.setenv(slot_var_name, v, 1) < 0 then
+      util.err('failed to set environment variable ' .. (@string)(slot_var_name) .. ': ' .. sys.errstr())
+    end
+  end
+end
+
+local function prep_child_for_exec()
+  local slot = add_proc(0)
+  set_slot_var(slot)
+  if not keep_stdin or open_tty then
+    local inputfile: string = open_tty and '/dev/tty' or '/dev/null'
+    sys.close(0)
+    local fd = sys.open(inputfile, sys.O_RDONLY, 0)
+    if fd < 0 then
+      local e = sys.errno()
+      if open_tty then die_errno(util.quote(inputfile), e)
+      else util.err(util.quote(inputfile) .. ': ' .. errmsg(e)) end
+    end
+    if 0 < fd then
+      if sys.dup2(fd, 0) ~= 0 then die_errno('failed to redirect standard input of the child process', sys.errno()) end
+      sys.close(fd)
+    end
+  end
+end
+
+-- buildcmd.c exceeds (): xstrtoul (base 10, no suffixes) of the variable.
+local function exceeds(name: cstring, quantity: integer): boolean
+  local val = sys.getenv(name)
+  if val == nilptr then return false end
+  local s = (@Bytes)(val)
+  local q: integer = 0
+  while s[q] == 32 or (s[q] >= 9 and s[q] <= 13) do q = q + 1 end
+  local ok = s[q] ~= 45
+  local limit: culong = 0
+  local e: cint = 0
+  if ok then
+    local endp: cstring
+    sys.seterrno(0)
+    limit = c_strtoul(val, &endp, 10)
+    e = sys.errno()
+    if (@usize)(endp) == (@usize)(val) then ok = false
+    elseif e ~= 0 then ok = false; if e ~= ERANGE then e = 0 end end
+  end
+  if not ok then
+    die_errno('Environment variable ' .. (@string)(name) .. ' is not set to a valid decimal number', e)
+  end
+  return (@culong)(quantity) > limit
+end
+
+local function bc_args_exceed_testing_limit(argv: CStrs): boolean
+  local chars: integer = 0
+  local args: integer = 0
+  local i = 0
+  while argv[i] ~= nilptr do
+    args = args + 1
+    chars = chars + c_strlen((@Bytes)(argv[i]))
+    i = i + 1
+  end
+  return exceeds('__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT', args) or
+         exceeds('__GNU_FINDUTILS_EXEC_ARG_LENGTH_LIMIT', chars)
+end
+
+-- xargs_do_exec: run ARGV (waiting for a free slot first); false asks
+-- bc_do_exec for fewer arguments after E2BIG.
+local function xargs_do_exec(argc: integer, argv: CStrs): boolean
+  if proc_max ~= 0 then
+    while procs_executing >= proc_max do wait_for_proc(false, 1) end
+  end
+  if not query_before_executing or print_args(true) then
+    if not query_before_executing and print_command then print_args(false) end
+    wait_for_proc(false, 0)
+    local fd: [2]cint
+    if sys.pipe(&fd) ~= 0 then die_errno('could not create pipe before fork', sys.errno()) end
+    sys.fcntl(fd[1], sys.F_SETFD, sys.FD_CLOEXEC)
+    util.flush()
+    local child: cint
+    while true do
+      child = sys.fork()
+      if child < 0 and sys.errno() == EAGAIN and procs_executing > 0 then
+        wait_for_proc(false, 1)
+      else
+        break
+      end
+    end
+    if child == -1 then die_errno('cannot fork', sys.errno()) end
+    if child == 0 then
+      sys.close(fd[0])
+      child_error = 0
+      prep_child_for_exec()
+      local e: cint
+      if bc_args_exceed_testing_limit(argv) then
+        e = E2BIG
+      elseif (@Bytes)(argv[0])[0] == 0 then
+        -- glibc's execvp fails an empty name with ENOENT; nelibc's searches
+        -- PATH for it (and reports EACCES for the directory it finds)
+        e = sys.ENOENT
+      else
+        sys.execvp(argv[0], argv)
+        e = sys.errno()
+      end
+      if e ~= 0 then sys.write(fd[1], &e, 4) end
+      sys.close(fd[1])
+      if e ~= E2BIG then
+        if e ~= 0 then util.err(view((@Bytes)(argv[0])) .. ': ' .. errmsg(e))
+        else util.err(view((@Bytes)(argv[0]))) end
+      end
+      sys._exit(e == sys.ENOENT and XARGS_EXIT_COMMAND_NOT_FOUND or XARGS_EXIT_COMMAND_CANNOT_BE_RUN)
+    end
+    sys.close(fd[1])
+    local buf: cint = 0
+    local r: clong
+    repeat
+      r = sys.read(fd[0], &buf, 4)
+    until not (r < 0 and sys.errno() == sys.EINTR)
+    if r < 0 then
+      local e = sys.errno()
+      sys.close(fd[0])
+      util.err('errno-buffer safe_read failed in xargs_do_exec (this is probably a bug, please report it): ' .. errmsg(e))
+    elseif r == 4 then
+      local st: cint = 0
+      sys.close(fd[0])
+      sys.waitpid(child, &st, 0)
+      if buf == E2BIG then return false
+      elseif buf == sys.ENOENT then xexit(XARGS_EXIT_COMMAND_NOT_FOUND)
+      else xexit(XARGS_EXIT_COMMAND_CANNOT_BE_RUN) end
+    elseif r == 0 then
+      add_proc(child)
+    else
+      die('read returned unexpected value ' .. tostring(r) .. '; this is probably a bug, please report it')
+    end
+    sys.close(fd[0])
+  end
+  return true
+end
+
+local function bc_push_arg(arg: Bytes, len: integer, initial: boolean) <forwarddecl> end
+
+-- bc_do_exec: terminate the list and run it, in pieces after E2BIG.
+local function bc_do_exec()
+  bc_push_arg(nilptr, 0, false)
+  local working = (@CStrs)(c_malloc((@csize)((1 + cmd_argc) * 8)))
+  local done: integer = 0
+  local limit = cmd_argc
+  repeat
+    local dst_pos = copy_args(working, limit, done)
+    if xargs_do_exec(dst_pos, working) then
+      limit = update_limit(true, limit)
+      done = done + (dst_pos - initial_argc)
+    else
+      if limit <= initial_argc + 1 then
+        die("can't call exec() due to argument size restrictions")
+      else
+        limit = update_limit(false, limit)
+      end
+    end
+  until not (done + 1 < cmd_argc - initial_argc)
+  c_free(working)
+  bc_clear_args()
+end
+
+local function bc_argc_limit_reached(initial: boolean): boolean
+  if not initial and args_per_exec ~= 0 and cmd_argc - initial_argc == args_per_exec then return true end
+  return cmd_argc == max_arg_count
+end
+
+-- bc_push_arg: append ARG (LEN counts its NUL), running the command first
+-- when it does not fit and after the list reaches a limit. A nil ARG is
+-- bc_args_complete's terminator.
+function bc_push_arg(arg: Bytes, len: integer, initial: boolean)
+  local terminate = arg == nilptr
+  if not terminate then
+    if cmd_argv_chars + len > arg_max then
+      if initial or cmd_argc == initial_argc then
+        die('cannot fit single argument within argument list size limit')
+      end
+      if replace_pat ~= nilptr or (exit_if_size_exceeded and (lines_per_exec ~= 0 or args_per_exec ~= 0)) then
+        die('argument list too long')
+      end
+      bc_do_exec()
+    end
+    if bc_argc_limit_reached(initial) then bc_do_exec() end
+  end
+  if cmd_argc >= cmd_argv_alloc then
+    if cmd_argv == nilptr then cmd_argv_alloc = 64 else cmd_argv_alloc = cmd_argv_alloc * 2 end
+    cmd_argv = (@CStrs)(c_realloc(cmd_argv, (@csize)(cmd_argv_alloc * 8)))
+  end
+  if terminate then
+    cmd_argv[cmd_argc] = nilptr
+    cmd_argc = cmd_argc + 1
+  else
+    cmd_argv[cmd_argc] = (@cstring)(&argbuf[cmd_argv_chars])
+    cmd_argc = cmd_argc + 1
+    c_strcpy(&argbuf[cmd_argv_chars], arg)
+    cmd_argv_chars = cmd_argv_chars + len
+    if bc_argc_limit_reached(initial) then bc_do_exec() end
+  end
+  if initial then cmd_initial_argv_chars = cmd_argv_chars end
+end
+
+-- bc_do_insert: ARG with every replace_pat replaced by LINEBUF.
+local function bc_do_insert(arg: Bytes, arglen: integer, line: Bytes, lblen: integer, initial: boolean)
+  local bytes_left = arg_max - 1
+  if insertbuf == nilptr then insertbuf = (@Bytes)(c_malloc((@csize)(arg_max + 1))) end
+  local p: integer = 0
+  local a: integer = 0
+  repeat
+    local s = c_strstr(&arg[a], replace_pat)
+    local len: integer = s >= 0 and s or arglen
+    if bytes_left <= len then break end
+    bytes_left = bytes_left - len
+    local k: integer = 0
+    while k < len and arg[a + k] ~= 0 do insertbuf[p + k] = arg[a + k]; k = k + 1 end
+    while k < len do insertbuf[p + k] = 0; k = k + 1 end
+    p = p + len
+    a = a + len
+    arglen = arglen - len
+    if s >= 0 then
+      if bytes_left <= lblen then break end
+      bytes_left = bytes_left - lblen
+      c_strcpy(&insertbuf[p], line)
+      p = p + lblen
+      a = a + rplen
+      arglen = arglen - rplen
+    end
+  until arg[a] == 0
+  if arg[a] ~= 0 then die('command too long') end
+  insertbuf[p] = 0
+  p = p + 1
+  bc_push_arg(insertbuf, p, initial)
+end
+
+local function exec_if_possible()
+  if replace_pat ~= nilptr or initial_args or cmd_argc == initial_argc or exit_if_size_exceeded then return end
+  bc_do_exec()
+end
+
+local function is_blank(c: integer): boolean return c == 32 or c == 9 end
+local function is_space(c: integer): boolean return c == 32 or (c >= 9 and c <= 13) end
+
+local function eof_str_matches(): boolean
+  return eof_str ~= nilptr and eof_str[0] == linebuf[0] and c_strcmp_eq(eof_str, linebuf)
+end
+
+local function unmatched(quotc: integer)
+  exec_if_possible()
+  die('unmatched ' .. (quotc == 34 and 'double' or 'single') ..
+      ' quote; by default quotes are special to xargs unless you use the -0 option')
+end
+
+-- read_line: one argument (one line under -I), pushed unless -I is in
+-- effect; its length with the NUL, or -1 at physical or logical EOF.
+local function read_line(): integer
+  if rl_eof then return -1 end
+  local state = SPACE
+  local prevc: integer = -1
+  local quotc: integer = 0
+  local c: integer = -1
+  local first = true
+  local seen_arg = false
+  local len: integer = 0
+  local p: integer = 0
+  local endbuf = arg_max - cmd_initial_argv_chars - 1
+  while true do
+    prevc = c
+    c = rgetc(input)
+    if c == -1 then
+      rl_eof = true
+      if p == 0 then return -1 end
+      linebuf[p] = 0; p = p + 1
+      len = p
+      if state == QUOTE then unmatched(quotc) end
+      if first and eof_str_matches() then return -1 end
+      if replace_pat == nilptr then bc_push_arg(linebuf, len, initial_args) end
+      return len
+    end
+    if state == SPACE then
+      if is_space(c) then continue end
+      state = NORM
+    end
+    if state == NORM then
+      if c == 10 then
+        if not is_blank(prevc) then lineno = lineno + 1 end
+        if p == 0 and not seen_arg then
+          state = SPACE
+          continue
+        end
+        linebuf[p] = 0; p = p + 1
+        len = p
+        if eof_str_matches() then
+          rl_eof = true
+          return first and -1 or len
+        end
+        if replace_pat == nilptr then bc_push_arg(linebuf, len, initial_args) end
+        return len
+      end
+      seen_arg = true
+      if replace_pat == nilptr and is_blank(c) then
+        linebuf[p] = 0; p = p + 1
+        len = p
+        if eof_str_matches() then
+          rl_eof = true
+          return first and -1 or len
+        end
+        bc_push_arg(linebuf, len, initial_args)
+        p = 0
+        state = SPACE
+        first = false
+        continue
+      end
+      if c == 92 then
+        state = BACKSLASH
+        continue
+      elseif c == 39 or c == 34 then
+        state = QUOTE
+        quotc = c
+        continue
+      end
+    elseif state == QUOTE then
+      if c == 10 then unmatched(quotc) end
+      if c == quotc then
+        state = NORM
+        seen_arg = true
+        continue
+      end
+    elseif state == BACKSLASH then
+      state = NORM
+    end
+    if c == 0 and not nullwarning_given then
+      util.err('WARNING: a NUL character occurred in the input.  It cannot be passed through in the argument list.  Did you mean to use the --null option?')
+      nullwarning_given = true
+    end
+    if p >= endbuf then
+      exec_if_possible()
+      die('argument line too long')
+    end
+    linebuf[p] = (@byte)(c); p = p + 1
+  end
+  return -1
+end
+
+-- read_string: one argument ended by the delimiter or by EOF.
+local function read_string(): integer
+  if rs_eof then return -1 end
+  local p: integer = 0
+  local endbuf = arg_max - cmd_initial_argv_chars - 1
+  while true do
+    local c = rgetc(input)
+    if c == -1 then
+      rs_eof = true
+      if p == 0 then return -1 end
+      linebuf[p] = 0; p = p + 1
+      if replace_pat == nilptr then bc_push_arg(linebuf, p, initial_args) end
+      return p
+    end
+    if c == input_delimiter then
+      lineno = lineno + 1
+      linebuf[p] = 0; p = p + 1
+      if replace_pat == nilptr then bc_push_arg(linebuf, p, initial_args) end
+      return p
+    end
+    if p >= endbuf then
+      exec_if_possible()
+      die('argument line too long')
+    end
+    linebuf[p] = (@byte)(c); p = p + 1
+  end
+  return -1
+end
+
+local function read_args(): integer
+  if use_read_string then return read_string() end
+  return read_line()
+end
+
+-- get_char_oct_or_hex_escape
+local function get_char_oct_or_hex_escape(s: string): integer
+  local base: cint = 8
+  local start: usize
+  if s:byte(2) == 120 then
+    start = 2; base = 16
+  elseif s:byte(2) >= 48 and s:byte(2) <= 57 then
+    start = 1; base = 8
+  else
+    die('Invalid escape sequence ' .. s .. ' in input delimiter specification.')
+  end
+  local cs = cdup(s)
+  local p = (@cstring)(&cs[start])
+  local endp: cstring = nilptr
+  sys.seterrno(0)
+  local val = c_strtoul(p, &endp, base)
+  if (val == ~(@culong)(0) and sys.errno() == ERANGE) or val > 255 then
+    if base == 16 then
+      die('Invalid escape sequence ' .. s .. ' in input delimiter specification; character values must not exceed ff.')
+    else
+      die('Invalid escape sequence ' .. s .. ' in input delimiter specification; character values must not exceed 377.')
+    end
+  end
+  local e = (@Bytes)(endp)
+  if e[0] ~= 0 then
+    die('Invalid escape sequence ' .. s .. ' in input delimiter specification; trailing characters ' ..
+        view(e) .. ' not recognised.')
+  end
+  return (@integer)(val)
+end
+
+-- get_input_delimiter; a value above 127 is a negative char in GNU, which
+-- getc's results never equal.
+local function get_input_delimiter(s: string): integer
+  local v: integer
+  if #s == 1 then
+    v = s:byte(1)
+  elseif #s > 0 and s:byte(1) == 92 then
+    local c = s:byte(2)
+    if c == 97 then v = 7 elseif c == 98 then v = 8 elseif c == 102 then v = 12
+    elseif c == 110 then v = 10 elseif c == 114 then v = 13 elseif c == 116 then v = 9
+    elseif c == 118 then v = 11 elseif c == 92 then v = 92
+    else v = get_char_oct_or_hex_escape(s) end
+  else
+    die('Invalid input delimiter specification ' .. s ..
+        ': the delimiter must be either a single character or an escape sequence starting with \\.')
+  end
+  if v >= 128 then v = v - 256 end
+  return v
+end
+
+local function warn_mutually_exclusive(option: string, offending: string)
+  util.err('warning: options ' .. offending .. ' and ' .. option ..
+           ' are mutually exclusive, ignoring previous ' .. offending .. ' value')
+end
+
+-- parse_num: strtol with GNU's range messages (fatal ones exit 1).
+local function parse_num(str: string, option: byte, min: integer, max: integer, fatal: boolean): integer
+  local cs = cdup(str)
+  local endp: cstring = nilptr
+  local val: integer = c_strtol((@cstring)(cs), &endp, 10)
+  local opt = string.char(option)
+  if (@usize)(endp) == (@usize)(cs) or (@Bytes)(endp)[0] ~= 0 then
+    errout(util.applet .. ': invalid number "' .. str .. '" for -' .. opt .. ' option\n')
+    usage_fail()
+  elseif val < min then
+    errout(util.applet .. ': value ' .. str .. ' for -' .. opt .. ' option should be >= ' .. tostring(min) .. '\n')
+    if fatal then usage_fail() end
+    val = min
+  elseif max >= 0 and val > max then
+    errout(util.applet .. ': value ' .. str .. ' for -' .. opt .. ' option should be <= ' .. tostring(max) .. '\n')
+    if fatal then usage_fail() end
+    val = max
+  end
+  return val
+end
+
+local function increment_proc_max(signo: cint)
+  if proc_max < MAX_PROC_MAX then proc_max = proc_max + 1 end
+  stop_waiting = 1
+end
+
+local function decrement_proc_max(signo: cint)
+  if proc_max > 1 then proc_max = proc_max - 1 end
+end
+
+local function usage()
+  util.write("Usage: " .. util.applet .. [[ [OPTION]... COMMAND [INITIAL-ARGS]...
+Run COMMAND with arguments INITIAL-ARGS and more arguments read from input.
+
+Mandatory and optional arguments to long options are also
+mandatory or optional for the corresponding short option.
+  -0, --null                   items are separated by a null, not whitespace;
+                                 disables quote and backslash processing and
+                                 logical EOF processing
+  -a, --arg-file=FILE          read arguments from FILE, not standard input
+  -d, --delimiter=CHARACTER    items in input stream are separated by CHARACTER,
+                                 not by whitespace; disables quote and backslash
+                                 processing and logical EOF processing
+  -E END                       set logical EOF string; if END occurs as a line
+                                 of input, the rest of the input is ignored
+                                 (ignored if -0 or -d was specified)
+  -e, --eof[=END]              equivalent to -E END if END is specified;
+                                 otherwise, there is no end-of-file string
+  -I R                         same as --replace=R
+  -i, --replace[=R]            replace R in INITIAL-ARGS with names read
+                                 from standard input, split at newlines;
+                                 if R is unspecified, assume {}
+  -L, --max-lines=MAX-LINES    use at most MAX-LINES non-blank input lines per
+                                 command line
+  -l[MAX-LINES]                similar to -L but defaults to at most one non-
+                                 blank input line if MAX-LINES is not specified
+  -n, --max-args=MAX-ARGS      use at most MAX-ARGS arguments per command line
+  -o, --open-tty               Reopen stdin as /dev/tty in the child process
+                                 before executing the command; useful to run an
+                                 interactive application.
+  -P, --max-procs=MAX-PROCS    run at most MAX-PROCS processes at a time
+  -p, --interactive            prompt before running commands
+      --process-slot-var=VAR   set environment variable VAR in child processes
+  -r, --no-run-if-empty        if there are no arguments, then do not run COMMAND;
+                                 if this option is not given, COMMAND will be
+                                 run at least once
+  -s, --max-chars=MAX-CHARS    limit length of command line to MAX-CHARS
+      --show-limits            show limits on command-line length
+  -t, --verbose                print commands before executing them
+  -x, --exit                   exit if the size (see -s) is exceeded
+      --help                   display this help and exit
+      --version                output version information and exit
+
+]])
+  xexit(0)
+end
+
+global function applet_xargs(args: sequence(string)): integer
+  local show_limits = false
+  local always_run_command = true
+  local input_file = '-'
+  local env_bad = false
+  parent = sys.getpid()
+  original_exit_value = 0
+  stdin_rd.fd = 0
+
+  -- bc_init_controlinfo (&bc_ctl, XARGS_POSIX_HEADROOM)
+  local size_of_environment = bc_size_of_environment()
+  posix_arg_size_min = 4096
+  posix_arg_size_max = bc_get_arg_max()
+  exit_if_size_exceeded = false
+  if size_of_environment > posix_arg_size_max then
+    env_bad = true
+  elseif XARGS_POSIX_HEADROOM + size_of_environment >= posix_arg_size_max then
+    env_bad = true
+  else
+    posix_arg_size_max = posix_arg_size_max - size_of_environment - XARGS_POSIX_HEADROOM
+    max_arg_count = posix_arg_size_max // 8 - 2
+    arg_max = posix_arg_size_max
+    local v = sys.sysconf(0)
+    if v > 0 and v - XARGS_POSIX_HEADROOM < arg_max then arg_max = v - XARGS_POSIX_HEADROOM end
+    -- bc_use_sensible_arg_max
+    local arg_size: integer = 131072
+    if arg_size > posix_arg_size_max then arg_max = posix_arg_size_max
+    elseif arg_size < posix_arg_size_min then arg_max = posix_arg_size_min
+    else arg_max = arg_size end
+  end
+
+  local longs: []util.LongOpt = {
+    {'null', 0, 48}, {'arg-file', 1, 97}, {'delimiter', 1, 100}, {'eof', 2, 101},
+    {'replace', 2, 73}, {'max-lines', 2, 108}, {'max-args', 1, 110}, {'open-tty', 0, 111},
+    {'interactive', 0, 112}, {'no-run-if-empty', 0, 114}, {'max-chars', 1, 115},
+    {'verbose', 0, 116}, {'show-limits', 0, 83}, {'exit', 0, 120}, {'max-procs', 1, 80},
+    {'process-slot-var', 1, 128}, {'version', 0, 118}, {'help', 0, 104},
+  }
+  local g = util.getopt(args, '+0a:E:e::i::I:l::L:n:oprs:txP:d:', &longs, #longs)
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 48 then
+      use_read_string = true
+      input_delimiter = 0
+    elseif c == 100 then
+      use_read_string = true
+      input_delimiter = get_input_delimiter(g.optarg)
+    elseif c == 69 or c == 101 then
+      if g.has_optarg and #g.optarg > 0 then eof_str = cdup(g.optarg) else eof_str = nilptr end
+    elseif c == 104 then
+      usage()
+    elseif c == 73 or c == 105 then
+      if g.has_optarg then replace_pat = cdup(g.optarg) else replace_pat = cdup('{}') end
+      if args_per_exec ~= 0 then
+        warn_mutually_exclusive('--replace/-I/-i', '--max-args')
+        args_per_exec = 0
+      end
+      if lines_per_exec ~= 0 then
+        warn_mutually_exclusive('--replace/-I/-i', '--max-lines')
+        lines_per_exec = 0
+      end
+    elseif c == 76 then
+      lines_per_exec = parse_num(g.optarg, 76, 1, -1, true)
+      if args_per_exec ~= 0 then
+        warn_mutually_exclusive('-L', '--max-args')
+        args_per_exec = 0
+      end
+      if replace_pat ~= nilptr then
+        warn_mutually_exclusive('-L', '--replace')
+        replace_pat = nilptr
+      end
+    elseif c == 108 then
+      if g.has_optarg then lines_per_exec = parse_num(g.optarg, 108, 1, -1, true)
+      else lines_per_exec = 1 end
+      if args_per_exec ~= 0 then
+        warn_mutually_exclusive('--max-lines/-l', '--max-args')
+        args_per_exec = 0
+      end
+      if replace_pat ~= nilptr then
+        warn_mutually_exclusive('--max-lines/-l', '--replace')
+        replace_pat = nilptr
+      end
+    elseif c == 110 then
+      args_per_exec = parse_num(g.optarg, 110, 1, -1, true)
+      if lines_per_exec ~= 0 then
+        warn_mutually_exclusive('--max-args/-n', '--max-lines')
+        lines_per_exec = 0
+      end
+      if replace_pat ~= nilptr then
+        if args_per_exec == 1 then
+          args_per_exec = 0
+        else
+          warn_mutually_exclusive('--max-args/-n', '--replace')
+          replace_pat = nilptr
+        end
+      end
+    elseif c == 115 then
+      if env_bad then die('environment is too large for exec') end
+      local arg_size = parse_num(g.optarg, 115, 1, posix_arg_size_max, false)
+      if arg_size > posix_arg_size_max then
+        util.err('warning: value ' .. tostring(arg_size) .. ' for -s option is too large, using ' ..
+                 tostring(posix_arg_size_max) .. ' instead')
+        arg_size = posix_arg_size_max
+      end
+      arg_max = arg_size
+    elseif c == 83 then
+      show_limits = true
+    elseif c == 116 then
+      print_command = true
+    elseif c == 120 then
+      exit_if_size_exceeded = true
+    elseif c == 111 then
+      open_tty = true
+    elseif c == 112 then
+      query_before_executing = true
+      print_command = true
+    elseif c == 114 then
+      always_run_command = false
+    elseif c == 80 then
+      proc_max = (@cint)(parse_num(g.optarg, 80, 0, MAX_PROC_MAX, true))
+    elseif c == 97 then
+      input_file = g.optarg
+    elseif c == 118 then
+      util.write('xargs (nebox) after GNU findutils 4.9.0\n')
+      xexit(0)
+    elseif c == 128 then
+      if g.optarg:find('=', 1, true) > 0 then
+        die("option --process-slot-var may not be set to a value which includes `='")
+      end
+      slot_var_name = (@cstring)(cdup(g.optarg))
+      if sys.unsetenv(slot_var_name) ~= 0 then
+        die_errno('failed to unset environment variable ' .. g.optarg, sys.errno())
+      end
+    else
+      usage_fail()
+    end
+  end
+
+  if eof_str ~= nilptr and use_read_string then
+    util.err('warning: the -E option has no effect if -0 or -d is used.\n')
+  end
+  if env_bad then die('environment is too large for exec') end
+
+  local sa: sys.Sigaction
+  sa.sa_handler = increment_proc_max
+  sa.sa_flags = 0
+  if sys.sigaction(SIGUSR1, &sa, nilptr) ~= 0 then util.err('Cannot set SIGUSR1 signal handler: ' .. sys.errstr()) end
+  local sb: sys.Sigaction
+  sb.sa_handler = decrement_proc_max
+  sb.sa_flags = 0
+  if sys.sigaction(SIGUSR2, &sb, nilptr) ~= 0 then util.err('Cannot set SIGUSR2 signal handler: ' .. sys.errstr()) end
+
+  if input_file ~= '-' then
+    keep_stdin = true
+    local fd = sys.open((@cstring)(cdup(input_file)), sys.O_RDONLY | sys.O_CLOEXEC, 0)
+    if fd < 0 then die_errno('Cannot open input file ' .. util.quote(input_file), sys.errno()) end
+    file_rd.fd = fd
+    input = &file_rd
+  end
+
+  if replace_pat ~= nilptr or lines_per_exec ~= 0 then exit_if_size_exceeded = true end
+
+  local ops = g:operands()
+  local argc = #ops
+  local xargv = (@CStrs)(c_malloc((@csize)((argc + 1) * 8)))
+  local xlen = (@*[0]integer)(c_malloc((@csize)((argc + 1) * 8)))
+  if argc == 0 then
+    argc = 1
+    xargv[0] = (@cstring)(cdup('echo'))
+  else
+    for i = 0, < argc do xargv[i] = (@cstring)(cdup(ops[i + 1])) end
+  end
+  for i = 0, < argc do xlen[i] = c_strlen((@Bytes)(xargv[i])) end
+
+  if show_limits then
+    local env = bc_size_of_environment()
+    errout('Your environment variables take up ' .. tostring(env) .. ' bytes\n')
+    errout('POSIX upper limit on argument length (this system): ' .. tostring(posix_arg_size_max) .. '\n')
+    errout('POSIX smallest allowable upper limit on argument length (all systems): ' .. tostring(posix_arg_size_min) .. '\n')
+    errout('Maximum length of command we could actually use: ' .. tostring((@uint64)(posix_arg_size_max - env)) .. '\n')
+    errout('Size of command buffer we are actually using: ' .. tostring(arg_max) .. '\n')
+    errout('Maximum parallelism (--max-procs must be no greater): ' .. tostring(MAX_PROC_MAX) .. '\n')
+    if sys.isatty(0) ~= 0 then
+      errout('\nExecution of xargs will continue now, and it will try to read its input and run commands; if this is not what you wanted to happen, please type the end-of-file keystroke.\n')
+      if always_run_command then
+        errout('Warning: ' .. view((@Bytes)(xargv[0])) .. ' will be run at least once.  If you do not want that to happen, then press the interrupt keystroke.\n')
+      end
+    end
+  end
+
+  linebuf = (@Bytes)(c_malloc((@csize)(arg_max + 1)))
+  argbuf = (@Bytes)(c_malloc((@csize)(arg_max + 1)))
+
+  local sc: sys.Sigaction
+  sc.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+  sys.sigaction(sys.SIGCHLD, &sc, nilptr)
+
+  if replace_pat == nilptr then
+    for i = 0, < argc do bc_push_arg((@Bytes)(xargv[i]), xlen[i] + 1, initial_args) end
+    initial_args = false
+    initial_argc = cmd_argc
+    cmd_initial_argv_chars = cmd_argv_chars
+    while read_args() ~= -1 do
+      if lines_per_exec ~= 0 and lineno >= lines_per_exec then
+        bc_do_exec()
+        lineno = 0
+      end
+    end
+    if cmd_argc ~= initial_argc or (always_run_command and not procs_executed) then bc_do_exec() end
+  else
+    rplen = c_strlen(replace_pat)
+    while true do
+      local n = read_args()
+      if n == -1 then break end
+      local len = n
+      bc_clear_args()
+      cmd_argv_chars = 0
+      bc_push_arg((@Bytes)(xargv[0]), xlen[0] + 1, initial_args)
+      len = len - 1
+      initial_args = false
+      for i = 1, < argc do bc_do_insert((@Bytes)(xargv[i]), xlen[i], linebuf, len, initial_args) end
+      bc_do_exec()
+    end
+  end
+  original_exit_value = child_error
+  xexit(child_error)
+  return child_error
+end
