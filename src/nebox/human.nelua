@@ -1,0 +1,239 @@
+-- gnulib human.c in the C locale: human_readable (exact integer arithmetic
+-- when the block sizes divide, long double otherwise, with its rounding
+-- styles, autoscaling, SI/IEC suffixes) and human_options (--block-size,
+-- BLOCK_SIZE/BLOCKSIZE, "human-readable"/"si", a leading "'" for grouping,
+-- which the C locale leaves without separators).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+global human = @record{}
+global human.ceiling: integer <comptime> = 0
+global human.round_to_nearest: integer <comptime> = 1
+global human.floor: integer <comptime> = 2
+global human.group_digits: integer <comptime> = 4
+global human.suppress_point_zero: integer <comptime> = 8
+global human.autoscale: integer <comptime> = 16
+global human.base_1024: integer <comptime> = 32
+global human.space_before_unit: integer <comptime> = 64
+global human.SI: integer <comptime> = 128
+global human.B: integer <comptime> = 256
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+local power_letter = ' KMGTPEZY'
+local EXPONENT_MAX <comptime> = 8
+
+local function u64_to_ld(v: uint64): clongdouble return (@clongdouble)(v) end
+local TWO64: clongdouble = 18446744073709551616.0
+
+local function adjust_value(inexact_style: integer, value: clongdouble): clongdouble
+  if inexact_style ~= human.round_to_nearest and value < (@clongdouble)(UMAX) then
+    local u: uint64 = (@uint64)(value)
+    local r = u64_to_ld(u)
+    if inexact_style == human.ceiling and r ~= value then r = r + 1 end
+    return r
+  end
+  return value
+end
+
+-- printf "%.0Lf": round half to even.
+local function fmt0(x: clongdouble): string
+  if x < TWO64 and x >= 0 then
+    local q: uint64 = (@uint64)(x)
+    local f = x - u64_to_ld(q)
+    if f > 0.5 or (f == 0.5 and (q & 1) == 1) then q = q + 1 end
+    return tostring(q)
+  end
+  return string.format('%.0f', (@float64)(x))
+end
+
+-- printf "%.1Lf".
+local function fmt1(x: clongdouble): string
+  if x < TWO64 / 16 and x >= 0 then
+    local q: uint64 = (@uint64)(x)
+    local t = (x - u64_to_ld(q)) * 10
+    local d: uint64 = (@uint64)(t)
+    local rem = t - u64_to_ld(d)
+    if rem > 0.5 or (rem == 0.5 and (d & 1) == 1) then d = d + 1 end
+    if d == 10 then q = q + 1; d = 0 end
+    return tostring(q) .. '.' .. tostring(d)
+  end
+  return string.format('%.1f', (@float64)(x))
+end
+
+-- human_readable: N in units of FROM_BLOCK_SIZE shown in TO_BLOCK_SIZE units.
+function human.readable(n: uint64, opts: integer, from_block_size: uint64, to_block_size: uint64): string
+  local inexact_style = opts & (human.round_to_nearest | human.floor | human.ceiling)
+  local base: uint64 = (opts & human.base_1024) ~= 0 and 1024 or 1000
+  local amt: uint64 = 0
+  local tenths: uint64 = 0
+  local exponent = -1
+  local rounding: uint64 = 0
+  local body: string     -- the number, point and fraction included
+  local use_int = false
+  if to_block_size <= from_block_size then
+    if from_block_size % to_block_size == 0 then
+      local multiplier = from_block_size // to_block_size
+      amt = n * multiplier
+      if amt // multiplier == n then
+        tenths = 0; rounding = 0; use_int = true
+      end
+    end
+  elseif from_block_size ~= 0 and to_block_size % from_block_size == 0 then
+    local divisor = to_block_size // from_block_size
+    local r10 = (n % divisor) * 10
+    local r2 = (r10 % divisor) * 2
+    amt = n // divisor
+    tenths = r10 // divisor
+    rounding = r2 < divisor and ((0 < r2) and 1 or 0) or (2 + ((divisor < r2) and 1 or 0))
+    use_int = true
+  end
+  if not use_int then
+    local dto: clongdouble = u64_to_ld(to_block_size)
+    local damt: clongdouble = u64_to_ld(n) * (u64_to_ld(from_block_size) / dto)
+    if (opts & human.autoscale) == 0 then
+      body = fmt0(adjust_value(inexact_style, damt))
+    else
+      local e: clongdouble = 1
+      exponent = 0
+      repeat
+        e = e * u64_to_ld(base)
+        exponent = exponent + 1
+      until not (e * u64_to_ld(base) <= damt and exponent < EXPONENT_MAX)
+      damt = damt / e
+      body = fmt1(adjust_value(inexact_style, damt))
+      local nonintegerlen = 2
+      local buflen = #body
+      if 1 + nonintegerlen + ((opts & human.base_1024) == 0 and 1 or 0) < buflen
+          or ((opts & human.suppress_point_zero) ~= 0 and body:byte(buflen) == 48) then
+        body = fmt0(adjust_value(inexact_style, damt * 10) / 10)
+      end
+    end
+  else
+    local frac = ''
+    if (opts & human.autoscale) ~= 0 then
+      exponent = 0
+      if base <= amt then
+        repeat
+          local r10 = (amt % base) * 10 + tenths
+          local r2 = (r10 % base) * 2 + (rounding >> 1)
+          amt = amt // base
+          tenths = r10 // base
+          if r2 < base then rounding = ((r2 + rounding) ~= 0) and 1 or 0
+          else rounding = 2 + ((base < r2 + rounding) and 1 or 0) end
+          exponent = exponent + 1
+        until not (base <= amt and exponent < EXPONENT_MAX)
+        if amt < 10 then
+          local up: boolean
+          if inexact_style == human.round_to_nearest then up = 2 < rounding + (tenths & 1)
+          else up = inexact_style == human.ceiling and 0 < rounding end
+          if up then
+            tenths = tenths + 1
+            rounding = 0
+            if tenths == 10 then amt = amt + 1; tenths = 0 end
+          end
+          if amt < 10 and (tenths ~= 0 or (opts & human.suppress_point_zero) == 0) then
+            frac = '.' .. tostring(tenths)
+            tenths = 0; rounding = 0
+          end
+        end
+      end
+    end
+    local up: boolean
+    if inexact_style == human.round_to_nearest then up = 5 < tenths + ((0 < rounding + (amt & 1)) and 1 or 0)
+    else up = inexact_style == human.ceiling and 0 < tenths + rounding end
+    if up then
+      amt = amt + 1
+      if (opts & human.autoscale) ~= 0 and amt == base and exponent < EXPONENT_MAX then
+        exponent = exponent + 1
+        if (opts & human.suppress_point_zero) == 0 then frac = '.0' .. frac end
+        amt = 1
+      end
+    end
+    body = tostring(amt) .. frac
+  end
+  local sb: stringbuilder
+  sb:write(body)
+  if (opts & human.SI) ~= 0 then
+    if exponent < 0 then
+      exponent = 0
+      local power: uint64 = 1
+      while power < to_block_size do
+        exponent = exponent + 1
+        if exponent == EXPONENT_MAX then break end
+        power = power * base
+      end
+    end
+    if (exponent ~= 0 or (opts & human.B) ~= 0) and (opts & human.space_before_unit) ~= 0 then sb:writebyte(32) end
+    if exponent ~= 0 then
+      if (opts & human.base_1024) == 0 and exponent == 1 then sb:writebyte(107)
+      else sb:writebyte(power_letter:byte(exponent + 1)) end
+    end
+    if (opts & human.B) ~= 0 then
+      if (opts & human.base_1024) ~= 0 and exponent ~= 0 then sb:writebyte(105) end
+      sb:writebyte(66)
+    end
+  end
+  return sb:promote()
+end
+
+local function default_block_size(): uint64
+  return sys.getenv('POSIXLY_CORRECT') ~= nilptr and 512 or 1024
+end
+
+-- human_options: (strtol status, options, block size). SPEC is used when
+-- GIVEN; otherwise BLOCK_SIZE, then BLOCKSIZE, then the default. BLOCK_SIZE
+-- is what the caller had before (gnulib leaves it alone on LONGINT_INVALID).
+function human.options(spec: string, given: boolean, block_size: uint64): (integer, integer, uint64)
+  local opts = 0
+  local st = 0
+  if not given then
+    local e = sys.getenv('BLOCK_SIZE')
+    if e == nilptr then e = sys.getenv('BLOCKSIZE') end
+    if e ~= nilptr then spec = (@string)(e); given = true end
+  end
+  if not given then
+    block_size = default_block_size()
+  else
+    if #spec > 0 and spec:byte(1) == 39 then
+      opts = opts | human.group_digits
+      spec = spec:sub(2)
+    end
+    -- ARGMATCH (spec, {"human-readable", "si"}), quietly
+    local idx = -1
+    if spec == 'human-readable' then idx = 0
+    elseif spec == 'si' then idx = 1
+    elseif #spec > 0 and ('human-readable'):sub(1, #spec) == spec then idx = 0
+    elseif #spec > 0 and ('si'):sub(1, #spec) == spec then idx = 1 end
+    if idx >= 0 then
+      opts = opts | (idx == 0 and (human.autoscale | human.SI | human.base_1024) or (human.autoscale | human.SI))
+      block_size = 1
+    else
+      local s, v = util.xstrtoumax_base(spec, 0, 'eEgGkKmMpPtTyYzZ0')
+      if s ~= 2 then block_size = v end
+      if s ~= 0 then
+        if block_size == 0 then block_size = default_block_size(); s = 2 end
+        return s, 0, block_size
+      end
+      local has_digit = false
+      for i = 1, #spec do
+        if spec:byte(i) >= 48 and spec:byte(i) <= 57 then has_digit = true; break end
+      end
+      if not has_digit then
+        opts = opts | human.SI
+        local last = spec:byte(#spec)
+        local prev: byte = #spec >= 2 and spec:byte(#spec - 1) or 0
+        if last == 66 then opts = opts | human.B end
+        if last ~= 66 or prev == 105 then opts = opts | human.base_1024 end
+      end
+    end
+  end
+  if block_size == 0 then
+    block_size = default_block_size()
+    st = 2
+  end
+  return st, opts, block_size
+end

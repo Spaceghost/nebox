@@ -190,6 +190,7 @@ global util.Getopt = @record{
   quiet: boolean,      -- keep errors in errmsg instead of printing them
   errmsg: string,
   longname: string,    -- the long option last matched
+  was_long: boolean,   -- whether the last option returned was a long one
 }
 
 function util.getopt(args: sequence(string), shortopts: string, longopts: *[0]util.LongOpt, nlong: integer): util.Getopt
@@ -221,6 +222,7 @@ local function getopt_err(g: *util.Getopt, s: string): integer
 end
 
 function util.Getopt:next(): integer
+  self.was_long = false
   self.optarg = ''
   self.has_optarg = false
   if #self.nextchar == 0 then
@@ -289,6 +291,7 @@ function util.Getopt:next(): integer
       if found < 0 then return getopt_err(self, "unrecognized option '" .. a .. "'") end
       local o = self.longopts[found]
       self.longname = o.name
+      self.was_long = true
       if eq > 0 then
         if o.has_arg == 0 then return getopt_err(self, "option '--" .. o.name .. "' doesn't allow an argument") end
         self.optarg = body:sub(eq + 1); self.has_optarg = true
@@ -324,22 +327,41 @@ function util.Getopt:next(): integer
   return c
 end
 
--- gnulib xstrtoumax (base 10): 0 LONGINT_OK, 1 LONGINT_OVERFLOW (value
--- saturated), 2 invalid (no digits, a '-', or a suffix not in SUFFIXES).
+function util.hexval(c: byte): integer
+  if c >= 48 and c <= 57 then return c - 48 end
+  if c >= 97 and c <= 102 then return c - 87 end
+  if c >= 65 and c <= 70 then return c - 55 end
+  return -1
+end
+
+-- gnulib xstrtoumax: 0 LONGINT_OK, 1 LONGINT_OVERFLOW (value saturated),
+-- 2 LONGINT_INVALID (no number, or a '-'), 3 LONGINT_INVALID_SUFFIX_CHAR
+-- (with or without overflow). BASE is 10 or 0 (strtoumax's 0x/0 prefixes).
 -- Suffixes: b=512, B=1024, c=1, w=2, k/K M/m G/g T/t P E Z Y in powers of
 -- 1024, or of 1000 with a trailing B/D, or 1024 with iB, when SUFFIXES has '0'.
-function util.xstrtoumax(s: string, suffixes: string): (integer, uint64)
+function util.xstrtoumax_base(s: string, base: integer, suffixes: string): (integer, uint64)
   local UMAX: uint64 = 0xffffffffffffffff
   local p = 1
   while p <= #s and (s:byte(p) == 32 or (s:byte(p) >= 9 and s:byte(p) <= 13)) do p = p + 1 end
   if p <= #s and s:byte(p) == 45 then return 2, 0 end
   if p <= #s and s:byte(p) == 43 then p = p + 1 end
+  local b: uint64 = 10
+  if base == 0 then
+    if p + 1 <= #s and s:byte(p) == 48 and (s:byte(p + 1) == 120 or s:byte(p + 1) == 88)
+        and p + 2 <= #s and util.hexval(s:byte(p + 2)) >= 0 then
+      b = 16; p = p + 2
+    elseif p <= #s and s:byte(p) == 48 then
+      b = 8
+    end
+  end
   local start = p
   local v: uint64 = 0
   local ovf = false
-  while p <= #s and s:byte(p) >= 48 and s:byte(p) <= 57 do
-    local d: uint64 = s:byte(p) - 48
-    if ovf or v > (UMAX - d) // 10 then ovf = true; v = UMAX else v = v * 10 + d end
+  while p <= #s do
+    local dv = util.hexval(s:byte(p))
+    if dv < 0 or (@uint64)(dv) >= b then break end
+    local d: uint64 = (@uint64)(dv)
+    if ovf or v > (UMAX - d) // b then ovf = true; v = UMAX else v = v * b + d end
     p = p + 1
   end
   local function valid(c: byte): boolean
@@ -351,7 +373,7 @@ function util.xstrtoumax(s: string, suffixes: string): (integer, uint64)
   end
   if p <= #s then
     local c = s:byte(p)
-    if not valid(c) then return 2, v end
+    if not valid(c) then return 3, v end
     local base: uint64 = 1024
     local nsuf = 1
     local power = 0
@@ -369,7 +391,7 @@ function util.xstrtoumax(s: string, suffixes: string): (integer, uint64)
       if c == 107 or c == 75 then power = 1 elseif c == 109 or c == 77 then power = 2
       elseif c == 71 or c == 103 then power = 3 elseif c == 84 or c == 116 then power = 4
       elseif c == 80 then power = 5 elseif c == 69 then power = 6 elseif c == 90 then power = 7
-      elseif c == 89 then power = 8 else return 2, v end
+      elseif c == 89 then power = 8 else return 3, v end
       mul = 0
     end
     if mul ~= 0 then
@@ -380,9 +402,21 @@ function util.xstrtoumax(s: string, suffixes: string): (integer, uint64)
       end
     end
     p = p + nsuf
-    if p <= #s then return 2, v end
+    if p <= #s then return 3, v end
   end
   return ovf and 1 or 0, v
+end
+
+function util.xstrtoumax(s: string, suffixes: string): (integer, uint64)
+  return util.xstrtoumax_base(s, 10, suffixes)
+end
+
+-- gnulib xstrtol_fatal's message for status ST (2 or more, or 1) of the
+-- argument ARG to option OPT ("-B" or "--block-size").
+function util.xstrtol_msg(st: integer, opt: string, arg: string): string
+  if st == 1 then return opt .. " argument '" .. arg .. "' too large" end
+  if st == 3 then return 'invalid suffix in ' .. opt .. " argument '" .. arg .. "'" end
+  return 'invalid ' .. opt .. " argument '" .. arg .. "'"
 end
 
 -- gnulib xdectoumax: util.xstrtoumax within [MIN, MAX]. On failure it
@@ -390,7 +424,7 @@ end
 function util.xdectoumax(s: string, min: uint64, max: uint64, suffixes: string, msg: string): (boolean, uint64, string)
   local st, v = util.xstrtoumax(s, suffixes)
   local function fail(t: string): (boolean, uint64, string) return false, 0, msg .. ': ' .. util.quote(s) .. t end
-  if st == 2 then return fail('') end
+  if st >= 2 then return fail('') end
   if st == 1 then return fail(': Value too large for defined data type') end
   if v < min or v > max then
     return fail(v > 0x3fffffff and ': Value too large for defined data type' or ': Numerical result out of range')

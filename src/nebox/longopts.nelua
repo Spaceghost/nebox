@@ -69,14 +69,6 @@ global longopts.du: []util.LongOpt = {
   {'time-style', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.df: []util.LongOpt = {
-  {'all', 0, 97}, {'block-size', 1, util.UNSUPPORTED}, {'inodes', 0, 105},
-  {'human-readable', 0, 104}, {'si', 0, 72}, {'local', 0, util.UNSUPPORTED},
-  {'output', 2, util.UNSUPPORTED}, {'portability', 0, 80}, {'print-type', 0, 84},
-  {'sync', 0, util.UNSUPPORTED}, {'no-sync', 0, util.UNSUPPORTED}, {'total', 0, util.UNSUPPORTED},
-  {'type', 1, util.UNSUPPORTED}, {'exclude-type', 1, util.UNSUPPORTED},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.basename: []util.LongOpt = {
   {'multiple', 0, 97}, {'suffix', 1, 115}, {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},

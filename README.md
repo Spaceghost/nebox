@@ -178,6 +178,18 @@ Stated here rather than worked around:
   gnulib backupfile.c (numbered names found by scanning the directory, with
   its string arithmetic) for cp, mv and install to share.
   `tests/ln_compare.py`: 149 cases, 0 mismatches.
+- `df` ports df.c over the mountinfo reader, gnulib fsusage (statfs) and
+  `src/nebox/human.nelua`, a port of gnulib human.c (integer arithmetic
+  when block sizes divide, long double otherwise, ceiling/floor/nearest
+  rounding, autoscaling, SI and IEC suffixes, human_options with
+  `--block-size`, `DF_BLOCK_SIZE`, `BLOCK_SIZE`, `BLOCKSIZE` and
+  `POSIXLY_CORRECT`). All options including `--output[=FIELDS]`, `--total`,
+  -t/-x/-F; the duplicate-device filter, over-mount detection, device-node
+  and FILE lookups, UUID device names resolved, GNU's column widths.
+  `util.xstrtoumax_base` (strtoumax base 0) and `util.xstrtol_msg` are the
+  shared number parser and its xstrtol_fatal messages. `tests/df_compare.py`:
+  357 cases against the container's live mount table (rerun when a busy file
+  system's usage moves between the two runs), 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

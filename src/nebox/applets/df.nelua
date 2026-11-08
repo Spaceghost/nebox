@@ -1,0 +1,785 @@
+-- df: a port of GNU coreutils 9.1 src/df.c (Linux, C locale) over
+-- src/nebox/mountlist.nelua (/proc/self/mountinfo), gnulib fsusage
+-- (statfs) and src/nebox/human.nelua. Every option: -a -B -h -H -i -k -l
+-- -m -P -T -t/-F -x -v --output[=FIELDS] --total --sync/--no-sync; the
+-- duplicate-device filter (shorter mount points and real device names
+-- win), over-mounted entries, best-match lookup for FILE operands and
+-- device nodes, UUID device names resolved, control characters in cells
+-- shown as '?', and GNU's column widths and alignment.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.human'
+require 'nebox.mountlist'
+require 'nebox.canonicalize'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_sync() <cimport 'sync', cinclude '<unistd.h>'> end
+
+local UMAX: uint64 <comptime> = 0xffffffffffffffff
+
+local SOURCE_FIELD <comptime> = 1
+local FSTYPE_FIELD <comptime> = 2
+local SIZE_FIELD <comptime> = 3
+local USED_FIELD <comptime> = 4
+local AVAIL_FIELD <comptime> = 5
+local PCENT_FIELD <comptime> = 6
+local ITOTAL_FIELD <comptime> = 7
+local IUSED_FIELD <comptime> = 8
+local IAVAIL_FIELD <comptime> = 9
+local IPCENT_FIELD <comptime> = 10
+local TARGET_FIELD <comptime> = 11
+local FILE_FIELD <comptime> = 12
+
+local BLOCK_FLD <comptime> = 0
+local INODE_FLD <comptime> = 1
+local OTHER_FLD <comptime> = 2
+
+local Field = @record{ arg: string, ftype: integer, caption: string, width: integer, left: boolean, used: boolean }
+local field_data: [13]Field
+local function init_fields()
+  field_data[1] = {arg = 'source', ftype = OTHER_FLD, caption = 'Filesystem', width = 14, left = true}
+  field_data[2] = {arg = 'fstype', ftype = OTHER_FLD, caption = 'Type', width = 4, left = true}
+  field_data[3] = {arg = 'size', ftype = BLOCK_FLD, caption = 'blocks', width = 5, left = false}
+  field_data[4] = {arg = 'used', ftype = BLOCK_FLD, caption = 'Used', width = 5, left = false}
+  field_data[5] = {arg = 'avail', ftype = BLOCK_FLD, caption = 'Available', width = 5, left = false}
+  field_data[6] = {arg = 'pcent', ftype = BLOCK_FLD, caption = 'Use%', width = 4, left = false}
+  field_data[7] = {arg = 'itotal', ftype = INODE_FLD, caption = 'Inodes', width = 5, left = false}
+  field_data[8] = {arg = 'iused', ftype = INODE_FLD, caption = 'IUsed', width = 5, left = false}
+  field_data[9] = {arg = 'iavail', ftype = INODE_FLD, caption = 'IFree', width = 5, left = false}
+  field_data[10] = {arg = 'ipcent', ftype = INODE_FLD, caption = 'IUse%', width = 4, left = false}
+  field_data[11] = {arg = 'target', ftype = OTHER_FLD, caption = 'Mounted on', width = 0, left = true}
+  field_data[12] = {arg = 'file', ftype = OTHER_FLD, caption = 'File', width = 0, left = true}
+end
+
+local DEFAULT_MODE <comptime> = 0
+local INODES_MODE <comptime> = 1
+local HUMAN_MODE <comptime> = 2
+local POSIX_MODE <comptime> = 3
+local OUTPUT_MODE <comptime> = 4
+
+local show_all_fs = false
+local show_local_fs = false
+local show_listed_fs = false
+local human_output_opts: integer = -1
+local output_block_size: uint64 = 0
+local file_systems_processed = false
+local require_sync = false
+local exit_status = 0
+local fs_select: sequence(string)
+local fs_exclude: sequence(string)
+local mounts: sequence(mountlist.Entry)
+local print_type = false
+local print_grand_total = false
+local header_mode = DEFAULT_MODE
+local columns: sequence(integer)
+local table: sequence(sequence(string))
+
+local FsUsage = @record{
+  blocksize: uint64, blocks: uint64, bfree: uint64, bavail: uint64,
+  bavail_top_bit_set: boolean, files: uint64, ffree: uint64,
+}
+local grand: FsUsage
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'df --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function get_fs_usage(file: string, fsp: *FsUsage): boolean
+  local fs: sys.Statfs
+  local r = sys.statfs(file, &fs)
+  if r ~= 0 then sys.seterrno((@cint)(-r)); return false end
+  local frsize: uint64 = (@uint64)(fs.f_frsize)
+  fsp.blocksize = frsize ~= 0 and frsize or (@uint64)(fs.f_bsize)
+  fsp.blocks = fs.f_blocks
+  fsp.bfree = fs.f_bfree
+  fsp.bavail = fs.f_bavail
+  fsp.bavail_top_bit_set = (fs.f_bavail >> 63) ~= 0
+  fsp.files = fs.f_files
+  fsp.ffree = fs.f_ffree
+  return true
+end
+
+local function automount_stat_err(file: string, st: *sys.Stat): cint
+  local fd = sys.open(file, sys.O_RDONLY | 0x100 | 0x800, 0)
+  if fd < 0 then
+    local e = sys.errno()
+    if e == 2 or e == 20 then return e end
+    return sys.stat(file, st) == 0 and 0 or sys.errno()
+  end
+  local err: cint = sys.fstat(fd, st) == 0 and 0 or sys.errno()
+  sys.close(fd)
+  return err
+end
+
+local function replace_control_chars(s: string): string
+  local sb: stringbuilder
+  for i = 1, #s do
+    local c = s:byte(i)
+    if c < 32 or c == 127 then sb:writebyte(63) else sb:writebyte(c) end
+  end
+  return sb:promote()
+end
+
+-- replace_invalid_chars for a terminal, C locale: control bytes become '?'.
+local function replace_problematic_chars(s: string): string
+  return replace_control_chars(s)
+end
+
+local function alloc_table_row()
+  local row: sequence(string)
+  table:push(row)
+end
+
+local function print_table()
+  for r = 1, #table do
+    local row = &table[r]
+    for col = 1, #columns do
+      local cell = ($row)[col]
+      if col ~= 1 then util.writebyte(32) end
+      local f = &field_data[columns[col]]
+      local pad = f.width - #cell
+      if pad < 0 then pad = 0 end
+      if f.left then
+        util.write(cell)
+        if col ~= #columns then for _ = 1, pad do util.writebyte(32) end end
+      else
+        for _ = 1, pad do util.writebyte(32) end
+        util.write(cell)
+      end
+    end
+    util.writebyte(10)
+  end
+end
+
+local function alloc_field(f: integer, caption: string)
+  columns:push(f)
+  if #caption > 0 then field_data[f].caption = caption end
+  field_data[f].used = true
+end
+
+local function decode_output_arg(arg: string)
+  local s = arg
+  while true do
+    local comma = s:find(',', 1, true)
+    local name = comma > 0 and s:sub(1, comma - 1) or s
+    local field = 0
+    for i = 1, 12 do
+      if field_data[i].arg == name then field = i; break end
+    end
+    if field == 0 then usage_fail('option --output: field ' .. util.quote(name) .. ' unknown') end
+    if field_data[field].used then
+      usage_fail('option --output: field ' .. util.quote(field_data[field].arg) .. ' used more than once')
+    end
+    if field == SIZE_FIELD then alloc_field(field, 'Size')
+    elseif field == AVAIL_FIELD then alloc_field(field, 'Avail')
+    else alloc_field(field, '') end
+    if comma == 0 then break end
+    s = s:sub(comma + 1)
+  end
+end
+
+local function get_field_list()
+  if header_mode == DEFAULT_MODE or header_mode == HUMAN_MODE or header_mode == POSIX_MODE then
+    alloc_field(SOURCE_FIELD, '')
+    if print_type then alloc_field(FSTYPE_FIELD, '') end
+    alloc_field(SIZE_FIELD, header_mode == HUMAN_MODE and 'Size' or '')
+    alloc_field(USED_FIELD, '')
+    alloc_field(AVAIL_FIELD, header_mode == HUMAN_MODE and 'Avail' or '')
+    alloc_field(PCENT_FIELD, header_mode == POSIX_MODE and 'Capacity' or '')
+    alloc_field(TARGET_FIELD, '')
+  elseif header_mode == INODES_MODE then
+    alloc_field(SOURCE_FIELD, '')
+    if print_type then alloc_field(FSTYPE_FIELD, '') end
+    alloc_field(ITOTAL_FIELD, '')
+    alloc_field(IUSED_FIELD, '')
+    alloc_field(IAVAIL_FIELD, '')
+    alloc_field(IPCENT_FIELD, '')
+    alloc_field(TARGET_FIELD, '')
+  else
+    if #columns == 0 then decode_output_arg('source,fstype,itotal,iused,iavail,ipcent,size,used,avail,pcent,file,target') end
+  end
+end
+
+local function get_header()
+  alloc_table_row()
+  local row = &table[#table]
+  for col = 1, #columns do
+    local f = &field_data[columns[col]]
+    local cell: string
+    local header = f.caption
+    if columns[col] == SIZE_FIELD and (header_mode == DEFAULT_MODE
+        or (header_mode == OUTPUT_MODE and (human_output_opts & human.autoscale) == 0)) then
+      local opts = human.suppress_point_zero | human.autoscale | human.SI
+        | (human_output_opts & (human.group_digits | human.base_1024 | human.B))
+      local q1000 = output_block_size
+      local q1024 = output_block_size
+      local d1000, d1024 = false, false
+      repeat
+        d1000 = q1000 % 1000 == 0; q1000 = q1000 // 1000
+        d1024 = q1024 % 1024 == 0; q1024 = q1024 // 1024
+      until not (d1000 and d1024)
+      if not d1000 and d1024 then opts = opts | human.base_1024 end
+      if not d1024 and d1000 then opts = opts & ~human.base_1024 end
+      if (opts & human.base_1024) == 0 then opts = opts | human.B end
+      cell = human.readable(output_block_size, opts, 1, 1) .. '-blocks'
+    elseif header_mode == POSIX_MODE and columns[col] == SIZE_FIELD then
+      cell = tostring(output_block_size) .. '-' .. header
+    else
+      cell = header
+    end
+    cell = replace_problematic_chars(cell)
+    row:push(cell)
+    if #cell > f.width then f.width = #cell end
+  end
+end
+
+local function selected_fstype(t: string, have: boolean): boolean
+  if #fs_select == 0 or not have then return true end
+  for i = 1, #fs_select do if fs_select[i] == t then return true end end
+  return false
+end
+
+local function excluded_fstype(t: string, have: boolean): boolean
+  if #fs_exclude == 0 or not have then return false end
+  for i = 1, #fs_exclude do if fs_exclude[i] == t then return true end end
+  return false
+end
+
+-- devlist_table: for each device, the index (into mounts) its last node holds.
+local Devnode = @record{ me: integer, dev: uint64 }
+local devnodes: sequence(Devnode)
+local have_devtable = false
+
+local function devlist_for_dev(dev: uint64): integer
+  if not have_devtable then return 0 end
+  for i = #devnodes, 1, -1 do
+    if devnodes[i].dev == dev then return i end
+  end
+  return 0
+end
+
+local function filter_mount_list(devices_only: boolean)
+  devnodes:clear()
+  have_devtable = true
+  local kept: sequence(integer)   -- devnode indexes in order of creation
+  for i = 1, #mounts do
+    local me = &mounts[i]
+    local buf: sys.Stat
+    local discard = 0
+    local dev: uint64
+    if (me.remote and show_local_fs) or (me.dummy and not show_all_fs and not show_listed_fs)
+        or (not selected_fstype(me.fstype, true) or excluded_fstype(me.fstype, true))
+        or sys.stat(me.mountdir, &buf) == -1 then
+      dev = me.dev
+    else
+      dev = buf.st_dev
+      local sd = devlist_for_dev(dev)
+      if sd > 0 then
+        local seen = &mounts[devnodes[sd].me]
+        local target_nearer_root = #seen.mountdir > #me.mountdir
+        local source_below_root = #seen.mntroot < #me.mntroot
+        if not print_grand_total and me.remote and seen.remote and seen.devname ~= me.devname then
+          -- keep both
+        elseif (me.devname:find('/', 1, true) > 0 and seen.devname:find('/', 1, true) == 0)
+            or (target_nearer_root and not source_below_root)
+            or (seen.devname ~= me.devname and me.mountdir == seen.mountdir) then
+          discard = devnodes[sd].me
+          devnodes[sd].me = i
+        else
+          discard = i
+        end
+      end
+    end
+    if discard == 0 then
+      devnodes:push({me = i, dev = dev})
+      kept:push(#devnodes)
+    end
+  end
+  if not devices_only then
+    local nl: sequence(mountlist.Entry)
+    for k = 1, #kept do nl:push(mounts[devnodes[kept[k]].me]) end
+    mounts = nl
+    devnodes:clear()
+    have_devtable = false
+  end
+end
+
+local function me_for_dev(dev: uint64): integer
+  local dl = devlist_for_dev(dev)
+  if dl > 0 then return devnodes[dl].me end
+  return 0
+end
+
+local function known_value(n: uint64): boolean return n < UMAX - 1 end
+
+local function df_readable(negative: boolean, n: uint64, input_units: uint64, output_units: uint64): string
+  if not known_value(n) and not negative then return '-' end
+  local s = human.readable(negative and (0 - n) or n, human_output_opts, input_units, output_units)
+  if negative then s = '-' .. s end
+  return s
+end
+
+local function add_uint_with_neg_flag(dest: *uint64, dest_neg: *boolean, src: uint64, src_neg: boolean)
+  if $dest_neg == src_neg then $dest = $dest + src; return end
+  if $dest_neg then $dest = 0 - $dest end
+  if src_neg then src = 0 - src end
+  if src < $dest then $dest = $dest - src
+  else
+    $dest = src - $dest
+    $dest_neg = src_neg
+  end
+  if $dest_neg then $dest = 0 - $dest end
+end
+
+local function has_uuid_suffix(s: string): boolean
+  if #s <= 36 then return false end
+  for i = #s - 35, #s do
+    local c = s:byte(i)
+    if not (c == 45 or (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)) then return false end
+  end
+  return true
+end
+
+local Values = @record{
+  input_units: uint64, output_units: uint64, total: uint64, available: uint64,
+  negate_available: boolean, available_to_root: uint64, used: uint64, negate_used: boolean,
+}
+
+local function get_field_values(bv: *Values, iv: *Values, fsu: *FsUsage)
+  iv.input_units = 1; iv.output_units = 1
+  iv.total = fsu.files
+  iv.available = fsu.ffree; iv.available_to_root = fsu.ffree
+  iv.negate_available = false
+  iv.used = UMAX
+  iv.negate_used = false
+  if known_value(iv.total) and known_value(iv.available_to_root) then
+    iv.used = iv.total - iv.available_to_root
+    iv.negate_used = iv.total < iv.available_to_root
+  end
+  bv.input_units = fsu.blocksize
+  bv.output_units = output_block_size
+  bv.total = fsu.blocks
+  bv.available = fsu.bavail
+  bv.available_to_root = fsu.bfree
+  bv.negate_available = fsu.bavail_top_bit_set and known_value(fsu.bavail)
+  bv.used = UMAX
+  bv.negate_used = false
+  if known_value(bv.total) and known_value(bv.available_to_root) then
+    bv.used = bv.total - bv.available_to_root
+    bv.negate_used = bv.total < bv.available_to_root
+  end
+end
+
+local function add_to_grand_total(bv: *Values, iv: *Values)
+  if known_value(iv.total) then grand.files = grand.files + iv.total end
+  if known_value(iv.available) then grand.ffree = grand.ffree + iv.available end
+  if known_value(bv.total) then grand.blocks = grand.blocks + bv.input_units * bv.total end
+  if known_value(bv.available_to_root) then grand.bfree = grand.bfree + bv.input_units * bv.available_to_root end
+  if known_value(bv.available) then
+    add_uint_with_neg_flag(&grand.bavail, &grand.bavail_top_bit_set, bv.input_units * bv.available, bv.negate_available)
+  end
+end
+
+local function pcent(v: *Values): string
+  local pct: float64 = -1
+  if not known_value(v.used) or not known_value(v.available) then
+  elseif not v.negate_used and v.used <= UMAX // 100 and v.used + v.available ~= 0
+      and ((v.used + v.available < v.used) == v.negate_available) then
+    local u100 = v.used * 100
+    local nonroot_total = v.used + v.available
+    pct = (@float64)(u100 // nonroot_total + ((u100 % nonroot_total ~= 0) and 1 or 0))
+  else
+    local u: float64 = v.negate_used and -(@float64)(0 - v.used) or (@float64)(v.used)
+    local a: float64 = v.negate_available and -(@float64)(0 - v.available) or (@float64)(v.available)
+    local nonroot_total = u + a
+    if nonroot_total ~= 0 then
+      pct = u * 100 / nonroot_total
+      local lipct: int64 = (@int64)(pct)
+      local ipct: float64 = (@float64)(lipct)
+      if ipct - 1 < pct and pct <= ipct + 1 then pct = ipct + ((ipct < pct) and 1 or 0) end
+    end
+  end
+  if 0 <= pct then return string.format('%.0f%%', pct) end
+  return '-'
+end
+
+local function get_dev(device: string, have_device: boolean, mount_point: string, have_mp: boolean,
+                       file: string, have_file: boolean, stat_file: string, have_stat_file: boolean,
+                       fstype: string, have_fstype: boolean, me_dummy: boolean, me_remote: boolean,
+                       force_fsu: *FsUsage, process_all: boolean)
+  if me_remote and show_local_fs then return end
+  if me_dummy and not show_all_fs and not show_listed_fs then return end
+  if not selected_fstype(fstype, have_fstype) or excluded_fstype(fstype, have_fstype) then return end
+  if force_fsu == nilptr and have_mp and not (#mount_point > 0 and mount_point:byte(1) == 47) then return end
+  if not have_stat_file then
+    stat_file = have_mp and mount_point or device
+  end
+  local fsu: FsUsage
+  if force_fsu ~= nilptr then
+    fsu = $force_fsu
+  elseif not get_fs_usage(stat_file, &fsu) then
+    local e = sys.errno()
+    if process_all and (e == 13 or e == 2) then
+      if not show_all_fs then return end
+      fstype = '-'; have_fstype = true
+      fsu = {blocksize = UMAX, blocks = UMAX, bfree = UMAX, bavail = UMAX, files = UMAX, ffree = UMAX}
+    else
+      util.err(errno_msg(util.quotef(stat_file), e))
+      exit_status = 1
+      return
+    end
+  elseif process_all and show_all_fs then
+    local sb: sys.Stat
+    if sys.stat(stat_file, &sb) == 0 then
+      local dm = me_for_dev(sb.st_dev)
+      if dm > 0 and mounts[dm].devname ~= device and (not mounts[dm].remote or not me_remote) then
+        fstype = '-'; have_fstype = true
+        fsu = {blocksize = UMAX, blocks = UMAX, bfree = UMAX, bavail = UMAX, files = UMAX, ffree = UMAX}
+      end
+    end
+  end
+  if fsu.blocks == 0 and not show_all_fs and not show_listed_fs then return end
+  if force_fsu == nilptr then file_systems_processed = true end
+  alloc_table_row()
+  local row = &table[#table]
+  if not have_device then device = '-' end
+  if not have_file then file = '-' end
+  local dev_name = device
+  if process_all and has_uuid_suffix(dev_name) then
+    local resolved = canon.canonicalize(dev_name, canon.CAN_EXISTING)
+    if #resolved > 0 then dev_name = resolved end
+  end
+  if not have_fstype then fstype = '-' end
+  local bv: Values
+  local iv: Values
+  get_field_values(&bv, &iv, &fsu)
+  if print_grand_total and force_fsu == nilptr then add_to_grand_total(&bv, &iv) end
+  for col = 1, #columns do
+    local fid = columns[col]
+    local f = &field_data[fid]
+    local v: *Values = f.ftype == BLOCK_FLD and &bv or &iv
+    local cell: string
+    if fid == SOURCE_FIELD then cell = dev_name
+    elseif fid == FSTYPE_FIELD then cell = fstype
+    elseif fid == SIZE_FIELD or fid == ITOTAL_FIELD then cell = df_readable(false, v.total, v.input_units, v.output_units)
+    elseif fid == USED_FIELD or fid == IUSED_FIELD then cell = df_readable(v.negate_used, v.used, v.input_units, v.output_units)
+    elseif fid == AVAIL_FIELD or fid == IAVAIL_FIELD then cell = df_readable(v.negate_available, v.available, v.input_units, v.output_units)
+    elseif fid == PCENT_FIELD or fid == IPCENT_FIELD then cell = pcent(v)
+    elseif fid == FILE_FIELD then cell = file
+    else cell = mount_point end
+    cell = replace_problematic_chars(cell)
+    if #cell > f.width then f.width = #cell end
+    row:push(cell)
+  end
+end
+
+local function canonical_abs(name: string): (boolean, string)
+  local r = canon.canonicalize(name, canon.CAN_EXISTING)
+  if #r > 0 and r:byte(1) == 47 then return true, r end
+  return false, ''
+end
+
+local function last_device_for_mount(mount: string): (boolean, string)
+  local le = 0
+  for i = 1, #mounts do
+    if mounts[i].mountdir == mount then le = i end
+  end
+  if le == 0 then return false, '' end
+  local ok, c = canonical_abs(mounts[le].devname)
+  if ok then return true, c end
+  return true, mounts[le].devname
+end
+
+local function get_device(device: string): boolean
+  local best = 0
+  local best_accessible = false
+  local eclipsed = false
+  local file = device
+  local okr, resolved = canonical_abs(device)
+  if okr then device = resolved end
+  local best_len = 0x7fffffffffffffff
+  for i = 1, #mounts do
+    local me = &mounts[i]
+    local devname = me.devname
+    local okc, cd = canonical_abs(me.devname)
+    if okc then devname = cd end
+    if device == devname then
+      local hl, last = last_device_for_mount(me.mountdir)
+      eclipsed = hl and last ~= devname
+      local len = #me.mountdir
+      if not eclipsed and (not best_accessible or len < best_len) then
+        local ds: sys.Stat
+        local this_acc = false
+        if sys.stat(me.mountdir, &ds) == 0 then best_accessible = true; this_acc = true end
+        if this_acc or (not best_accessible and len < best_len) then
+          best = i
+          if len == 1 then break end
+          best_len = len
+        end
+      end
+    end
+  end
+  if best > 0 then
+    local me = &mounts[best]
+    get_dev(me.devname, true, me.mountdir, true, file, true, '', false, me.fstype, true, me.dummy, me.remote, nilptr, false)
+    return true
+  elseif eclipsed then
+    util.err('cannot access ' .. util.quoteaf(file) .. ': over-mounted by another device')
+    exit_status = 1
+    return true
+  end
+  return false
+end
+
+-- gnulib find_mount_point (chdir walk), for points no mount entry covers.
+local function c_fchdir(fd: cint): cint <cimport 'fchdir', cinclude '<unistd.h>'> end
+local function find_mount_point(file: string, fst: *sys.Stat): (boolean, string)
+  local cwd = sys.open('.', sys.O_RDONLY | sys.O_DIRECTORY | 0x200000, 0)
+  if cwd < 0 then util.err(errno_msg('cannot get current directory', sys.errno())); return false, '' end
+  local last: sys.Stat
+  local mp = ''
+  local ok = false
+  if (fst.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    last = $fst
+    if sys.chdir(file) < 0 then
+      util.err(errno_msg('cannot change to directory ' .. util.quoteaf(file), sys.errno()))
+      sys.close(cwd); return false, ''
+    end
+  else
+    local dir = util.dirname(file)
+    if sys.chdir(dir) < 0 then
+      util.err(errno_msg('cannot change to directory ' .. util.quoteaf(dir), sys.errno()))
+      sys.close(cwd); return false, ''
+    end
+    if sys.stat('.', &last) < 0 then
+      util.err(errno_msg('cannot stat current directory (now ' .. util.quoteaf(dir) .. ')', sys.errno()))
+      goto done
+    end
+  end
+  while true do
+    local st: sys.Stat
+    if sys.stat('..', &st) < 0 then util.err(errno_msg('cannot stat ' .. util.quoteaf('..'), sys.errno())); goto done end
+    if st.st_dev ~= last.st_dev or st.st_ino == last.st_ino then break end
+    if sys.chdir('..') < 0 then util.err(errno_msg('cannot change to directory ' .. util.quoteaf('..'), sys.errno())); goto done end
+    last = st
+  end
+  do
+    local buf: [4096]cchar
+    if sys.getcwd(&buf[0], #buf) ~= nilptr then mp = string.copy((@cstring)(&buf[0])); ok = true end
+  end
+::done::
+  if c_fchdir(cwd) ~= 0 then
+    util.err(errno_msg('failed to return to initial working directory', sys.errno()))
+    util.flush(); c_exit(1)
+  end
+  sys.close(cwd)
+  return ok, mp
+end
+
+local function get_point(point: string, statp: *sys.Stat)
+  local best = 0
+  local okr, resolved = canonical_abs(point)
+  if okr then
+    local rlen = #resolved
+    local best_len = 0
+    for i = 1, #mounts do
+      local me = &mounts[i]
+      if me.fstype ~= 'lofs' and (best == 0 or mounts[best].dummy or not me.dummy) then
+        local len = #me.mountdir
+        if best_len <= len and len <= rlen
+            and (len == 1 or ((len == rlen or resolved:byte(len + 1) == 47) and me.mountdir == resolved:sub(1, len))) then
+          best = i
+          best_len = len
+        end
+      end
+    end
+  end
+  if best > 0 then
+    local ds: sys.Stat
+    if sys.stat(mounts[best].mountdir, &ds) ~= 0 or ds.st_dev ~= statp.st_dev then best = 0 end
+  end
+  if best == 0 then
+    for i = 1, #mounts do
+      local me = &mounts[i]
+      if statp.st_dev == me.dev and me.fstype ~= 'lofs' and (best == 0 or mounts[best].dummy or not me.dummy) then
+        local ds: sys.Stat
+        if sys.stat(me.mountdir, &ds) ~= 0 or ds.st_dev ~= me.dev then
+          me.dev = UMAX - 1
+        else
+          best = i
+        end
+      end
+    end
+  end
+  if best > 0 then
+    local me = &mounts[best]
+    get_dev(me.devname, true, me.mountdir, true, point, true, point, true, me.fstype, true, me.dummy, me.remote, nilptr, false)
+  else
+    local okm, mp = find_mount_point(point, statp)
+    if okm then
+      get_dev('', false, mp, true, point, true, '', false, '', false, false, false, nilptr, false)
+    end
+  end
+end
+
+local function get_entry(name: string, statp: *sys.Stat)
+  local f = statp.st_mode & sys.S_IFMT
+  if (f == 0x6000 or f == 0x2000) and get_device(name) then return end
+  get_point(name, statp)
+end
+
+local function get_all_entries()
+  filter_mount_list(show_all_fs)
+  for i = 1, #mounts do
+    local me = &mounts[i]
+    get_dev(me.devname, true, me.mountdir, true, '', false, '', false, me.fstype, true, me.dummy, me.remote, nilptr, true)
+  end
+end
+
+global function applet_df(args: sequence(string)): integer
+  init_fields()
+  local posix_format = false
+  grand.blocksize = 1
+  local longs: []util.LongOpt = {
+    {'all', 0, 97}, {'block-size', 1, 66}, {'inodes', 0, 105}, {'human-readable', 0, 104},
+    {'si', 0, 72}, {'local', 0, 108}, {'output', 2, 259}, {'portability', 0, 80},
+    {'print-type', 0, 84}, {'sync', 0, 257}, {'no-sync', 0, 256}, {'total', 0, 258},
+    {'type', 1, 116}, {'exclude-type', 1, 120},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'aB:iF:hHklmPTt:vx:', &longs, #longs)
+  g.quiet = true
+  local function mut_excl(a: string, b: string) usage_fail('options ' .. a .. ' and ' .. b .. ' are mutually exclusive') end
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 97 then show_all_fs = true
+    elseif c == 66 then
+      local st, o, bs = human.options(g.optarg, true, output_block_size)
+      human_output_opts = o; output_block_size = bs
+      if st ~= 0 then
+        util.err(util.xstrtol_msg(st, g.was_long and '--block-size' or '-B', g.optarg))
+        util.flush()
+        local m = "Try 'df --help' for more information.\n"
+        sys.write(2, m.data, m.size)
+        c_exit(1)
+      end
+    elseif c == 105 then
+      if header_mode == OUTPUT_MODE then mut_excl('-i', '--output') end
+      header_mode = INODES_MODE
+    elseif c == 104 then human_output_opts = human.autoscale | human.SI | human.base_1024; output_block_size = 1
+    elseif c == 72 then human_output_opts = human.autoscale | human.SI; output_block_size = 1
+    elseif c == 107 then human_output_opts = 0; output_block_size = 1024
+    elseif c == 108 then show_local_fs = true
+    elseif c == 109 then human_output_opts = 0; output_block_size = 1024 * 1024
+    elseif c == 84 then
+      if header_mode == OUTPUT_MODE then mut_excl('-T', '--output') end
+      print_type = true
+    elseif c == 80 then
+      if header_mode == OUTPUT_MODE then mut_excl('-P', '--output') end
+      posix_format = true
+    elseif c == 257 then require_sync = true
+    elseif c == 256 then require_sync = false
+    elseif c == 70 or c == 116 then fs_select:insert(1, g.optarg)
+    elseif c == 118 then
+    elseif c == 120 then fs_exclude:insert(1, g.optarg)
+    elseif c == 259 then
+      if header_mode == INODES_MODE then mut_excl('-i', '--output') end
+      if posix_format and header_mode == DEFAULT_MODE then mut_excl('-P', '--output') end
+      if print_type then mut_excl('-T', '--output') end
+      header_mode = OUTPUT_MODE
+      if g.has_optarg then decode_output_arg(g.optarg) end
+    elseif c == 258 then print_grand_total = true
+    end
+  end
+  if human_output_opts == -1 then
+    if posix_format then
+      human_output_opts = 0
+      output_block_size = sys.getenv('POSIXLY_CORRECT') ~= nilptr and 512 or 1024
+    else
+      local e = sys.getenv('DF_BLOCK_SIZE')
+      local _, o, bs = human.options(e ~= nilptr and (@string)(e) or '', e ~= nilptr, output_block_size)
+      human_output_opts = o; output_block_size = bs
+    end
+  end
+  if header_mode == INODES_MODE or header_mode == OUTPUT_MODE then
+  elseif (human_output_opts & human.autoscale) ~= 0 then header_mode = HUMAN_MODE
+  elseif posix_format then header_mode = POSIX_MODE end
+  do
+    local match = false
+    for i = 1, #fs_select do
+      for j = 1, #fs_exclude do
+        if fs_select[i] == fs_exclude[j] then
+          util.err('file system type ' .. util.quote(fs_select[i]) .. ' both selected and excluded')
+          match = true
+          break
+        end
+      end
+    end
+    if match then util.flush(); return 1 end
+  end
+  local ops = g:operands()
+  local stats: sequence(sys.Stat)
+  local valid: sequence(boolean)
+  for i = 1, #ops do
+    local st: sys.Stat
+    local err = automount_stat_err(ops[i], &st)
+    stats:push(st)
+    if err ~= 0 then
+      util.err(errno_msg(util.quotef(ops[i]), err))
+      exit_status = 1
+      valid:push(false)
+    else
+      valid:push(true)
+    end
+  end
+  local okm: boolean
+  mounts, okm = mountlist.read()
+  if not okm then
+    local status = 0
+    if #ops == 0 or show_all_fs or show_local_fs or #fs_select > 0 or #fs_exclude > 0 then status = 1 end
+    util.err(errno_msg((status == 0 and 'Warning: ' or '') .. 'cannot read table of mounted file systems', sys.errno()))
+    if status ~= 0 then util.flush(); c_exit(status) end
+  end
+  if require_sync then c_sync() end
+  get_field_list()
+  get_header()
+  if #ops > 0 then
+    show_listed_fs = true
+    for i = 1, #ops do
+      if valid[i] then get_entry(ops[i], &stats[i]) end
+    end
+  else
+    get_all_entries()
+  end
+  if file_systems_processed then
+    if print_grand_total then
+      get_dev('total', true, field_data[SOURCE_FIELD].used and '-' or 'total', true, '', false, '', false,
+        '', false, false, false, &grand, false)
+    end
+    print_table()
+  else
+    if exit_status == 0 then
+      util.err('no file systems processed')
+      util.flush()
+      return 1
+    end
+  end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return exit_status
+end
