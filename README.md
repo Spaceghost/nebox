@@ -370,6 +370,17 @@ Stated here rather than worked around:
     arithmetic step back k bytes; nebox does the same within the line but
     stops at its start where GNU reads the bytes before it.
   - `--help` omits GNU's closing links; `--version` prints nebox's line.
+- `od` ports od.c: every -t type and size (d o u x as C S I L or 1 2 4 8,
+  f as F D L or 4 8 16, a, c, the z trailer), the old-style letters, -A,
+  -j and -N with od's multipliers, -S, -v, -w, --endian, --traditional
+  and the old [+]OFFSET[.][b] [LABEL] operands, GNU's padding of mixed
+  types, '*' for repeated blocks, skipping by size arithmetic, lseek or
+  reading, gnulib ftoastr for floats (the shortest %g that reads back),
+  and unbuffered reading under -N so a shared pipe keeps its rest.
+  `tests/od_compare.py`: 170 fixed and 500 random cases, 0 mismatches
+  but one known case: a pseudo-denormal long double (exponent 0 with the
+  integer bit set) prints as the FPU reads it, where glibc's printf drops
+  the integer bit.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
@@ -639,19 +650,11 @@ Stated here rather than worked around:
 - `find` has the usual tests and actions (-name -iname -path -regex -type
   -size -empty -newer -mtime -mmin -perm -user -group -links -inum -maxdepth
   -mindepth -depth -prune -print -print0 -delete -exec ; and + -quit), but
-  walks directories in sorted name order; GNU uses directory order. No -L/-H,
-  -printf, or -ls.
-- `du` and `find` print entries in sorted name order; GNU prints in directory
-  order.
-- `od` supports -A -t (a c d u o x; sizes 1 2 4 8) -b -c -d -o -x -s -i -l -j
-  -N -v; no floats or -w. `hexdump` offers -C -c -b -d -o -x -n -s -v only.
+  walks directories in sorted name order; GNU uses directory order (`du`,
+  a port, follows GNU's). No -L/-H, -printf, or -ls.
+- `hexdump` offers -C -c -b -d -o -x -n -s -v only.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
-- `tsort` reproduces GNU's output order (sorted zero-degree queue, successors
-  in reverse input order).
-- `stat` has no `%w`/birth time or device-name formatting beyond
-  `%d`/`%D`/`%t`/`%T`; `%x %y %z` and the default output show local time
-  with nanoseconds and `%z` offset, as GNU does (`stat-tz`).
 - `xargs` runs commands with `fork`+`execvp`; no `-P`, `-L`, or `-s` limits.
 - `groups`/`whoami` know only the
   current process.
@@ -682,8 +685,8 @@ Stated here rather than worked around:
   `[+-]N unit [ago]` for years, months, fortnights, weeks, days, hours,
   minutes and seconds, applied in parse-datetime's order (calendar units on
   the broken-down time, then seconds; relative-only strings keep the current
-  DST flag). Against GNU date 9.1 (`date-d-*`). Not understood: month names,
-  ordinal words, `week` numbers, named zones other than UTC/GMT, `DST`. No
+  DST flag), and month names (`D MON Y`, `MON D`, `D-MON-Y`). Against GNU
+  date 9.1 (`date-d-*`). Not understood: ordinal words, `week` numbers, named zones other than UTC/GMT, `DST`. No
   `-I`, `--rfc-3339`, `-f`, long options, or setting the date.
 - `ls` follows GNU ls 9.1 in the C locale with the options
   `-1 -a -A -B -c -C -d -F -g -G -h -i -I PATTERN -k -l -m -n -N -o -p -q

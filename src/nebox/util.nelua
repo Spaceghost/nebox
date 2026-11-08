@@ -374,6 +374,13 @@ function util.xstrtoumax_base(s: string, base: integer, suffixes: string): (inte
     elseif p <= #s and s:byte(p) == 48 then
       b = 8
     end
+  else
+    -- strtoumax with an explicit base; base 16 allows the 0x prefix
+    b = (@uint64)(base)
+    if base == 16 and p + 1 <= #s and s:byte(p) == 48 and (s:byte(p + 1) == 120 or s:byte(p + 1) == 88)
+        and p + 2 <= #s and util.hexval(s:byte(p + 2)) >= 0 then
+      p = p + 2
+    end
   end
   local start = p
   local v: uint64 = 0
