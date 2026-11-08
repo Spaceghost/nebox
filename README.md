@@ -237,6 +237,13 @@ Stated here rather than worked around:
   RENAME_NOREPLACE attempt for two operands, copy-into-self handling.
   `tests/mv_compare.py`: 116 cases, 22 of them across file systems (tmpfs to
   ZFS), 0 mismatches as an ordinary user and as root.
+- `install` ports install.c over copy.nelua with gnulib mkancesdirs,
+  make_dir_parents and dirchownmod (whole paths instead of savewd's chdir
+  walk, the failing-component message included): -b -c -C -d -D -g -m -o
+  -p -s -S -t -T -v, `--strip-program`, need_copy's comparisons, the strip
+  child, umask 0. `--preserve-context` and `-Z`/`--context` warn as GNU does
+  without SELinux. `tests/install_compare.py`: 100 cases, 0 mismatches as an
+  ordinary user and as root.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

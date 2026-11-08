@@ -1,0 +1,531 @@
+-- install: a port of GNU coreutils 9.1 src/install.c over
+-- src/nebox/copy.nelua, with gnulib mkancesdirs, make_dir_parents and
+-- dirchownmod done on whole paths instead of savewd's chdir walk. -b -c -C
+-- -d -D -g -m -o -p -s -S -t -T -v, --strip-program, --preserve-context and
+-- -Z/--context (warned about as GNU does without SELinux), need_copy's
+-- comparisons, the strip child, and umask 0 for everything created.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.backup'
+require 'nebox.copy'
+require 'nebox.modechange'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_fchownat(fd: cint, path: cstring, uid: cuint, gid: cuint, flags: cint): cint <cimport 'fchownat', cinclude '<unistd.h>'> end
+local function c_fchmodat(fd: cint, path: cstring, mode: cuint, flags: cint): cint <cimport 'fchmodat', cinclude '<sys/stat.h>'> end
+local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+local function c_unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
+local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
+local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function c_fchown(fd: cint, uid: cuint, gid: cuint): cint <cimport 'fchown', cinclude '<unistd.h>'> end
+local function c_fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
+local function c_umask(m: cuint): cuint <cimport 'umask', cinclude '<sys/stat.h>'> end
+local function c_getuid(): cuint <cimport 'getuid', cinclude '<unistd.h>'> end
+local function c_getgid(): cuint <cimport 'getgid', cinclude '<unistd.h>'> end
+local function c_access(path: cstring, mode: cint): cint <cimport 'access', cinclude '<unistd.h>'> end
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwnam(name: cstring): *Passwd <cimport 'getpwnam', cinclude '<pwd.h>'> end
+local function c_getgrnam(name: cstring): *Group <cimport 'getgrnam', cinclude '<grp.h>'> end
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local NOID: cuint <comptime> = 0xffffffff
+local DEFAULT_MODE: cuint <comptime> = 0x1ED -- 0755
+local CHMOD_MODE_BITS: cuint <comptime> = 0xFFF
+local S_IRWXUGO: cuint <comptime> = 0x1FF
+local S_IFMT: cuint <comptime> = 0xF000
+
+local owner_name = ''
+local have_owner = false
+local owner_id: cuint = NOID
+local group_name = ''
+local have_group = false
+local group_id: cuint = NOID
+local mode: cuint = DEFAULT_MODE
+local dir_mode: cuint = DEFAULT_MODE
+local dir_mode_bits: cuint = CHMOD_MODE_BITS
+local copy_only_if_needed = false
+local strip_files = false
+local dir_arg = false
+local strip_program = 'strip'
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+local function die(msg: string) util.err(msg); util.flush(); c_exit(1) end
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'install --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+local function extra_mode(input: cuint): boolean
+  return (input & ~(S_IRWXUGO | S_IFMT)) ~= 0
+end
+
+local function util_full_read(fd: cint, buf: *[0]byte, n: integer): integer
+  local got = 0
+  while got < n do
+    local r = sys.read(fd, &buf[got], (@csize)(n - got))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return -1
+    end
+    if r == 0 then break end
+    got = got + r
+  end
+  return got
+end
+
+local function have_same_content(a: cint, b: cint): boolean
+  local ab: [4096]byte
+  local bb: [4096]byte
+  while true do
+    local n = util_full_read(a, &ab, 4096)
+    if n <= 0 then return n == 0 end
+    if n ~= util_full_read(b, &bb, 4096) then return false end
+    for i = 0, n - 1 do if ab[i] ~= bb[i] then return false end end
+  end
+  return true
+end
+
+
+local function need_copy(src_name: string, dest_name: string, dest_dirfd: cint, dest_relname: string): boolean
+  local src_sb: sys.Stat
+  local dest_sb: sys.Stat
+  if extra_mode(mode) then return true end
+  if sys.lstat(src_name, &src_sb) ~= 0 then return true end
+  if c_fstatat(dest_dirfd, dest_relname, &dest_sb, AT_SYMLINK_NOFOLLOW) ~= 0 then return true end
+  if (src_sb.st_mode & S_IFMT) ~= 0x8000 or (dest_sb.st_mode & S_IFMT) ~= 0x8000
+      or extra_mode(src_sb.st_mode) or extra_mode(dest_sb.st_mode) then return true end
+  if src_sb.st_size ~= dest_sb.st_size or (dest_sb.st_mode & CHMOD_MODE_BITS) ~= mode then return true end
+  if owner_id == NOID then
+    if dest_sb.st_uid ~= c_getuid() then return true end
+  elseif dest_sb.st_uid ~= owner_id then return true end
+  if group_id == NOID then
+    if dest_sb.st_gid ~= c_getgid() then return true end
+  elseif dest_sb.st_gid ~= group_id then return true end
+  local sfd = sys.open(src_name, sys.O_RDONLY, 0)
+  if sfd < 0 then return true end
+  local dfd = c_openat(dest_dirfd, dest_relname, sys.O_RDONLY, 0)
+  if dfd < 0 then sys.close(sfd); return true end
+  local match = have_same_content(sfd, dfd)
+  sys.close(sfd); sys.close(dfd)
+  return not match
+end
+
+local function announce_mkdir(dir: string, x: *copy.Options)
+  if x.verbose then util.write('install: creating directory ' .. util.quoteaf(dir) .. '\n') end
+end
+
+-- make_ancestor: mkdir (COMPONENT, DEFAULT_MODE), announcing DIR.
+local function make_ancestor(dir: string, x: *copy.Options): cint
+  local r = sys.mkdir(dir, DEFAULT_MODE)
+  if r == 0 then announce_mkdir(dir, x) end
+  return r
+end
+
+-- savewd_chdir's check on a whole path: the directory must be searchable.
+local function can_enter(dir: string, nofollow: boolean): boolean
+  local st: sys.Stat
+  local r: cint
+  if nofollow then r = sys.lstat(dir, &st) else r = sys.stat(dir, &st) end
+  if r ~= 0 then return false end
+  if (st.st_mode & S_IFMT) ~= 0x4000 then
+    if nofollow and (st.st_mode & S_IFMT) == 0xA000 then sys.seterrno(40) else sys.seterrno(20) end
+    return false
+  end
+  if c_access(dir, 1) ~= 0 then return false end
+  return true
+end
+
+-- gnulib mkancesdirs: the offset just past the ancestors (1-based index of
+-- the last component), or -1 with errno and FILE as gnulib leaves it: cut
+-- at the component that could not be entered.
+local function mkancesdirs(file: string, x: *copy.Options): (integer, string)
+  local sep = 0
+  local component = 1
+  local p = 1
+  while p <= #file do
+    local c = file:byte(p)
+    p = p + 1
+    local nxt: byte = p <= #file and file:byte(p) or 0
+    if nxt == 47 then
+      if c ~= 47 then sep = p end
+    elseif c == 47 and nxt ~= 0 and sep ~= 0 then
+      local comp = file:sub(component, sep - 1)
+      if comp ~= '.' then
+        local prefix = file:sub(1, sep - 1)
+        local make_dir_errno: cint = 0
+        local made_dir = false
+        if comp == '..' then
+          made_dir = false
+        elseif make_ancestor(prefix, x) < 0 then
+          make_dir_errno = sys.errno()
+        else
+          made_dir = true
+        end
+        if not can_enter(prefix, made_dir) then
+          if make_dir_errno ~= 0 and sys.errno() == 2 then sys.seterrno(make_dir_errno) end
+          return -1, prefix
+        end
+      end
+      component = p
+    end
+  end
+  return component, file
+end
+
+local function dirchownmod(dir: string, mkdir_mode: cuint, owner: cuint, group: cuint, md: cuint, mode_bits: cuint, have_mkdir_mode: boolean): cint
+  local st: sys.Stat
+  local fd = sys.open(dir, sys.O_RDONLY | sys.O_DIRECTORY | 0x100 | 0x800 | (have_mkdir_mode and sys.O_NOFOLLOW or 0), 0)
+  local result: cint
+  if fd >= 0 then result = sys.fstat(fd, &st) else result = sys.stat(dir, &st) end
+  if result == 0 then
+    local dmode = st.st_mode
+    if (dmode & S_IFMT) ~= 0x4000 then
+      sys.seterrno(20)
+      result = -1
+    else
+      local indeterminate: cuint = 0
+      if (owner ~= NOID and owner ~= st.st_uid) or (group ~= NOID and group ~= st.st_gid) then
+        if fd >= 0 then result = c_fchown(fd, owner, group)
+        else result = c_fchownat(AT_FDCWD, dir, owner, group, have_mkdir_mode and AT_SYMLINK_NOFOLLOW or 0) end
+        if result == 0 and (dmode & 0x49) ~= 0 then indeterminate = dmode & 0xC00 end
+      end
+      if result == 0 and (((dmode ~ md) | indeterminate) & mode_bits) ~= 0 then
+        local chmod_mode = md | (dmode & CHMOD_MODE_BITS & ~mode_bits)
+        if fd >= 0 then result = c_fchmod(fd, chmod_mode) else result = sys.chmod(dir, chmod_mode) end
+      end
+    end
+  end
+  if fd >= 0 then
+    if result == 0 then result = sys.close(fd)
+    else
+      local e = sys.errno()
+      sys.close(fd)
+      sys.seterrno(e)
+    end
+  end
+  return result
+end
+
+-- gnulib make_dir_parents for install -d (make_ancestor, preserve_existing false).
+local function make_dir_parents(dir: string, x: *copy.Options, md: cuint, mode_bits: cuint, owner: cuint, group: cuint): boolean
+  local mkdir_errno: cint = 0
+  local prefix_len, cut = mkancesdirs(dir, x)
+  if prefix_len < 0 then
+    mkdir_errno = sys.errno()
+    dir = cut
+  else
+    local keep_owner = owner == NOID and group == NOID
+    local keep_special = ((mode_bits & 0xC00) | (md & 0x200)) == 0
+    local mkdir_mode = md
+    local have_mkdir_mode = true
+    if not keep_owner then mkdir_mode = mkdir_mode & ~(@cuint)(0x3F)
+    elseif not keep_special then mkdir_mode = mkdir_mode & ~(@cuint)(0x12) end
+    if sys.mkdir(dir, mkdir_mode) == 0 then
+      local umask_must_be_ok = (md & mode_bits & S_IRWXUGO) == 0
+      announce_mkdir(dir, x)
+      if keep_owner and keep_special and umask_must_be_ok then return true end
+    else
+      mkdir_errno = sys.errno()
+      have_mkdir_mode = false
+    end
+    if dirchownmod(dir, mkdir_mode, owner, group, md, mode_bits, have_mkdir_mode) == 0 then return true end
+    if mkdir_errno == 0 or (mkdir_errno ~= 2 and sys.errno() ~= 20) then
+      util.err(errno_msg((keep_owner and 'cannot change permissions of ' or 'cannot change owner and permissions of ') .. util.quote(dir), sys.errno()))
+      return false
+    end
+  end
+  util.err(errno_msg('cannot create directory ' .. util.quote(dir), mkdir_errno))
+  return false
+end
+
+local function strip(name: string): boolean
+  util.flush()
+  local pid = sys.fork()
+  if pid == -1 then
+    util.err(errno_msg('fork system call failed', sys.errno()))
+    return false
+  end
+  if pid == 0 then
+    local argv: [3]cstring = {strip_program, name, nilptr}
+    sys.execvp(strip_program, &argv)
+    util.err(errno_msg('cannot run ' .. util.quoteaf(strip_program), sys.errno()))
+    util.flush()
+    c_exit(1)
+  end
+  local status: cint = 0
+  if sys.waitpid(pid, &status, 0) < 0 then
+    util.err(errno_msg('waiting for strip', sys.errno()))
+    return false
+  end
+  if (status & 0x7f) ~= 0 or ((status >> 8) & 0xff) ~= 0 then
+    util.err('strip process terminated abnormally')
+    return false
+  end
+  return true
+end
+
+local function change_attributes(name: string, dirfd: cint, relname: string): boolean
+  if not (owner_id == NOID and group_id == NOID) and c_fchownat(dirfd, relname, owner_id, group_id, AT_SYMLINK_NOFOLLOW) ~= 0 then
+    util.err(errno_msg('cannot change ownership of ' .. util.quoteaf(name), sys.errno()))
+    return false
+  elseif c_fchmodat(dirfd, relname, mode, 0) ~= 0 then
+    util.err(errno_msg('cannot change permissions of ' .. util.quoteaf(name), sys.errno()))
+    return false
+  end
+  return true
+end
+
+local function change_timestamps(src_sb: *sys.Stat, dest: string, dirfd: cint, relname: string): boolean
+  local ts: [2]sys.Timespec = {src_sb.st_atim, src_sb.st_mtim}
+  if c_utimensat(dirfd, relname, &ts, 0) ~= 0 then
+    util.err(errno_msg('cannot set timestamps for ' .. util.quoteaf(dest), sys.errno()))
+    return false
+  end
+  return true
+end
+
+local function copy_file(from: string, to: string, to_dirfd: cint, to_relname: string, x: *copy.Options): boolean
+  if copy_only_if_needed and not need_copy(from, to, to_dirfd, to_relname) then return true end
+  local copy_into_self = false
+  return copy.copy(from, to, to_dirfd, to_relname, 0, x, &copy_into_self, nilptr)
+end
+
+local function install_file_in_file(from: string, to: string, to_dirfd: cint, to_relname: string, x: *copy.Options): boolean
+  local from_sb: sys.Stat
+  if x.preserve_timestamps and sys.stat(from, &from_sb) ~= 0 then
+    util.err(errno_msg('cannot stat ' .. util.quoteaf(from), sys.errno()))
+    return false
+  end
+  if not copy_file(from, to, to_dirfd, to_relname, x) then return false end
+  if strip_files then
+    if not strip(to) then
+      if c_unlinkat(to_dirfd, to_relname, 0) ~= 0 then die(errno_msg('cannot unlink ' .. util.quoteaf(to), sys.errno())) end
+      return false
+    end
+  end
+  if x.preserve_timestamps and (strip_files or (from_sb.st_mode & S_IFMT) ~= 0x8000)
+      and not change_timestamps(&from_sb, to, to_dirfd, to_relname) then
+    return false
+  end
+  return change_attributes(to, to_dirfd, to_relname)
+end
+
+local function mkancesdirs_safe_wd(to: string, x: *copy.Options): boolean
+  local r, cut = mkancesdirs(to, x)
+  if r == -1 then
+    util.err(errno_msg('cannot create directory ' .. util.quoteaf(cut), sys.errno()))
+    return false
+  end
+  return true
+end
+
+local function install_file_in_dir(from: string, to_dir: string, x: *copy.Options, mkdir_and_install: boolean, target_dirfd: *cint): boolean
+  local to, off = copy.file_name_concat(to_dir, copy.last_component(from))
+  local to_relname = to:sub(off)
+  local ret = true
+  if $target_dirfd == -1 then
+    ret = mkdir_and_install
+    if ret then ret = mkancesdirs_safe_wd(to, x) end
+    if ret then
+      local fd = sys.open(to_dir, 0x200000 | sys.O_DIRECTORY, 0)
+      if fd < 0 then
+        util.err(errno_msg('cannot open ' .. util.quoteaf(to), sys.errno()))
+        ret = false
+      else
+        $target_dirfd = fd
+      end
+    end
+  end
+  if ret then
+    local to_dirfd = $target_dirfd
+    if to_dirfd == -1 then
+      to_dirfd = AT_FDCWD
+      to_relname = to
+    end
+    ret = install_file_in_file(from, to, to_dirfd, to_relname, x)
+  end
+  return ret
+end
+
+local function get_ids()
+  if have_owner then
+    local pw = c_getpwnam(owner_name)
+    if pw == nilptr then
+      local st, v = util.xstrtoumax_base(owner_name, 0, '')
+      if st ~= 0 or v > 0xffffffff then die('invalid user ' .. util.quote(owner_name)) end
+      owner_id = (@cuint)(v)
+    else
+      owner_id = pw.pw_uid
+    end
+  else
+    owner_id = NOID
+  end
+  if have_group then
+    local gr = c_getgrnam(group_name)
+    if gr == nilptr then
+      local st, v = util.xstrtoumax_base(group_name, 0, '')
+      if st ~= 0 or v > 0xffffffff then die('invalid group ' .. util.quote(group_name)) end
+      group_id = (@cuint)(v)
+    else
+      group_id = gr.gr_gid
+    end
+  else
+    group_id = NOID
+  end
+end
+
+global function applet_install(args: sequence(string)): integer
+  local exit_status = 0
+  local specified_mode = ''
+  local have_mode = false
+  local make_backups = false
+  local backup_suffix = ''
+  local have_suffix = false
+  local version_control = ''
+  local have_vc = false
+  local mkdir_and_install = false
+  local target_directory = ''
+  local have_target = false
+  local no_target_directory = false
+  local strip_program_specified = false
+  local x: copy.Options
+  copy.default_options(&x)
+  x.copy_as_regular = true
+  x.reflink_mode = copy.REFLINK_AUTO
+  x.dereference = copy.DEREF_ALWAYS
+  x.unlink_dest_before_opening = true
+  x.interactive = copy.I_UNSPECIFIED
+  x.install_mode = true
+  x.data_copy_required = true
+  x.sparse_mode = copy.SPARSE_AUTO
+  x.backup_type = backup.NONE
+  x.set_mode = true
+  x.mode = 0x180 -- S_IRUSR | S_IWUSR
+  c_umask(0)
+  local longs: []util.LongOpt = {
+    {'backup', 2, 98}, {'compare', 0, 67}, {'context', 2, 90}, {'directory', 0, 100}, {'group', 1, 103},
+    {'mode', 1, 109}, {'no-target-directory', 0, 84}, {'owner', 1, 111}, {'preserve-timestamps', 0, 112},
+    {'preserve-context', 0, 256}, {'strip', 0, 115}, {'strip-program', 1, 257}, {'suffix', 1, 83},
+    {'target-directory', 1, 116}, {'verbose', 0, 118},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'bcCsDdg:m:o:pt:TvS:Z', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 98 then
+      make_backups = true
+      if g.has_optarg then version_control = g.optarg; have_vc = true end
+    elseif c == 99 then
+    elseif c == 67 then copy_only_if_needed = true
+    elseif c == 115 then strip_files = true
+    elseif c == 257 then strip_program = g.optarg; strip_program_specified = true
+    elseif c == 100 then dir_arg = true
+    elseif c == 68 then mkdir_and_install = true
+    elseif c == 118 then x.verbose = true
+    elseif c == 103 then group_name = g.optarg; have_group = true
+    elseif c == 109 then specified_mode = g.optarg; have_mode = true
+    elseif c == 111 then owner_name = g.optarg; have_owner = true
+    elseif c == 112 then x.preserve_timestamps = true
+    elseif c == 83 then make_backups = true; backup_suffix = g.optarg; have_suffix = true
+    elseif c == 116 then
+      if have_target then die('multiple target directories specified') end
+      target_directory = g.optarg; have_target = true
+    elseif c == 84 then no_target_directory = true
+    elseif c == 256 then util.err('WARNING: ignoring --preserve-context; this kernel is not SELinux-enabled')
+    elseif c == 90 then
+      if g.has_optarg then util.err('warning: ignoring --context; it requires an SELinux-enabled kernel') end
+    end
+  end
+  if dir_arg and strip_files then die('the strip option may not be used when installing a directory') end
+  if dir_arg and have_target then die('target directory not allowed when installing a directory') end
+  x.backup_type = make_backups and backup.xget_version('backup type', version_control, have_vc) or backup.NONE
+  backup.set_simple_suffix(backup_suffix, have_suffix)
+  local file = g:operands()
+  local n_files = #file
+  if n_files <= ((dir_arg or have_target) and 0 or 1) then
+    if n_files <= 0 then usage_fail('missing file operand') end
+    usage_fail('missing destination file operand after ' .. util.quoteaf(file[1]))
+  end
+  local target_dirfd: cint = AT_FDCWD
+  if no_target_directory then
+    if have_target then die('cannot combine --target-directory (-t) and --no-target-directory (-T)') end
+    if 2 < n_files then usage_fail('extra operand ' .. util.quoteaf(file[3])) end
+  elseif have_target then
+    target_dirfd = copy.target_directory_operand(target_directory)
+    if not (target_dirfd ~= -1 or (mkdir_and_install and sys.errno() == 2)) then
+      die(errno_msg('failed to access ' .. util.quoteaf(target_directory), sys.errno()))
+    end
+  elseif not dir_arg then
+    local lastfile = file[n_files]
+    local fd = copy.target_directory_operand(lastfile)
+    if fd ~= -1 then
+      target_dirfd = fd
+      target_directory = lastfile; have_target = true
+      n_files = n_files - 1
+    elseif 2 < n_files then
+      die(errno_msg('target ' .. util.quoteaf(lastfile), sys.errno()))
+    end
+  end
+  if have_mode then
+    local ch, ok = modechange.compile(specified_mode)
+    if not ok then die('invalid mode ' .. util.quote(specified_mode)) end
+    mode = modechange.adjust(0, false, 0, ch)
+    dir_mode, dir_mode_bits = modechange.adjust(0, true, 0, ch)
+  end
+  if strip_program_specified and not strip_files then
+    util.err('WARNING: ignoring --strip-program option as -s option was not specified')
+  end
+  if copy_only_if_needed and x.preserve_timestamps then
+    usage_fail('options --compare (-C) and --preserve-timestamps are mutually exclusive')
+  end
+  if copy_only_if_needed and strip_files then usage_fail('options --compare (-C) and --strip are mutually exclusive') end
+  if copy_only_if_needed and extra_mode(mode) then
+    util.err('the --compare (-C) option is ignored when you specify a mode with non-permission bits')
+  end
+  get_ids()
+  if dir_arg then
+    for i = 1, n_files do
+      if not make_dir_parents(file[i], &x, dir_mode, dir_mode_bits, owner_id, group_id) then exit_status = 1 end
+    end
+  else
+    if not have_target then
+      local okf: boolean
+      if mkdir_and_install then
+        okf = mkancesdirs_safe_wd(file[2], &x) and install_file_in_file(file[1], file[2], AT_FDCWD, file[2], &x)
+      else
+        okf = install_file_in_file(file[1], file[2], AT_FDCWD, file[2], &x)
+      end
+      if not okf then exit_status = 1 end
+    else
+      x.dest_info = true
+      for i = 1, n_files do
+        if not install_file_in_dir(file[i], target_directory, &x, i == 1 and mkdir_and_install, &target_dirfd) then
+          exit_status = 1
+        end
+      end
+    end
+  end
+  copy.close_stdin()
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return exit_status
+end
