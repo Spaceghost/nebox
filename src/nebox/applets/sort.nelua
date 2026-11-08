@@ -1,0 +1,2020 @@
+-- sort: a port of GNU coreutils 9.1 src/sort.c in the C locale, with the
+-- gnulib pieces it uses (strnumcmp, filevercmp, xstrtol, readtokens0,
+-- randread's file source, mbsnwidth's single-byte path, posixver).
+-- Lines are compared exactly as sort.c compares them: keys from begfield /
+-- limfield, the numeric, general-numeric, human, month, random (MD5 of the
+-- key under a state seeded from 16 random bytes), version, -d/-i/-f
+-- variants, and the last-resort byte comparison unless -s or -u. The sort
+-- is the same stable merge sort (low half first, ties to the low half), -u
+-- keeps the first line of an equal run, and -m and -c stream their inputs
+-- with mergefps' and check's algorithms, including --batch-size's
+-- intermediate merges. --debug annotations and warnings, obsolete +POS1
+-- -POS2 keys with the _POSIX2_VERSION and POSIXLY_CORRECT rules,
+-- --files0-from, and the validation and messages of -S, -T, --parallel,
+-- --batch-size and --compress-program follow sort.c; the sort itself runs
+-- in memory with one thread and no temporary files, which for any input
+-- that fits gives GNU's output.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.digest'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_realloc(p: pointer, n: csize): pointer <cimport 'realloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+local function c_memcmp(a: pointer, b: pointer, n: csize): cint <cimport 'memcmp', cinclude '<string.h>'> end
+local function c_memcpy(d: pointer, s: pointer, n: csize): pointer <cimport 'memcpy', cinclude '<string.h>'> end
+local function c_memmove(d: pointer, s: pointer, n: csize): pointer <cimport 'memmove', cinclude '<string.h>'> end
+local function c_strtold(s: cstring, e: *cstring): clongdouble <cimport 'strtold', cinclude '<stdlib.h>'> end
+local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
+local function c_getrlimit(res: cint, r: pointer): cint <cimport 'getrlimit', cinclude '<sys/resource.h>'> end
+
+local SORT_FAILURE: cint <comptime> = 2
+local SIZE_MAX: uint64 <comptime> = 0xffffffffffffffff
+local UINT_MAX: uint64 <comptime> = 0xffffffff
+local NMERGE_DEFAULT: uint64 <comptime> = 16
+
+-- xstrtol results, with gnulib's values.
+local LONGINT_OK: integer <comptime> = 0
+local LONGINT_OVERFLOW: integer <comptime> = 1
+local LONGINT_INVALID_SUFFIX_CHAR: integer <comptime> = 2
+local LONGINT_INVALID: integer <comptime> = 4
+
+-- set_ordering's blank types.
+local BL_START: integer <comptime> = 0
+local BL_END: integer <comptime> = 1
+local BL_BOTH: integer <comptime> = 2
+
+-- Key.ignore: no table, nonprinting (-i) or nondictionary (-d).
+local IGN_NONPRINTING: integer <comptime> = 1
+local IGN_NONDICT: integer <comptime> = 2
+
+-- Long-only option codes.
+local CHECK_OPTION: integer <comptime> = 300
+local COMPRESS_PROGRAM_OPTION: integer <comptime> = 301
+local DEBUG_PROGRAM_OPTION: integer <comptime> = 302
+local FILES0_FROM_OPTION: integer <comptime> = 303
+local NMERGE_OPTION: integer <comptime> = 304
+local RANDOM_SOURCE_OPTION: integer <comptime> = 305
+local SORT_OPTION: integer <comptime> = 306
+local PARALLEL_OPTION: integer <comptime> = 307
+local HELP_OPTION: integer <comptime> = 308
+local VERSION_OPTION: integer <comptime> = 309
+
+local Key = @record{
+  sword: uint64, schar: uint64,   -- zero-origin start field and extra chars; sword SIZE_MAX = line start
+  eword: uint64, echar: uint64,   -- zero-origin end field and chars; eword SIZE_MAX = line end
+  ignore: integer,
+  translate: boolean,
+  skipsblanks: boolean, skipeblanks: boolean,
+  numeric: boolean, rnd: boolean, general_numeric: boolean, human_numeric: boolean,
+  month: boolean, reverse: boolean, version: boolean, traditional_used: boolean,
+}
+
+-- A line: TEXT[0 .. LEN-1] with TEXT[LEN] a NUL standing in for the line
+-- delimiter, as fillbuf leaves it; KEYBEG/KEYLIM bound the first key.
+local Line = @record{text: *[0]byte, len: usize, keybeg: usize, keylim: usize}
+
+local keylist: sequence(Key)
+local tab: integer = -1          -- -t byte, or -1 for TAB_DEFAULT
+local eolchar: byte = 10
+local reverse = false
+local stable = false
+local unique = false
+local debug = false
+local nmerge: uint64 = NMERGE_DEFAULT
+local blanks: [256]boolean
+local nonprinting: [256]boolean
+local nondictionary: [256]boolean
+local fold_toupper: [256]byte
+local random_md5_state: digest.Ctx
+local have_read_stdin = false
+local nthreads: uint64 = 0
+
+local function isdig(c: integer): boolean return c >= 48 and c <= 57 end
+local function c_isspace(c: integer): boolean return c == 32 or (c >= 9 and c <= 13) end
+
+local function inittables()
+  for i = 0, 255 do
+    blanks[i] = i == 32 or i == 9 or i == 10
+    nonprinting[i] = not (i >= 32 and i <= 126)
+    local alnum = isdig(i) or (i >= 65 and i <= 90) or (i >= 97 and i <= 122)
+    nondictionary[i] = not alnum and not blanks[i]
+    fold_toupper[i] = (i >= 97 and i <= 122) and (@byte)(i - 32) or (@byte)(i)
+  end
+end
+
+local function key_init(): Key
+  local k: Key
+  k.eword = SIZE_MAX
+  return k
+end
+
+----------------------------------------------------------------------------
+-- Diagnostics and exits.
+
+local function die(msg: string)
+  util.err(msg)
+  c_exit(SORT_FAILURE)
+end
+
+local function die_errno(e: cint, msg: string)
+  if e == 0 then die(msg) end
+  die(msg .. ': ' .. sys.strerror(e))
+end
+
+-- sort_die: "MESSAGE: FILE: strerror", FILE quoted with quotef.
+local function sort_die(message: string, file: string)
+  die_errno(sys.errno(), message .. ': ' .. util.quotef(file))
+end
+
+local function try_help(status: cint)
+  util.flush()
+  local m = "Try 'sort --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(status)
+end
+
+local function incompatible_options(opts: string)
+  die("options '-" .. opts .. "' are incompatible")
+end
+
+local function badfieldspec(spec: string, msgid: string)
+  die(msgid .. ': invalid field specification ' .. util.quote(spec))
+end
+
+----------------------------------------------------------------------------
+-- Output: a buffer over fd 1 that, like stdio, reports the first failed
+-- write as "write failed" once more than a buffer's worth (st_blksize) was
+-- written and as "fflush failed" at the end otherwise; close_stdout then
+-- adds "write error".
+
+local OUTCAP: usize <comptime> = 65536
+local obuf: [65536]byte
+local olen: usize = 0
+local ototal: uint64 = 0
+local ofail: cint = 0
+local oblksize: uint64 = 8192
+local outname = 'standard output'
+
+local function die_write(what: string)
+  util.err(what .. ': ' .. util.quotef(outname) .. ': ' .. sys.strerror(ofail))
+  util.err('write error')
+  c_exit(SORT_FAILURE)
+end
+
+local function write_fd(p: *[0]byte, n: usize)
+  local done: usize = 0
+  while done < n do
+    local r = sys.write(1, &p[done], n - done)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      ofail = sys.errno()
+      return
+    end
+    done = done + (@usize)(r)
+  end
+end
+
+local function oflush()
+  if olen > 0 and ofail == 0 then write_fd(&obuf, olen) end
+  olen = 0
+end
+
+local function out_bytes(p: *[0]byte, n: usize)
+  ototal = ototal + n
+  if ofail == 0 then
+    if olen + n > OUTCAP then oflush() end
+    if ofail == 0 then
+      if n >= OUTCAP then
+        write_fd(p, n)
+      else
+        c_memcpy(&obuf[olen], p, n)
+        olen = olen + n
+      end
+    end
+  end
+  if ofail ~= 0 and ototal > oblksize then die_write('write failed') end
+end
+
+local function out_byte(b: byte)
+  local x: [1]byte = {b}
+  out_bytes(&x, 1)
+end
+
+local function out_str(s: string)
+  out_bytes(s.data, s.size)
+end
+
+local function out_finish()
+  oflush()
+  if ofail ~= 0 then die_write(ototal > oblksize and 'write failed' or 'fflush failed') end
+end
+
+local function out_start()
+  local st: sys.Stat
+  if sys.fstat(1, &st) == 0 and st.st_blksize > 0 then oblksize = (@uint64)(st.st_blksize) end
+end
+
+----------------------------------------------------------------------------
+-- gnulib xstrtoumax over S from 0-based offset START, returning the status,
+-- the value and the 0-based offset of the first unparsed byte (the suffix).
+
+local function xstrtoumax_p(s: string, start: usize, valid: string): (integer, uint64, usize)
+  local n = s.size
+  local q = start
+  while q < n and c_isspace(s.data[q]) do q = q + 1 end
+  if q < n and s.data[q] == 45 then return LONGINT_INVALID, 0, start end
+  local p = q
+  if p < n and s.data[p] == 43 then p = p + 1 end
+  local dstart = p
+  local v: uint64 = 0
+  local err = LONGINT_OK
+  while p < n and isdig(s.data[p]) do
+    local d: uint64 = s.data[p] - 48
+    if err == LONGINT_OVERFLOW or v > (SIZE_MAX - d) // 10 then err = LONGINT_OVERFLOW; v = SIZE_MAX
+    else v = v * 10 + d end
+    p = p + 1
+  end
+  local function valid_has(c: byte): boolean
+    return c ~= 0 and valid:find(string.char(c), 1, true) > 0
+  end
+  if p == dstart then
+    -- strtoumax made no conversion: the suffix starts at S itself
+    p = start
+    if p < n and valid_has(s.data[p]) then v = 1 else return LONGINT_INVALID, 0, start end
+  end
+  if p < n then
+    local c = s.data[p]
+    if not valid_has(c) then return err | LONGINT_INVALID_SUFFIX_CHAR, v, p end
+    local power = 0
+    if c == 69 then power = 6 elseif c == 71 or c == 103 then power = 3
+    elseif c == 107 or c == 75 then power = 1 elseif c == 77 or c == 109 then power = 2
+    elseif c == 80 then power = 5 elseif c == 84 or c == 116 then power = 4
+    elseif c == 89 then power = 8 elseif c == 90 then power = 7
+    else return err | LONGINT_INVALID_SUFFIX_CHAR, v, p end
+    for _ = 1, power do
+      if v > SIZE_MAX // 1024 then v = SIZE_MAX; err = err | LONGINT_OVERFLOW else v = v * 1024 end
+    end
+    p = p + 1
+    if p < n then err = err | LONGINT_INVALID_SUFFIX_CHAR end
+  end
+  return err, v, p
+end
+
+-- xstrtol_fatal for option OPT ("-S" or "--buffer-size").
+local function xstrtol_fatal(e: integer, opt: string, arg: string)
+  if e == LONGINT_INVALID then die('invalid ' .. opt .. " argument '" .. arg .. "'") end
+  if (e & LONGINT_INVALID_SUFFIX_CHAR) ~= 0 then die('invalid suffix in ' .. opt .. " argument '" .. arg .. "'") end
+  die(opt .. " argument '" .. arg .. "' too large")
+end
+
+-- parse_field_count: the count at 0-based POS of STRING (SIZE_MAX on
+-- overflow). Returns false only when the count is invalid and MSGID is
+-- empty; with a MSGID that is fatal.
+local function parse_field_count(str: string, pos: usize, msgid: string): (boolean, uint64, usize)
+  local e, n, suffix = xstrtoumax_p(str, pos, '')
+  if e == LONGINT_INVALID then
+    if #msgid > 0 then
+      die(msgid .. ': invalid count at start of ' .. util.quote(str:sub(pos + 1)))
+    end
+    return false, 0, pos
+  end
+  if (e & LONGINT_OVERFLOW) ~= 0 then n = SIZE_MAX end
+  return true, n, suffix
+end
+
+local function byte_at(s: string, i: usize): integer
+  if i < s.size then return s.data[i] end
+  return 0
+end
+
+-- set_ordering: apply ordering letters from 0-based POS of S; returns the
+-- offset of the first byte that is not one.
+local function set_ordering(s: string, pos: usize, key: *Key, blanktype: integer): usize
+  while pos < s.size do
+    local c = s.data[pos]
+    if c == 98 then
+      if blanktype == BL_START or blanktype == BL_BOTH then key.skipsblanks = true end
+      if blanktype == BL_END or blanktype == BL_BOTH then key.skipeblanks = true end
+    elseif c == 100 then key.ignore = IGN_NONDICT
+    elseif c == 102 then key.translate = true
+    elseif c == 103 then key.general_numeric = true
+    elseif c == 104 then key.human_numeric = true
+    elseif c == 105 then if key.ignore == 0 then key.ignore = IGN_NONPRINTING end
+    elseif c == 77 then key.month = true
+    elseif c == 110 then key.numeric = true
+    elseif c == 82 then key.rnd = true
+    elseif c == 114 then key.reverse = true
+    elseif c == 86 then key.version = true
+    else return pos end
+    pos = pos + 1
+  end
+  return pos
+end
+
+local function key_numeric(key: *Key): boolean
+  return key.numeric or key.general_numeric or key.human_numeric
+end
+
+local function default_key_compare(key: *Key): boolean
+  return not (key.ignore ~= 0 or key.translate or key.skipsblanks or key.skipeblanks
+              or key_numeric(key) or key.month or key.version or key.rnd)
+end
+
+local function key_to_opts(key: *Key): string
+  local sb: stringbuilder
+  if key.skipsblanks or key.skipeblanks then sb:write('b') end
+  if key.ignore == IGN_NONDICT then sb:write('d') end
+  if key.translate then sb:write('f') end
+  if key.general_numeric then sb:write('g') end
+  if key.human_numeric then sb:write('h') end
+  if key.ignore == IGN_NONPRINTING then sb:write('i') end
+  if key.month then sb:write('M') end
+  if key.numeric then sb:write('n') end
+  if key.rnd then sb:write('R') end
+  if key.reverse then sb:write('r') end
+  if key.version then sb:write('V') end
+  return sb:promote()
+end
+
+----------------------------------------------------------------------------
+-- Fields.
+
+-- MIN (LIM, PTR + OFF) as sort.c computes it with pointer arithmetic: an
+-- offset near SIZE_MAX (a count that overflowed, then was decremented)
+-- wraps around to just before PTR. A wrap past the start of the line,
+-- where GNU would read outside the line, stops at the line start.
+local function advance(ptr: usize, lim: usize, off: uint64): usize
+  local back: uint64 = (~off) + 1
+  if back ~= 0 and back <= 0x400000000000 then
+    if back > ptr then return 0 end
+    return ptr - back
+  end
+  if off >= lim - ptr then return lim end
+  return ptr + off
+end
+
+local function begfield(l: *Line, key: *Key): usize
+  local t = l.text
+  local ptr: usize = 0
+  local lim = l.len
+  local sword = key.sword
+  if tab >= 0 then
+    while ptr < lim and sword ~= 0 do
+      sword = sword - 1
+      while ptr < lim and t[ptr] ~= tab do ptr = ptr + 1 end
+      if ptr < lim then ptr = ptr + 1 end
+    end
+  else
+    while ptr < lim and sword ~= 0 do
+      sword = sword - 1
+      while ptr < lim and blanks[t[ptr]] do ptr = ptr + 1 end
+      while ptr < lim and not blanks[t[ptr]] do ptr = ptr + 1 end
+    end
+  end
+  if key.skipsblanks then
+    while ptr < lim and blanks[t[ptr]] do ptr = ptr + 1 end
+  end
+  return advance(ptr, lim, key.schar)
+end
+
+local function limfield(l: *Line, key: *Key): usize
+  local t = l.text
+  local ptr: usize = 0
+  local lim = l.len
+  local eword = key.eword
+  local echar = key.echar
+  if echar == 0 then eword = eword + 1 end
+  if tab >= 0 then
+    while ptr < lim and eword ~= 0 do
+      eword = eword - 1
+      while ptr < lim and t[ptr] ~= tab do ptr = ptr + 1 end
+      if ptr < lim and (eword ~= 0 or echar ~= 0) then ptr = ptr + 1 end
+    end
+  else
+    while ptr < lim and eword ~= 0 do
+      eword = eword - 1
+      while ptr < lim and blanks[t[ptr]] do ptr = ptr + 1 end
+      while ptr < lim and not blanks[t[ptr]] do ptr = ptr + 1 end
+    end
+  end
+  if echar ~= 0 then
+    if key.skipeblanks then
+      while ptr < lim and blanks[t[ptr]] do ptr = ptr + 1 end
+    end
+    ptr = advance(ptr, lim, echar)
+  end
+  return ptr
+end
+
+-- fillbuf's precomputation of the first key.
+local function setkeys(l: *Line)
+  if #keylist == 0 then return end
+  local key = &keylist[1]
+  if key.eword == SIZE_MAX then l.keylim = l.len else l.keylim = limfield(l, key) end
+  if key.sword ~= SIZE_MAX then
+    l.keybeg = begfield(l, key)
+  else
+    local p: usize = 0
+    if key.skipsblanks then
+      while blanks[l.text[p]] do p = p + 1 end
+    end
+    l.keybeg = p
+  end
+end
+
+----------------------------------------------------------------------------
+-- Comparisons over NUL-terminated byte arrays, as in strnumcmp-in.h. The
+-- thousands separator is sort.c's NON_CHAR (CHAR_MAX + 1), which a byte
+-- 0x80 matches there because the bytes are read as unsigned char.
+
+local THOUSANDS_SEP: integer <comptime> = 128
+
+local function fraccompare(a: *[0]byte, b: *[0]byte): integer
+  local ai: usize, bi: usize = 0, 0
+  local tmpa: integer = a[0]
+  local tmpb: integer = b[0]
+  if tmpa == 46 and tmpb == 46 then
+    repeat
+      ai = ai + 1; bi = bi + 1
+      tmpa = a[ai]; tmpb = b[bi]
+    until not (tmpa == tmpb and isdig(tmpa))
+    if isdig(tmpa) and isdig(tmpb) then return tmpa - tmpb end
+    if isdig(tmpa) then
+      while tmpa == 48 do ai = ai + 1; tmpa = a[ai] end
+      return isdig(tmpa) and 1 or 0
+    end
+    if isdig(tmpb) then
+      while tmpb == 48 do bi = bi + 1; tmpb = b[bi] end
+      return isdig(tmpb) and -1 or 0
+    end
+    return 0
+  elseif tmpa == 46 then
+    repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= 48
+    return isdig(tmpa) and 1 or 0
+  elseif tmpb == 46 then
+    repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= 48
+    return isdig(tmpb) and -1 or 0
+  end
+  return 0
+end
+
+local function strnumcmp(a: *[0]byte, b: *[0]byte): integer
+  local ai: usize, bi: usize = 0, 0
+  local tmpa: integer = a[0]
+  local tmpb: integer = b[0]
+  local tmp: integer
+  local log_a: integer, log_b: integer = 0, 0
+  if tmpa == 45 then
+    repeat ai = ai + 1; tmpa = a[ai] until not (tmpa == 48 or tmpa == THOUSANDS_SEP)
+    if tmpb ~= 45 then
+      if tmpa == 46 then
+        repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= 48
+      end
+      if isdig(tmpa) then return -1 end
+      while tmpb == 48 or tmpb == THOUSANDS_SEP do bi = bi + 1; tmpb = b[bi] end
+      if tmpb == 46 then
+        repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= 48
+      end
+      return isdig(tmpb) and -1 or 0
+    end
+    repeat bi = bi + 1; tmpb = b[bi] until not (tmpb == 48 or tmpb == THOUSANDS_SEP)
+    while tmpa == tmpb and isdig(tmpa) do
+      repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= THOUSANDS_SEP
+      repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= THOUSANDS_SEP
+    end
+    if (tmpa == 46 and not isdig(tmpb)) or (tmpb == 46 and not isdig(tmpa)) then
+      return fraccompare((@*[0]byte)(&b[bi]), (@*[0]byte)(&a[ai]))
+    end
+    tmp = tmpb - tmpa
+    while isdig(tmpa) do
+      log_a = log_a + 1
+      repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= THOUSANDS_SEP
+    end
+    while isdig(tmpb) do
+      log_b = log_b + 1
+      repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= THOUSANDS_SEP
+    end
+    if log_a ~= log_b then return log_a < log_b and 1 or -1 end
+    if log_a == 0 then return 0 end
+    return tmp
+  elseif tmpb == 45 then
+    repeat bi = bi + 1; tmpb = b[bi] until not (tmpb == 48 or tmpb == THOUSANDS_SEP)
+    if tmpb == 46 then
+      repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= 48
+    end
+    if isdig(tmpb) then return 1 end
+    while tmpa == 48 or tmpa == THOUSANDS_SEP do ai = ai + 1; tmpa = a[ai] end
+    if tmpa == 46 then
+      repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= 48
+    end
+    return isdig(tmpa) and 1 or 0
+  end
+  while tmpa == 48 or tmpa == THOUSANDS_SEP do ai = ai + 1; tmpa = a[ai] end
+  while tmpb == 48 or tmpb == THOUSANDS_SEP do bi = bi + 1; tmpb = b[bi] end
+  while tmpa == tmpb and isdig(tmpa) do
+    repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= THOUSANDS_SEP
+    repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= THOUSANDS_SEP
+  end
+  if (tmpa == 46 and not isdig(tmpb)) or (tmpb == 46 and not isdig(tmpa)) then
+    return fraccompare((@*[0]byte)(&a[ai]), (@*[0]byte)(&b[bi]))
+  end
+  tmp = tmpa - tmpb
+  while isdig(tmpa) do
+    log_a = log_a + 1
+    repeat ai = ai + 1; tmpa = a[ai] until tmpa ~= THOUSANDS_SEP
+  end
+  while isdig(tmpb) do
+    log_b = log_b + 1
+    repeat bi = bi + 1; tmpb = b[bi] until tmpb ~= THOUSANDS_SEP
+  end
+  if log_a ~= log_b then return log_a < log_b and -1 or 1 end
+  if log_a == 0 then return 0 end
+  return tmp
+end
+
+local function skipblanks(p: *[0]byte): *[0]byte
+  local i: usize = 0
+  while blanks[p[i]] do i = i + 1 end
+  return (@*[0]byte)(&p[i])
+end
+
+local function numcompare(a: *[0]byte, b: *[0]byte): integer
+  return strnumcmp(skipblanks(a), skipblanks(b))
+end
+
+local function unit_order(c: integer): integer
+  if c == 75 or c == 107 then return 1 end
+  if c == 77 then return 2 end
+  if c == 71 then return 3 end
+  if c == 84 then return 4 end
+  if c == 80 then return 5 end
+  if c == 69 then return 6 end
+  if c == 90 then return 7 end
+  if c == 89 then return 8 end
+  return 0
+end
+
+-- traverse_raw_number: the highest digit (0 if none) and the offset just
+-- past the number. sort.c compares a signed char with NON_CHAR here, so no
+-- byte is a thousands separator.
+local function traverse_raw_number(t: *[0]byte, start: usize): (integer, usize)
+  local p = start
+  local maxd: integer = 0
+  local ch: integer = t[p]; p = p + 1
+  while isdig(ch) do
+    if ch > maxd then maxd = ch end
+    ch = t[p]; p = p + 1
+  end
+  if ch == 46 then
+    ch = t[p]; p = p + 1
+    while isdig(ch) do
+      if ch > maxd then maxd = ch end
+      ch = t[p]; p = p + 1
+    end
+  end
+  return maxd, p - 1
+end
+
+local function find_unit_order(t: *[0]byte): integer
+  local minus = t[0] == 45
+  local maxd, p = traverse_raw_number(t, minus and 1 or 0)
+  if maxd > 48 then
+    local order = unit_order(t[p])
+    return minus and -order or order
+  end
+  return 0
+end
+
+local function human_numcompare(a: *[0]byte, b: *[0]byte): integer
+  a = skipblanks(a); b = skipblanks(b)
+  local diff = find_unit_order(a) - find_unit_order(b)
+  if diff ~= 0 then return diff end
+  return strnumcmp(a, b)
+end
+
+-- strtold, except that a "0x" with no hex digits after it converts as the
+-- "0" before the x, as in glibc and C99 (nelibc's strtold reports no
+-- conversion there).
+local function xstrtold(s: cstring, e: *cstring): clongdouble
+  local v = c_strtold(s, e)
+  if $e ~= s then return v end
+  local p = (@*[0]byte)(s)
+  local i: usize = 0
+  while c_isspace(p[i]) do i = i + 1 end
+  local neg = p[i] == 45
+  if p[i] == 43 or p[i] == 45 then i = i + 1 end
+  if p[i] == 48 and (p[i + 1] == 120 or p[i + 1] == 88) then
+    $e = (@cstring)(&p[i + 1])
+    local z: clongdouble = 0
+    if neg then z = -z end
+    return z
+  end
+  return v
+end
+
+local function general_numcompare(sa: *[0]byte, sb: *[0]byte): integer
+  local ea: cstring
+  local eb: cstring
+  local a = xstrtold((@cstring)(sa), &ea)
+  local b = xstrtold((@cstring)(sb), &eb)
+  if (@cstring)(sa) == ea then return (@cstring)(sb) == eb and 0 or -1 end
+  if (@cstring)(sb) == eb then return 1 end
+  if a < b then return -1 end
+  if a > b then return 1 end
+  if a == b then return 0 end
+  if b == b then return -1 end
+  if a == a then return 1 end
+  -- nan_compare: the bytes of the two NaNs, padding cleared
+  local na: [2]uint64
+  local nb: [2]uint64
+  $(@*clongdouble)(&na) = c_strtold((@cstring)(sa), nilptr)
+  $(@*clongdouble)(&nb) = c_strtold((@cstring)(sb), nilptr)
+  na[1] = na[1] & 0xffff; nb[1] = nb[1] & 0xffff
+  return c_memcmp(&na, &nb, 16)
+end
+
+local month_names: [12]string = {'APR', 'AUG', 'DEC', 'FEB', 'JAN', 'JUL', 'JUN', 'MAR', 'MAY', 'NOV', 'OCT', 'SEP'}
+local month_vals: [12]integer = {4, 8, 12, 2, 1, 7, 6, 3, 5, 11, 10, 9}
+
+-- getmonth: 1..12 for the month name at M (after blanks), 0 if none; *EA
+-- gets the offset past the name.
+local function getmonth(m: *[0]byte, ea: *usize): integer
+  local i: usize = 0
+  while blanks[m[i]] do i = i + 1 end
+  local lo, hi = 0, 12
+  repeat
+    local ix = (lo + hi) // 2
+    local n = month_names[ix]
+    local j: usize = 0
+    while true do
+      if j >= n.size then
+        if ea ~= nilptr then $ea = i + j end
+        return month_vals[ix]
+      end
+      local c: integer = fold_toupper[m[i + j]]
+      local nc: integer = n.data[j]
+      if c < nc then hi = ix; break
+      elseif c > nc then lo = ix + 1; break end
+      j = j + 1
+    end
+  until not (lo < hi)
+  return 0
+end
+
+local function compare_random(ta: *[0]byte, lena: usize, tb: *[0]byte, lenb: usize): integer
+  local s0: digest.Ctx = random_md5_state
+  local s1: digest.Ctx = random_md5_state
+  if lena > 0 then digest.update(&s0, ta, (@integer)(lena)) end
+  if lenb > 0 then digest.update(&s1, tb, (@integer)(lenb)) end
+  local d0: [64]byte
+  local d1: [64]byte
+  digest.final(&s0, &d0)
+  digest.final(&s1, &d1)
+  local diff: integer = c_memcmp(&d0, &d1, 16)
+  if diff == 0 then
+    local n = lena < lenb and lena or lenb
+    diff = c_memcmp(ta, tb, n)
+    if diff == 0 then diff = (lena > lenb and 1 or 0) - (lena < lenb and 1 or 0) end
+  end
+  return diff
+end
+
+-- Scratch for keys copied with ignored bytes dropped or translated.
+local cmpbuf: *[0]byte = nilptr
+local cmpcap: usize = 0
+
+local function cmpbuf_reserve(n: usize)
+  if n <= cmpcap then return end
+  local cap = cmpcap * 2
+  if cap < n then cap = n end
+  if cap < 4096 then cap = 4096 end
+  cmpbuf = (@*[0]byte)(c_realloc(cmpbuf, cap))
+  cmpcap = cap
+end
+
+local function ignored(ign: integer, c: byte): boolean
+  if ign == IGN_NONDICT then return nondictionary[c] end
+  if ign == IGN_NONPRINTING then return nonprinting[c] end
+  return false
+end
+
+local function keycompare(a: *Line, b: *Line): integer
+  local ki = 1
+  local key = &keylist[1]
+  local texta: usize = a.keybeg
+  local textb: usize = b.keybeg
+  local lima: usize = a.keylim
+  local limb: usize = b.keylim
+  while true do
+    local diff: integer = 0
+    local ign = key.ignore
+    local tr = key.translate
+    if lima < texta then lima = texta end
+    if limb < textb then limb = textb end
+    local lena = lima - texta
+    local lenb = limb - textb
+    if key_numeric(key) or key.month or key.rnd or key.version then
+      local ta: *[0]byte
+      local tb: *[0]byte
+      local tlena: usize = 0
+      local tlenb: usize = 0
+      local enda: byte = 0
+      local endb: byte = 0
+      local copied = ign ~= 0 or tr
+      if copied then
+        cmpbuf_reserve(lena + 1 + lenb + 1)
+        ta = cmpbuf
+        tb = (@*[0]byte)(&cmpbuf[lena + 1])
+        for i: usize = 0, < lena do
+          local c = a.text[texta + i]
+          if not ignored(ign, c) then
+            if tr then ta[tlena] = fold_toupper[c] else ta[tlena] = c end
+            tlena = tlena + 1
+          end
+        end
+        ta[tlena] = 0
+        for i: usize = 0, < lenb do
+          local c = b.text[textb + i]
+          if not ignored(ign, c) then
+            if tr then tb[tlenb] = fold_toupper[c] else tb[tlenb] = c end
+            tlenb = tlenb + 1
+          end
+        end
+        tb[tlenb] = 0
+      else
+        ta = (@*[0]byte)(&a.text[texta]); tlena = lena; enda = ta[tlena]; ta[tlena] = 0
+        tb = (@*[0]byte)(&b.text[textb]); tlenb = lenb; endb = tb[tlenb]; tb[tlenb] = 0
+      end
+      if key.numeric then diff = numcompare(ta, tb)
+      elseif key.general_numeric then diff = general_numcompare(ta, tb)
+      elseif key.human_numeric then diff = human_numcompare(ta, tb)
+      elseif key.month then diff = getmonth(ta, nilptr) - getmonth(tb, nilptr)
+      elseif key.rnd then diff = compare_random(ta, tlena, tb, tlenb)
+      else
+        diff = filevercmp((@string){data = ta, size = tlena}, (@string){data = tb, size = tlenb})
+      end
+      if not copied then
+        ta[tlena] = enda
+        tb[tlenb] = endb
+      end
+    elseif ign ~= 0 then
+      local pa = texta
+      local pb = textb
+      local differ = false
+      while true do
+        while pa < lima and ignored(ign, a.text[pa]) do pa = pa + 1 end
+        while pb < limb and ignored(ign, b.text[pb]) do pb = pb + 1 end
+        if not (pa < lima and pb < limb) then break end
+        local ca: integer = a.text[pa]
+        local cb: integer = b.text[pb]
+        if tr then ca = fold_toupper[ca]; cb = fold_toupper[cb] end
+        diff = ca - cb
+        if diff ~= 0 then differ = true; break end
+        pa = pa + 1; pb = pb + 1
+      end
+      if not differ then diff = (pa < lima and 1 or 0) - (pb < limb and 1 or 0) end
+    elseif lena == 0 then
+      diff = lenb ~= 0 and -1 or 0
+    elseif lenb == 0 then
+      diff = 1
+    else
+      if tr then
+        local pa = texta
+        local pb = textb
+        while pa < lima and pb < limb do
+          diff = (@integer)(fold_toupper[a.text[pa]]) - (@integer)(fold_toupper[b.text[pb]])
+          pa = pa + 1; pb = pb + 1
+          if diff ~= 0 then break end
+        end
+      else
+        diff = c_memcmp(&a.text[texta], &b.text[textb], lena < lenb and lena or lenb)
+      end
+      if diff == 0 then diff = lena < lenb and -1 or (lena ~= lenb and 1 or 0) end
+    end
+    if diff ~= 0 then return key.reverse and -diff or diff end
+    ki = ki + 1
+    if ki > #keylist then break end
+    key = &keylist[ki]
+    if key.eword ~= SIZE_MAX then lima = limfield(a, key); limb = limfield(b, key)
+    else lima = a.len; limb = b.len end
+    if key.sword ~= SIZE_MAX then
+      texta = begfield(a, key); textb = begfield(b, key)
+    else
+      texta = 0; textb = 0
+      if key.skipsblanks then
+        while texta < lima and blanks[a.text[texta]] do texta = texta + 1 end
+        while textb < limb and blanks[b.text[textb]] do textb = textb + 1 end
+      end
+    end
+  end
+  return 0
+end
+
+local function compare(a: *Line, b: *Line): integer
+  local diff: integer
+  if #keylist > 0 then
+    diff = keycompare(a, b)
+    if diff ~= 0 or unique or stable then return diff end
+  end
+  local alen = a.len
+  local blen = b.len
+  if alen == 0 then diff = blen ~= 0 and -1 or 0
+  elseif blen == 0 then diff = 1
+  else
+    diff = c_memcmp(a.text, b.text, alen < blen and alen or blen)
+    if diff == 0 then diff = alen < blen and -1 or (alen ~= blen and 1 or 0) end
+  end
+  return reverse and -diff or diff
+end
+
+----------------------------------------------------------------------------
+-- --debug annotations.
+
+-- debug_width: mbsnwidth in the C locale (control bytes 0, others 1) plus
+-- one for each tab.
+local function debug_width(t: *[0]byte, from: usize, to: usize): usize
+  local w: usize = 0
+  local i = from
+  while i < to do
+    local c = t[i]
+    if c == 9 then w = w + 1
+    elseif not (c < 32 or c == 127) then w = w + 1 end
+    i = i + 1
+  end
+  return w
+end
+
+local function mark_key(offset: usize, width: usize)
+  for _ = 1, offset do out_byte(32) end
+  if width == 0 then
+    out_str('^ no match for key\n')
+  else
+    for _ = 1, width do out_byte(95) end
+    out_byte(10)
+  end
+end
+
+local function debug_key(l: *Line, key: *Key)
+  local t = l.text
+  local beg: usize = 0
+  local lim: usize = l.len
+  if key ~= nilptr then
+    if key.sword ~= SIZE_MAX then beg = begfield(l, key) end
+    if key.eword ~= SIZE_MAX then lim = limfield(l, key) end
+    if (key.skipsblanks and key.sword == SIZE_MAX) or key.month or key_numeric(key) then
+      local saved = t[lim]
+      t[lim] = 0
+      while blanks[t[beg]] do beg = beg + 1 end
+      local tighter = beg
+      if lim < beg then
+        tighter = lim
+      elseif key.month then
+        local e: usize = 0
+        if getmonth((@*[0]byte)(&t[beg]), &e) ~= 0 then tighter = beg + e end
+      elseif key.general_numeric then
+        local e: cstring
+        xstrtold((@cstring)(&t[beg]), &e)
+        tighter = beg + (@usize)((@isize)(e) - (@isize)((@cstring)(&t[beg])))
+      elseif key.numeric or key.human_numeric then
+        local p = beg + ((beg < lim and t[beg] == 45) and 1 or 0)
+        local maxd, np = traverse_raw_number(t, p)
+        if maxd >= 48 then
+          tighter = np + ((key.human_numeric and unit_order(t[np]) ~= 0) and 1 or 0)
+        end
+      else
+        tighter = lim
+      end
+      t[lim] = saved
+      lim = tighter
+    end
+  end
+  mark_key(debug_width(t, 0, beg), debug_width(t, beg, lim))
+end
+
+local function debug_line(l: *Line)
+  if #keylist == 0 then debug_key(l, nilptr); return end
+  local i = 1
+  while true do
+    debug_key(l, &keylist[i])
+    i = i + 1
+    if i > #keylist then
+      if not (unique or stable) then debug_key(l, nilptr) end
+      break
+    end
+  end
+end
+
+-- write_line to standard output.
+local function write_line(l: *Line)
+  if debug then
+    for i: usize = 0, < l.len do
+      local c = l.text[i]
+      if c == 9 then c = 62 end
+      out_byte(c)
+    end
+    out_byte(10)
+    debug_line(l)
+  else
+    out_bytes(l.text, l.len)
+    out_byte(eolchar)
+  end
+end
+
+----------------------------------------------------------------------------
+-- Inputs.
+
+local function grow(p: *[0]byte, cap: *usize, need: usize): *[0]byte
+  if need <= $cap then return p end
+  local n = $cap * 2
+  if n < need then n = need end
+  if n < 65536 then n = 65536 end
+  local q = (@*[0]byte)(c_realloc(p, n))
+  if q == nilptr then die('memory exhausted') end
+  $cap = n
+  return q
+end
+
+-- xfopen for reading: "-" is standard input.
+local function xfopen(name: string): cint
+  if name == '-' then
+    have_read_stdin = true
+    return 0
+  end
+  local fd = sys.open(name, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then sort_die('open failed', name) end
+  return fd
+end
+
+local function xfclose(fd: cint)
+  if fd > 0 then sys.close(fd) end
+end
+
+local function read_some(fd: cint, p: *[0]byte, n: usize, name: string): usize
+  while true do
+    local r = sys.read(fd, p, n)
+    if r >= 0 then return (@usize)(r) end
+    if sys.errno() ~= sys.EINTR then sort_die('read failed', name) end
+  end
+  return 0
+end
+
+-- Read all of FD, then split it into lines (a final unterminated line gets
+-- a delimiter, as fillbuf supplies one).
+local function read_lines(fd: cint, name: string, out: *sequence(Line))
+  local cap: usize = 0
+  local used: usize = 0
+  local buf: *[0]byte = nilptr
+  while true do
+    buf = grow(buf, &cap, used + 65536 + 1)
+    local r = read_some(fd, (@*[0]byte)(&buf[used]), cap - used - 1, name)
+    if r == 0 then break end
+    used = used + r
+  end
+  local start: usize = 0
+  for i: usize = 0, < used do
+    if buf[i] == eolchar then
+      buf[i] = 0
+      local l: Line = {text = (@*[0]byte)(&buf[start]), len = i - start}
+      setkeys(&l)
+      out:push(l)
+      start = i + 1
+    end
+  end
+  if start < used then
+    buf[used] = 0
+    local l: Line = {text = (@*[0]byte)(&buf[start]), len = used - start}
+    setkeys(&l)
+    out:push(l)
+  end
+end
+
+-- An input of mergefps or check: a file read buffer by buffer, or the
+-- in-memory result of an earlier merge (GNU's temporary file).
+local Source = @record{
+  name: string,
+  isfile: boolean,
+  fd: cint,
+  buf: *[0]byte,
+  cap: usize,
+  used: usize,
+  start: usize,     -- start of the unterminated line at the end of buf
+  eof: boolean,
+  done: boolean,
+  lines: sequence(Line),
+}
+
+local function new_source(name: string, isfile: boolean): *Source
+  local s = (@*Source)(c_malloc(#@Source))
+  local z: Source
+  $s = z
+  s.name = name
+  s.isfile = isfile
+  s.fd = -1
+  return s
+end
+
+local function src_open(s: *Source)
+  if s.isfile then s.fd = xfopen(s.name) end
+end
+
+local function src_close(s: *Source)
+  if s.isfile then xfclose(s.fd) end
+end
+
+-- fillbuf: the next batch of lines, false at the end.
+local function src_fill(s: *Source): boolean
+  if not s.isfile then
+    if s.done then return false end
+    s.done = true
+    return #s.lines > 0
+  end
+  if s.eof then return false end
+  if s.start > 0 then
+    c_memmove(s.buf, &s.buf[s.start], s.used - s.start)
+    s.used = s.used - s.start
+    s.start = 0
+  end
+  s.lines:clear()
+  while true do
+    s.buf = grow(s.buf, &s.cap, s.used + 65536 + 1)
+    local r = read_some(s.fd, (@*[0]byte)(&s.buf[s.used]), s.cap - s.used - 1, s.name)
+    if r == 0 then
+      s.eof = true
+      if s.used > s.start then
+        s.buf[s.used] = 0
+        local l: Line = {text = (@*[0]byte)(&s.buf[s.start]), len = s.used - s.start}
+        setkeys(&l)
+        s.lines:push(l)
+        s.used = s.used + 1
+        s.start = s.used
+      end
+      return #s.lines > 0
+    end
+    local scan = s.used
+    s.used = s.used + r
+    for i: usize = scan, < s.used do
+      if s.buf[i] == eolchar then
+        s.buf[i] = 0
+        local l: Line = {text = (@*[0]byte)(&s.buf[s.start]), len = i - s.start}
+        setkeys(&l)
+        s.lines:push(l)
+        s.start = i + 1
+      end
+    end
+    if #s.lines > 0 then return true end
+  end
+  return false
+end
+
+-- Merge output that is not standard output: collected like a temporary
+-- file, then turned into an in-memory Source.
+local Arena = @record{buf: *[0]byte, cap: usize, used: usize, offs: sequence(usize), lens: sequence(usize)}
+
+local function arena_add(ar: *Arena, l: *Line)
+  ar.buf = grow(ar.buf, &ar.cap, ar.used + l.len + 1)
+  if l.len > 0 then c_memcpy(&ar.buf[ar.used], l.text, l.len) end
+  ar.buf[ar.used + l.len] = 0
+  ar.offs:push(ar.used)
+  ar.lens:push(l.len)
+  ar.used = ar.used + l.len + 1
+end
+
+local function arena_source(ar: *Arena): *Source
+  local s = new_source('', false)
+  for i = 1, #ar.offs do
+    local l: Line = {text = (@*[0]byte)(&ar.buf[ar.offs[i]]), len = ar.lens[i]}
+    setkeys(&l)
+    s.lines:push(l)
+  end
+  return s
+end
+
+-- A copy of a line that outlives its buffer (mergefps' saved line).
+local SavedLine = @record{line: Line, cap: usize}
+
+local function save_line(sv: *SavedLine, l: *Line)
+  if sv.cap < l.len + 1 then
+    local n = sv.cap
+    if n == 0 then n = l.len + 1 end
+    while n < l.len + 1 do n = n * 2 end
+    sv.line.text = (@*[0]byte)(c_realloc(sv.line.text, n))
+    sv.cap = n
+  end
+  c_memcpy(sv.line.text, l.text, l.len + 1)
+  sv.line.len = l.len
+  sv.line.keybeg = l.keybeg
+  sv.line.keylim = l.keylim
+end
+
+----------------------------------------------------------------------------
+-- mergefps: merge FILES (already open) to standard output, or into AR.
+
+local function curline(files: *sequence(*Source), cur: *sequence(integer), p: integer): *Line
+  local s: *Source = ($files)[p]
+  return &s.lines[($cur)[p]]
+end
+
+local function mergefps(fs: sequence(*Source), ar: *Arena)
+  local files: sequence(*Source)
+  local cur: sequence(integer)
+  for i = 1, #fs do files:push(fs[i]) end
+  local i = 1
+  while i <= #files do
+    if src_fill(files[i]) then
+      cur:push(1)
+      i = i + 1
+    else
+      src_close(files[i])
+      files:remove(i)
+    end
+  end
+  local nfiles = #files
+  local ord: sequence(integer)
+  for k = 1, nfiles do ord:push(k) end
+  local k = 2
+  while k <= nfiles do
+    if compare(curline(&files, &cur, ord[k - 1]), curline(&files, &cur, ord[k])) > 0 then
+      local t = ord[k - 1]; ord[k - 1] = ord[k]; ord[k] = t
+      k = 1
+    end
+    k = k + 1
+  end
+  local saved: SavedLine
+  local have_saved = false
+  while nfiles > 0 do
+    local f = ord[1]
+    local smallest = curline(&files, &cur, f)
+    if unique then
+      if have_saved and compare(&saved.line, smallest) ~= 0 then
+        have_saved = false
+        if ar ~= nilptr then arena_add(ar, &saved.line) else write_line(&saved.line) end
+      end
+      if not have_saved then
+        have_saved = true
+        save_line(&saved, smallest)
+      end
+    else
+      if ar ~= nilptr then arena_add(ar, smallest) else write_line(smallest) end
+    end
+    local exhausted = false
+    if cur[f] < #files[f].lines then
+      cur[f] = cur[f] + 1
+    elseif src_fill(files[f]) then
+      cur[f] = 1
+    else
+      exhausted = true
+    end
+    if exhausted then
+      for j = 2, nfiles do
+        if ord[j] > f then ord[j] = ord[j] - 1 end
+      end
+      nfiles = nfiles - 1
+      src_close(files[f])
+      files:remove(f)
+      cur:remove(f)
+      ord:remove(1)
+    else
+      -- push the new line back until a larger one; ties go to the lower file
+      local lo = 2
+      local hi = nfiles + 1
+      local probe = lo
+      local ord0 = ord[1]
+      while lo < hi do
+        local cmp = compare(curline(&files, &cur, ord0), curline(&files, &cur, ord[probe]))
+        if cmp < 0 or (cmp == 0 and ord0 < ord[probe]) then hi = probe else lo = probe + 1 end
+        probe = (lo + hi) // 2
+      end
+      local count = lo - 2
+      for j = 1, count do ord[j] = ord[j + 1] end
+      ord[count + 1] = ord0
+    end
+  end
+  if unique and have_saved then
+    if ar ~= nilptr then arena_add(ar, &saved.line) else write_line(&saved.line) end
+  end
+end
+
+-- mergefiles into a "temporary file".
+local function mergefiles(group: sequence(*Source)): *Source
+  for i = 1, #group do src_open(group[i]) end
+  local ar: Arena
+  mergefps(group, &ar)
+  return arena_source(&ar)
+end
+
+----------------------------------------------------------------------------
+-- Output file handling.
+
+local have_outfile = false
+local outfile = ''
+
+-- check_output: create the output file without truncating it and make it
+-- standard output.
+local function check_output()
+  if not have_outfile then return end
+  local fd = sys.open(outfile, sys.O_WRONLY | sys.O_CREAT | sys.O_CLOEXEC, 0x1B6)
+  if fd < 0 then sort_die('open failed', outfile) end
+  if fd ~= 1 then
+    sys.dup2(fd, 1)
+    sys.close(fd)
+  end
+end
+
+-- stream_open (FILE, "w"): truncate the output file.
+local function open_output()
+  if have_outfile and c_ftruncate(1, 0) ~= 0 then
+    local e = sys.errno()
+    local st: sys.Stat
+    if sys.fstat(1, &st) ~= 0 or (st.st_mode & sys.S_IFMT) == sys.S_IFREG then
+      die_errno(e, util.quotef(outfile) .. ': error truncating')
+    end
+  end
+  out_start()
+end
+
+local function same_inode(a: *sys.Stat, b: *sys.Stat): boolean
+  return a.st_dev == b.st_dev and a.st_ino == b.st_ino
+end
+
+-- avoid_trashing_input: inputs that are the output are first copied.
+local function avoid_trashing_input(files: sequence(*Source))
+  local tempcopy: *Source = nilptr
+  for i = 1, #files do
+    local f = files[i]
+    if not f.isfile then continue end
+    local is_stdin = f.name == '-'
+    local same = false
+    if have_outfile and outfile == f.name and not is_stdin then
+      same = true
+    else
+      local outst: sys.Stat
+      if sys.fstat(1, &outst) ~= 0 then break end
+      local inst: sys.Stat
+      local r: cint
+      if is_stdin then r = sys.fstat(0, &inst) else r = sys.stat(f.name, &inst) end
+      same = r == 0 and same_inode(&inst, &outst)
+    end
+    if same then
+      if tempcopy == nilptr then
+        local g: sequence(*Source)
+        g:push(f)
+        tempcopy = mergefiles(g)
+      end
+      local c = new_source('', false)
+      c.lines = tempcopy.lines
+      files[i] = c
+    end
+  end
+end
+
+local function merge(files: sequence(*Source))
+  local nfiles = #files
+  while nmerge < (@uint64)(nfiles) do
+    local nm = (@integer)(nmerge)
+    local in_ = 0
+    local out = 0
+    while nm <= nfiles - in_ do
+      local g: sequence(*Source)
+      for j = 1, nm do g:push(files[in_ + j]) end
+      files[out + 1] = mergefiles(g)
+      out = out + 1
+      in_ = in_ + nm
+    end
+    local remainder = nfiles - in_
+    local cheap_slots = nm - out % nm
+    if cheap_slots < remainder then
+      local nshortmerge = remainder - cheap_slots + 1
+      local g: sequence(*Source)
+      for j = 1, nshortmerge do g:push(files[in_ + j]) end
+      files[out + 1] = mergefiles(g)
+      out = out + 1
+      in_ = in_ + nshortmerge
+    end
+    for j = in_ + 1, nfiles do files[out + j - in_] = files[j] end
+    nfiles = nfiles - (in_ - out)
+    files:resize(nfiles)
+  end
+  avoid_trashing_input(files)
+  for i = 1, #files do src_open(files[i]) end
+  open_output()
+  mergefps(files, nilptr)
+  out_finish()
+end
+
+-- sort: read every input, sort stably, write with -u's first-of-a-run.
+local function msort(a: *[0]Line, tmp: *[0]Line, n: usize)
+  if n < 2 then return end
+  if n == 2 then
+    if compare(&a[0], &a[1]) > 0 then
+      local t = a[0]; a[0] = a[1]; a[1] = t
+    end
+    return
+  end
+  local nlo = n // 2
+  msort(a, tmp, nlo)
+  msort((@*[0]Line)(&a[nlo]), tmp, n - nlo)
+  for i: usize = 0, < nlo do tmp[i] = a[i] end
+  local i: usize, j: usize, k: usize = 0, nlo, 0
+  while i < nlo and j < n do
+    if compare(&tmp[i], &a[j]) <= 0 then a[k] = tmp[i]; i = i + 1
+    else a[k] = a[j]; j = j + 1 end
+    k = k + 1
+  end
+  while i < nlo do a[k] = tmp[i]; i = i + 1; k = k + 1 end
+end
+
+local function sort_files(files: sequence(string))
+  local lines: sequence(Line)
+  for i = 1, #files do
+    local fd = xfopen(files[i])
+    read_lines(fd, files[i], &lines)
+    xfclose(fd)
+  end
+  local n = (@usize)(#lines)
+  if n > 1 then
+    local tmp = (@*[0]Line)(c_malloc((n // 2 + 1) * #@Line))
+    msort((@*[0]Line)(&lines[1]), tmp, n)
+  end
+  open_output()
+  if n > 1 and nthreads > 1 then
+    -- queue_init and merge_tree_init allocate 2 * 8 and 2 * 128 bytes per
+    -- thread (nthreads is capped at SIZE_MAX / 256); a huge --parallel
+    -- runs out of memory there
+    local nt = nthreads
+    if nt > SIZE_MAX // 256 then nt = SIZE_MAX // 256 end
+    local q = c_malloc(16 * nt)
+    local t: pointer = nilptr
+    if q ~= nilptr then t = c_malloc(256 * nt) end
+    if q == nilptr or t == nilptr then die('memory exhausted') end
+    c_free(t); c_free(q)
+  end
+  local saved: *Line = nilptr
+  for i = 1, #lines do
+    local l = &lines[i]
+    if unique then
+      if saved ~= nilptr and compare(l, saved) == 0 then continue end
+      saved = l
+    end
+    write_line(l)
+  end
+  out_finish()
+end
+
+-- check: are the lines of NAME in order? With CHECKONLY 'c', report the
+-- first line out of order.
+local function check(name: string, checkonly: byte): boolean
+  local s = new_source(name, true)
+  s.fd = xfopen(name)
+  local prev: SavedLine
+  local have_prev = false
+  local line_number: uint64 = 0
+  local nonunique: integer = unique and 0 or 1
+  local ordered = true
+  while src_fill(s) do
+    local bad = 0
+    if have_prev and nonunique <= compare(&prev.line, &s.lines[1]) then bad = 1 end
+    if bad == 0 then
+      for i = 2, #s.lines do
+        if nonunique <= compare(&s.lines[i - 1], &s.lines[i]) then bad = i; break end
+      end
+    end
+    if bad > 0 then
+      if checkonly == 99 then
+        local l = &s.lines[bad]
+        local sb: stringbuilder
+        sb:write(util.applet, ': ', name, ':', tostring(line_number + (@uint64)(bad)), ': disorder: ')
+        sb:write((@string){data = l.text, size = l.len})
+        sb:writebyte(eolchar)
+        local m = sb:promote()
+        sys.write(2, m.data, m.size)
+      end
+      ordered = false
+      break
+    end
+    line_number = line_number + (@uint64)(#s.lines)
+    save_line(&prev, &s.lines[#s.lines])
+    have_prev = true
+  end
+  xfclose(s.fd)
+  return ordered
+end
+
+----------------------------------------------------------------------------
+-- Option helpers.
+
+local function specify_sort_size(optname: string, s: string)
+  local e, n, suffix = xstrtoumax_p(s, 0, 'EgGkKmMPtTYZ')
+  if e == LONGINT_OK and isdig(s.data[suffix - 1]) then
+    if n <= SIZE_MAX // 1024 then n = n * 1024 else e = LONGINT_OVERFLOW end
+  end
+  if e == LONGINT_INVALID_SUFFIX_CHAR and isdig(s.data[suffix - 1]) and suffix + 1 == s.size then
+    local c = s.data[suffix]
+    if c == 98 then
+      e = LONGINT_OK
+    elseif c == 37 then
+      -- physmem_total () * n / 100, in double
+      local info: [16]culong
+      local total: float64 = 0
+      if sys.sys3(sys.SYS_SYSINFO, (@culong)((@usize)(&info)), 0, 0) == 0 then
+        local unit: float64 = (@float64)((@uint32)(info[13] & 0xffffffff))
+        local pages = sys.sysconf(30)
+        total = (@float64)(info[4]) * unit
+        if pages > 0 then total = (@float64)((@uint64)(total) // (@uint64)(pages) * (@uint64)(pages)) end
+      end
+      local mem = total * (@float64)(n) / 100
+      if mem < 18446744073709551615.0 then e = LONGINT_OK else e = LONGINT_OVERFLOW end
+    end
+  end
+  if e ~= LONGINT_OK then xstrtol_fatal(e, optname, s) end
+end
+
+local function specify_nmerge(s: string)
+  local e, n = xstrtoumax_p(s, 0, '')
+  local rl: [2]culong
+  local cur: uint64 = 20
+  if c_getrlimit(7, &rl) == 0 then cur = rl[0] end
+  local max_nmerge: uint64 = (cur - 3) & UINT_MAX
+  if e == LONGINT_OK then
+    if n > UINT_MAX then
+      e = LONGINT_OVERFLOW
+    elseif n < 2 then
+      util.err('invalid --batch-size argument ' .. util.quote(s))
+      die("minimum --batch-size argument is '2'")
+    elseif max_nmerge < n then
+      e = LONGINT_OVERFLOW
+    else
+      nmerge = n
+      return
+    end
+  end
+  if e == LONGINT_OVERFLOW then
+    util.err('--batch-size argument ' .. util.quote(s) .. ' too large')
+    die('maximum --batch-size argument with current rlimit is ' .. tostring(max_nmerge))
+  end
+  xstrtol_fatal(e, '--batch-size', s)
+end
+
+local function specify_nthreads(s: string)
+  local e, n = xstrtoumax_p(s, 0, '')
+  if e == LONGINT_OVERFLOW then nthreads = SIZE_MAX; return end
+  if e ~= LONGINT_OK then xstrtol_fatal(e, '--parallel', s) end
+  if n == 0 then die('number in parallel must be nonzero') end
+  nthreads = n
+end
+
+-- posix2_version: _POSIX2_VERSION when it is a whole decimal number.
+local function posix2_version(): int64
+  local v: int64 = 200809
+  local cs = sys.getenv('_POSIX2_VERSION')
+  if cs == nilptr then return v end
+  local s: string = cs
+  if #s == 0 then return v end
+  local p: usize = 0
+  while p < s.size and c_isspace(s.data[p]) do p = p + 1 end
+  local neg = false
+  if p < s.size and (s.data[p] == 43 or s.data[p] == 45) then neg = s.data[p] == 45; p = p + 1 end
+  local d0 = p
+  local mag: uint64 = 0
+  local big = false
+  while p < s.size and isdig(s.data[p]) do
+    if mag > 100000000000 then big = true else mag = mag * 10 + (s.data[p] - 48) end
+    p = p + 1
+  end
+  if p == d0 or p ~= s.size then return v end
+  if big or mag > 0x7fffffff then return neg and -0x80000000 or 0x7fffffff end
+  local r: int64 = (@int64)(mag)
+  if neg then r = -r end
+  return r
+end
+
+local function usage()
+  out_start()
+  out_str([==[
+Usage: sort [OPTION]... [FILE]...
+  or:  sort [OPTION]... --files0-from=F
+Write sorted concatenation of all FILE(s) to standard output.
+
+With no FILE, or when FILE is -, read standard input.
+
+Mandatory arguments to long options are mandatory for short options too.
+Ordering options:
+
+  -b, --ignore-leading-blanks  ignore leading blanks
+  -d, --dictionary-order      consider only blanks and alphanumeric characters
+  -f, --ignore-case           fold lower case to upper case characters
+  -g, --general-numeric-sort  compare according to general numerical value
+  -i, --ignore-nonprinting    consider only printable characters
+  -M, --month-sort            compare (unknown) < 'JAN' < ... < 'DEC'
+  -h, --human-numeric-sort    compare human readable numbers (e.g., 2K 1G)
+  -n, --numeric-sort          compare according to string numerical value
+  -R, --random-sort           shuffle, but group identical keys.  See shuf(1)
+      --random-source=FILE    get random bytes from FILE
+  -r, --reverse               reverse the result of comparisons
+      --sort=WORD             sort according to WORD:
+                                general-numeric -g, human-numeric -h, month -M,
+                                numeric -n, random -R, version -V
+  -V, --version-sort          natural sort of (version) numbers within text
+
+Other options:
+
+      --batch-size=NMERGE   merge at most NMERGE inputs at once;
+                            for more use temp files
+  -c, --check, --check=diagnose-first  check for sorted input; do not sort
+  -C, --check=quiet, --check=silent  like -c, but do not report first bad line
+      --compress-program=PROG  compress temporaries with PROG;
+                              decompress them with PROG -d
+      --debug               annotate the part of the line used to sort,
+                              and warn about questionable usage to stderr
+      --files0-from=F       read input from the files specified by
+                            NUL-terminated names in file F;
+                            If F is - then read names from standard input
+  -k, --key=KEYDEF          sort via a key; KEYDEF gives location and type
+  -m, --merge               merge already sorted files; do not sort
+  -o, --output=FILE         write result to FILE instead of standard output
+  -s, --stable              stabilize sort by disabling last-resort comparison
+  -S, --buffer-size=SIZE    use SIZE for main memory buffer
+  -t, --field-separator=SEP  use SEP instead of non-blank to blank transition
+  -T, --temporary-directory=DIR  use DIR for temporaries, not $TMPDIR or /tmp;
+                              multiple options specify multiple directories
+      --parallel=N          change the number of sorts run concurrently to N
+  -u, --unique              with -c, check for strict ordering;
+                              without -c, output only the first of an equal run
+  -z, --zero-terminated     line delimiter is NUL, not newline
+      --help        display this help and exit
+      --version     output version information and exit
+
+KEYDEF is F[.C][OPTS][,F[.C][OPTS]] for start and stop position, where F is a
+field number and C a character position in the field; both are origin 1, and
+the stop position defaults to the line's end.  If neither -t nor -b is in
+effect, characters in a field are counted from the beginning of the preceding
+whitespace.  OPTS is one or more single-letter ordering options [bdfgiMhnRrV],
+which override global ordering options for that key.  If no key is given, use
+the entire line as the key.  Use --debug to diagnose incorrect key usage.
+
+SIZE may be followed by the following multiplicative suffixes:
+% 1% of memory, b 1, K 1024 (default), and so on for M, G, T, P, E, Z, Y.
+
+*** WARNING ***
+The locale specified by the environment affects sort order.
+Set LC_ALL=C to get the traditional sort order that uses
+native byte values.
+]==])
+  out_finish()
+  c_exit(0)
+end
+
+-- key_warnings: --debug's data-independent warnings.
+local function key_warnings(gkey: *Key, gkey_only: boolean)
+  local ugkey: Key = $gkey
+  local keynum = 1
+  local basic_numeric_field = false
+  local general_numeric_field = false
+  local basic_numeric_field_span = false
+  local general_numeric_field_span = false
+  for ki = 1, #keylist do
+    local key = &keylist[ki]
+    if key_numeric(key) then
+      if key.general_numeric then general_numeric_field = true else basic_numeric_field = true end
+    end
+    if key.traditional_used then
+      local sword = key.sword
+      local eword = key.eword
+      if sword == SIZE_MAX then sword = sword + 1 end
+      local po = '+' .. tostring(sword)
+      local pn = '-k ' .. tostring(sword + 1)
+      if key.eword ~= SIZE_MAX then
+        po = po .. ' -' .. tostring(eword + 1)
+        pn = pn .. ',' .. tostring(eword + 1 + ((key.echar == SIZE_MAX) and 1 or 0))
+      end
+      util.err('obsolescent key ' .. util.quote(po) .. ' used; consider ' .. util.quote(pn) .. ' instead')
+    end
+    local zero_width = key.sword ~= SIZE_MAX and key.eword < key.sword
+    if zero_width then util.err('key ' .. tostring(keynum) .. ' has zero width and will be ignored') end
+    local implicit_skip = key_numeric(key) or key.month
+    local line_offset = key.eword == 0 and key.echar ~= 0
+    if not zero_width and not gkey_only and tab < 0 and not line_offset
+       and ((not key.skipsblanks and not implicit_skip)
+            or (not key.skipsblanks and key.schar ~= 0)
+            or (not key.skipeblanks and key.echar ~= 0)) then
+      util.err('leading blanks are significant in key ' .. tostring(keynum) .. "; consider also specifying 'b'")
+    end
+    if not gkey_only and key_numeric(key) then
+      local sword = key.sword + 1
+      local eword = key.eword + 1
+      if sword == 0 then sword = sword + 1 end
+      if eword == 0 or sword < eword then
+        util.err('key ' .. tostring(keynum) .. ' is numeric and spans multiple fields')
+        if key.general_numeric then general_numeric_field_span = true else basic_numeric_field_span = true end
+      end
+    end
+    if ugkey.ignore ~= 0 and ugkey.ignore == key.ignore then ugkey.ignore = 0 end
+    if ugkey.translate and key.translate then ugkey.translate = false end
+    ugkey.skipsblanks = ugkey.skipsblanks and not key.skipsblanks
+    ugkey.skipeblanks = ugkey.skipeblanks and not key.skipeblanks
+    ugkey.month = ugkey.month and not key.month
+    ugkey.numeric = ugkey.numeric and not key.numeric
+    ugkey.general_numeric = ugkey.general_numeric and not key.general_numeric
+    ugkey.human_numeric = ugkey.human_numeric and not key.human_numeric
+    ugkey.rnd = ugkey.rnd and not key.rnd
+    ugkey.version = ugkey.version and not key.version
+    ugkey.reverse = ugkey.reverse and not key.reverse
+    keynum = keynum + 1
+  end
+  -- C locale: no thousands separator, '.' as the decimal point
+  local number_locale_warned = false
+  if basic_numeric_field_span or general_numeric_field_span then
+    if tab == 46 then
+      util.err("field separator '.' is treated as a decimal point in numbers")
+      number_locale_warned = true
+    elseif tab == 45 then
+      util.err("field separator '-' is treated as a minus sign in numbers")
+    elseif general_numeric_field_span and tab == 43 then
+      util.err("field separator '+' is treated as a plus sign in numbers")
+    end
+  end
+  if (basic_numeric_field or general_numeric_field) and not number_locale_warned then
+    util.err((tab == 46 and '' or 'note ') .. "numbers use '.' as a decimal point in this locale")
+  end
+  if not default_key_compare(&ugkey) or (ugkey.reverse and (stable or unique) and #keylist > 0) then
+    local ugkey_reverse = ugkey.reverse
+    if not (stable or unique) then ugkey.reverse = false end
+    local opts = key_to_opts(&ugkey)
+    if #opts == 1 then util.err("option '-" .. opts .. "' is ignored")
+    else util.err("options '-" .. opts .. "' are ignored") end
+    ugkey.reverse = ugkey_reverse
+  end
+  if ugkey.reverse and not (stable or unique) and #keylist > 0 then
+    util.err("option '-r' only applies to last-resort comparison")
+  end
+end
+
+----------------------------------------------------------------------------
+
+global function applet_sort(args: sequence(string)): integer
+  inittables()
+  keylist:clear()
+  tab = -1; eolchar = 10
+  reverse = false; stable = false; unique = false; debug = false
+  nmerge = NMERGE_DEFAULT
+  nthreads = 0
+  have_outfile = false; outfile = ''
+  local gkey = key_init()
+  gkey.sword = SIZE_MAX
+  local gkey_only = false
+  local checkonly: byte = 0
+  local mergeonly = false
+  local random_source = ''
+  local have_rs = false
+  local need_random = false
+  local files: sequence(string)
+  local posixly_correct = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  local posix_ver = posix2_version()
+  local traditional_usage = not (200112 <= posix_ver and posix_ver < 200809)
+  local files_from = ''
+  local have_ff = false
+  local compress_program = ''
+  local have_cp = false
+  local longs: []util.LongOpt = {
+    {'ignore-leading-blanks', 0, 98}, {'check', 2, CHECK_OPTION},
+    {'compress-program', 1, COMPRESS_PROGRAM_OPTION}, {'debug', 0, DEBUG_PROGRAM_OPTION},
+    {'dictionary-order', 0, 100}, {'ignore-case', 0, 102}, {'files0-from', 1, FILES0_FROM_OPTION},
+    {'general-numeric-sort', 0, 103}, {'ignore-nonprinting', 0, 105}, {'key', 1, 107},
+    {'merge', 0, 109}, {'month-sort', 0, 77}, {'numeric-sort', 0, 110},
+    {'human-numeric-sort', 0, 104}, {'version-sort', 0, 86}, {'random-sort', 0, 82},
+    {'random-source', 1, RANDOM_SOURCE_OPTION}, {'sort', 1, SORT_OPTION}, {'output', 1, 111},
+    {'reverse', 0, 114}, {'stable', 0, 115}, {'batch-size', 1, NMERGE_OPTION},
+    {'buffer-size', 1, 83}, {'field-separator', 1, 116}, {'temporary-directory', 1, 84},
+    {'unique', 0, 117}, {'zero-terminated', 0, 122}, {'parallel', 1, PARALLEL_OPTION},
+    {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+  }
+  local g = util.getopt(args, '-bcCdfghik:mMno:rRsS:t:T:uVy:z', &longs, #longs)
+  g.quiet = true
+  local c: integer = 0
+  while true do
+    -- an operand after "--", or (POSIXLY_CORRECT) after a file, unless
+    -- the POSIX version is not 1003.1-2001, -c was not seen and the
+    -- operand is "-o FILE" or "-oFILE"
+    local take_file = false
+    if c == -1 then
+      take_file = true
+    elseif posixly_correct and #files ~= 0
+           and not (traditional_usage and checkonly == 0 and g.optind <= #args
+                    and #args[g.optind] >= 2 and args[g.optind]:byte(1) == 45 and args[g.optind]:byte(2) == 111
+                    and (#args[g.optind] > 2 or g.optind ~= #args)) then
+      take_file = true
+    else
+      c = g:next()
+      if c == -1 then take_file = true end
+    end
+    if take_file then
+      if g.optind > #args then break end
+      files:push(args[g.optind])
+      g.optind = g.optind + 1
+      continue
+    end
+    local optarg = g.optarg
+    if c == 63 then
+      util.err(g.errmsg)
+      try_help(SORT_FAILURE)
+    elseif c == 1 then
+      local iskey = false
+      if #optarg > 0 and optarg:byte(1) == 43 then
+        local minus_pos_usage = g.optind <= #args and #args[g.optind] >= 2 and args[g.optind]:byte(1) == 45
+                                and isdig(args[g.optind]:byte(2))
+        traditional_usage = traditional_usage or (minus_pos_usage and not posixly_correct)
+        if traditional_usage then
+          -- +POS1 [-POS2] is a key if possible; an invalid +POS1 is a file
+          local key = key_init()
+          local ok, v, s = parse_field_count(optarg, 1, '')
+          if ok then
+            key.sword = v
+            if byte_at(optarg, s) == 46 then
+              ok, v, s = parse_field_count(optarg, s + 1, '')
+              if ok then key.schar = v end
+            end
+          end
+          if not (key.sword ~= 0 or key.schar ~= 0) then key.sword = SIZE_MAX end
+          if ok and set_ordering(optarg, s, &key, BL_START) == optarg.size then
+            if minus_pos_usage then
+              local optarg1 = args[g.optind]
+              g.optind = g.optind + 1
+              local _, v1, s1 = parse_field_count(optarg1, 1, "invalid number after '-'")
+              key.eword = v1
+              if byte_at(optarg1, s1) == 46 then
+                _, v1, s1 = parse_field_count(optarg1, s1 + 1, "invalid number after '.'")
+                key.echar = v1
+              end
+              if key.echar == 0 and key.eword ~= 0 then key.eword = key.eword - 1 end
+              if set_ordering(optarg1, s1, &key, BL_END) ~= optarg1.size then
+                badfieldspec(optarg1, 'stray character in field spec')
+              end
+            end
+            key.traditional_used = true
+            keylist:push(key)
+            iskey = true
+          end
+        end
+      end
+      if not iskey then files:push(optarg) end
+    elseif c == SORT_OPTION or c == 98 or c == 100 or c == 102 or c == 103 or c == 104 or c == 105
+           or c == 77 or c == 110 or c == 114 or c == 82 or c == 86 then
+      if c == SORT_OPTION then
+        local names: []string = {'general-numeric', 'human-numeric', 'month', 'numeric', 'random', 'version'}
+        local values: []integer = {103, 104, 77, 110, 82, 86}
+        c = util.argmatch('--sort', optarg, &names, &values, 6)
+        if c < 0 then try_help(1) end
+      end
+      set_ordering(string.char(c), 0, &gkey, BL_BOTH)
+    elseif c == CHECK_OPTION or c == 99 or c == 67 then
+      if c == CHECK_OPTION then
+        if g.has_optarg then
+          local names: []string = {'quiet', 'silent', 'diagnose-first'}
+          local values: []integer = {67, 67, 99}
+          c = util.argmatch('--check', optarg, &names, &values, 3)
+          if c < 0 then try_help(1) end
+        else
+          c = 99
+        end
+      end
+      if checkonly ~= 0 and checkonly ~= c then incompatible_options('cC') end
+      checkonly = (@byte)(c)
+    elseif c == COMPRESS_PROGRAM_OPTION then
+      if have_cp and compress_program ~= optarg then die('multiple compress programs specified') end
+      compress_program = optarg; have_cp = true
+    elseif c == DEBUG_PROGRAM_OPTION then
+      debug = true
+    elseif c == FILES0_FROM_OPTION then
+      files_from = optarg; have_ff = true
+    elseif c == 107 then
+      local key = key_init()
+      local _, v, s = parse_field_count(optarg, 0, 'invalid number at field start')
+      key.sword = v
+      if key.sword == 0 then badfieldspec(optarg, 'field number is zero') end
+      key.sword = key.sword - 1
+      if byte_at(optarg, s) == 46 then
+        _, v, s = parse_field_count(optarg, s + 1, "invalid number after '.'")
+        key.schar = v
+        if key.schar == 0 then badfieldspec(optarg, 'character offset is zero') end
+        key.schar = key.schar - 1
+      end
+      if not (key.sword ~= 0 or key.schar ~= 0) then key.sword = SIZE_MAX end
+      s = set_ordering(optarg, s, &key, BL_START)
+      if byte_at(optarg, s) ~= 44 then
+        key.eword = SIZE_MAX
+        key.echar = 0
+      else
+        _, v, s = parse_field_count(optarg, s + 1, "invalid number after ','")
+        key.eword = v
+        if key.eword == 0 then badfieldspec(optarg, 'field number is zero') end
+        key.eword = key.eword - 1
+        if byte_at(optarg, s) == 46 then
+          _, v, s = parse_field_count(optarg, s + 1, "invalid number after '.'")
+          key.echar = v
+        end
+        s = set_ordering(optarg, s, &key, BL_END)
+      end
+      if s < optarg.size then badfieldspec(optarg, 'stray character in field spec') end
+      keylist:push(key)
+    elseif c == 109 then
+      mergeonly = true
+    elseif c == NMERGE_OPTION then
+      specify_nmerge(optarg)
+    elseif c == 111 then
+      if have_outfile and outfile ~= optarg then die('multiple output files specified') end
+      outfile = optarg; have_outfile = true
+    elseif c == RANDOM_SOURCE_OPTION then
+      if have_rs and random_source ~= optarg then die('multiple random sources specified') end
+      random_source = optarg; have_rs = true
+    elseif c == 115 then
+      stable = true
+    elseif c == 83 then
+      specify_sort_size(g.was_long and '--buffer-size' or '-S', optarg)
+    elseif c == 116 then
+      if #optarg == 0 then die('empty tab') end
+      local newtab: integer = optarg:byte(1)
+      if #optarg > 1 then
+        if optarg == '\\0' then newtab = 0
+        else die('multi-character tab ' .. util.quote(optarg)) end
+      end
+      if tab >= 0 and tab ~= newtab then die('incompatible tabs') end
+      tab = newtab
+    elseif c == 84 then
+      -- -T DIR: temporary files are never created
+    elseif c == PARALLEL_OPTION then
+      specify_nthreads(optarg)
+    elseif c == 117 then
+      unique = true
+    elseif c == 121 then
+      -- -y[N] is ignored; as a separate argument only digits are its value
+      if g.optind == g.arg_index + 2 then
+        local p = 1
+        while p <= #optarg and isdig(optarg:byte(p)) do p = p + 1 end
+        if p <= #optarg then g.optind = g.optind - 1 end
+      end
+    elseif c == 122 then
+      eolchar = 0
+    elseif c == HELP_OPTION then
+      usage()
+    elseif c == VERSION_OPTION then
+      out_start()
+      out_str('sort (nebox) after GNU coreutils 9.1\n')
+      out_finish()
+      return 0
+    else
+      try_help(SORT_FAILURE)
+    end
+  end
+
+  if have_ff then
+    if #files > 0 then
+      util.err('extra operand ' .. util.quoteaf(files[1]))
+      util.flush()
+      local m = 'file operands cannot be combined with --files0-from\n'
+      sys.write(2, m.data, m.size)
+      try_help(SORT_FAILURE)
+    end
+    local fd = xfopen(files_from)
+    local cap: usize = 0
+    local used: usize = 0
+    local buf: *[0]byte = nilptr
+    local failed = false
+    while true do
+      buf = grow(buf, &cap, used + 65536 + 1)
+      local r = sys.read(fd, &buf[used], cap - used - 1)
+      if r < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        failed = true
+        break
+      end
+      if r == 0 then break end
+      used = used + (@usize)(r)
+    end
+    if failed then die('cannot read file names from ' .. util.quoteaf(files_from)) end
+    xfclose(fd)
+    local start: usize = 0
+    for i: usize = 0, < used do
+      if buf[i] == 0 then
+        files:push((@string){data = (@*[0]byte)(&buf[start]), size = i - start})
+        start = i + 1
+      end
+    end
+    if start < used then files:push((@string){data = (@*[0]byte)(&buf[start]), size = used - start}) end
+    if #files == 0 then die('no input from ' .. util.quoteaf(files_from)) end
+    for i = 1, #files do
+      if files[i] == '-' then
+        die('when reading file names from stdin, no file name of ' .. util.quoteaf(files[i]) .. ' allowed')
+      elseif #files[i] == 0 then
+        die(util.quotef(files_from) .. ':' .. tostring(i) .. ': invalid zero-length file name')
+      end
+    end
+  end
+
+  -- inheritance of global options to individual keys
+  for i = 1, #keylist do
+    local key = &keylist[i]
+    if default_key_compare(key) and not key.reverse then
+      key.ignore = gkey.ignore
+      key.translate = gkey.translate
+      key.skipsblanks = gkey.skipsblanks
+      key.skipeblanks = gkey.skipeblanks
+      key.month = gkey.month
+      key.numeric = gkey.numeric
+      key.general_numeric = gkey.general_numeric
+      key.human_numeric = gkey.human_numeric
+      key.version = gkey.version
+      key.rnd = gkey.rnd
+      key.reverse = gkey.reverse
+    end
+    need_random = need_random or key.rnd
+  end
+  if #keylist == 0 and not default_key_compare(&gkey) then
+    gkey_only = true
+    keylist:push(gkey)
+    need_random = need_random or gkey.rnd
+  end
+
+  -- check_ordering_compatibility
+  for i = 1, #keylist do
+    local key = &keylist[i]
+    local n = (key.numeric and 1 or 0) + (key.general_numeric and 1 or 0) + (key.human_numeric and 1 or 0)
+              + (key.month and 1 or 0) + ((key.version or key.rnd or key.ignore ~= 0) and 1 or 0)
+    if n > 1 then
+      key.skipsblanks = false; key.skipeblanks = false; key.reverse = false
+      incompatible_options(key_to_opts(key))
+    end
+  end
+
+  if debug then
+    if checkonly ~= 0 or have_outfile then
+      incompatible_options(string.char(checkonly ~= 0 and checkonly or 111) .. ' --debug')
+    end
+    util.err('text ordering performed using simple byte comparison')
+    key_warnings(&gkey, gkey_only)
+  end
+
+  reverse = gkey.reverse
+
+  if need_random then
+    local seed: [16]byte
+    if have_rs then
+      local fd = sys.open(random_source, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+      if fd < 0 then sort_die('open failed', random_source) end
+      local got: usize = 0
+      while got < 16 do
+        local r = sys.read(fd, &seed[got], 16 - got)
+        if r < 0 then
+          if sys.errno() == sys.EINTR then continue end
+          die_errno(sys.errno(), util.quote(random_source) .. ': read error')
+        end
+        if r == 0 then die(util.quote(random_source) .. ': end of file') end
+        got = got + (@usize)(r)
+      end
+      sys.close(fd)
+    else
+      local got: usize = 0
+      while got < 16 do
+        local r = sys.getrandom(&seed[got], 16 - got, 0)
+        if r < 0 then
+          if sys.errno() == sys.EINTR then continue end
+          sort_die('open failed', 'getrandom')
+        end
+        got = got + (@usize)(r)
+      end
+    end
+    digest.init(&random_md5_state, digest.MD5, 0)
+    digest.update(&random_md5_state, &seed, 16)
+  end
+
+  if #files == 0 then files:push('-') end
+
+  if checkonly ~= 0 then
+    if #files > 1 then
+      die('extra operand ' .. util.quoteaf(files[2]) .. ' not allowed with -' .. string.char(checkonly))
+    end
+    if have_outfile then incompatible_options(string.char(checkonly) .. 'o') end
+    return check(files[1], checkonly) and 0 or 1
+  end
+
+  -- check_inputs: every input must be readable
+  for i = 1, #files do
+    if files[i] ~= '-' and sys.access(files[i], sys.R_OK) ~= 0 then sort_die('cannot read', files[i]) end
+  end
+  check_output()
+  if have_outfile then outname = outfile end
+
+  if mergeonly then
+    local srcs: sequence(*Source)
+    for i = 1, #files do srcs:push(new_source(files[i], true)) end
+    merge(srcs)
+  else
+    sort_files(files)
+  end
+  return 0
+end

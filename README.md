@@ -326,6 +326,50 @@ Stated here rather than worked around:
   /dev/null, POSIX's "differ: char" message in the C locale, every "EOF
   on" form and stdio's write-error messages. `tests/cmp_compare.py`: 110
   fixed and 400 random cases, 0 mismatches.
+- `sort` ports sort.c in the C locale (`src/nebox/applets/sort.nelua`):
+  keys from begfield/limfield with GNU's inheritance of global options,
+  -b -d -f -g -h -i -M -n -R -r -V and `--sort=WORD` (strnumcmp, where a
+  0x80 byte counts as the thousands separator as it does in GNU's C
+  locale; filevercmp; strtold; getmonth; -R as the MD5 of the key under a
+  state seeded from 16 bytes of `--random-source` or getrandom, so a given
+  source gives GNU's order), the last-resort comparison unless -s or -u,
+  the same stable merge sort, -u keeping the first line of an equal run,
+  -c/-C/`--check=` with GNU's disorder report, -m through mergefps
+  (streamed, ties to the earlier file, `--batch-size` intermediate merges
+  done in memory with GNU's grouping, an output that is also an input
+  copied first), -o created before and truncated after the input is read,
+  -t (`\0`, multi-character and incompatible tabs), -z, obsolete `+POS1
+  -POS2` keys under GNU's `_POSIX2_VERSION`/POSIXLY_CORRECT rules,
+  `--files0-from`, every key-parse and ordering-incompatibility message,
+  `--debug` (key underlining with mbsnwidth's C-locale widths, and the
+  zero-width, leading-blank, multi-field numeric, field-separator, ignored
+  option and `-r` warnings), and GNU's "open failed", "cannot read",
+  "read failed", "write failed"/"fflush failed" plus "write error"
+  messages and statuses. `tests/sort_compare.py`: 340 fixed and 500 random
+  cases, 0 mismatches (5 more runs of 3000 random cases with other seeds
+  also gave 0). Differences:
+  - nebox sorts in memory in one thread and never makes temporary files.
+    -S (size suffixes and `%` of physical memory), -T, `--parallel`,
+    `--batch-size` and `--compress-program` are validated with GNU's
+    messages and limits but change nothing else, except that
+    `--batch-size` shapes -m as in GNU and a huge `--parallel` runs out of
+    memory where GNU does (allocating GNU's per-thread merge structures).
+    GNU spills inputs larger than its buffer to temporary files and merges
+    them; that gives the same output whenever the ordering is consistent,
+    but a compress program is never run, so a missing one is not reported.
+  - Only the C locale: `--debug` always reports simple byte comparison.
+  - Two NaNs under -g: GNU memcmps the whole 16-byte long double, whose six
+    padding bytes its compiler leaves uninitialized (sort.c's memset is a
+    dead store), so their order and whether -u merges them depend on the
+    stack; nebox compares the ten value bytes. nelibc's strtold also keeps
+    no `nan(...)` payload and accepts `-` inside the parentheses, so such
+    NaNs order differently from glibc's. nelibc's strtold reports no
+    conversion for `0x` without hex digits; sort converts it as `0`, as
+    glibc does.
+  - A character offset that overflowed (2^64 - k) makes GNU's pointer
+    arithmetic step back k bytes; nebox does the same within the line but
+    stops at its start where GNU reads the bytes before it.
+  - `--help` omits GNU's closing links; `--version` prints nebox's line.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's
@@ -601,17 +645,6 @@ Stated here rather than worked around:
   order.
 - `od` supports -A -t (a c d u o x; sizes 1 2 4 8) -b -c -d -o -x -s -i -l -j
   -N -v; no floats or -w. `hexdump` offers -C -c -b -d -o -x -n -s -v only.
-- `sort` takes -b -c -C -d -f -h -i -m -n -o -r -s -t -u -V -z and -k with
-  `F[.C][OPTS][,F[.C][OPTS]]` positions and the modifiers b d f h i n r V,
-  following GNU's key inheritance, last-resort and -u/-c rules in the C locale
-  (bytes, no collation). -n compares digit strings like GNU, -h knows the
-  suffixes k K M G T P E Z Y, -V implements gnulib filevercmp, -g is
-  general_numcompare (strtold; conversion errors, then NaNs by bit pattern,
-  then numbers) and -M is getmonth over the C locale's month names. Long
-  options follow GNU's table, including `--check[=quiet|silent|diagnose-first]`
-  and `--sort=WORD`; GNU's ordering-compatibility check (one of n g h M,
-  V, or an ignore option) applies. `tests/sort_compare.py`: 2011 random
-  cases against GNU. No -R/--random-source, --parallel, -S, -T, or locales.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
 - `tsort` reproduces GNU's output order (sorted zero-degree queue, successors

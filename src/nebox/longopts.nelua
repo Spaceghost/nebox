@@ -17,20 +17,6 @@ global longopts.mkdir: []util.LongOpt = {
   {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
 }
-global longopts.sort: []util.LongOpt = {
-  {'ignore-leading-blanks', 0, 98}, {'check', 2, 200},
-  {'compress-program', 1, util.UNSUPPORTED}, {'debug', 0, util.UNSUPPORTED},
-  {'dictionary-order', 0, 100}, {'ignore-case', 0, 102}, {'files0-from', 1, util.UNSUPPORTED},
-  {'general-numeric-sort', 0, 103}, {'ignore-nonprinting', 0, 105}, {'key', 1, 107},
-  {'merge', 0, 109}, {'month-sort', 0, 77}, {'numeric-sort', 0, 110},
-  {'human-numeric-sort', 0, 104}, {'version-sort', 0, 86}, {'random-sort', 0, util.UNSUPPORTED},
-  {'random-source', 1, util.UNSUPPORTED}, {'sort', 1, 204}, {'output', 1, 111},
-  {'reverse', 0, 114}, {'stable', 0, 115}, {'batch-size', 1, util.UNSUPPORTED},
-  {'buffer-size', 1, util.UNSUPPORTED}, {'field-separator', 1, 116},
-  {'temporary-directory', 1, util.UNSUPPORTED}, {'unique', 0, 117}, {'zero-terminated', 0, 122},
-  {'parallel', 1, util.UNSUPPORTED}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
-}
 global longopts.basename: []util.LongOpt = {
   {'multiple', 0, 97}, {'suffix', 1, 115}, {'zero', 0, 122}, {'help', 0, util.UNSUPPORTED},
   {'version', 0, util.UNSUPPORTED},
