@@ -1086,35 +1086,6 @@ global function applet_mv(args: sequence(string)): integer
   return rc
 end
 
-global function applet_ln(args: sequence(string)): integer
-  local o = util.parsel(args, 'sfnvT', &longopts.ln, #longopts.ln)
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands < 1 then return util.die('missing file operand') end
-  local targets: sequence(string)
-  local dst: string
-  if #o.operands == 1 then
-    targets:push(o.operands[1]); dst = util.basename(o.operands[1])
-  else
-    for i: integer = 1, #o.operands - 1 do targets:push(o.operands[i]) end
-    dst = o.operands[#o.operands]
-  end
-  local dstdir = util.isdir(dst) and not (o:has('n') and not util.isdir(dst))
-  if #targets > 1 and not dstdir then return util.die("target '" .. dst .. "' is not a directory") end
-  local rc: integer = 0
-  for _, t in ipairs(targets) do
-    local link = dstdir and util.join(dst, util.basename(t)) or dst
-    if o:has('f') then sys.unlink(link) end
-    local r: cint
-    if o:has('s') then r = sys.symlink(t, link) else r = sys.link(t, link) end
-    if r ~= 0 then
-      util.err("failed to create " .. (o:has('s') and 'symbolic' or 'hard') .. " link '" .. link .. "': " .. sys.errstr())
-      rc = 1
-    elseif o:has('v') then
-      util.line("'" .. link .. "' -> '" .. t .. "'")
-    end
-  end
-  return rc
-end
 
 
 global function applet_pwd(args: sequence(string)): integer

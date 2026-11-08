@@ -155,3 +155,40 @@ function canon.canonicalize(name: string, can_mode: integer): (string, cint)
   r:destroy()
   return out, 0
 end
+
+local function path_common_prefix(p1: string, p2: string): integer
+  local function at(s: string, i: integer): byte
+    if i >= 1 and i <= #s then return s:byte(i) end
+    return 0
+  end
+  if (at(p1, 2) == 47) ~= (at(p2, 2) == 47) then return 0 end
+  local i = 0
+  local ret = 0
+  while at(p1, i + 1) ~= 0 and at(p2, i + 1) ~= 0 do
+    if at(p1, i + 1) ~= at(p2, i + 1) then break end
+    if at(p1, i + 1) == 47 then ret = i + 1 end
+    i = i + 1
+  end
+  local c1, c2 = at(p1, i + 1), at(p2, i + 1)
+  if (c1 == 0 and c2 == 0) or (c1 == 0 and c2 == 47) or (c2 == 0 and c1 == 47) then ret = i end
+  return ret
+end
+
+-- coreutils relpath.c: the name of CAN_FNAME relative to CAN_RELDIR (both
+-- canonical) written to SB, or false when they share no prefix.
+function canon.relpath(can_fname: string, can_reldir: string, sb: *stringbuilder): boolean
+  local common = path_common_prefix(can_reldir, can_fname)
+  if common == 0 then return false end
+  local relto = can_reldir:sub(common + 1)
+  local fsuf = can_fname:sub(common + 1)
+  if #relto > 0 and relto:byte(1) == 47 then relto = relto:sub(2) end
+  if #fsuf > 0 and fsuf:byte(1) == 47 then fsuf = fsuf:sub(2) end
+  if #relto > 0 then
+    sb:write('..')
+    for k = 1, #relto do if relto:byte(k) == 47 then sb:write('/..') end end
+    if #fsuf > 0 then sb:write('/'); sb:write(fsuf) end
+  else
+    sb:write(#fsuf > 0 and fsuf or '.')
+  end
+  return true
+end

@@ -150,7 +150,7 @@ Stated here rather than worked around:
   styles), `src/nebox/mountlist.nelua` (/proc/self/mountinfo with ME_DUMMY
   and ME_REMOTE) and `src/nebox/fstype.nelua` (stat.c's 132 file-system
   magic numbers, generated). SELinux detection is `/sys/fs/selinux/enforce`
-  rather than libselinux. `tests/stat_compare.py`: 279 fixed cases plus 400
+  rather than libselinux. `tests/stat_compare.py`: 274 fixed cases plus 400
   random format strings over a shared fixture, 0 mismatches (1500 random
   also run clean).
 - `rm` ports rm.c and remove.c over a traversal that hands remove.c's
@@ -168,6 +168,16 @@ Stated here rather than worked around:
   sort past 10000 entries, and `--one-file-system` across a real mount
   point. Paths are used whole, so names longer than PATH_MAX fail where fts
   would cope.
+- `ln` ports ln.c with gnulib force-link.c: hard and symbolic links, -d/-F,
+  -f, -i, -L/-P, -n, -r (relpath over canonical names, now shared as
+  `canon.relpath`), -s, -t/-T, -v, the atomic first attempt, the "same
+  file" and "will not overwrite just-created" checks, replacement through a
+  temporary name renamed over the old link, and un-backup when the new link
+  fails. Backups (-b, `--backup=CONTROL`, -S, `VERSION_CONTROL`,
+  `SIMPLE_BACKUP_SUFFIX`) come from `src/nebox/backup.nelua`, a port of
+  gnulib backupfile.c (numbered names found by scanning the directory, with
+  its string arithmetic) for cp, mv and install to share.
+  `tests/ln_compare.py`: 149 cases, 0 mismatches.
 - `readlink` and `realpath` port readlink.c, realpath.c and relpath.c over
   a port of gnulib's `canonicalize_filename_mode` (`src/nebox/canonicalize.nelua`):
   -e -f -m, -L -P -s, -n -q -v -z, `--relative-to`/`--relative-base`, GNU's

@@ -1,0 +1,202 @@
+-- gnulib backupfile.c, backup-find.c and xgetversion: backup types from
+-- --backup/VERSION_CONTROL, the simple suffix from --suffix or
+-- SIMPLE_BACKUP_SUFFIX, and the next backup name for a file, numbered
+-- names found by scanning its directory as numbered_backup does (string
+-- arithmetic on the version, a leading 0 added after all 9s).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+global backup = @record{}
+global backup.NONE: integer <comptime> = 0
+global backup.SIMPLE: integer <comptime> = 1
+global backup.EXISTING: integer <comptime> = 2
+global backup.NUMBERED: integer <comptime> = 3
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function c_fdopendir(fd: cint): *sys.DIR <cimport 'fdopendir', cinclude '<dirent.h>'> end
+local function c_renameat2(ofd: cint, old: cstring, nfd: cint, new: cstring, flags: cuint): cint <cimport 'renameat2', cinclude '<stdio.h>'> end
+local function c_fpathconf(fd: cint, name: cint): clong <cimport 'fpathconf', cinclude '<unistd.h>'> end
+local function c_pathconf(path: cstring, name: cint): clong <cimport 'pathconf', cinclude '<unistd.h>'> end
+
+local simple_suffix = '~'
+local have_simple_suffix = false
+
+-- gnulib last_component / base_len.
+local function last_component_off(s: string): integer
+  local i = 1
+  while i <= #s and s:byte(i) == 47 do i = i + 1 end
+  local base = i
+  local saw = false
+  while i <= #s do
+    if s:byte(i) == 47 then saw = true
+    elseif saw then base = i; saw = false end
+    i = i + 1
+  end
+  return base
+end
+
+local function base_len(s: string, from: integer): integer
+  local n = #s - from + 1
+  while n > 1 and s:byte(from + n - 1) == 47 do n = n - 1 end
+  return n
+end
+
+function backup.set_simple_suffix(s: string, given: boolean)
+  if not given then
+    local e = sys.getenv('SIMPLE_BACKUP_SUFFIX')
+    if e ~= nilptr then s = (@string)(e); given = true end
+  end
+  if given and #s > 0 and last_component_off(s) == 1 then simple_suffix = string.copy(s)
+  else simple_suffix = '~' end
+  have_simple_suffix = true
+end
+
+-- get_version / xget_version: exits after the usage hint when invalid.
+local function get_version(context: string, version: string): integer
+  if #version == 0 then return backup.EXISTING end
+  local names: []string = {'none', 'off', 'simple', 'never', 'existing', 'nil', 'numbered', 't'}
+  local values: []integer = {0, 0, 1, 1, 2, 2, 3, 3}
+  local v = util.argmatch(context, version, &names, &values, 8)
+  if v < 0 then
+    util.flush()
+    local m = "Try '" .. util.applet .. " --help' for more information.\n"
+    sys.write(2, m.data, m.size)
+    c_exit(1)
+  end
+  return v
+end
+
+function backup.xget_version(context: string, version: string, given: boolean): integer
+  if given and #version > 0 then return get_version(context, version) end
+  local e = sys.getenv('VERSION_CONTROL')
+  return get_version('$VERSION_CONTROL', e ~= nilptr and (@string)(e) or '')
+end
+
+local BACKUP_IS_SAME_LENGTH <comptime> = 0
+local BACKUP_IS_LONGER <comptime> = 1
+local BACKUP_IS_NEW <comptime> = 2
+
+-- numbered_backup: BUF (bytes of the name, filelen long) gets ".~N~".
+local function numbered_backup(dir_fd: cint, buf: *sequence(byte), filelen: integer, base_offset: integer): (integer, cint)
+  local result = BACKUP_IS_NEW
+  local versionlenmax = 1
+  local baselen = filelen - base_offset
+  -- the directory: the name with its base replaced by "."
+  local sb: stringbuilder
+  for i = 1, base_offset do sb:writebyte(buf[i]) end
+  sb:write('.')
+  local dname = sb:promote()
+  buf:resize(filelen)
+  buf:push(46); buf:push(126); buf:push(49); buf:push(126)
+  local fd = c_openat(dir_fd, dname, sys.O_RDONLY | sys.O_DIRECTORY | 0x80000, 0)
+  local dirp: *sys.DIR = nilptr
+  if fd >= 0 then
+    dirp = c_fdopendir(fd)
+    if dirp == nilptr then sys.close(fd) end
+  end
+  if dirp == nilptr then return result, -1 end
+  while true do
+    local dp = sys.readdir(dirp)
+    if dp == nilptr then break end
+    local name = sys.cstr(&dp.d_name)
+    if #name < baselen + 4 then continue end
+    local match = true
+    for k = 0, baselen + 1 do
+      if buf[base_offset + 1 + k] ~= name:byte(k + 1) then match = false; break end
+    end
+    if not match then continue end
+    local p = baselen + 3 -- 1-based index into name of the version's first digit
+    local c0 = name:byte(p)
+    if not (c0 >= 49 and c0 <= 57) then continue end
+    local all_9s = c0 == 57
+    local versionlen = 1
+    while p + versionlen <= #name and name:byte(p + versionlen) >= 48 and name:byte(p + versionlen) <= 57 do
+      all_9s = all_9s and name:byte(p + versionlen) == 57
+      versionlen = versionlen + 1
+    end
+    if not (p + versionlen == #name and name:byte(p + versionlen) == 126) then continue end
+    local ok = versionlenmax < versionlen
+    if not ok and versionlenmax == versionlen then
+      -- memcmp (buf + filelen + 2, p, versionlen) <= 0
+      local cmp = 0
+      for k = 0, versionlen - 1 do
+        local a: integer = filelen + 3 + k <= #buf and buf[filelen + 3 + k] or 0
+        local b = name:byte(p + k)
+        if a ~= b then cmp = a < b and -1 or 1; break end
+      end
+      ok = cmp <= 0
+    end
+    if not ok then continue end
+    versionlenmax = (all_9s and 1 or 0) + versionlen
+    result = all_9s and BACKUP_IS_LONGER or BACKUP_IS_SAME_LENGTH
+    buf:resize(filelen)
+    buf:push(46); buf:push(126)
+    if all_9s then buf:push(48) end
+    for k = 0, versionlen do buf:push(name:byte(p + k)) end -- digits and '~'
+    -- add 1 to the version number
+    local q = #buf - 1
+    while buf[q] == 57 do buf[q] = 48; q = q - 1 end
+    buf[q] = buf[q] + 1
+  end
+  local dfd = fd
+  sys.closedir(dirp)
+  return result, dfd
+end
+
+-- check_extension: names over 14 bytes are checked against NAME_MAX of the
+-- directory and cut to fit with E as the last byte.
+local function check_extension(buf: *sequence(byte), filelen: integer, e: byte, dir_fd: cint, have_dir: boolean): boolean
+  local sb: stringbuilder
+  for i = 1, #buf do sb:writebyte(buf[i]) end
+  local s = sb:promote()
+  local base = last_component_off(s)
+  local baselen = base_len(s, base)
+  local baselen_max = 255
+  if 14 < baselen then
+    sys.seterrno(0)
+    local name_max: clong
+    if not have_dir then
+      local dir = s:sub(1, base - 1) .. '.'
+      name_max = c_pathconf(dir, 3)
+    else
+      name_max = c_fpathconf(dir_fd, 3)
+    end
+    if sys.errno() == 0 then name_max = name_max - 1 end
+    baselen_max = name_max >= 0 and name_max or (name_max < -1 and 14 or 0x7fffffff)
+  end
+  if baselen <= baselen_max then return true end
+  local bl = filelen + 1 - base
+  if baselen_max <= bl then bl = baselen_max - 1 end
+  buf:resize(base - 1 + bl)
+  buf:push(e)
+  return false
+end
+
+-- backupfile_internal without the rename: the backup name, relative to DIR_FD.
+function backup.find_name(dir_fd: cint, file: string, btype: integer): string
+  if not have_simple_suffix then backup.set_simple_suffix('', false) end
+  local base_offset = last_component_off(file) - 1
+  local filelen = base_offset + base_len(file, base_offset + 1)
+  local buf: sequence(byte)
+  for i = 1, filelen do buf:push(file:byte(i)) end
+  if btype == backup.SIMPLE then
+    for i = 1, #simple_suffix do buf:push(simple_suffix:byte(i)) end
+  else
+    local r, _ = numbered_backup(dir_fd, &buf, filelen, base_offset)
+    if r == BACKUP_IS_NEW and btype == backup.EXISTING then
+      buf:resize(filelen)
+      for i = 1, #simple_suffix do buf:push(simple_suffix:byte(i)) end
+    end
+    if r == BACKUP_IS_NEW or r == BACKUP_IS_LONGER then
+      check_extension(&buf, filelen, 126, dir_fd, false)
+    end
+  end
+  local sb: stringbuilder
+  for i = 1, #buf do sb:writebyte(buf[i]) end
+  return sb:promote()
+end

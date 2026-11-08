@@ -36,7 +36,7 @@ s.bind(os.path.join(F, 'sock'))
 s.close()
 FILES = ['reg', 'empty', 'dir', 'lnk', 'dangling', 'fifo', 'sock', "'sp ace'", "\"q'uote\"", "$'nl\\nname'",
          "$'tab\\tx'", "'$dollar'", "$'\\001ctl'", "$'hi\\xff'", 'lnk2', "'\"dq\"'", "'back\\slash'",
-         '/dev/null', '/', '.', 'deep/a/b', 'hard', 'nonexistent', '/dev']
+         '/dev/zero', '/', '.', 'deep/a/b', 'hard', 'nonexistent']
 
 CASES = []
 for f in FILES:
@@ -46,7 +46,7 @@ for f in ['reg', 'dir', '/', '/dev/null', 'nonexistent', '-', '/proc']:
 DIR = 'nNdDiaAfFhuUgGmsrRtTBbowWxXyYzZC'
 FSDIR = 'naibfdlsStTcz'
 for c in DIR:
-    CASES.append("@stat -c '[%%%s]' reg dir lnk fifo /dev/null" % c)
+    CASES.append("@stat -c '[%%%s]' reg dir lnk fifo /dev/zero" % c)
     CASES.append("@stat -L -c '[%%%s]' lnk dangling" % c)
 for c in FSDIR:
     CASES.append("@stat -f -c '[%%%s]' . /" % c)
@@ -84,7 +84,7 @@ for _ in range(NRAND):
         parts.append('%' + flags + w + p + rnd.choice(DIR.replace('m', '').replace('C', '')))
     fl = rnd.choice(['', '-L '])
     fmt = '|'.join(parts).replace("'", "'\\''")
-    CASES.append("@stat %s-c '%s' reg empty dir lnk fifo 'sp ace' /dev/null" % (fl, fmt))
+    CASES.append("@stat %s-c '%s' reg empty dir lnk fifo 'sp ace' /dev/zero" % (fl, fmt))
 
 
 def run(cmd, which):

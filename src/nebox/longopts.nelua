@@ -38,14 +38,6 @@ global longopts.mv: []util.LongOpt = {
   {'target-directory', 1, util.UNSUPPORTED}, {'update', 0, util.UNSUPPORTED}, {'verbose', 0, 118},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
-global longopts.ln: []util.LongOpt = {
-  {'backup', 2, util.UNSUPPORTED}, {'directory', 0, util.UNSUPPORTED}, {'no-dereference', 0, 110},
-  {'no-target-directory', 0, 84}, {'force', 0, 102}, {'interactive', 0, util.UNSUPPORTED},
-  {'suffix', 1, util.UNSUPPORTED}, {'target-directory', 1, util.UNSUPPORTED},
-  {'logical', 0, util.UNSUPPORTED}, {'physical', 0, util.UNSUPPORTED},
-  {'relative', 0, util.UNSUPPORTED}, {'symbolic', 0, 115}, {'verbose', 0, 118},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
-}
 global longopts.touch: []util.LongOpt = {
   {'time', 1, 200}, {'no-create', 0, 99}, {'date', 1, 100}, {'reference', 1, 114},
   {'no-dereference', 0, 104}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},

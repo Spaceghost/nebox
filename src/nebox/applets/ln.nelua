@@ -1,0 +1,427 @@
+-- ln: a port of GNU coreutils 9.1 src/ln.c with gnulib force-link.c. Hard
+-- and symbolic links, -b/--backup[=CONTROL] and -S (src/nebox/backup.nelua),
+-- -d/-F, -f, -i, -L/-P, -n, -r (canonical names through relpath), -s,
+-- -t/-T, -v; the atomic first attempt, "same file" and "just-created"
+-- checks, replacement through a temporary name renamed over the old one,
+-- and un-backup when the new link fails.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.backup'
+require 'nebox.canonicalize'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_linkat(ofd: cint, old: cstring, nfd: cint, new: cstring, flags: cint): cint <cimport 'linkat', cinclude '<unistd.h>'> end
+local function c_symlinkat(target: cstring, nfd: cint, new: cstring): cint <cimport 'symlinkat', cinclude '<unistd.h>'> end
+local function c_renameat(ofd: cint, old: cstring, nfd: cint, new: cstring): cint <cimport 'renameat', cinclude '<stdio.h>'> end
+local function c_unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
+local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
+local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+
+local AT_FDCWD: cint <comptime> = -100
+local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
+local AT_SYMLINK_FOLLOW: cint <comptime> = 0x400
+local O_PATH: cint <comptime> = 0x200000
+local ENOENT: cint <comptime> = 2
+local EEXIST: cint <comptime> = 17
+local ENOTDIR: cint <comptime> = 20
+local EINVAL: cint <comptime> = 22
+local EMLINK: cint <comptime> = 31
+local ENOSPC: cint <comptime> = 28
+local EROFS: cint <comptime> = 30
+local EDQUOT: cint <comptime> = 122
+local ENAMETOOLONG: cint <comptime> = 36
+
+local symbolic_link = false
+local relative = false
+local logical = false
+local remove_existing_files = false
+local interactive = false
+local verbose = false
+local hard_dir_link = false
+local dereference_dest_dir_symlinks = true
+local backup_type: integer = backup.NONE
+local use_dest_set = false
+
+local DestInfo = @record{ name: string, ino: uint64, dev: uint64 }
+local dest_set: sequence(DestInfo)
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function die(msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit(1)
+end
+
+local function usage_fail(msg: string)
+  if #msg > 0 then util.err(msg) end
+  util.flush()
+  local m = "Try 'ln --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit(1)
+end
+
+-- stdin for yesno, buffered like stdio.
+local inbuf: [4096]byte
+local inlen: integer = 0
+local inpos: integer = 0
+local ineof = false
+local function yesno(): boolean
+  local first: integer = -1
+  local got = false
+  while true do
+    if inpos == inlen then
+      if ineof then break end
+      local r = sys.read(0, &inbuf[0], #inbuf)
+      if r < 0 and sys.errno() == sys.EINTR then continue end
+      if r <= 0 then ineof = true; break end
+      inlen = r; inpos = 0
+    end
+    local c = inbuf[inpos]
+    inpos = inpos + 1
+    if not got then first = c; got = true end
+    if c == 10 then break end
+  end
+  return first == 121 or first == 89
+end
+
+local function last_component(s: string): string
+  local i = 1
+  while i <= #s and s:byte(i) == 47 do i = i + 1 end
+  local base = i
+  local saw = false
+  while i <= #s do
+    if s:byte(i) == 47 then saw = true
+    elseif saw then base = i; saw = false end
+    i = i + 1
+  end
+  return s:sub(base)
+end
+
+local function strip_trailing_slashes(s: string): string
+  local b = #s - #last_component(s) -- bytes before the base
+  local n = #s
+  while n > b + 1 and s:byte(n) == 47 do n = n - 1 end
+  return s:sub(1, n)
+end
+
+-- gnulib dir_name (mdir_name).
+local function dir_name(s: string): string
+  local base_off = #s - #last_component(s)
+  local len = base_off
+  while len > 1 and s:byte(len) == 47 do len = len - 1 end
+  if len == 0 then
+    return (#s > 0 and s:byte(1) == 47) and '/' or '.'
+  end
+  return s:sub(1, len)
+end
+
+-- gnulib file_name_concat: (result, offset of the base in it, 1-based).
+local function file_name_concat(dir: string, base: string): (string, integer)
+  local dirbase = last_component(dir)
+  local dirbase_off = #dir - #dirbase
+  local dirbaselen = #dirbase
+  while dirbaselen > 1 and dirbase:byte(dirbaselen) == 47 do dirbaselen = dirbaselen - 1 end
+  if #dirbase == 0 then dirbaselen = 0 end
+  local dirlen = dirbase_off + dirbaselen
+  local sep = ''
+  if dirbaselen > 0 then
+    if dir:byte(dirlen) ~= 47 and not (#base > 0 and base:byte(1) == 47) then sep = '/' end
+  elseif #base > 0 and base:byte(1) == 47 then
+    sep = '.'
+  end
+  local head = dir:sub(1, dirlen) .. sep
+  return head .. base, #head + 1
+end
+
+local function convert_abs_rel(from: string, target: string): string
+  local targetdir = dir_name(target)
+  local realdest = canon.canonicalize(targetdir, canon.CAN_MISSING)
+  local realfrom = canon.canonicalize(from, canon.CAN_MISSING)
+  if #realdest > 0 and #realfrom > 0 then
+    local sb: stringbuilder
+    if canon.relpath(realfrom, realdest, &sb) then
+      local r = sb:promote()
+      if #r < 4096 then return r end
+    end
+  end
+  return from
+end
+
+local function errnoize(r: cint): cint
+  if r == 0 then return 0 end
+  return sys.errno()
+end
+
+local function atomic_link(source: string, destdir_fd: cint, dest_base: string): cint
+  if symbolic_link then
+    if relative then return -1 end
+    return errnoize(c_symlinkat(source, destdir_fd, dest_base))
+  end
+  return errnoize(c_linkat(AT_FDCWD, source, destdir_fd, dest_base, logical and AT_SYMLINK_FOLLOW or 0))
+end
+
+-- samedir_template + try_tempname: a fresh "CuXXXXXX" name beside DSTNAME.
+local tmpcounter: uint64 = 0
+local function temp_beside(dstname: string): string
+  local dir = dstname:sub(1, #dstname - #last_component(dstname))
+  local letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  local r: [8]byte
+  sys.getrandom(&r, 8, 0)
+  local v: uint64 = 0
+  for i = 0, 7 do v = (v << 8) | r[i] end
+  tmpcounter = tmpcounter + 1
+  v = v + tmpcounter
+  local sb: stringbuilder
+  sb:write(dir); sb:write('Cu')
+  for _ = 1, 6 do sb:writebyte(letters:byte((@integer)(v % 62) + 1)); v = v // 62 end
+  return sb:promote()
+end
+
+-- force_symlinkat / force_linkat: -1 when the link replaced DSTNAME.
+local function force_link(symlink: boolean, srcname: string, dstdir: cint, dstname: string, flags: cint, force: boolean, err: cint): cint
+  if err < 0 then
+    if symlink then err = errnoize(c_symlinkat(srcname, dstdir, dstname))
+    else err = errnoize(c_linkat(AT_FDCWD, srcname, dstdir, dstname, flags)) end
+  end
+  if not force or err ~= EEXIST then return err end
+  local tmp: string
+  local made = false
+  for _ = 1, 100 do
+    tmp = temp_beside(dstname)
+    local r: cint
+    if symlink then r = c_symlinkat(srcname, dstdir, tmp)
+    else r = c_linkat(AT_FDCWD, srcname, dstdir, tmp, flags) end
+    if r == 0 then made = true; break end
+    if sys.errno() ~= EEXIST then return sys.errno() end
+  end
+  if not made then return EEXIST end
+  local res: cint = c_renameat(dstdir, tmp, dstdir, dstname) == 0 and -1 or sys.errno()
+  c_unlinkat(dstdir, tmp, 0)
+  return res
+end
+
+local function seen_file(name: string, st: *sys.Stat): boolean
+  for i = 1, #dest_set do
+    local e = &dest_set[i]
+    if e.name == name and e.ino == st.st_ino and e.dev == st.st_dev then return true end
+  end
+  return false
+end
+
+-- gnulib same_nameat: same base name in the same directory.
+local function same_nameat(source: string, destdir_fd: cint, dest_base: string): boolean
+  if last_component(source) ~= last_component(dest_base) then return false end
+  local a: sys.Stat
+  local b: sys.Stat
+  if c_fstatat(AT_FDCWD, dir_name(source), &a, 0) ~= 0 then return false end
+  if c_fstatat(destdir_fd, dir_name(dest_base), &b, 0) ~= 0 then return false end
+  return a.st_dev == b.st_dev and a.st_ino == b.st_ino
+end
+
+local function do_link(source: string, destdir_fd: cint, dest_base: string, dest: string, link_errno: cint): boolean
+  local source_stats: sys.Stat
+  local source_status: cint = 1
+  local backup_base = ''
+  local have_backup = false
+  local nofollow_flag: cint = logical and 0 or AT_SYMLINK_NOFOLLOW
+  if link_errno < 0 then link_errno = atomic_link(source, destdir_fd, dest_base) end
+  if (link_errno ~= 0 or use_dest_set) and not symbolic_link then
+    source_status = c_fstatat(AT_FDCWD, source, &source_stats, nofollow_flag)
+    if source_status ~= 0 then
+      util.err(errno_msg('failed to access ' .. util.quoteaf(source), sys.errno()))
+      return false
+    end
+  end
+  if link_errno ~= 0 then
+    if not symbolic_link and not hard_dir_link and (source_stats.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+      util.err(util.quotef(source) .. ': hard link not allowed for directory')
+      return false
+    end
+    if relative then source = convert_abs_rel(source, dest) end
+    local force = remove_existing_files or interactive or backup_type ~= backup.NONE
+    if force then
+      local dest_stats: sys.Stat
+      if c_fstatat(destdir_fd, dest_base, &dest_stats, AT_SYMLINK_NOFOLLOW) ~= 0 then
+        if sys.errno() ~= ENOENT then
+          util.err(errno_msg('failed to access ' .. util.quoteaf(dest), sys.errno()))
+          return false
+        end
+        force = false
+      elseif (dest_stats.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+        util.err(util.quotef(dest) .. ': cannot overwrite directory')
+        return false
+      elseif use_dest_set and seen_file(dest, &dest_stats) then
+        util.err('will not overwrite just-created ' .. util.quoteaf(dest) .. ' with ' .. util.quoteaf(source))
+        return false
+      else
+        local check = backup_type ~= backup.NONE and not symbolic_link or (backup_type == backup.NONE and remove_existing_files)
+        if check then
+          if source_status ~= 0 then source_status = sys.stat(source, &source_stats) end
+          if source_status == 0 and source_stats.st_dev == dest_stats.st_dev and source_stats.st_ino == dest_stats.st_ino
+              and (source_stats.st_nlink == 1 or same_nameat(source, destdir_fd, dest_base)) then
+            util.err(util.quoteaf(source) .. ' and ' .. util.quoteaf(dest) .. ' are the same file')
+            return false
+          end
+        end
+        if link_errno < 0 or link_errno == EEXIST then
+          if interactive then
+            util.flush()
+            local m = 'ln: replace ' .. util.quoteaf(dest) .. '? '
+            sys.write(2, m.data, m.size)
+            if not yesno() then return true end
+          end
+          if backup_type ~= backup.NONE then
+            backup_base = backup.find_name(destdir_fd, dest_base, backup_type)
+            have_backup = true
+            if c_renameat(destdir_fd, dest_base, destdir_fd, backup_base) ~= 0 then
+              local e = sys.errno()
+              have_backup = false
+              if e ~= ENOENT then
+                util.err(errno_msg('cannot backup ' .. util.quoteaf(dest), e))
+                return false
+              end
+              force = false
+            end
+          end
+        end
+      end
+    end
+    link_errno = force_link(symbolic_link, source, destdir_fd, dest_base, logical and AT_SYMLINK_FOLLOW or 0, force, link_errno)
+  end
+  if link_errno <= 0 then
+    if not symbolic_link and use_dest_set then
+      dest_set:push({name = dest, ino = source_stats.st_ino, dev = source_stats.st_dev})
+    end
+    if verbose then
+      local qb, sep = '', ''
+      if have_backup then
+        local destdirlen = #dest - #dest_base
+        qb = util.quoteaf(destdirlen > 0 and dest:sub(1, destdirlen) .. backup_base or backup_base)
+        sep = ' ~ '
+      end
+      util.write(qb .. sep .. util.quoteaf(dest) .. (symbolic_link and ' -> ' or ' => ') .. util.quoteaf(source) .. '\n')
+    end
+  else
+    local msg: string
+    if symbolic_link then
+      if link_errno ~= ENAMETOOLONG and #source > 0 then msg = 'failed to create symbolic link ' .. util.quoteaf(dest)
+      else msg = 'failed to create symbolic link ' .. util.quoteaf(dest) .. ' -> ' .. util.quoteaf(source) end
+    elseif link_errno == EMLINK then msg = 'failed to create hard link to ' .. util.quoteaf(source)
+    elseif link_errno == EDQUOT or link_errno == EEXIST or link_errno == ENOSPC or link_errno == EROFS then
+      msg = 'failed to create hard link ' .. util.quoteaf(dest)
+    else
+      msg = 'failed to create hard link ' .. util.quoteaf(dest) .. ' => ' .. util.quoteaf(source)
+    end
+    util.err(errno_msg(msg, link_errno))
+    if have_backup then
+      if c_renameat(destdir_fd, backup_base, destdir_fd, dest_base) ~= 0 then
+        util.err(errno_msg('cannot un-backup ' .. util.quoteaf(dest), sys.errno()))
+      end
+    end
+  end
+  return link_errno <= 0
+end
+
+global function applet_ln(args: sequence(string)): integer
+  local make_backups = false
+  local backup_suffix = ''
+  local have_suffix = false
+  local version_control = ''
+  local have_vc = false
+  local target_directory = ''
+  local have_target = false
+  local destdir_fd: cint = AT_FDCWD
+  local no_target_directory = false
+  local link_errno: cint = -1
+  local longs: []util.LongOpt = {
+    {'backup', 2, 98}, {'directory', 0, 70}, {'no-dereference', 0, 110},
+    {'no-target-directory', 0, 84}, {'force', 0, 102}, {'interactive', 0, 105},
+    {'suffix', 1, 83}, {'target-directory', 1, 116}, {'logical', 0, 76}, {'physical', 0, 80},
+    {'relative', 0, 114}, {'symbolic', 0, 115}, {'verbose', 0, 118},
+    {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  }
+  local g = util.getopt(args, 'bdfinrst:vFLPS:T', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 63 then usage_fail(g.errmsg) end
+    if c == util.UNSUPPORTED then usage_fail("option '--" .. g.longname .. "' is not supported") end
+    if c == 98 then
+      make_backups = true
+      if g.has_optarg then version_control = g.optarg; have_vc = true end
+    elseif c == 100 or c == 70 then hard_dir_link = true
+    elseif c == 102 then remove_existing_files = true; interactive = false
+    elseif c == 105 then remove_existing_files = false; interactive = true
+    elseif c == 76 then logical = true
+    elseif c == 110 then dereference_dest_dir_symlinks = false
+    elseif c == 80 then logical = false
+    elseif c == 114 then relative = true
+    elseif c == 115 then symbolic_link = true
+    elseif c == 116 then
+      if have_target then die('multiple target directories specified') end
+      local st: sys.Stat
+      if sys.stat(g.optarg, &st) ~= 0 then die(errno_msg('failed to access ' .. util.quoteaf(g.optarg), sys.errno())) end
+      if (st.st_mode & sys.S_IFMT) ~= sys.S_IFDIR then die('target ' .. util.quoteaf(g.optarg) .. ' is not a directory') end
+      target_directory = g.optarg; have_target = true
+    elseif c == 84 then no_target_directory = true
+    elseif c == 118 then verbose = true
+    elseif c == 83 then make_backups = true; backup_suffix = g.optarg; have_suffix = true
+    end
+  end
+  local file = g:operands()
+  local n_files = #file
+  if n_files <= 0 then usage_fail('missing file operand') end
+  if relative and not symbolic_link then die('cannot do --relative without --symbolic') end
+  if no_target_directory then
+    if have_target then die('cannot combine --target-directory and --no-target-directory') end
+    if n_files ~= 2 then
+      if n_files < 2 then usage_fail('missing destination file operand after ' .. util.quoteaf(file[1])) end
+      usage_fail('extra operand ' .. util.quoteaf(file[3]))
+    end
+  elseif n_files < 2 and not have_target then
+    target_directory = '.'; have_target = true
+    destdir_fd = AT_FDCWD
+  else
+    if n_files == 2 and not have_target then link_errno = atomic_link(file[1], AT_FDCWD, file[2]) end
+    if link_errno < 0 or link_errno == EEXIST or link_errno == ENOTDIR or link_errno == EINVAL then
+      local d = have_target and target_directory or file[n_files]
+      local flags = O_PATH | sys.O_DIRECTORY | (dereference_dest_dir_symlinks and 0 or sys.O_NOFOLLOW)
+      destdir_fd = c_openat(AT_FDCWD, d, flags, 0)
+      local err = sys.errno()
+      if destdir_fd >= 0 then
+        if not have_target then n_files = n_files - 1 end
+        target_directory = d; have_target = true
+      elseif not (n_files == 2 and not have_target) then
+        die(errno_msg('target ' .. util.quoteaf(d), err))
+      end
+    end
+  end
+  backup_type = make_backups and backup.xget_version('backup type', version_control, have_vc) or backup.NONE
+  backup.set_simple_suffix(backup_suffix, have_suffix)
+  local ok = true
+  if have_target then
+    if 2 <= n_files and remove_existing_files and not symbolic_link and backup_type ~= backup.NUMBERED then
+      use_dest_set = true
+    end
+    for i = 1, n_files do
+      local dest, boff = file_name_concat(target_directory, last_component(file[i]))
+      dest = dest:sub(1, boff - 1) .. strip_trailing_slashes(dest:sub(boff))
+      local dest_base = dest:sub(boff)
+      if not do_link(file[i], destdir_fd, dest_base, dest, -1) then ok = false end
+    end
+  else
+    ok = do_link(file[1], AT_FDCWD, file[2], file[2], link_errno)
+  end
+  if inpos < inlen then sys.lseek(0, -(inlen - inpos), sys.SEEK_CUR) end
+  if not util.flush() then util.err(errno_msg('write error', sys.errno())); return 1 end
+  return ok and 0 or 1
+end
