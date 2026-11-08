@@ -388,11 +388,10 @@ def norm(r, s):
     return rc, NS_RE.sub(rb'\1N\2', out), FINAL_RE.sub(rb'\1N\2', err)
 
 
-# Known differences, run and reported but not counted: nelibc's localtime_r
-# fails for the last representable year (tm_year INT_MAX) in a zone west
-# of UTC, where the UTC year has already overflowed.
-KNOWN = [('America/New_York', 'date -d @67768036191676800'),
-         ('America/New_York', "date -d '2147485547-12-31 23:59:59' +%s")]
+# The last representable year west of UTC (nelibc's localtime_r once failed
+# there; fixed in nelibc f5f5557).
+CASES += [('America/New_York', 'date -d @67768036191676800', False),
+          ('America/New_York', "date -d '2147485547-12-31 23:59:59' +%s", False)]
 # glibc applies a POSIX TZ rule (a TZ string, or a zone file's footer past
 # its last transition) only from 1970: earlier times are standard time.
 # Its rule arithmetic also overflows int past year 5885487. nelibc applies
@@ -439,14 +438,7 @@ for tz, cmd, now in CASES:
                 if x != y:
                     print('  %s gnu:   %r' % (name, x if isinstance(x, int) else x[:1500]))
                     print('  %s nebox: %r' % (name, y if isinstance(y, int) else y[:1500]))
-known = 0
-for tz, cmd in KNOWN:
-    g, n = run(tz, cmd, 'gnu'), run(tz, cmd, 'nb')
-    if g != n:
-        known += 1
-    else:
-        print('KNOWN DIFFERENCE GONE: TZ=%s %s' % (tz, cmd))
-print('date_compare: %d cases, %d mismatches (%d rerun in Asia/Tokyo for glibc POSIX-rule years; %d known nelibc differences)'
-      % (len(CASES), bad, rerun, known))
+print('date_compare: %d cases, %d mismatches (%d rerun in Asia/Tokyo for glibc POSIX-rule years)'
+      % (len(CASES), bad, rerun))
 shutil.rmtree(d)
 sys.exit(1 if bad else 0)

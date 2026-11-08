@@ -852,11 +852,6 @@ Stated here rather than worked around:
   seeds with 12000 random strings each also gave 0. -f with 100000 lines
   (30000 with `--debug` or invalid lines) stayed near 8 MB resident.
   Differences:
-  - nelibc's localtime_r fails for the last year time_t can show (tm_year
-    INT_MAX) in a zone west of UTC, where the UTC year has already
-    overflowed: `TZ=America/New_York date -d @67768036191676800` is "out of
-    range" where GNU prints year 2147485547. The test runs the two such
-    cases and reports them as known differences.
   - glibc applies a POSIX TZ rule (a TZ string such as
     `EST5EDT,M3.2.0,M11.1.0`, or a zone file's footer after its last
     transition) only from 1970, so earlier times are standard time there,
