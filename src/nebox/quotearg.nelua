@@ -236,10 +236,12 @@ function quotearg.restyled(arg: string, style: integer, flags: integer, qtt: *[2
     if q.force then
       local st = q.style
       if st == quotearg.SHELL_ALWAYS and backslash_escapes then st = quotearg.SHELL_ESCAPE_ALWAYS end
+      q.out:destroy()
       return quotearg.restyled(arg, st, flags & ~quotearg.ELIDE_OUTER_QUOTES, nilptr)
     end
     if q.style == quotearg.SHELL_ALWAYS and not q.elide and encountered_single_quote then
       if all_compat then
+        q.out:destroy()
         return quotearg.restyled(arg, quotearg.C, flags, qtt)
       elseif scanning then
         scanning = false
@@ -251,6 +253,7 @@ function quotearg.restyled(arg: string, style: integer, flags: integer, qtt: *[2
   end
   local sb: stringbuilder
   for i = 1, #q.out do sb:writebyte(q.out[i]) end
+  q.out:destroy()
   if #quote_string > 0 and not q.elide then sb:write(quote_string) end
   return sb:promote()
 end

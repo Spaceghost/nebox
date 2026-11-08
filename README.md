@@ -42,12 +42,12 @@ stdout, exit status, and the resulting directory tree.
 
 ```
 [ awk b2sum base32 base64 basename basenc cat chgrp chmod chown cksum cmp comm
-cp cut date df dirname du echo env expand expr factor false find fold free
+cp cut date df dir dirname du echo env expand expr factor false find fold free
 grep groups head hexdump hostname id install join kill link ln ls md5sum mkdir
 mktemp mv nl nproc nsh od paste patch printenv printf pwd readlink realpath
 rev rm rmdir sed seq sh sha1sum sha224sum sha256sum sha384sum sha512sum shuf
 sleep sort split stat strings sum sync tac tail tee test timeout touch tr true
-truncate tsort tty uname unexpand uniq unlink wc which whoami xargs yes
+truncate tsort tty uname unexpand uniq unlink vdir wc which whoami xargs yes
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
@@ -720,30 +720,57 @@ Stated here rather than worked around:
   DST flag), and month names (`D MON Y`, `MON D`, `D-MON-Y`). Against GNU
   date 9.1 (`date-d-*`). Not understood: ordinal words, `week` numbers, named zones other than UTC/GMT, `DST`. No
   `-I`, `--rfc-3339`, `-f`, long options, or setting the date.
-- `ls` follows GNU ls 9.1 in the C locale with the options
-  `-1 -a -A -B -c -C -d -F -g -G -h -i -I PATTERN -k -l -m -n -N -o -p -q
-  -r -R -s -S -t -T COLS -u -v -w COLS -x -X`, permuted as getopt does:
-  the last of -C -x -m -l -1 picks the format (-1 does not undo -l), the
-  column layout is GNU's calculate_columns (columns at least 3 wide, filled
-  down for -C and across for -x, tab stops every 8 or `-T`/`TABSIZE`),
-  the width comes from -w (0 for no limit), else `COLUMNS` (an invalid
-  value is ignored with GNU's warning), else 80; -s/-i fields are padded
-  per listing; widths cover every command-line operand, directories
-  included; only printable bytes count toward a name's width; -q shows
-  them as `?`; -F marks `/ * @ | =` and, with -l, the symlink target's
-  type; command-line symlinks to directories are followed unless -d, -F
-  or -l; -c/-u sort by that time when -l is absent; -I uses FNM_PERIOD
-  (`ls-C-*`, `ls-s*`, `ls-i-columns`, `ls-sort-X-v`, `ls-u-c`, `ls-I-B`,
-  `ls-q`, `ls-lF`, `ls-l-dev`). -k changes nothing because `BLOCK_SIZE`
-  and `LS_BLOCK_SIZE` are not read. Not implemented: -f and -U (directory
-  order), -L and -H, -Q -b and the other quoting styles, -Z, --color and
-  every long option, ACL and SELinux markers, locales. On a terminal ls
-  defaults to -C with the width from COLUMNS or the terminal, but names
-  are not quoted as GNU quotes them there; no case covers it (the harness
-  has no terminal). `-l` shows the year instead of the time for files older than
-  six months or in the future, as GNU does (`ls-l-tz`). `-l` and `id`
-  resolve names by reading `/etc/passwd` and `/etc/group` directly (nelibc
-  has no `getpwuid`); unknown ids print as numbers.
+- `ls`, `dir` and `vdir` port GNU coreutils 9.1 `src/ls.c` in the C locale
+  (`src/nebox/applets/ls.nelua`): every option and long option with
+  getopt_long's abbreviation rules and ls's XARGMATCH/argmatch messages
+  (exit 1) and line-width, tab-size, block-size and time-style errors
+  (exit 2); `dir` defaults to -C and escape quoting, `vdir` to -l. Ported
+  as written: gobble_file's stat/lstat decisions (-L, -H,
+  `--dereference-command-line-symlink-to-dir` and the default of following
+  command-line symlinks to directories unless -d, -F or -l), d_type use,
+  "cannot access" entries shown with `?` fields, print_dir with the -R
+  dev/ino loop check ("not listing already-listed directory") and its
+  marker entries, the -1 -U streaming case, extract_dirs_from_files, the
+  sort variants (-t -S -X -v -U -f -r, `--sort=width`, `--time=`
+  atime/ctime/birth through statx, `--group-directories-first`) over
+  gnulib's mpsort, calculate_columns and the -C/-x/-m printers with tab
+  indentation, print_long_format's column widths, the "total" line,
+  recent/old timestamps (six months, future times, years that do not fit
+  printed as seconds), `--time-style` (full-iso, long-iso, iso, locale,
+  `+FORMAT` with the two-format newline form, `TIME_STYLE`, `posix-`) over
+  the nstrftime port, block sizes (-h, `--si`, -k, `--block-size`,
+  `LS_BLOCK_SIZE`, `BLOCK_SIZE`, `BLOCKSIZE`, `POSIXLY_CORRECT`), quoting
+  through gnulib quotearg (every `--quoting-style`, -b -Q -N, `QUOTING_STYLE`,
+  -q and `--show-control-chars`, outer-quote alignment, the indicator
+  characters quoted under `--file-type`/-F), `--dired` offsets, `--zero`,
+  `--hyperlink` (file:// URLs with the escaped host name), -Z, `--author`,
+  ACL `+` markers from the POSIX ACL xattrs as gnulib's file_has_acl reads
+  them, and `LS_COLORS` (get_funky_string's escapes including its `^?`
+  quirk, extensions, `ln=target`, `or`, `mi`, `mh`, `su`/`sg`/`tw`/`ow`/`st`,
+  `ec`/`lc`/`rc`/`rs`/`cl`, the "unrecognized prefix" and "unparsable value"
+  diagnostics; with `LS_COLORS` unset, ls.c's built-in colors when
+  `COLORTERM` is set or `TERM` matches a dircolors TERM line). On a
+  terminal it defaults to -C, -q and shell-escape quoting with the width
+  from TIOCGWINSZ. `tests/ls_compare.py`: 2464 fixed cases (46 of them on a
+  pseudo-terminal) and 400 random option combinations against GNU ls, dir
+  and vdir, 0 mismatches as an ordinary user; run as root (other owners,
+  unknown ids, a file capability) 2878 cases, 0 mismatches; a run of 2500
+  random cases with another seed also gave 0. Differences:
+  - `--help` and `--version` are refused as unsupported options (status 2).
+  - `ca`: nebox colors files that have a `security.capability` attribute,
+    as an ls built with libcap does; the GNU ls in the test container is
+    built without libcap and never does. The root run checks that this is
+    the only difference for such a file.
+  - SELinux contexts are the raw `security.selinux` attribute (no
+    libselinux translation, no SMACK); without one, -Z shows `?` and -l no
+    `.` marker, as GNU does on a system without SELinux.
+  - Only the C locale: no multibyte widths, `locale` and `posix-` styles
+    give the C formats, names compare bytewise.
+  - Files are examined with stat/lstat; statx (with AT_NO_AUTOMOUNT) is
+    used only for birth times, so listing an automount point may trigger it.
+  - The color restore on SIGINT/SIGTSTP is ported but untested: the test
+    pseudo-terminal is not a controlling terminal.
+  - User and group names come from nelibc's getpwuid/getgrgid.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `printf` (the applet and the `sh` builtin) ports printf.c: escapes
   including \u/\U (gnulib's \uXXXX fallback in the C locale), `%b`, `%q`,

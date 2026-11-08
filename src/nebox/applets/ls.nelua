@@ -1,0 +1,2596 @@
+-- ls, dir and vdir: a port of GNU coreutils 9.1 src/ls.c in the C locale.
+--
+-- The functions keep ls.c's names and control flow: decode_switches,
+-- parse_ls_color/get_funky_string, gobble_file (the same stat/lstat
+-- decisions, -L/-H/--dereference-command-line-symlink-to-dir), print_dir
+-- (readdir order, -R with the dev/ino loop check and its marker entries,
+-- the one-per-line -U streaming case), extract_dirs_from_files, the eight
+-- sort-function variants over gnulib's mpsort, calculate_columns and the
+-- column printers, print_long_format with GNU's width bookkeeping, the
+-- "total" line, --dired offsets, --hyperlink (file:// URLs with the host
+-- name and RFC 3986 escaping), quote_name/quote_name_buf over gnulib
+-- quotearg, LS_COLORS with every indicator and extension, and the signal
+-- handling that restores colors. Unibyte paths only: the C locale.
+--
+-- Capabilities are read from the security.capability xattr (ls built
+-- with libcap), SELinux contexts from security.selinux, ACLs from the
+-- POSIX ACL xattrs as gnulib's file_has_acl does on Linux.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.clock'
+require 'nebox.quotearg'
+require 'nebox.human'
+require 'nebox.canonicalize'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+local function c_getxattr(p: cstring, name: cstring, buf: pointer, n: csize): clong <cimport 'getxattr', cinclude '<sys/xattr.h>'> end
+local function c_lgetxattr(p: cstring, name: cstring, buf: pointer, n: csize): clong <cimport 'lgetxattr', cinclude '<sys/xattr.h>'> end
+local function c_fnmatch(pat: cstring, s: cstring, flags: cint): cint <cimport 'fnmatch', cinclude '<fnmatch.h>'> end
+local function c_dirfd(d: *sys.DIR): cint <cimport 'dirfd', cinclude '<dirent.h>'> end
+local function c_statx(dirfd: cint, path: cstring, flags: cint, mask: cuint, buf: pointer): cint <cimport 'statx', cinclude '<sys/stat.h>'> end
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
+local SigSet = @record{bits: [16]culong}
+local function c_sigprocmask(how: cint, set: *SigSet, old: *SigSet): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
+
+-- struct statx (the Linux UAPI layout, 256 bytes)
+local StatxTs = @record{tv_sec: int64, tv_nsec: uint32, reserved: int32}
+local Statx = @record{
+  stx_mask: uint32, stx_blksize: uint32, stx_attributes: uint64, stx_nlink: uint32, stx_uid: uint32,
+  stx_gid: uint32, stx_mode: uint16, spare0: uint16, stx_ino: uint64, stx_size: uint64, stx_blocks: uint64,
+  stx_attributes_mask: uint64, stx_atime: StatxTs, stx_btime: StatxTs, stx_ctime: StatxTs, stx_mtime: StatxTs,
+  rest: [16]uint64,
+}
+local STATX_BTIME: cuint <comptime> = 0x800
+local AT_NO_AUTOMOUNT: cint <comptime> = 0x800
+
+local ENOENT: cint <comptime> = 2
+local EINVAL: cint <comptime> = 22
+local EBUSY: cint <comptime> = 16
+local ENOSYS: cint <comptime> = 38
+local ENODATA: cint <comptime> = 61
+local EOVERFLOW: cint <comptime> = 75
+local ENOTSUP: cint <comptime> = 95
+local FNM_PERIOD: cint <comptime> = 4
+local SA_RESTART: cint <comptime> = 0x10000000
+local SIG_BLOCK: cint <comptime> = 0
+local SIG_SETMASK: cint <comptime> = 2
+local SIGSTOP: cint <comptime> = 19
+local SIZE_MAX: uint64 <comptime> = 0xffffffffffffffff
+local PTRDIFF_MAX: uint64 <comptime> = 0x7fffffffffffffff
+
+local LS_LS <comptime> = 1
+local LS_MULTI_COL <comptime> = 2
+local LS_LONG_FORMAT <comptime> = 3
+
+-- enum filetype
+local FT_UNKNOWN <comptime> = 0
+local FT_FIFO <comptime> = 1
+local FT_CHARDEV <comptime> = 2
+local FT_DIRECTORY <comptime> = 3
+local FT_BLOCKDEV <comptime> = 4
+local FT_NORMAL <comptime> = 5
+local FT_SYMLINK <comptime> = 6
+local FT_SOCK <comptime> = 7
+local FT_WHITEOUT <comptime> = 8
+local FT_ARG_DIRECTORY <comptime> = 9
+local filetype_letter = '?pcdb-lswd'
+
+local ACL_T_NONE <comptime> = 0
+local ACL_T_LSM_CONTEXT_ONLY <comptime> = 1
+local ACL_T_YES <comptime> = 2
+
+-- enum format
+local long_format <comptime> = 0
+local one_per_line <comptime> = 1
+local many_per_line <comptime> = 2
+local horizontal <comptime> = 3
+local with_commas <comptime> = 4
+
+-- enum time_type
+local time_mtime <comptime> = 0
+local time_ctime <comptime> = 1
+local time_atime <comptime> = 2
+local time_btime <comptime> = 3
+
+-- enum sort_type
+local sort_name <comptime> = 0
+local sort_extension <comptime> = 1
+local sort_width <comptime> = 2
+local sort_size <comptime> = 3
+local sort_version <comptime> = 4
+local sort_time <comptime> = 5
+local sort_none <comptime> = 6
+
+-- enum indicator_style
+local IND_NONE <comptime> = 0
+local IND_SLASH <comptime> = 1
+local IND_FILE_TYPE <comptime> = 2
+local IND_CLASSIFY <comptime> = 3
+
+local when_never <comptime> = 0
+local when_always <comptime> = 1
+local when_if_tty <comptime> = 2
+
+local DEREF_UNDEFINED <comptime> = 0
+local DEREF_NEVER <comptime> = 1
+local DEREF_COMMAND_LINE_ARGUMENTS <comptime> = 2
+local DEREF_COMMAND_LINE_SYMLINK_TO_DIR <comptime> = 3
+local DEREF_ALWAYS <comptime> = 4
+
+-- enum indicator_no
+local C_LEFT <comptime> = 0
+local C_RIGHT <comptime> = 1
+local C_END <comptime> = 2
+local C_RESET <comptime> = 3
+local C_NORM <comptime> = 4
+local C_FILE <comptime> = 5
+local C_DIR <comptime> = 6
+local C_LINK <comptime> = 7
+local C_FIFO <comptime> = 8
+local C_SOCK <comptime> = 9
+local C_BLK <comptime> = 10
+local C_CHR <comptime> = 11
+local C_MISSING <comptime> = 12
+local C_ORPHAN <comptime> = 13
+local C_EXEC <comptime> = 14
+local C_DOOR <comptime> = 15
+local C_SETUID <comptime> = 16
+local C_SETGID <comptime> = 17
+local C_STICKY <comptime> = 18
+local C_OTHER_WRITABLE <comptime> = 19
+local C_STICKY_OTHER_WRITABLE <comptime> = 20
+local C_CAP <comptime> = 21
+local C_MULTIHARDLINK <comptime> = 22
+local C_CLR_TO_EOL <comptime> = 23
+local N_INDICATORS <comptime> = 24
+local indicator_name: [24]string = {
+  'lc', 'rc', 'ec', 'rs', 'no', 'fi', 'di', 'ln', 'pi', 'so',
+  'bd', 'cd', 'mi', 'or', 'ex', 'do', 'su', 'sg', 'st',
+  'ow', 'tw', 'ca', 'mh', 'cl',
+}
+-- FILETYPE_INDICATORS, indexed by enum filetype
+local filetype_indicator: [10]integer = {
+  C_ORPHAN, C_FIFO, C_CHR, C_DIR, C_BLK, C_FILE, C_LINK, C_SOCK, C_FILE, C_DIR,
+}
+
+local IGNORE_DEFAULT <comptime> = 0
+local IGNORE_DOT_AND_DOTDOT <comptime> = 1
+local IGNORE_MINIMAL <comptime> = 2
+
+local MIN_COLUMN_WIDTH <comptime> = 3
+local TIME_STAMP_LEN_MAXIMUM <comptime> = 1000
+
+local S_IXUGO: cuint <comptime> = 0x49
+local S_ISUID: cuint <comptime> = 0x800
+local S_ISGID: cuint <comptime> = 0x400
+local S_ISVTX: cuint <comptime> = 0x200
+local S_IWOTH: cuint <comptime> = 0x2
+
+-- A length/buffer string; SET is false for a NULL string.
+local BinStr = @record{s: string, set: boolean}
+
+local FileInfo = @record{
+  name: string,
+  linkname: string, has_linkname: boolean,
+  absolute_name: string, has_absolute_name: boolean,
+  stat: sys.Stat,
+  filetype: integer,
+  linkmode: cuint,
+  scontext: string,
+  stat_ok: boolean,
+  linkok: boolean,
+  acl_type: integer,
+  has_capability: boolean,
+  quoted: integer,
+  width: integer,
+}
+
+local Pending = @record{
+  name: string, has_name: boolean,
+  realname: string, has_realname: boolean,
+  command_line_arg: boolean,
+}
+
+local DevIno = @record{dev: culong, ino: culong}
+local ColorExt = @record{ext: string, seq: BinStr}
+local IdName = @record{id: cuint, name: string, found: boolean}
+
+---------------------------------------------------------------------------
+-- State (ls.c's static variables)
+
+local ls_mode: integer = LS_LS
+local exit_status: integer = 0
+local print_dir_name: boolean = true
+local format: integer = 0
+local time_type: integer = time_mtime
+local sort_type: integer = sort_name
+local sort_reverse: boolean = false
+local print_owner: boolean = true
+local print_author: boolean = false
+local print_group: boolean = true
+local numeric_ids: boolean = false
+local print_block_size: boolean = false
+local human_output_opts: integer = 0
+local output_block_size: uint64 = 0
+local file_human_output_opts: integer = 0
+local file_output_block_size: uint64 = 1
+local dired: boolean = false
+local indicator_style: integer = IND_NONE
+local print_with_color: boolean = false
+local print_hyperlink: boolean = false
+local used_color: boolean = false
+local check_symlink_mode: boolean = false
+local print_inode: boolean = false
+local dereference: integer = DEREF_UNDEFINED
+local recursive: boolean = false
+local immediate_dirs: boolean = false
+local directories_first: boolean = false
+local ignore_mode: integer = IGNORE_DEFAULT
+local ignore_patterns: sequence(string)
+local hide_patterns: sequence(string)
+local qmark_funny_chars: boolean = false
+local filename_qs: integer = quotearg.LITERAL
+local filename_qtt: [256]boolean
+local dirname_qs: integer = quotearg.LITERAL
+local dirname_qtt: [256]boolean
+local tabsize: integer = 0
+local line_length: integer = 0
+local max_idx: integer = 0
+local format_needs_stat: boolean = false
+local format_needs_type: boolean = false
+local long_time_format: [2]string = {'%b %e  %Y', '%b %e %H:%M'}
+local eolbyte: byte = 10
+local print_scontext: boolean = false
+local any_has_acl: boolean = false
+local inode_number_width: integer = 0
+local block_size_width: integer = 0
+local nlink_width: integer = 0
+local scontext_width: integer = 0
+local owner_width: integer = 0
+local group_width: integer = 0
+local author_width: integer = 0
+local major_device_number_width: integer = 0
+local minor_device_number_width: integer = 0
+local file_size_width: integer = 0
+local cwd_file: sequence(FileInfo)
+local sorted_file: sequence(integer)
+local cwd_some_quoted: boolean = false
+local align_variable_outer_quotes: boolean = false
+local color_symlink_as_referent: boolean = false
+local hostname_escaped: string
+local current_time: sys.Timespec
+local pending_dirs: sequence(Pending)
+local loop_detect: boolean = false
+local dev_ino_stack: sequence(DevIno)
+local dired_pos: integer = 0
+local dired_obstack: sequence(integer)
+local subdired_obstack: sequence(integer)
+local color_indicator: [24]BinStr
+local color_ext_list: sequence(ColorExt)
+local out_tty: integer = -1
+local print_dir_first: boolean = true
+local user_cache: sequence(IdName)
+local group_cache: sequence(IdName)
+local long_time_width: integer = -1
+local interrupt_signal: cint = 0
+local stop_signal_count: cint = 0
+local caught_signals: SigSet
+
+local function stdout_isatty(): boolean
+  if out_tty < 0 then out_tty = sys.isatty(1) == 1 and 1 or 0 end
+  return out_tty == 1
+end
+
+local function cpath(s: string): cstring
+  if #s == 0 then return (@cstring)('') end
+  return (@cstring)(s.data)
+end
+
+local function cempty(p: cstring): boolean
+  return p == nilptr or $(@*byte)(p) == 0
+end
+
+local function isprint(c: byte): boolean return c >= 32 and c < 127 end
+local function iscntrl(c: byte): boolean return c < 32 or c == 127 end
+
+-- gnulib mbswidth in the C locale: printable and non-control bytes count.
+local function mbswidth(s: string): integer
+  local w: integer = 0
+  for i: usize = 0, < s.size do
+    local c = s.data[i]
+    if isprint(c) or not iscntrl(c) then w = w + 1 end
+  end
+  return w
+end
+
+local function die(status: integer, msg: string)
+  util.err(msg)
+  util.flush()
+  c_exit((@cint)(status))
+end
+
+local function usage_fail(status: integer)
+  util.flush()
+  local m = "Try '" .. util.applet .. " --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  c_exit((@cint)(status))
+end
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function quoteaf(s: string): string
+  return quotearg.restyled(s, quotearg.SHELL_ESCAPE_ALWAYS, 0, nilptr)
+end
+
+local function quotef(s: string): string
+  local qtt: [256]boolean
+  qtt[58] = true
+  return quotearg.restyled(s, quotearg.SHELL_ESCAPE, 0, &qtt)
+end
+
+local function set_exit_status(serious: boolean)
+  if serious then exit_status = 2
+  elseif exit_status == 0 then exit_status = 1 end
+end
+
+-- file_failure: "MESSAGE 'FILE': strerror (errno)".
+local function file_failure(serious: boolean, message: string, file: string)
+  local e = sys.errno()
+  local q = quoteaf(file)
+  util.err(errno_msg(message .. ' ' .. q, e))
+  q:destroy()
+  set_exit_status(serious)
+end
+
+---------------------------------------------------------------------------
+-- Output with --dired byte offsets
+
+local function dired_outbyte(c: byte)
+  dired_pos = dired_pos + 1
+  util.writebyte(c)
+end
+
+local function dired_outbuf(s: string)
+  dired_pos = dired_pos + #s
+  util.write(s)
+end
+
+local function dired_indent()
+  if dired then dired_outbuf('  ') end
+end
+
+local function push_current_dired_pos(obs: *sequence(integer))
+  if dired then obs:push(dired_pos) end
+end
+
+local function dired_dump_obstack(prefix: string, os: *sequence(integer))
+  if #os > 0 then
+    util.write(prefix)
+    for i = 1, #os do
+      util.writebyte(32)
+      local s = tostring(os[i]); util.write(s); s:destroy()
+    end
+    util.writebyte(10)
+  end
+end
+
+---------------------------------------------------------------------------
+-- Signals: restore the default color when interrupted or stopped
+
+local sig_list: [12]cint = {20, 14, 1, 2, 13, 3, 15, 29, 27, 26, 24, 25}
+
+local function sigaddset(set: *SigSet, n: cint)
+  local b = n - 1
+  set.bits[b // 64] = set.bits[b // 64] | ((@culong)(1) << (b % 64))
+end
+
+local function sigismember(set: *SigSet, n: cint): boolean
+  local b = n - 1
+  return (set.bits[b // 64] & ((@culong)(1) << (b % 64))) ~= 0
+end
+
+local function sighandler(sig: cint)
+  if interrupt_signal == 0 then interrupt_signal = sig end
+end
+
+local function stophandler(sig: cint)
+  if interrupt_signal == 0 then stop_signal_count = stop_signal_count + 1 end
+end
+
+local function signal_setup(init: boolean)
+  if init then
+    local act: sys.Sigaction
+    caught_signals = (@SigSet)()
+    for j = 0, < #sig_list do
+      sys.sigaction(sig_list[j], nilptr, &act)
+      if (@usize)((@pointer)(act.sa_handler)) ~= sys.SIG_IGN then sigaddset(&caught_signals, sig_list[j]) end
+    end
+    local mask = (@*[16]culong)(&act.sa_mask)
+    for k = 0, < 16 do mask[k] = caught_signals.bits[k] end
+    act.sa_flags = SA_RESTART
+    for j = 0, < #sig_list do
+      if sigismember(&caught_signals, sig_list[j]) then
+        if sig_list[j] == sys.SIGTSTP then act.sa_handler = stophandler else act.sa_handler = sighandler end
+        sys.sigaction(sig_list[j], &act, nilptr)
+      end
+    end
+  else
+    for j = 0, < #sig_list do
+      if sigismember(&caught_signals, sig_list[j]) then
+        local act: sys.Sigaction
+        act.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+        sys.sigaction(sig_list[j], &act, nilptr)
+      end
+    end
+  end
+end
+
+local function raise(sig: cint)
+  sys.kill(sys.getpid(), sig)
+end
+
+---------------------------------------------------------------------------
+-- Colors
+
+local function is_colored(t: integer): boolean
+  local s = color_indicator[t].s
+  local len = #s
+  return not (len == 0 or (len == 1 and s.data[0] == 48) or (len == 2 and s.data[0] == 48 and s.data[1] == 48))
+end
+
+local function prep_non_filename_text() <forwarddecl> end
+
+local function put_indicator(ind: *BinStr)
+  if not used_color then
+    used_color = true
+    if sys.tcgetpgrp(1) >= 0 then signal_setup(true) end
+    prep_non_filename_text()
+  end
+  util.write(ind.s)
+end
+
+function prep_non_filename_text()
+  if color_indicator[C_END].set then
+    put_indicator(&color_indicator[C_END])
+  else
+    put_indicator(&color_indicator[C_LEFT])
+    put_indicator(&color_indicator[C_RESET])
+    put_indicator(&color_indicator[C_RIGHT])
+  end
+end
+
+local function restore_default_color()
+  put_indicator(&color_indicator[C_LEFT])
+  put_indicator(&color_indicator[C_RIGHT])
+end
+
+local function set_normal_color()
+  if print_with_color and is_colored(C_NORM) then
+    put_indicator(&color_indicator[C_LEFT])
+    put_indicator(&color_indicator[C_NORM])
+    put_indicator(&color_indicator[C_RIGHT])
+  end
+end
+
+local function process_signals()
+  while interrupt_signal ~= 0 or stop_signal_count ~= 0 do
+    if used_color then restore_default_color() end
+    util.flush()
+    local oldset: SigSet
+    c_sigprocmask(SIG_BLOCK, &caught_signals, &oldset)
+    local sig = interrupt_signal
+    local stops = stop_signal_count
+    if stops ~= 0 then
+      stop_signal_count = stops - 1
+      sig = SIGSTOP
+    else
+      local act: sys.Sigaction
+      act.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+      sys.sigaction(sig, &act, nilptr)
+    end
+    raise(sig)
+    c_sigprocmask(SIG_SETMASK, &oldset, nilptr)
+  end
+end
+
+local function init_colors()
+  local function lit(s: string): BinStr return {s = s, set = true} end
+  color_indicator[C_LEFT] = lit('\27[')
+  color_indicator[C_RIGHT] = lit('m')
+  color_indicator[C_RESET] = lit('0')
+  color_indicator[C_DIR] = lit('01;34')
+  color_indicator[C_LINK] = lit('01;36')
+  color_indicator[C_FIFO] = lit('33')
+  color_indicator[C_SOCK] = lit('01;35')
+  color_indicator[C_BLK] = lit('01;33')
+  color_indicator[C_CHR] = lit('01;33')
+  color_indicator[C_EXEC] = lit('01;32')
+  color_indicator[C_DOOR] = lit('01;35')
+  color_indicator[C_SETUID] = lit('37;41')
+  color_indicator[C_SETGID] = lit('30;43')
+  color_indicator[C_STICKY] = lit('37;44')
+  color_indicator[C_OTHER_WRITABLE] = lit('34;42')
+  color_indicator[C_STICKY_OTHER_WRITABLE] = lit('30;42')
+  color_indicator[C_CLR_TO_EOL] = lit('\27[K')
+end
+
+local function at(s: string, i: integer): byte
+  if i < 0 or i >= #s then return 0 end
+  return s.data[i]
+end
+
+local ST_GND <comptime> = 0
+local ST_BACKSLASH <comptime> = 1
+local ST_OCTAL <comptime> = 2
+local ST_HEX <comptime> = 3
+local ST_CARET <comptime> = 4
+local ST_END <comptime> = 5
+local ST_ERROR <comptime> = 6
+
+-- get_funky_string: decode one LS_COLORS value starting at *PP.
+local function get_funky_string(s: string, pp: *integer, equals_end: boolean): (string, boolean)
+  local p = $pp
+  local sb: stringbuilder
+  local num: integer = 0
+  local state = ST_GND
+  while state < ST_END do
+    local c = at(s, p)
+    if state == ST_GND then
+      if c == 58 or c == 0 then state = ST_END
+      elseif c == 92 then state = ST_BACKSLASH; p = p + 1
+      elseif c == 94 then state = ST_CARET; p = p + 1
+      elseif c == 61 and equals_end then state = ST_END
+      else sb:writebyte(c); p = p + 1 end
+    elseif state == ST_BACKSLASH then
+      if c >= 48 and c <= 55 then state = ST_OCTAL; num = c - 48
+      elseif c == 120 or c == 88 then state = ST_HEX; num = 0
+      elseif c == 97 then num = 7
+      elseif c == 98 then num = 8
+      elseif c == 101 then num = 27
+      elseif c == 102 then num = 12
+      elseif c == 110 then num = 10
+      elseif c == 114 then num = 13
+      elseif c == 116 then num = 9
+      elseif c == 118 then num = 11
+      elseif c == 63 then num = 127
+      elseif c == 95 then num = 32
+      elseif c == 0 then state = ST_ERROR
+      else num = c end
+      if state == ST_BACKSLASH then
+        sb:writebyte((@byte)(num & 0xff))
+        state = ST_GND
+      end
+      p = p + 1
+    elseif state == ST_OCTAL then
+      if c < 48 or c > 55 then
+        sb:writebyte((@byte)(num & 0xff)); state = ST_GND
+      else
+        num = ((num << 3) + (c - 48)) & 0xff; p = p + 1
+      end
+    elseif state == ST_HEX then
+      if c >= 48 and c <= 57 then num = ((num << 4) + (c - 48)) & 0xff; p = p + 1
+      elseif c >= 97 and c <= 102 then num = ((num << 4) + (c - 97) + 10) & 0xff; p = p + 1
+      elseif c >= 65 and c <= 70 then num = ((num << 4) + (c - 65) + 10) & 0xff; p = p + 1
+      else sb:writebyte((@byte)(num & 0xff)); state = ST_GND end
+    elseif state == ST_CARET then
+      state = ST_GND
+      if c >= 64 and c <= 126 then sb:writebyte(c & 31); p = p + 1
+      elseif c == 63 then sb:writebyte(127) -- the '?' is not consumed, as in ls.c
+      else state = ST_ERROR end
+    end
+  end
+  $pp = p
+  return sb:promote(), state ~= ST_ERROR
+end
+
+local term_patterns: [25]string = {
+  'Eterm', 'ansi', '*color*', 'con[0-9]*x[0-9]*', 'cons25', 'console', 'cygwin', '*direct*',
+  'dtterm', 'gnome', 'hurd', 'jfbterm', 'konsole', 'kterm', 'linux', 'linux-c', 'mlterm',
+  'putty', 'rxvt*', 'screen*', 'st', 'terminator', 'tmux*', 'vt100', 'xterm*',
+}
+
+-- known_term_type: TERM matches one of dircolors' TERM lines.
+local function known_term_type(): boolean
+  local term = sys.getenv('TERM')
+  if cempty(term) then return false end
+  for i = 0, < #term_patterns do
+    if c_fnmatch(term_patterns[i], term, 0) == 0 then return true end
+  end
+  return false
+end
+
+local PS_START <comptime> = 1
+local PS_2 <comptime> = 2
+local PS_3 <comptime> = 3
+local PS_4 <comptime> = 4
+local PS_DONE <comptime> = 5
+local PS_FAIL <comptime> = 6
+
+local function parse_ls_color()
+  local pc = sys.getenv('LS_COLORS')
+  if cempty(pc) then
+    local colorterm = sys.getenv('COLORTERM')
+    if cempty(colorterm) and not known_term_type() then
+      print_with_color = false
+    end
+    return
+  end
+  local s: string = pc
+  local p: integer = 0
+  local label: [2]byte = {63, 63}
+  local state = PS_START
+  while true do
+    if state == PS_START then
+      local c = at(s, p)
+      if c == 58 then
+        p = p + 1
+      elseif c == 42 then
+        p = p + 1
+        local e, ok = get_funky_string(s, &p, true)
+        color_ext_list:push({ext = e})
+        state = ok and PS_4 or PS_FAIL
+      elseif c == 0 then
+        state = PS_DONE
+        break
+      else
+        label[0] = c; p = p + 1
+        state = PS_2
+      end
+    elseif state == PS_2 then
+      local c = at(s, p)
+      if c ~= 0 then label[1] = c; p = p + 1; state = PS_3
+      else state = PS_FAIL end
+    elseif state == PS_3 then
+      state = PS_FAIL
+      local c = at(s, p); p = p + 1
+      if c == 61 then
+        local lab: string = (@string){data = &label[0], size = 2}
+        for ind_no = 0, < N_INDICATORS do
+          if lab == indicator_name[ind_no] then
+            local v, ok = get_funky_string(s, &p, false)
+            color_indicator[ind_no] = {s = v, set = true}
+            state = ok and PS_START or PS_FAIL
+            break
+          end
+        end
+        if state == PS_FAIL then util.err('unrecognized prefix: ' .. util.quote(lab)) end
+      end
+    elseif state == PS_4 then
+      local c = at(s, p); p = p + 1
+      if c == 61 then
+        local v, ok = get_funky_string(s, &p, false)
+        color_ext_list[#color_ext_list].seq = {s = v, set = true}
+        state = ok and PS_START or PS_FAIL
+      else
+        state = PS_FAIL
+      end
+    else -- PS_FAIL
+      break
+    end
+  end
+  if state == PS_FAIL then
+    util.err('unparsable value for LS_COLORS environment variable')
+    color_ext_list:clear()
+    print_with_color = false
+  end
+  if color_indicator[C_LINK].s == 'target' then color_symlink_as_referent = true end
+end
+
+---------------------------------------------------------------------------
+-- File names: quoting and widths
+
+local function first_byte(s: string): byte
+  if #s == 0 then return 0 end
+  return s.data[0]
+end
+
+local function needs_quoting(name: string): boolean
+  local q = quotearg.restyled(name, filename_qs, 0, &filename_qtt)
+  local r = first_byte(name) ~= first_byte(q) or #name ~= #q
+  q:destroy()
+  return r
+end
+
+-- quote_name_buf: the quoted name (ALLOC tells whether it is a new string),
+-- its displayed width, and whether a padding space goes before it.
+local function quote_name_buf(name: string, qs: integer, qtt: *[256]boolean, needs_general_quoting: integer)
+    : (string, integer, boolean, boolean)
+  local needs_further_quoting = qmark_funny_chars and
+    (qs == quotearg.SHELL or qs == quotearg.SHELL_ALWAYS or qs == quotearg.LITERAL)
+  local buf: string = name
+  local alloc = false
+  local quoted = false
+  if needs_general_quoting ~= 0 then
+    buf = quotearg.restyled(name, qs, 0, qtt)
+    alloc = true
+    quoted = first_byte(name) ~= first_byte(buf) or #name ~= #buf
+  elseif needs_further_quoting then
+    buf = string.copy(name)
+    alloc = true
+  end
+  local width: integer = 0
+  if needs_further_quoting then
+    for i: usize = 0, < buf.size do
+      if not isprint(buf.data[i]) then buf.data[i] = 63 end
+    end
+    width = #buf
+  else
+    for i: usize = 0, < buf.size do
+      if isprint(buf.data[i]) then width = width + 1 end
+    end
+  end
+  local pad = align_variable_outer_quotes and cwd_some_quoted and not quoted
+  return buf, width, pad, alloc
+end
+
+local function quote_name_width(name: string, needs_general_quoting: integer): integer
+  local buf, width, pad, alloc = quote_name_buf(name, filename_qs, &filename_qtt, needs_general_quoting)
+  if alloc then buf:destroy() end
+  return width + (pad and 1 or 0)
+end
+
+-- file_escape: %XX for bytes outside RFC 3986's unreserved set; with PATH,
+-- '/' is kept.
+local function file_escape(str: string, path: boolean): string
+  local sb: stringbuilder
+  for i: usize = 0, < str.size do
+    local c = str.data[i]
+    if path and c == 47 then
+      sb:writebyte(47)
+    elseif (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+        or c == 126 or c == 45 or c == 46 or c == 95 then
+      sb:writebyte(c)
+    else
+      sb:writef('%%%02x', c)
+    end
+  end
+  return sb:promote()
+end
+
+local function print_color_indicator(ind: *BinStr): boolean
+  if ind ~= nilptr then
+    if is_colored(C_NORM) then restore_default_color() end
+    put_indicator(&color_indicator[C_LEFT])
+    put_indicator(ind)
+    put_indicator(&color_indicator[C_RIGHT])
+  end
+  return ind ~= nilptr
+end
+
+local function quote_name(name: string, qs: integer, qtt: *[256]boolean, needs_general_quoting: integer,
+    color: *BinStr, allow_pad: boolean, stack: *sequence(integer), absolute_name: string, has_abs: boolean): integer
+  local buf, width, pad, alloc = quote_name_buf(name, qs, qtt, needs_general_quoting)
+  local len: integer = #buf
+  if pad and allow_pad then dired_outbyte(32) end
+  if color ~= nilptr then print_color_indicator(color) end
+  local skip_quotes = false
+  if has_abs then
+    if align_variable_outer_quotes and cwd_some_quoted and not pad then
+      skip_quotes = true
+      util.writebyte(first_byte(buf))
+    end
+    local n = file_escape(absolute_name, true)
+    util.write('\27]8;;file://')
+    util.write(hostname_escaped)
+    if first_byte(n) ~= 47 then util.writebyte(47) end
+    util.write(n)
+    util.writebyte(7)
+    n:destroy()
+  end
+  if stack ~= nilptr then push_current_dired_pos(stack) end
+  if skip_quotes then
+    if len >= 2 then util.writebytes(&buf.data[1], (@usize)(len - 2)) end
+  else
+    util.write(buf)
+  end
+  dired_pos = dired_pos + len
+  if stack ~= nilptr then push_current_dired_pos(stack) end
+  if has_abs then
+    util.write('\27]8;;\7')
+    if skip_quotes and len > 0 then util.writebyte(buf.data[len - 1]) end
+  end
+  if alloc then buf:destroy() end
+  return len + (pad and 1 or 0)
+end
+
+---------------------------------------------------------------------------
+-- Users and groups (idcache's getuser/getgroup)
+
+local function getuser(uid: cuint): (string, boolean)
+  for i = 1, #user_cache do
+    if user_cache[i].id == uid then return user_cache[i].name, user_cache[i].found end
+  end
+  local e: IdName = {id = uid}
+  local p = c_getpwuid(uid)
+  if p ~= nilptr then e.name = string.copy((@string)(p.pw_name)); e.found = true end
+  user_cache:push(e)
+  return e.name, e.found
+end
+
+local function getgroup(gid: cuint): (string, boolean)
+  for i = 1, #group_cache do
+    if group_cache[i].id == gid then return group_cache[i].name, group_cache[i].found end
+  end
+  local e: IdName = {id = gid}
+  local g = c_getgrgid(gid)
+  if g ~= nilptr then e.name = string.copy((@string)(g.gr_name)); e.found = true end
+  group_cache:push(e)
+  return e.name, e.found
+end
+
+local function digits_u(v: uint64): integer
+  local n: integer = 1
+  while v >= 10 do v = v // 10; n = n + 1 end
+  return n
+end
+
+local function format_user_or_group_width(name: string, has_name: boolean, id: uint64): integer
+  if has_name then
+    local len = mbswidth(name)
+    return len > 0 and len or 0
+  end
+  return digits_u(id)
+end
+
+local function format_user_width(u: cuint): integer
+  if numeric_ids then return digits_u(u) end
+  local name, found = getuser(u)
+  return format_user_or_group_width(name, found, u)
+end
+
+local function format_group_width(g: cuint): integer
+  if numeric_ids then return digits_u(g) end
+  local name, found = getgroup(g)
+  return format_user_or_group_width(name, found, g)
+end
+
+local function format_user_or_group(name: string, has_name: boolean, id: uint64, width: integer)
+  if has_name then
+    local pad = width - mbswidth(name)
+    if pad < 0 then pad = 0 end
+    dired_outbuf(name)
+    for _ = 0, pad do dired_outbyte(32) end
+  else
+    local s = tostring(id)
+    for _ = #s + 1, width do dired_outbyte(32) end
+    dired_outbuf(s)
+    dired_outbyte(32)
+    s:destroy()
+  end
+end
+
+local function format_user(u: cuint, width: integer, stat_ok: boolean)
+  if not stat_ok then format_user_or_group('?', true, u, width); return end
+  if numeric_ids then format_user_or_group('', false, u, width); return end
+  local name, found = getuser(u)
+  format_user_or_group(name, found, u, width)
+end
+
+local function format_group(g: cuint, width: integer, stat_ok: boolean)
+  if not stat_ok then format_user_or_group('?', true, g, width); return end
+  if numeric_ids then format_user_or_group('', false, g, width); return end
+  local name, found = getgroup(g)
+  format_user_or_group(name, found, g, width)
+end
+
+---------------------------------------------------------------------------
+-- File names and the table of files
+
+-- gnulib last_component: the 0-based offset of the last file name component.
+local function last_component(name: string): integer
+  local base: integer = 0
+  while base < #name and name.data[base] == 47 do base = base + 1 end
+  local last_was_slash = false
+  for p = base, < #name do
+    if name.data[p] == 47 then
+      last_was_slash = true
+    elseif last_was_slash then
+      base = p
+      last_was_slash = false
+    end
+  end
+  return base
+end
+
+-- gnulib base_len for the string from offset OFF.
+local function base_len_from(name: string, off: integer): integer
+  local len = #name - off
+  while 1 < len and name.data[off + len - 1] == 47 do len = len - 1 end
+  return len
+end
+
+-- gnulib dir_len.
+local function dir_len(file: string): integer
+  local prefix_length: integer = (#file > 0 and file.data[0] == 47) and 1 or 0
+  local length = last_component(file)
+  while prefix_length < length do
+    if file.data[length - 1] ~= 47 then break end
+    length = length - 1
+  end
+  return length
+end
+
+-- gnulib file_name_concat (DIR, BASE, NULL).
+local function file_name_concat(dir: string, base: string): string
+  local dirbase = last_component(dir)
+  local dirbaselen = base_len_from(dir, dirbase)
+  local dirlen = dirbase + dirbaselen
+  local sep: byte = 0
+  if dirbaselen ~= 0 then
+    if dir.data[dirlen - 1] ~= 47 and first_byte(base) ~= 47 then sep = 47 end
+  elseif first_byte(base) == 47 then
+    sep = 46
+  end
+  local sb: stringbuilder
+  sb:write((@string){data = dir.data, size = (@usize)(dirlen)})
+  if sep ~= 0 then sb:writebyte(sep) end
+  sb:write(base)
+  return sb:promote()
+end
+
+-- attach: DIRNAME/NAME, without "./" for the directory ".".
+local function attach(dirname: string, name: string): string
+  local sb: stringbuilder
+  if not (dirname == '.') then
+    sb:write(dirname)
+    if #dirname > 0 and dirname.data[#dirname - 1] ~= 47 then sb:writebyte(47) end
+  end
+  sb:write(name)
+  return sb:promote()
+end
+
+-- make_link_name: LINKNAME relative to the directory of NAME.
+local function make_link_name(name: string, linkname: string): string
+  if first_byte(linkname) == 47 then return string.copy(linkname) end
+  local prefix_len = dir_len(name)
+  if prefix_len == 0 then return string.copy(linkname) end
+  if name.data[prefix_len - 1] ~= 47 then prefix_len = prefix_len + 1 end
+  local sb: stringbuilder
+  sb:write((@string){data = name.data, size = (@usize)(prefix_len)})
+  sb:write(linkname)
+  return sb:promote()
+end
+
+local function dot_or_dotdot(s: string, off: integer): boolean
+  local n = #s - off
+  if n >= 1 and s.data[off] == 46 then
+    local k = (n >= 2 and s.data[off + 1] == 46) and 2 or 1
+    return k == n or (k < n and s.data[off + k] == 47)
+  end
+  return false
+end
+
+local function basename_is_dot_or_dotdot(name: string): boolean
+  return dot_or_dotdot(name, last_component(name))
+end
+
+local function patterns_match(patterns: *sequence(string), file: string): boolean
+  for i = #patterns, 1, -1 do
+    if c_fnmatch(cpath(patterns[i]), cpath(file), FNM_PERIOD) == 0 then return true end
+  end
+  return false
+end
+
+local function file_ignored(name: string): boolean
+  if ignore_mode ~= IGNORE_MINIMAL and first_byte(name) == 46 then
+    if ignore_mode == IGNORE_DEFAULT then return true end
+    local k: integer = (#name >= 2 and name.data[1] == 46) and 2 or 1
+    if k >= #name then return true end
+  end
+  if ignore_mode == IGNORE_DEFAULT and patterns_match(&hide_patterns, name) then return true end
+  return patterns_match(&ignore_patterns, name)
+end
+
+local function free_ent(f: *FileInfo)
+  f.name:destroy()
+  f.linkname:destroy()
+  f.absolute_name:destroy()
+  f.scontext:destroy()
+end
+
+local function clear_files()
+  for i = 1, #cwd_file do free_ent(&cwd_file[i]) end
+  cwd_file:clear()
+  sorted_file:clear()
+  cwd_some_quoted = false
+  any_has_acl = false
+  inode_number_width = 0
+  block_size_width = 0
+  nlink_width = 0
+  owner_width = 0
+  group_width = 0
+  author_width = 0
+  scontext_width = 0
+  major_device_number_width = 0
+  minor_device_number_width = 0
+  file_size_width = 0
+end
+
+local function errno_unsupported(e: cint): boolean
+  return e == EINVAL or e == ENOSYS or e == ENOTSUP
+end
+
+local scon_unsupported_device: culong = 0
+local acl_unsupported_device: culong = 0
+local cap_unsupported_device: culong = 0
+
+-- getfilecon_cache: the security.selinux attribute, as libselinux's
+-- [l]getfilecon returns it untranslated.
+local function getfilecon_cache(file: string, f: *FileInfo, deref: boolean): integer
+  if f.stat.st_dev == scon_unsupported_device then sys.seterrno(ENOTSUP); return -1 end
+  local buf: [4096]byte
+  local r: clong
+  if deref then r = c_getxattr(cpath(file), 'security.selinux', &buf[0], #buf)
+  else r = c_lgetxattr(cpath(file), 'security.selinux', &buf[0], #buf) end
+  if r == 0 then sys.seterrno(ENOTSUP); r = -1 end
+  if r < 0 then
+    if errno_unsupported(sys.errno()) then scon_unsupported_device = f.stat.st_dev end
+    return -1
+  end
+  local n: usize = 0
+  while n < (@usize)(r) and buf[n] ~= 0 do n = n + 1 end
+  f.scontext = string.copy((@string){data = &buf[0], size = n})
+  return (@integer)(r)
+end
+
+-- gnulib file_has_acl over the POSIX ACL xattrs.
+local function file_has_acl(name: string, st: *sys.Stat): integer
+  if (st.st_mode & sys.S_IFMT) == sys.S_IFLNK then return 0 end
+  local ret = c_getxattr(cpath(name), 'system.posix_acl_access', nilptr, 0)
+  if ret < 0 and sys.errno() == ENODATA then ret = 0
+  elseif ret > 0 then return 1 end
+  if ret == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    ret = c_getxattr(cpath(name), 'system.posix_acl_default', nilptr, 0)
+    if ret < 0 and sys.errno() == ENODATA then ret = 0
+    elseif ret > 0 then return 1 end
+  end
+  if ret < 0 then
+    local e = sys.errno()
+    if e == EBUSY or e == EINVAL or e == ENOSYS or e == ENOTSUP then return 0 end
+    return -1
+  end
+  return (@integer)(ret)
+end
+
+local function file_has_acl_cache(file: string, f: *FileInfo): integer
+  if f.stat.st_dev == acl_unsupported_device then sys.seterrno(ENOTSUP); return 0 end
+  sys.seterrno(0)
+  local n = file_has_acl(file, &f.stat)
+  if n <= 0 and errno_unsupported(sys.errno()) then acl_unsupported_device = f.stat.st_dev end
+  return n
+end
+
+-- has_capability: libcap's cap_get_file finds a security.capability
+-- attribute (whose cap_to_text is never empty).
+local function has_capability_cache(file: string, f: *FileInfo): boolean
+  if f.stat.st_dev == cap_unsupported_device then sys.seterrno(ENOTSUP); return false end
+  local buf: [64]byte
+  local r = c_getxattr(cpath(file), 'security.capability', &buf[0], #buf)
+  local b = r > 0
+  if not b and errno_unsupported(sys.errno()) then cap_unsupported_device = f.stat.st_dev end
+  return b
+end
+
+-- The birth time in st_mtim, or -1/-1 when the file system has none, as
+-- ls's do_statx stores it.
+local function stat_btime(name: string, st: *sys.Stat, nofollow: boolean)
+  local stx: Statx
+  local fl: cint = AT_NO_AUTOMOUNT
+  if nofollow then fl = fl | sys.AT_SYMLINK_NOFOLLOW end
+  if c_statx(sys.AT_FDCWD, cpath(name), fl, STATX_BTIME, &stx) == 0 and (stx.stx_mask & STATX_BTIME) ~= 0 then
+    st.st_mtim.tv_sec = stx.stx_btime.tv_sec
+    st.st_mtim.tv_nsec = stx.stx_btime.tv_nsec
+  else
+    st.st_mtim.tv_sec = -1
+    st.st_mtim.tv_nsec = -1
+  end
+end
+
+local function do_stat(name: string, st: *sys.Stat): cint
+  local r = sys.stat(cpath(name), st)
+  if r == 0 and time_type == time_btime then stat_btime(name, st, false) end
+  return r
+end
+
+local function do_lstat(name: string, st: *sys.Stat): cint
+  local r = sys.lstat(cpath(name), st)
+  if r == 0 and time_type == time_btime then stat_btime(name, st, true) end
+  return r
+end
+
+local function major(d: culong): uint64 return ((d >> 8) & 0xfff) | ((d >> 32) & ~(@culong)(0xfff)) end
+local function minor(d: culong): uint64 return (d & 0xff) | ((d >> 12) & ~(@culong)(0xff)) end
+
+local function unsigned_file_size(size: clong): uint64 return (@uint64)(size) end
+
+-- areadlink_with_size.
+local function read_link(filename: string): (string, boolean)
+  local size: usize = 4096
+  while true do
+    local buf = string.create(size)
+    local n = sys.readlink(cpath(filename), buf.data, size)
+    if n < 0 then buf:destroy(); return '', false end
+    if (@usize)(n) < size then
+      local r = string.copy((@string){data = buf.data, size = (@usize)(n)})
+      buf:destroy()
+      return r, true
+    end
+    buf:destroy()
+    size = size * 2
+  end
+  return '', false
+end
+
+-- gobble_file: add a file to the table; returns its block count.
+local function gobble_file(name: string, ftype: integer, inode: culong, command_line_arg: boolean, dirname: string): uint64
+  local blocks: uint64 = 0
+  local f: FileInfo
+  f.stat.st_ino = inode
+  f.filetype = ftype
+  f.quoted = -1
+  if not cwd_some_quoted and align_variable_outer_quotes then
+    f.quoted = needs_quoting(name) and 1 or 0
+    if f.quoted ~= 0 then cwd_some_quoted = true end
+  end
+  if command_line_arg or print_hyperlink or format_needs_stat
+      or (ftype == FT_DIRECTORY and print_with_color
+          and (is_colored(C_OTHER_WRITABLE) or is_colored(C_STICKY) or is_colored(C_STICKY_OTHER_WRITABLE)))
+      or ((print_inode or format_needs_type) and (ftype == FT_SYMLINK or ftype == FT_UNKNOWN)
+          and (dereference == DEREF_ALWAYS or color_symlink_as_referent or check_symlink_mode))
+      or (print_inode and inode == 0)
+      or (format_needs_type
+          and (ftype == FT_UNKNOWN or command_line_arg
+               or (ftype == FT_NORMAL and (indicator_style == IND_CLASSIFY
+                   or (print_with_color and (is_colored(C_EXEC) or is_colored(C_SETUID)
+                       or is_colored(C_SETGID) or is_colored(C_CAP))))))) then
+    local full_name: string
+    local own_full = false
+    if first_byte(name) == 47 or #dirname == 0 then
+      full_name = name
+    else
+      full_name = attach(dirname, name); own_full = true
+    end
+    if print_hyperlink then
+      local a, e = canon.canonicalize(full_name, canon.CAN_MISSING)
+      if #a > 0 then
+        f.absolute_name = a; f.has_absolute_name = true
+      else
+        sys.seterrno(e)
+        file_failure(command_line_arg, 'error canonicalizing', full_name)
+      end
+    end
+    local err: cint
+    local do_deref: boolean
+    local done = false
+    if dereference == DEREF_ALWAYS then
+      err = do_stat(full_name, &f.stat)
+      do_deref = true
+      done = true
+    elseif dereference == DEREF_COMMAND_LINE_ARGUMENTS or dereference == DEREF_COMMAND_LINE_SYMLINK_TO_DIR then
+      if command_line_arg then
+        err = do_stat(full_name, &f.stat)
+        do_deref = true
+        done = true
+        if dereference ~= DEREF_COMMAND_LINE_ARGUMENTS then
+          local need_lstat: boolean
+          if err < 0 then need_lstat = sys.errno() == ENOENT
+          else need_lstat = (f.stat.st_mode & sys.S_IFMT) ~= sys.S_IFDIR end
+          if need_lstat then done = false end
+        end
+      end
+    end
+    if not done then
+      err = do_lstat(full_name, &f.stat)
+      do_deref = false
+    end
+    if err ~= 0 then
+      file_failure(command_line_arg, 'cannot access', full_name)
+      if own_full then full_name:destroy() end
+      if command_line_arg then
+        f.absolute_name:destroy()
+        return 0
+      end
+      f.scontext = string.copy('?')
+      f.name = string.copy(name)
+      cwd_file:push(f)
+      return 0
+    end
+    f.stat_ok = true
+    local fmode = f.stat.st_mode & sys.S_IFMT
+    if (ftype == FT_NORMAL or fmode == sys.S_IFREG) and print_with_color and is_colored(C_CAP) then
+      f.has_capability = has_capability_cache(full_name, &f)
+    end
+    if format == long_format or print_scontext then
+      local have_scontext = false
+      local have_acl = false
+      local attr_len = getfilecon_cache(full_name, &f, do_deref)
+      local ferr = attr_len < 0
+      local ferrno: cint = sys.errno()
+      if not ferr then
+        have_scontext = not (f.scontext == 'unlabeled')
+      else
+        f.scontext = string.copy('?')
+        if ferrno == ENOTSUP or ferrno == ENODATA then ferr = false end
+      end
+      if not ferr and format == long_format then
+        local n = file_has_acl_cache(full_name, &f)
+        ferrno = sys.errno()
+        ferr = n < 0
+        have_acl = n > 0
+      end
+      if not have_scontext and not have_acl then f.acl_type = ACL_T_NONE
+      elseif have_scontext and not have_acl then f.acl_type = ACL_T_LSM_CONTEXT_ONLY
+      else f.acl_type = ACL_T_YES end
+      if f.acl_type ~= ACL_T_NONE then any_has_acl = true end
+      if ferr then
+        local q = quotef(full_name)
+        util.err(errno_msg(q, ferrno))
+        q:destroy()
+      end
+    end
+    if fmode == sys.S_IFLNK and (format == long_format or check_symlink_mode) then
+      local ln, ok = read_link(full_name)
+      if ok then
+        f.linkname = ln; f.has_linkname = true
+      else
+        file_failure(command_line_arg, 'cannot read symbolic link', full_name)
+      end
+      if f.has_linkname then
+        local linkname = make_link_name(full_name, f.linkname)
+        if f.quoted == 0 and needs_quoting(f.linkname) then f.quoted = -1 end
+        local linkstats: sys.Stat
+        if (IND_FILE_TYPE <= indicator_style or check_symlink_mode)
+            and sys.stat(cpath(linkname), &linkstats) == 0 then
+          f.linkok = true
+          f.linkmode = linkstats.st_mode
+        end
+        linkname:destroy()
+      end
+    end
+    if fmode == sys.S_IFLNK then
+      f.filetype = FT_SYMLINK
+    elseif fmode == sys.S_IFDIR then
+      if command_line_arg and not immediate_dirs then f.filetype = FT_ARG_DIRECTORY
+      else f.filetype = FT_DIRECTORY end
+    else
+      f.filetype = FT_NORMAL
+    end
+    blocks = (@uint64)(f.stat.st_blocks)
+    if format == long_format or print_block_size then
+      local hs = human.readable(blocks, human_output_opts, 512, output_block_size)
+      local len = mbswidth(hs)
+      hs:destroy()
+      if block_size_width < len then block_size_width = len end
+    end
+    if format == long_format then
+      if print_owner then
+        local len = format_user_width(f.stat.st_uid)
+        if owner_width < len then owner_width = len end
+      end
+      if print_group then
+        local len = format_group_width(f.stat.st_gid)
+        if group_width < len then group_width = len end
+      end
+      if print_author then
+        local len = format_user_width(f.stat.st_uid)
+        if author_width < len then author_width = len end
+      end
+    end
+    if print_scontext then
+      local len = #f.scontext
+      if scontext_width < len then scontext_width = len end
+    end
+    if format == long_format then
+      local b_len = digits_u(f.stat.st_nlink)
+      if nlink_width < b_len then nlink_width = b_len end
+      if fmode == sys.S_IFCHR or fmode == sys.S_IFBLK then
+        local len = digits_u(major(f.stat.st_rdev))
+        if major_device_number_width < len then major_device_number_width = len end
+        len = digits_u(minor(f.stat.st_rdev))
+        if minor_device_number_width < len then minor_device_number_width = len end
+        len = major_device_number_width + 2 + minor_device_number_width
+        if file_size_width < len then file_size_width = len end
+      else
+        local hs = human.readable(unsigned_file_size(f.stat.st_size), file_human_output_opts, 1, file_output_block_size)
+        local len = mbswidth(hs)
+        hs:destroy()
+        if file_size_width < len then file_size_width = len end
+      end
+    end
+    if own_full then full_name:destroy() end
+  end
+  if print_inode then
+    local len = digits_u(f.stat.st_ino)
+    if inode_number_width < len then inode_number_width = len end
+  end
+  f.name = string.copy(name)
+  cwd_file:push(f)
+  return blocks
+end
+
+local function is_directory(f: *FileInfo): boolean
+  return f.filetype == FT_DIRECTORY or f.filetype == FT_ARG_DIRECTORY
+end
+
+local function is_linked_directory(f: *FileInfo): boolean
+  return f.filetype == FT_DIRECTORY or f.filetype == FT_ARG_DIRECTORY or (f.linkmode & sys.S_IFMT) == sys.S_IFDIR
+end
+
+local function queue_directory(name: string, has_name: boolean, realname: string, has_realname: boolean,
+    command_line_arg: boolean)
+  local p: Pending = {command_line_arg = command_line_arg}
+  if has_name then p.name = string.copy(name); p.has_name = true end
+  if has_realname then p.realname = string.copy(realname); p.has_realname = true end
+  pending_dirs:push(p)
+end
+
+-- extract_dirs_from_files: queue the directories and drop the
+-- command-line ones from the table. HAS_DIRNAME false is ls.c's NULL.
+local function extract_dirs_from_files(dirname: string, has_dirname: boolean, command_line_arg: boolean)
+  local ignore_dot_and_dot_dot = has_dirname
+  if has_dirname and loop_detect then
+    queue_directory('', false, dirname, true, false)
+  end
+  for i = #sorted_file, 1, -1 do
+    local f = &cwd_file[sorted_file[i]]
+    if is_directory(f) and (not ignore_dot_and_dot_dot or not basename_is_dot_or_dotdot(f.name)) then
+      if not has_dirname or first_byte(f.name) == 47 then
+        queue_directory(f.name, true, f.linkname, f.has_linkname, command_line_arg)
+      else
+        local nm = file_name_concat(dirname, f.name)
+        queue_directory(nm, true, f.linkname, f.has_linkname, command_line_arg)
+        nm:destroy()
+      end
+    end
+  end
+  local j = 1
+  for i = 1, #sorted_file do
+    local k = sorted_file[i]
+    sorted_file[j] = k
+    if cwd_file[k].filetype ~= FT_ARG_DIRECTORY then j = j + 1 end
+  end
+  sorted_file:resize((@usize)(j - 1))
+end
+
+---------------------------------------------------------------------------
+-- Sorting
+
+local function strcmp(a: string, b: string): integer
+  local n = #a < #b and #a or #b
+  for i = 0, < n do
+    local x, y = a.data[i], b.data[i]
+    if x ~= y then return x < y and -1 or 1 end
+  end
+  if #a == #b then return 0 end
+  return #a < #b and -1 or 1
+end
+
+local function timespec_cmp(a: sys.Timespec, b: sys.Timespec): integer
+  if a.tv_sec ~= b.tv_sec then return a.tv_sec < b.tv_sec and -1 or 1 end
+  if a.tv_nsec ~= b.tv_nsec then return a.tv_nsec < b.tv_nsec and -1 or 1 end
+  return 0
+end
+
+local function get_time(st: *sys.Stat, t: integer): sys.Timespec
+  if t == time_ctime then return st.st_ctim
+  elseif t == time_atime then return st.st_atim end
+  return st.st_mtim -- mtime, or the birth time do_statx stored there
+end
+
+local function fileinfo_name_width(f: *FileInfo): integer
+  if f.width ~= 0 then return f.width end
+  return quote_name_width(f.name, f.quoted)
+end
+
+-- strrchr (NAME, '.') or "".
+local function extension_of(name: string): string
+  for i = #name - 1, 0, -1 do
+    if name.data[i] == 46 then return (@string){data = &name.data[i], size = (@usize)(#name - i)} end
+  end
+  return ''
+end
+
+-- The key comparison of ls.c's cmp_* functions (A before B when < 0).
+local function key_cmp(a: *FileInfo, b: *FileInfo): integer
+  local diff: integer = 0
+  if sort_type == sort_time then
+    diff = timespec_cmp(get_time(&b.stat, time_type), get_time(&a.stat, time_type))
+  elseif sort_type == sort_size then
+    if b.stat.st_size ~= a.stat.st_size then diff = b.stat.st_size < a.stat.st_size and -1 or 1 end
+  elseif sort_type == sort_extension then
+    diff = strcmp(extension_of(a.name), extension_of(b.name))
+  elseif sort_type == sort_width then
+    diff = fileinfo_name_width(a) - fileinfo_name_width(b)
+  elseif sort_type == sort_version then
+    diff = filevercmp(a.name, b.name)
+  end
+  if diff ~= 0 then return diff end
+  return strcmp(a.name, b.name)
+end
+
+local function sort_cmp(ia: integer, ib: integer): integer
+  local a, b = &cwd_file[ia], &cwd_file[ib]
+  if directories_first then
+    local diff = (is_linked_directory(b) and 1 or 0) - (is_linked_directory(a) and 1 or 0)
+    if diff ~= 0 then return diff end
+  end
+  if sort_reverse then return key_cmp(b, a) end
+  return key_cmp(a, b)
+end
+
+-- gnulib mpsort over sorted_file, with TMP as scratch (offsets are 0-based).
+local function mpsort_with_tmp(base: *[0]integer, n: integer, tmp: *[0]integer) <forwarddecl> end
+
+local function mpsort_into_tmp(base: *[0]integer, n: integer, tmp: *[0]integer)
+  local n1 = n // 2
+  local n2 = n - n1
+  local a: integer = 0
+  local alim = n1
+  local b = n1
+  local blim = n
+  mpsort_with_tmp(&base[n1], n2, tmp)
+  mpsort_with_tmp(base, n1, tmp)
+  local ba = base[a]
+  local bb = base[b]
+  local t: integer = 0
+  while true do
+    if sort_cmp(ba, bb) <= 0 then
+      tmp[t] = ba; t = t + 1
+      a = a + 1
+      if a == alim then break end
+      ba = base[a]
+    else
+      tmp[t] = bb; t = t + 1
+      b = b + 1
+      if b == blim then
+        for k = a, < alim do tmp[t] = base[k]; t = t + 1 end
+        return
+      end
+      bb = base[b]
+    end
+  end
+  for k = b, < blim do tmp[t] = base[k]; t = t + 1 end
+end
+
+function mpsort_with_tmp(base: *[0]integer, n: integer, tmp: *[0]integer)
+  if n <= 2 then
+    if n == 2 then
+      local p0, p1 = base[0], base[1]
+      if not (sort_cmp(p0, p1) <= 0) then base[0] = p1; base[1] = p0 end
+    end
+    return
+  end
+  local n1 = n // 2
+  local n2 = n - n1
+  local t: integer = 0
+  local tlim = n1
+  local b = n1
+  local blim = n
+  mpsort_with_tmp(&base[n1], n2, tmp)
+  if n1 < 2 then tmp[0] = base[0] else mpsort_into_tmp(base, n1, tmp) end
+  local tt = tmp[t]
+  local bb = base[b]
+  local i: integer = 0
+  while true do
+    if sort_cmp(tt, bb) <= 0 then
+      base[i] = tt; i = i + 1
+      t = t + 1
+      if t == tlim then break end
+      tt = tmp[t]
+    else
+      base[i] = bb; i = i + 1
+      b = b + 1
+      if b == blim then
+        for k = t, < tlim do base[i] = tmp[k]; i = i + 1 end
+        break
+      end
+      bb = base[b]
+    end
+  end
+end
+
+local function sort_files()
+  sorted_file:clear()
+  for i = 1, #cwd_file do sorted_file:push(i) end
+  -- update_current_files_info
+  if sort_type == sort_width or (line_length ~= 0 and (format == many_per_line or format == horizontal)) then
+    for i = 1, #cwd_file do
+      local f = &cwd_file[i]
+      f.width = fileinfo_name_width(f)
+    end
+  end
+  if sort_type == sort_none then return end
+  local n = #sorted_file
+  if n < 2 then return end
+  local tmp: sequence(integer)
+  tmp:resize((@usize)(n // 2 + 1))
+  mpsort_with_tmp((@*[0]integer)(&sorted_file[1]), n, (@*[0]integer)(&tmp[1]))
+  tmp:destroy()
+end
+
+---------------------------------------------------------------------------
+-- Printing names
+
+local function get_color_indicator(f: *FileInfo, symlink_target: boolean): *BinStr
+  local name: string
+  local mode: cuint
+  local linkok: integer
+  if symlink_target then
+    name = f.linkname
+    mode = f.linkmode
+    linkok = f.linkok and 0 or -1
+  else
+    name = f.name
+    mode = (color_symlink_as_referent and f.linkok) and f.linkmode or f.stat.st_mode
+    linkok = f.linkok and 1 or 0
+  end
+  local t: integer
+  if linkok == -1 and is_colored(C_MISSING) then
+    t = C_MISSING
+  elseif not f.stat_ok then
+    t = filetype_indicator[f.filetype]
+  else
+    local k = mode & sys.S_IFMT
+    if k == sys.S_IFREG then
+      t = C_FILE
+      if (mode & S_ISUID) ~= 0 and is_colored(C_SETUID) then t = C_SETUID
+      elseif (mode & S_ISGID) ~= 0 and is_colored(C_SETGID) then t = C_SETGID
+      elseif is_colored(C_CAP) and f.has_capability then t = C_CAP
+      elseif (mode & S_IXUGO) ~= 0 and is_colored(C_EXEC) then t = C_EXEC
+      elseif 1 < f.stat.st_nlink and is_colored(C_MULTIHARDLINK) then t = C_MULTIHARDLINK end
+    elseif k == sys.S_IFDIR then
+      t = C_DIR
+      if (mode & S_ISVTX) ~= 0 and (mode & S_IWOTH) ~= 0 and is_colored(C_STICKY_OTHER_WRITABLE) then
+        t = C_STICKY_OTHER_WRITABLE
+      elseif (mode & S_IWOTH) ~= 0 and is_colored(C_OTHER_WRITABLE) then t = C_OTHER_WRITABLE
+      elseif (mode & S_ISVTX) ~= 0 and is_colored(C_STICKY) then t = C_STICKY end
+    elseif k == sys.S_IFLNK then t = C_LINK
+    elseif k == sys.S_IFIFO then t = C_FIFO
+    elseif k == sys.S_IFSOCK then t = C_SOCK
+    elseif k == sys.S_IFBLK then t = C_BLK
+    elseif k == sys.S_IFCHR then t = C_CHR
+    else t = C_ORPHAN end
+  end
+  local ext: *BinStr = nilptr
+  if t == C_FILE then
+    local len = #name
+    for i = #color_ext_list, 1, -1 do
+      local e = &color_ext_list[i]
+      local el = #e.ext
+      if el <= len then
+        local same = true
+        for k = 0, < el do
+          local x, y = name.data[len - el + k], e.ext.data[k]
+          if x >= 65 and x <= 90 then x = x + 32 end
+          if y >= 65 and y <= 90 then y = y + 32 end
+          if x ~= y then same = false; break end
+        end
+        if same then ext = &e.seq; break end
+      end
+    end
+  end
+  if t == C_LINK and linkok == 0 then
+    if color_symlink_as_referent or is_colored(C_ORPHAN) then t = C_ORPHAN end
+  end
+  local s: *BinStr = ext ~= nilptr and ext or &color_indicator[t]
+  if s.set then return s end
+  return nilptr
+end
+
+local function print_name_with_quoting(f: *FileInfo, symlink_target: boolean, stack: *sequence(integer), start_col: integer): integer
+  local name = symlink_target and f.linkname or f.name
+  local color: *BinStr = nilptr
+  if print_with_color then color = get_color_indicator(f, symlink_target) end
+  local used_color_this_time = print_with_color and (color ~= nilptr or is_colored(C_NORM))
+  local len = quote_name(name, filename_qs, &filename_qtt, f.quoted, color, not symlink_target, stack,
+    f.absolute_name, f.has_absolute_name)
+  process_signals()
+  if used_color_this_time then
+    prep_non_filename_text()
+    if line_length ~= 0 then
+      local last: uint64 = (@uint64)(start_col + len) - 1
+      if (@uint64)(start_col) // (@uint64)(line_length) ~= last // (@uint64)(line_length) then
+        put_indicator(&color_indicator[C_CLR_TO_EOL])
+      end
+    end
+  end
+  return len
+end
+
+local function get_type_indicator(stat_ok: boolean, mode: cuint, ftype: integer): byte
+  local k = mode & sys.S_IFMT
+  local isreg: boolean
+  if stat_ok then isreg = k == sys.S_IFREG else isreg = ftype == FT_NORMAL end
+  if isreg then
+    if stat_ok and indicator_style == IND_CLASSIFY and (mode & S_IXUGO) ~= 0 then return 42 end
+    return 0
+  end
+  local isdir: boolean
+  if stat_ok then isdir = k == sys.S_IFDIR else isdir = ftype == FT_DIRECTORY or ftype == FT_ARG_DIRECTORY end
+  if isdir then return 47 end
+  if indicator_style == IND_SLASH then return 0 end
+  if (stat_ok and k == sys.S_IFLNK) or (not stat_ok and ftype == FT_SYMLINK) then return 64 end
+  if (stat_ok and k == sys.S_IFIFO) or (not stat_ok and ftype == FT_FIFO) then return 124 end
+  if (stat_ok and k == sys.S_IFSOCK) or (not stat_ok and ftype == FT_SOCK) then return 61 end
+  return 0
+end
+
+local function print_type_indicator(stat_ok: boolean, mode: cuint, ftype: integer): boolean
+  local c = get_type_indicator(stat_ok, mode, ftype)
+  if c ~= 0 then dired_outbyte(c) end
+  return c ~= 0
+end
+
+local function inode_str(f: *FileInfo): string
+  if f.stat_ok and f.stat.st_ino ~= 0 then return tostring(f.stat.st_ino) end
+  return string.copy('?')
+end
+
+local function blocks_str(f: *FileInfo): string
+  if not f.stat_ok then return string.copy('?') end
+  return human.readable((@uint64)(f.stat.st_blocks), human_output_opts, 512, output_block_size)
+end
+
+-- printf ("%*s ", WIDTH, S), not counted in --dired offsets.
+local function print_padded(s: string, width: integer)
+  for _ = #s + 1, width do util.writebyte(32) end
+  util.write(s)
+  util.writebyte(32)
+end
+
+local function print_file_name_and_frills(f: *FileInfo, start_col: integer): integer
+  set_normal_color()
+  if print_inode then
+    local s = inode_str(f)
+    print_padded(s, format == with_commas and 0 or inode_number_width)
+    s:destroy()
+  end
+  if print_block_size then
+    local s = blocks_str(f)
+    print_padded(s, format == with_commas and 0 or block_size_width)
+    s:destroy()
+  end
+  if print_scontext then print_padded(f.scontext, format == with_commas and 0 or scontext_width) end
+  local width = print_name_with_quoting(f, false, nilptr, start_col)
+  if indicator_style ~= IND_NONE then
+    if print_type_indicator(f.stat_ok, f.stat.st_mode, f.filetype) then width = width + 1 end
+  end
+  return width
+end
+
+local function length_of_file_name_and_frills(f: *FileInfo): integer
+  local len: integer = 0
+  if print_inode then
+    len = len + 1 + (format == with_commas and digits_u(f.stat.st_ino) or inode_number_width)
+  end
+  if print_block_size then
+    if format == with_commas then
+      local s = blocks_str(f)
+      len = len + 1 + #s
+      s:destroy()
+    else
+      len = len + 1 + block_size_width
+    end
+  end
+  if print_scontext then
+    len = len + 1 + (format == with_commas and #f.scontext or scontext_width)
+  end
+  len = len + fileinfo_name_width(f)
+  if indicator_style ~= IND_NONE then
+    if get_type_indicator(f.stat_ok, f.stat.st_mode, f.filetype) ~= 0 then len = len + 1 end
+  end
+  return len
+end
+
+local function indent(from: integer, to: integer)
+  while from < to do
+    if tabsize ~= 0 and to // tabsize > (from + 1) // tabsize then
+      util.writebyte(9)
+      from = from + tabsize - from % tabsize
+    else
+      util.writebyte(32)
+      from = from + 1
+    end
+  end
+end
+
+-- calculate_columns: the column count, and the widths of each column
+-- (COL_ARR, 0-based).
+local function calculate_columns(by_columns: boolean, col_arr: *sequence(integer)): integer
+  local n = #sorted_file
+  local max_cols = (0 < max_idx and max_idx < n) and max_idx or n
+  local valid_len: sequence(boolean)
+  local line_len: sequence(integer)
+  local base: sequence(integer)
+  local arr: sequence(integer)
+  for i = 0, < max_cols do
+    valid_len:push(true)
+    line_len:push((i + 1) * MIN_COLUMN_WIDTH)
+    base:push(#arr)
+    for _ = 0, i do arr:push(MIN_COLUMN_WIDTH) end
+  end
+  for filesno = 0, < n do
+    local name_length = length_of_file_name_and_frills(&cwd_file[sorted_file[filesno + 1]])
+    for i = 0, < max_cols do
+      if valid_len[i + 1] then
+        local idx: integer
+        if by_columns then idx = filesno // ((n + i) // (i + 1)) else idx = filesno % (i + 1) end
+        local real_length = name_length + (idx == i and 0 or 2)
+        local slot = base[i + 1] + idx + 1
+        if arr[slot] < real_length then
+          line_len[i + 1] = line_len[i + 1] + (real_length - arr[slot])
+          arr[slot] = real_length
+          valid_len[i + 1] = line_len[i + 1] < line_length
+        end
+      end
+    end
+  end
+  local cols = max_cols
+  while 1 < cols do
+    if valid_len[cols] then break end
+    cols = cols - 1
+  end
+  col_arr:clear()
+  if cols >= 1 then
+    for k = 0, < cols do col_arr:push(arr[base[cols] + k + 1]) end
+  end
+  valid_len:destroy(); line_len:destroy(); base:destroy(); arr:destroy()
+  return cols
+end
+
+local function print_many_per_line()
+  local col_arr: sequence(integer)
+  local cols = calculate_columns(true, &col_arr)
+  local n = #sorted_file
+  local rows = n // cols + (n % cols ~= 0 and 1 or 0)
+  for row = 0, < rows do
+    local col: integer = 0
+    local filesno = row
+    local pos: integer = 0
+    while true do
+      local f = &cwd_file[sorted_file[filesno + 1]]
+      local name_length = length_of_file_name_and_frills(f)
+      local max_name_length = col_arr[col + 1]
+      col = col + 1
+      print_file_name_and_frills(f, pos)
+      filesno = filesno + rows
+      if filesno >= n then break end
+      indent(pos + name_length, pos + max_name_length)
+      pos = pos + max_name_length
+    end
+    util.writebyte(eolbyte)
+  end
+  col_arr:destroy()
+end
+
+local function print_horizontal()
+  local col_arr: sequence(integer)
+  local cols = calculate_columns(false, &col_arr)
+  local n = #sorted_file
+  local pos: integer = 0
+  local f = &cwd_file[sorted_file[1]]
+  local name_length = length_of_file_name_and_frills(f)
+  local max_name_length = col_arr[1]
+  print_file_name_and_frills(f, 0)
+  for filesno = 1, < n do
+    local col = filesno % cols
+    if col == 0 then
+      util.writebyte(eolbyte)
+      pos = 0
+    else
+      indent(pos + name_length, pos + max_name_length)
+      pos = pos + max_name_length
+    end
+    f = &cwd_file[sorted_file[filesno + 1]]
+    print_file_name_and_frills(f, pos)
+    name_length = length_of_file_name_and_frills(f)
+    max_name_length = col_arr[col + 1]
+  end
+  util.writebyte(eolbyte)
+  col_arr:destroy()
+end
+
+local function print_with_separator(sep: byte)
+  local pos: integer = 0
+  for filesno = 1, #sorted_file do
+    local f = &cwd_file[sorted_file[filesno]]
+    local len: integer = line_length ~= 0 and length_of_file_name_and_frills(f) or 0
+    if filesno ~= 1 then
+      local separator: byte
+      if line_length == 0 or (pos + len + 2 < line_length) then
+        pos = pos + 2
+        separator = 32
+      else
+        pos = 0
+        separator = eolbyte
+      end
+      util.writebyte(sep)
+      util.writebyte(separator)
+    end
+    print_file_name_and_frills(f, pos)
+    pos = pos + len
+  end
+  util.writebyte(eolbyte)
+end
+
+---------------------------------------------------------------------------
+-- Long format
+
+local function format_time(fmt: string, tm: *util.Time): string
+  return util.timestr(fmt, tm)
+end
+
+local function long_time_expected_width(): integer
+  if long_time_width < 0 then
+    local tm, ok = util.breaktime(0, 0, false)
+    if ok then
+      local s = format_time(long_time_format[0], &tm)
+      if #s ~= 0 and #s <= TIME_STAMP_LEN_MAXIMUM then long_time_width = mbswidth(s) end
+      s:destroy()
+    end
+    if long_time_width < 0 then long_time_width = 0 end
+  end
+  return long_time_width
+end
+
+local function ftypelet(mode: cuint): byte
+  local k = mode & sys.S_IFMT
+  if k == sys.S_IFREG then return 45 end
+  if k == sys.S_IFDIR then return 100 end
+  if k == sys.S_IFBLK then return 98 end
+  if k == sys.S_IFCHR then return 99 end
+  if k == sys.S_IFLNK then return 108 end
+  if k == sys.S_IFIFO then return 112 end
+  if k == sys.S_IFSOCK then return 115 end
+  return 63
+end
+
+-- gnulib filemodestring: 10 characters and a space.
+local function filemodestring(mode: cuint, buf: *[12]byte)
+  buf[0] = ftypelet(mode)
+  local function bit(m: cuint, b: cuint, c: byte): byte return (m & b) ~= 0 and c or 45 end
+  buf[1] = bit(mode, 0x100, 114)
+  buf[2] = bit(mode, 0x80, 119)
+  if (mode & S_ISUID) ~= 0 then buf[3] = (mode & 0x40) ~= 0 and 115 or 83 else buf[3] = bit(mode, 0x40, 120) end
+  buf[4] = bit(mode, 0x20, 114)
+  buf[5] = bit(mode, 0x10, 119)
+  if (mode & S_ISGID) ~= 0 then buf[6] = (mode & 0x8) ~= 0 and 115 or 83 else buf[6] = bit(mode, 0x8, 120) end
+  buf[7] = bit(mode, 0x4, 114)
+  buf[8] = bit(mode, 0x2, 119)
+  if (mode & S_ISVTX) ~= 0 then buf[9] = (mode & 0x1) ~= 0 and 116 or 84 else buf[9] = bit(mode, 0x1, 120) end
+  buf[10] = 32
+  buf[11] = 0
+end
+
+local function sb_padleft(sb: *stringbuilder, s: string, width: integer)
+  for _ = mbswidth(s) + 1, width do sb:writebyte(32) end
+  sb:write(s)
+end
+
+local function print_long_format(f: *FileInfo)
+  local modebuf: [12]byte
+  if f.stat_ok then
+    filemodestring(f.stat.st_mode, &modebuf)
+  else
+    modebuf[0] = filetype_letter:byte(f.filetype + 1)
+    for k = 1, 10 do modebuf[k] = 63 end
+    modebuf[11] = 0
+  end
+  local modelen: usize = 11
+  if not any_has_acl then modelen = 10
+  elseif f.acl_type == ACL_T_LSM_CONTEXT_ONLY then modebuf[10] = 46
+  elseif f.acl_type == ACL_T_YES then modebuf[10] = 43 end
+  local when_timespec: sys.Timespec
+  local btime_ok = true
+  if time_type == time_ctime then when_timespec = f.stat.st_ctim
+  elseif time_type == time_mtime then when_timespec = f.stat.st_mtim
+  elseif time_type == time_atime then when_timespec = f.stat.st_atim
+  else
+    when_timespec = f.stat.st_mtim
+    if when_timespec.tv_sec == -1 and when_timespec.tv_nsec == -1 then btime_ok = false end
+  end
+  local sb: stringbuilder
+  if print_inode then
+    local s = inode_str(f)
+    for _ = #s + 1, inode_number_width do sb:writebyte(32) end
+    sb:write(s); sb:writebyte(32)
+    s:destroy()
+  end
+  if print_block_size then
+    local s = blocks_str(f)
+    sb_padleft(&sb, s, block_size_width)
+    sb:writebyte(32)
+    s:destroy()
+  end
+  sb:write((@string){data = &modebuf[0], size = modelen})
+  sb:writebyte(32)
+  do
+    local s: string
+    if f.stat_ok then s = tostring(f.stat.st_nlink) else s = string.copy('?') end
+    for _ = #s + 1, nlink_width do sb:writebyte(32) end
+    sb:write(s); sb:writebyte(32)
+    s:destroy()
+  end
+  dired_indent()
+  if print_owner or print_group or print_author or print_scontext then
+    dired_outbuf(sb:view())
+    sb:clear()
+    if print_owner then format_user(f.stat.st_uid, owner_width, f.stat_ok) end
+    if print_group then format_group(f.stat.st_gid, group_width, f.stat_ok) end
+    if print_author then format_user(f.stat.st_uid, author_width, f.stat_ok) end
+    if print_scontext then format_user_or_group(f.scontext, true, 0, scontext_width) end
+  end
+  local fmode = f.stat.st_mode & sys.S_IFMT
+  if f.stat_ok and (fmode == sys.S_IFCHR or fmode == sys.S_IFBLK) then
+    local blanks_width = file_size_width - (major_device_number_width + 2 + minor_device_number_width)
+    if blanks_width < 0 then blanks_width = 0 end
+    local ma = tostring(major(f.stat.st_rdev))
+    local mi = tostring(minor(f.stat.st_rdev))
+    for _ = #ma + 1, major_device_number_width + blanks_width do sb:writebyte(32) end
+    sb:write(ma); sb:write(', ')
+    for _ = #mi + 1, minor_device_number_width do sb:writebyte(32) end
+    sb:write(mi); sb:writebyte(32)
+    ma:destroy(); mi:destroy()
+  else
+    local s: string
+    if not f.stat_ok then s = string.copy('?')
+    else s = human.readable(unsigned_file_size(f.stat.st_size), file_human_output_opts, 1, file_output_block_size) end
+    sb_padleft(&sb, s, file_size_width)
+    sb:writebyte(32)
+    s:destroy()
+  end
+  local done = false
+  if f.stat_ok and btime_ok then
+    local tm, ok = util.breaktime((@integer)(when_timespec.tv_sec), (@integer)(when_timespec.tv_nsec), false)
+    if ok then
+      if timespec_cmp(current_time, when_timespec) < 0 then
+        sys.clock_gettime(sys.CLOCK_REALTIME, &current_time)
+      end
+      local six_months_ago: sys.Timespec = {current_time.tv_sec - 31556952 // 2, current_time.tv_nsec}
+      local recent = timespec_cmp(six_months_ago, when_timespec) < 0 and timespec_cmp(when_timespec, current_time) < 0
+      local s = format_time(long_time_format[recent and 1 or 0], &tm)
+      if #s <= TIME_STAMP_LEN_MAXIMUM then
+        sb:write(s); sb:writebyte(32)
+        done = true
+      end
+      s:destroy()
+    end
+  end
+  if not done then
+    local s: string
+    if not f.stat_ok or not btime_ok then s = string.copy('?') else s = tostring(when_timespec.tv_sec) end
+    for _ = #s + 1, long_time_expected_width() do sb:writebyte(32) end
+    sb:write(s); sb:writebyte(32)
+    s:destroy()
+  end
+  local col: integer = #sb
+  dired_outbuf(sb:view())
+  sb:destroy()
+  local w = print_name_with_quoting(f, false, &dired_obstack, col)
+  if f.filetype == FT_SYMLINK then
+    if f.has_linkname then
+      dired_outbuf(' -> ')
+      print_name_with_quoting(f, true, nilptr, col + w + 4)
+      if indicator_style ~= IND_NONE then print_type_indicator(true, f.linkmode, FT_UNKNOWN) end
+    end
+  elseif indicator_style ~= IND_NONE then
+    print_type_indicator(f.stat_ok, f.stat.st_mode, f.filetype)
+  end
+end
+
+local function print_current_files()
+  if format == one_per_line then
+    for i = 1, #sorted_file do
+      print_file_name_and_frills(&cwd_file[sorted_file[i]], 0)
+      util.writebyte(eolbyte)
+    end
+  elseif format == many_per_line then
+    if line_length == 0 then print_with_separator(32) else print_many_per_line() end
+  elseif format == horizontal then
+    if line_length == 0 then print_with_separator(32) else print_horizontal() end
+  elseif format == with_commas then
+    print_with_separator(44)
+  else
+    for i = 1, #sorted_file do
+      set_normal_color()
+      print_long_format(&cwd_file[sorted_file[i]])
+      dired_outbyte(eolbyte)
+    end
+  end
+end
+
+---------------------------------------------------------------------------
+-- Directories
+
+local function visit_dir(dev: culong, ino: culong): boolean
+  for i = 1, #dev_ino_stack do
+    if dev_ino_stack[i].dev == dev and dev_ino_stack[i].ino == ino then return true end
+  end
+  return false
+end
+
+local function print_dir(name: string, realname: string, has_realname: boolean, command_line_arg: boolean)
+  local total_blocks: uint64 = 0
+  sys.seterrno(0)
+  local dirp = sys.opendir(cpath(name))
+  if dirp == nilptr then
+    file_failure(command_line_arg, 'cannot open directory', name)
+    return
+  end
+  if loop_detect then
+    local dir_stat: sys.Stat
+    local fd = c_dirfd(dirp)
+    local r: cint
+    if 0 <= fd then r = sys.fstat(fd, &dir_stat) else r = sys.stat(cpath(name), &dir_stat) end
+    if r < 0 then
+      file_failure(command_line_arg, 'cannot determine device and inode of', name)
+      sys.closedir(dirp)
+      return
+    end
+    if visit_dir(dir_stat.st_dev, dir_stat.st_ino) then
+      local q = quotef(name)
+      util.err(q .. ': not listing already-listed directory')
+      q:destroy()
+      sys.closedir(dirp)
+      set_exit_status(true)
+      return
+    end
+    dev_ino_stack:push({dev = dir_stat.st_dev, ino = dir_stat.st_ino})
+  end
+  clear_files()
+  if recursive or print_dir_name then
+    if not print_dir_first then dired_outbyte(10) end
+    print_dir_first = false
+    dired_indent()
+    local absolute_name: string
+    local has_abs = false
+    if print_hyperlink then
+      local a, e = canon.canonicalize(name, canon.CAN_MISSING)
+      if #a > 0 then
+        absolute_name = a; has_abs = true
+      else
+        sys.seterrno(e)
+        file_failure(command_line_arg, 'error canonicalizing', name)
+      end
+    end
+    quote_name(has_realname and realname or name, dirname_qs, &dirname_qtt, -1, nilptr, true,
+      &subdired_obstack, absolute_name, has_abs)
+    absolute_name:destroy()
+    dired_outbuf(':\n')
+  end
+  while true do
+    sys.seterrno(0)
+    local nxt = sys.readdir(dirp)
+    if nxt ~= nilptr then
+      local dname: string = (@cstring)(&nxt.d_name[0])
+      if not file_ignored(dname) then
+        local ftype = FT_UNKNOWN
+        local dt = nxt.d_type
+        if dt == 6 then ftype = FT_BLOCKDEV
+        elseif dt == 2 then ftype = FT_CHARDEV
+        elseif dt == 4 then ftype = FT_DIRECTORY
+        elseif dt == 1 then ftype = FT_FIFO
+        elseif dt == 10 then ftype = FT_SYMLINK
+        elseif dt == 8 then ftype = FT_NORMAL
+        elseif dt == 12 then ftype = FT_SOCK
+        elseif dt == 14 then ftype = FT_WHITEOUT end
+        total_blocks = total_blocks + gobble_file(dname, ftype, 0, false, name)
+        -- print each name right away in this narrow case, as ls does
+        if format == one_per_line and sort_type == sort_none and not print_block_size and not recursive then
+          sort_files()
+          print_current_files()
+          clear_files()
+        end
+      end
+    elseif sys.errno() ~= 0 then
+      local e = sys.errno()
+      file_failure(command_line_arg, 'reading directory', name)
+      if e ~= EOVERFLOW then break end
+    else
+      break
+    end
+    process_signals()
+  end
+  if sys.closedir(dirp) ~= 0 then
+    file_failure(command_line_arg, 'closing directory', name)
+  end
+  sort_files()
+  if recursive then extract_dirs_from_files(name, true, false) end
+  if format == long_format or print_block_size then
+    local s = human.readable(total_blocks, human_output_opts, 512, output_block_size)
+    dired_indent()
+    dired_outbuf('total')
+    dired_outbyte(32)
+    dired_outbuf(s)
+    dired_outbyte(eolbyte)
+    s:destroy()
+  end
+  if #sorted_file > 0 then print_current_files() end
+end
+
+---------------------------------------------------------------------------
+-- Options
+
+local FILE_TYPE_INDICATOR_OPTION <comptime> = 256
+local AUTHOR_OPTION <comptime> = 257
+local BLOCK_SIZE_OPTION <comptime> = 258
+local COLOR_OPTION <comptime> = 259
+local DEREFERENCE_COMMAND_LINE_SYMLINK_TO_DIR_OPTION <comptime> = 260
+local FORMAT_OPTION <comptime> = 261
+local FULL_TIME_OPTION <comptime> = 262
+local GROUP_DIRECTORIES_FIRST_OPTION <comptime> = 263
+local HIDE_OPTION <comptime> = 264
+local HYPERLINK_OPTION <comptime> = 265
+local INDICATOR_STYLE_OPTION <comptime> = 266
+local QUOTING_STYLE_OPTION <comptime> = 267
+local SHOW_CONTROL_CHARS_OPTION <comptime> = 268
+local SI_OPTION <comptime> = 269
+local SORT_OPTION <comptime> = 270
+local TIME_OPTION <comptime> = 271
+local TIME_STYLE_OPTION <comptime> = 272
+local ZERO_OPTION <comptime> = 273
+
+local long_options: []util.LongOpt = {
+  {'all', 0, 97}, {'escape', 0, 98}, {'directory', 0, 100}, {'dired', 0, 68},
+  {'full-time', 0, FULL_TIME_OPTION}, {'group-directories-first', 0, GROUP_DIRECTORIES_FIRST_OPTION},
+  {'human-readable', 0, 104}, {'inode', 0, 105}, {'kibibytes', 0, 107}, {'numeric-uid-gid', 0, 110},
+  {'no-group', 0, 71}, {'hide-control-chars', 0, 113}, {'reverse', 0, 114}, {'size', 0, 115},
+  {'width', 1, 119}, {'almost-all', 0, 65}, {'ignore-backups', 0, 66}, {'classify', 2, 70},
+  {'file-type', 0, FILE_TYPE_INDICATOR_OPTION}, {'si', 0, SI_OPTION}, {'dereference-command-line', 0, 72},
+  {'dereference-command-line-symlink-to-dir', 0, DEREFERENCE_COMMAND_LINE_SYMLINK_TO_DIR_OPTION},
+  {'hide', 1, HIDE_OPTION}, {'ignore', 1, 73}, {'indicator-style', 1, INDICATOR_STYLE_OPTION},
+  {'dereference', 0, 76}, {'literal', 0, 78}, {'quote-name', 0, 81}, {'quoting-style', 1, QUOTING_STYLE_OPTION},
+  {'recursive', 0, 82}, {'format', 1, FORMAT_OPTION}, {'show-control-chars', 0, SHOW_CONTROL_CHARS_OPTION},
+  {'sort', 1, SORT_OPTION}, {'tabsize', 1, 84}, {'time', 1, TIME_OPTION}, {'time-style', 1, TIME_STYLE_OPTION},
+  {'zero', 0, ZERO_OPTION}, {'color', 2, COLOR_OPTION}, {'hyperlink', 2, HYPERLINK_OPTION},
+  {'block-size', 1, BLOCK_SIZE_OPTION}, {'context', 0, 90}, {'author', 0, AUTHOR_OPTION},
+  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+}
+
+local format_args: []string = {'verbose', 'long', 'commas', 'horizontal', 'across', 'vertical', 'single-column'}
+local format_types: []integer = {long_format, long_format, with_commas, horizontal, horizontal, many_per_line, one_per_line}
+local sort_args: []string = {'none', 'time', 'size', 'extension', 'version', 'width'}
+local sort_types: []integer = {sort_none, sort_time, sort_size, sort_extension, sort_version, sort_width}
+local time_args: []string = {'atime', 'access', 'use', 'ctime', 'status', 'birth', 'creation'}
+local time_types: []integer = {time_atime, time_atime, time_atime, time_ctime, time_ctime, time_btime, time_btime}
+local when_args: []string = {'always', 'yes', 'force', 'never', 'no', 'none', 'auto', 'tty', 'if-tty'}
+local when_types: []integer = {when_always, when_always, when_always, when_never, when_never, when_never,
+  when_if_tty, when_if_tty, when_if_tty}
+local indicator_style_args: []string = {'none', 'slash', 'file-type', 'classify'}
+local indicator_style_types: []integer = {IND_NONE, IND_SLASH, IND_FILE_TYPE, IND_CLASSIFY}
+local quoting_style_vals: []integer = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+local time_style_args: []string = {'full-iso', 'long-iso', 'iso', 'locale'}
+
+-- gnulib argmatch without diagnostics: the index, -1 invalid, -2 ambiguous.
+local function argmatch(arg: string, names: *[0]string, values: *[0]integer, n: integer): integer
+  local found = -1
+  local ambiguous = false
+  for k = 0, < n do
+    if names[k] == arg then return k end
+    if #arg <= #names[k] and names[k]:subview(1, #arg) == arg then
+      if found < 0 then found = k
+      elseif values == nilptr or values[found] ~= values[k] then ambiguous = true end
+    end
+  end
+  if ambiguous then return -2 end
+  return found
+end
+
+-- XARGMATCH: a failure prints GNU's lines and exits through usage (1).
+local function xargmatch(context: string, arg: string, names: *[0]string, values: *[0]integer, n: integer): integer
+  local v = util.argmatch(context, arg, names, values, n)
+  if v < 0 then usage_fail(1) end
+  return v
+end
+
+-- decode_line_length: -1 when invalid; 0 (no limit) when too large.
+local function decode_line_length(spec: string): integer
+  local st, v = util.xstrtoumax_base(spec, 0, '')
+  if st == 0 then return v <= PTRDIFF_MAX and (@integer)(v) or 0 end
+  if st == 1 then return 0 end
+  return -1
+end
+
+-- xnumtoumax (base 0, no suffixes) within [0, PTRDIFF_MAX].
+local function xnumtoumax(s: string, msg: string): integer
+  local st, v = util.xstrtoumax_base(s, 0, '')
+  if st == 0 and v > PTRDIFF_MAX then
+    die(2, msg .. ': ' .. util.quote(s) .. ': Value too large for defined data type')
+  elseif st == 1 then
+    die(2, msg .. ': ' .. util.quote(s) .. ': Value too large for defined data type')
+  elseif st ~= 0 then
+    die(2, msg .. ': ' .. util.quote(s))
+  end
+  return (@integer)(v)
+end
+
+local function getenv_quoting_style(): integer
+  local q = sys.getenv('QUOTING_STYLE')
+  if q == nilptr then return -1 end
+  local qs: string = q
+  local i = argmatch(qs, &quotearg.style_names, &quoting_style_vals, 10)
+  if i < 0 then
+    util.err('ignoring invalid value of environment variable QUOTING_STYLE: ' .. util.quote(qs))
+    return -1
+  end
+  return quoting_style_vals[i]
+end
+
+local WinSize = @record{row: cushort, col: cushort, xpixel: cushort, ypixel: cushort}
+
+local function decode_switches(args: sequence(string)): sequence(string)
+  local time_style_option: string
+  local have_time_style = false
+  local kibibytes_specified = false
+  local format_opt: integer = -1
+  local hide_control_chars_opt: integer = -1
+  local quoting_style_opt: integer = -1
+  local sort_opt: integer = -1
+  local tabsize_opt: integer = -1
+  local width_opt: integer = -1
+  local g = util.getopt(args, 'abcdfghiklmnopqrstuvw:xABCDFGHI:LNQRST:UXZ1', &long_options, #long_options)
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 97 then ignore_mode = IGNORE_MINIMAL
+    elseif c == 98 then quoting_style_opt = quotearg.ESCAPE
+    elseif c == 99 then time_type = time_ctime
+    elseif c == 100 then immediate_dirs = true
+    elseif c == 102 then
+      ignore_mode = IGNORE_MINIMAL
+      sort_opt = sort_none
+      if format_opt == long_format then format_opt = -1 end
+      print_with_color = false
+      print_hyperlink = false
+      print_block_size = false
+    elseif c == FILE_TYPE_INDICATOR_OPTION then indicator_style = IND_FILE_TYPE
+    elseif c == 103 then format_opt = long_format; print_owner = false
+    elseif c == 104 then
+      human_output_opts = human.autoscale | human.SI | human.base_1024
+      file_human_output_opts = human_output_opts
+      output_block_size = 1; file_output_block_size = 1
+    elseif c == 105 then print_inode = true
+    elseif c == 107 then kibibytes_specified = true
+    elseif c == 108 then format_opt = long_format
+    elseif c == 109 then format_opt = with_commas
+    elseif c == 110 then numeric_ids = true; format_opt = long_format
+    elseif c == 111 then format_opt = long_format; print_group = false
+    elseif c == 112 then indicator_style = IND_SLASH
+    elseif c == 113 then hide_control_chars_opt = 1
+    elseif c == 114 then sort_reverse = true
+    elseif c == 115 then print_block_size = true
+    elseif c == 116 then sort_opt = sort_time
+    elseif c == 117 then time_type = time_atime
+    elseif c == 118 then sort_opt = sort_version
+    elseif c == 119 then
+      width_opt = decode_line_length(g.optarg)
+      if width_opt < 0 then die(2, 'invalid line width: ' .. util.quote(g.optarg)) end
+    elseif c == 120 then format_opt = horizontal
+    elseif c == 65 then ignore_mode = IGNORE_DOT_AND_DOTDOT
+    elseif c == 66 then ignore_patterns:push('*~'); ignore_patterns:push('.*~')
+    elseif c == 67 then format_opt = many_per_line
+    elseif c == 68 then dired = true
+    elseif c == 70 then
+      local i = when_always
+      if g.has_optarg then i = xargmatch('--classify', g.optarg, &when_args, &when_types, #when_args) end
+      if i == when_always or (i == when_if_tty and stdout_isatty()) then indicator_style = IND_CLASSIFY end
+    elseif c == 71 then print_group = false
+    elseif c == 72 then dereference = DEREF_COMMAND_LINE_ARGUMENTS
+    elseif c == DEREFERENCE_COMMAND_LINE_SYMLINK_TO_DIR_OPTION then dereference = DEREF_COMMAND_LINE_SYMLINK_TO_DIR
+    elseif c == 73 then ignore_patterns:push(g.optarg)
+    elseif c == 76 then dereference = DEREF_ALWAYS
+    elseif c == 78 then quoting_style_opt = quotearg.LITERAL
+    elseif c == 81 then quoting_style_opt = quotearg.C
+    elseif c == 82 then recursive = true
+    elseif c == 83 then sort_opt = sort_size
+    elseif c == 84 then tabsize_opt = xnumtoumax(g.optarg, 'invalid tab size')
+    elseif c == 85 then sort_opt = sort_none
+    elseif c == 88 then sort_opt = sort_extension
+    elseif c == 49 then
+      if format_opt ~= long_format then format_opt = one_per_line end
+    elseif c == AUTHOR_OPTION then print_author = true
+    elseif c == HIDE_OPTION then hide_patterns:push(g.optarg)
+    elseif c == SORT_OPTION then sort_opt = xargmatch('--sort', g.optarg, &sort_args, &sort_types, #sort_args)
+    elseif c == GROUP_DIRECTORIES_FIRST_OPTION then directories_first = true
+    elseif c == TIME_OPTION then time_type = xargmatch('--time', g.optarg, &time_args, &time_types, #time_args)
+    elseif c == FORMAT_OPTION then format_opt = xargmatch('--format', g.optarg, &format_args, &format_types, #format_args)
+    elseif c == FULL_TIME_OPTION then
+      format_opt = long_format
+      time_style_option = 'full-iso'; have_time_style = true
+    elseif c == COLOR_OPTION then
+      local i = when_always
+      if g.has_optarg then i = xargmatch('--color', g.optarg, &when_args, &when_types, #when_args) end
+      print_with_color = i == when_always or (i == when_if_tty and stdout_isatty())
+    elseif c == HYPERLINK_OPTION then
+      local i = when_always
+      if g.has_optarg then i = xargmatch('--hyperlink', g.optarg, &when_args, &when_types, #when_args) end
+      print_hyperlink = i == when_always or (i == when_if_tty and stdout_isatty())
+    elseif c == INDICATOR_STYLE_OPTION then
+      indicator_style = xargmatch('--indicator-style', g.optarg, &indicator_style_args, &indicator_style_types,
+        #indicator_style_args)
+    elseif c == QUOTING_STYLE_OPTION then
+      quoting_style_opt = xargmatch('--quoting-style', g.optarg, &quotearg.style_names, &quoting_style_vals, 10)
+    elseif c == TIME_STYLE_OPTION then
+      time_style_option = g.optarg; have_time_style = true
+    elseif c == SHOW_CONTROL_CHARS_OPTION then hide_control_chars_opt = 0
+    elseif c == BLOCK_SIZE_OPTION then
+      local e, o, bs = human.options(g.optarg, true, output_block_size)
+      if e ~= 0 then
+        local m: string
+        if e == 1 then m = "--block-size argument " .. util.quote(g.optarg) .. " too large"
+        elseif e == 3 then m = "invalid suffix in --block-size argument " .. util.quote(g.optarg)
+        else m = "invalid --block-size argument " .. util.quote(g.optarg) end
+        die(2, m)
+      end
+      human_output_opts = o; output_block_size = bs
+      file_human_output_opts = o; file_output_block_size = bs
+    elseif c == SI_OPTION then
+      human_output_opts = human.autoscale | human.SI
+      file_human_output_opts = human_output_opts
+      output_block_size = 1; file_output_block_size = 1
+    elseif c == 90 then print_scontext = true
+    elseif c == ZERO_OPTION then
+      eolbyte = 0
+      hide_control_chars_opt = 0
+      if format_opt ~= long_format then format_opt = one_per_line end
+      print_with_color = false
+      quoting_style_opt = quotearg.LITERAL
+    elseif c == util.UNSUPPORTED then
+      util.err("option '--" .. g.longname .. "' is not supported")
+      usage_fail(2)
+    else
+      usage_fail(2)
+    end
+  end
+  local operands = g:operands()
+
+  if output_block_size == 0 then
+    local ls_block_size = sys.getenv('LS_BLOCK_SIZE')
+    local spec: string
+    if ls_block_size ~= nilptr then spec = ls_block_size end
+    local _, o, bs = human.options(spec, ls_block_size ~= nilptr, output_block_size)
+    human_output_opts = o; output_block_size = bs
+    if ls_block_size ~= nilptr or sys.getenv('BLOCK_SIZE') ~= nilptr then
+      file_human_output_opts = human_output_opts
+      file_output_block_size = output_block_size
+    end
+    if kibibytes_specified then
+      human_output_opts = 0
+      output_block_size = 1024
+    end
+  end
+
+  if 0 <= format_opt then format = format_opt
+  elseif ls_mode == LS_LS then format = stdout_isatty() and many_per_line or one_per_line
+  elseif ls_mode == LS_MULTI_COL then format = many_per_line
+  else format = long_format end
+
+  local linelen = width_opt
+  if format == many_per_line or format == horizontal or format == with_commas or print_with_color then
+    if linelen < 0 then
+      local ws: WinSize
+      if stdout_isatty() and sys.ioctl(1, 0x5413, &ws) >= 0 and 0 < ws.col then linelen = ws.col end
+    end
+    if linelen < 0 then
+      local p = sys.getenv('COLUMNS')
+      if not cempty(p) then
+        local ps: string = p
+        linelen = decode_line_length(ps)
+        if linelen < 0 then
+          util.err('ignoring invalid width in environment variable COLUMNS: ' .. util.quote(ps))
+        end
+      end
+    end
+  end
+  line_length = linelen < 0 and 80 or linelen
+  max_idx = line_length // MIN_COLUMN_WIDTH
+  if line_length % MIN_COLUMN_WIDTH ~= 0 then max_idx = max_idx + 1 end
+
+  if format == many_per_line or format == horizontal or format == with_commas then
+    if 0 <= tabsize_opt then
+      tabsize = tabsize_opt
+    else
+      tabsize = 8
+      local p = sys.getenv('TABSIZE')
+      if p ~= nilptr then
+        local ps: string = p
+        local st, v = util.xstrtoumax_base(ps, 0, '')
+        if st == 0 then
+          tabsize = (@integer)(v)
+        else
+          util.err('ignoring invalid tab size in environment variable TABSIZE: ' .. util.quote(ps))
+        end
+      end
+    end
+  end
+
+  if hide_control_chars_opt < 0 then qmark_funny_chars = ls_mode == LS_LS and stdout_isatty()
+  else qmark_funny_chars = hide_control_chars_opt == 1 end
+
+  local qs = quoting_style_opt
+  if qs < 0 then qs = getenv_quoting_style() end
+  if qs < 0 then
+    if ls_mode == LS_LS then qs = stdout_isatty() and quotearg.SHELL_ESCAPE or -1
+    else qs = quotearg.ESCAPE end
+  end
+  if qs < 0 then qs = quotearg.LITERAL end
+  align_variable_outer_quotes = (format == long_format
+      or ((format == many_per_line or format == horizontal) and line_length ~= 0))
+    and (qs == quotearg.SHELL or qs == quotearg.SHELL_ESCAPE or qs == quotearg.C_MAYBE)
+  filename_qs = qs
+  if qs == quotearg.ESCAPE then filename_qtt[32] = true end
+  if IND_FILE_TYPE <= indicator_style then
+    local chars = '*=>@|'
+    for k = indicator_style - IND_FILE_TYPE + 1, #chars do filename_qtt[chars:byte(k)] = true end
+  end
+  dirname_qs = qs
+  dirname_qtt[58] = true
+
+  dired = dired and format == long_format and not print_hyperlink
+  if eolbyte == 0 and dired then die(2, '--dired and --zero are incompatible') end
+
+  if 0 <= sort_opt then sort_type = sort_opt
+  elseif format ~= long_format and (time_type == time_ctime or time_type == time_atime or time_type == time_btime) then
+    sort_type = sort_time
+  else sort_type = sort_name end
+
+  if format == long_format then
+    local style: string = time_style_option
+    if not have_time_style then
+      local e = sys.getenv('TIME_STYLE')
+      if e ~= nilptr then style = e else style = 'locale' end
+    end
+    -- "posix-" leaves the C locale's formats in place, as ls does when
+    -- the locale is not a "hard" one
+    if #style >= 6 and style:subview(1, 6) == 'posix-' then return operands end
+    if first_byte(style) == 43 then
+      local p0 = style:sub(2)
+      local nl = p0:find('\n', 1, true)
+      if nl <= 0 then
+        long_time_format[0] = p0
+        long_time_format[1] = p0
+      else
+        if p0:find('\n', nl + 1, true) > 0 then
+          die(2, 'invalid time style format ' .. util.quote(p0))
+        end
+        long_time_format[0] = p0:sub(1, nl - 1)
+        long_time_format[1] = p0:sub(nl + 1)
+      end
+    else
+      local res = argmatch(style, &time_style_args, nilptr, #time_style_args)
+      if res < 0 then
+        util.err((res == -1 and 'invalid' or 'ambiguous') .. ' argument ' .. util.quote(style) .. " for 'time style'")
+        util.flush()
+        local m = "Valid arguments are:\n  - [posix-]full-iso\n  - [posix-]long-iso\n  - [posix-]iso\n" ..
+          "  - [posix-]locale\n  - +FORMAT (e.g., +%H:%M) for a 'date'-style format\n"
+        sys.write(2, m.data, m.size)
+        usage_fail(2)
+      end
+      if res == 0 then
+        long_time_format[0] = '%Y-%m-%d %H:%M:%S.%N %z'; long_time_format[1] = long_time_format[0]
+      elseif res == 1 then
+        long_time_format[0] = '%Y-%m-%d %H:%M'; long_time_format[1] = long_time_format[0]
+      elseif res == 2 then
+        long_time_format[0] = '%Y-%m-%d '; long_time_format[1] = '%m-%d %H:%M'
+      end
+    end
+  end
+  return operands
+end
+
+---------------------------------------------------------------------------
+
+local function ls_main(args: sequence(string), mode: integer): integer
+  ls_mode = mode
+  init_colors()
+  exit_status = 0
+  print_dir_name = true
+  current_time.tv_sec = (@clong)(-0x7fffffffffffffff - 1)
+  current_time.tv_nsec = -1
+  local files = decode_switches(args)
+  if print_with_color then parse_ls_color() end
+  if print_with_color then tabsize = 0 end
+  if directories_first then
+    check_symlink_mode = true
+  elseif print_with_color then
+    if is_colored(C_ORPHAN) or (is_colored(C_EXEC) and color_symlink_as_referent)
+        or (is_colored(C_MISSING) and format == long_format) then
+      check_symlink_mode = true
+    end
+  end
+  if dereference == DEREF_UNDEFINED then
+    if immediate_dirs or indicator_style == IND_CLASSIFY or format == long_format then dereference = DEREF_NEVER
+    else dereference = DEREF_COMMAND_LINE_SYMLINK_TO_DIR end
+  end
+  loop_detect = recursive
+  format_needs_stat = sort_type == sort_time or sort_type == sort_size or format == long_format
+    or print_scontext or print_block_size
+  format_needs_type = not format_needs_stat and (recursive or print_with_color or indicator_style ~= IND_NONE
+    or directories_first)
+  if print_hyperlink then
+    local buf: [256]cchar
+    local h: string = ''
+    if sys.gethostname(&buf[0], #buf) == 0 then
+      buf[255] = 0
+      h = sys.cstr(&buf[0])
+    end
+    hostname_escaped = file_escape(h, false)
+  end
+  clear_files()
+  local n_files = #files
+  if n_files <= 0 then
+    if immediate_dirs then gobble_file('.', FT_DIRECTORY, 0, true, '')
+    else queue_directory('.', true, '', false, true) end
+  else
+    for i = 1, n_files do gobble_file(files[i], FT_UNKNOWN, 0, true, '') end
+  end
+  if #cwd_file > 0 then
+    sort_files()
+    if not immediate_dirs then extract_dirs_from_files('', false, true) end
+  end
+  if #sorted_file > 0 then
+    print_current_files()
+    if #pending_dirs > 0 then dired_outbyte(10) end
+  elseif n_files <= 1 and #pending_dirs == 1 then
+    print_dir_name = false
+  end
+  while #pending_dirs > 0 do
+    local thispend = pending_dirs:pop()
+    if loop_detect and not thispend.has_name then
+      dev_ino_stack:pop()
+      thispend.realname:destroy()
+      continue
+    end
+    print_dir(thispend.name, thispend.realname, thispend.has_realname, thispend.command_line_arg)
+    thispend.name:destroy()
+    thispend.realname:destroy()
+    print_dir_name = true
+  end
+  if print_with_color and used_color then
+    local l, r = color_indicator[C_LEFT].s, color_indicator[C_RIGHT].s
+    if not (l == '\27[' and r == 'm') then restore_default_color() end
+    util.flush()
+    signal_setup(false)
+    for _ = 1, stop_signal_count do raise(SIGSTOP) end
+    if interrupt_signal ~= 0 then raise(interrupt_signal) end
+  end
+  if dired then
+    dired_dump_obstack('//DIRED//', &dired_obstack)
+    dired_dump_obstack('//SUBDIRED//', &subdired_obstack)
+    util.write('//DIRED-OPTIONS// --quoting-style=')
+    util.write(quotearg.style_names[filename_qs])
+    util.writebyte(10)
+  end
+  if not util.flush() then
+    util.err(errno_msg('write error', sys.errno()))
+    return 2
+  end
+  return exit_status
+end
+
+global function applet_ls(args: sequence(string)): integer
+  return ls_main(args, LS_LS)
+end
+
+global function applet_dir(args: sequence(string)): integer
+  return ls_main(args, LS_MULTI_COL)
+end
+
+global function applet_vdir(args: sequence(string)): integer
+  return ls_main(args, LS_LONG_FORMAT)
+end

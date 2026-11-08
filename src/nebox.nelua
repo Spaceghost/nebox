@@ -65,6 +65,7 @@ require 'nebox.applets.awk'
 require 'nebox.applets.sh'
 require 'nebox.applets.diff'
 require 'nebox.applets.patch'
+require 'nebox.applets.ls'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
@@ -74,7 +75,7 @@ local applets: []Applet = {
   {'cat', applet_cat}, {'chgrp', applet_chgrp}, {'chmod', applet_chmod},
   {'chown', applet_chown}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
   {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'dd', applet_dd},
-  {'df', applet_df}, {'diff', applet_diff}, {'dirname', applet_dirname}, {'du', applet_du},
+  {'df', applet_df}, {'diff', applet_diff}, {'dir', applet_dir}, {'dirname', applet_dirname}, {'du', applet_du},
   {'echo', applet_echo}, {'env', applet_env}, {'expand', applet_expand}, {'expr', applet_expr},
   {'factor', applet_factor}, {'false', applet_false}, {'find', applet_find},
   {'fold', applet_fold}, {'free', applet_free}, {'grep', applet_grep},
@@ -94,7 +95,7 @@ local applets: []Applet = {
   {'test', applet_test}, {'timeout', applet_timeout}, {'touch', applet_touch},
   {'tr', applet_tr}, {'true', applet_true}, {'truncate', applet_truncate},
   {'tsort', applet_tsort}, {'tty', applet_tty}, {'unexpand', applet_unexpand},
-  {'uname', applet_uname}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'wc', applet_wc},
+  {'uname', applet_uname}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'vdir', applet_vdir}, {'wc', applet_wc},
   {'which', applet_which}, {'whoami', applet_whoami}, {'xargs', applet_xargs},
   {'yes', applet_yes},
 }
