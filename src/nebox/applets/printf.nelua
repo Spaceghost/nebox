@@ -191,8 +191,7 @@ local function emit(st: *State, spec: string, kind: integer, v: NumVal, ch: cint
     util.writebytes(big, (@usize)(n))
     c_free(big)
   else
-    -- xprintf: a failed conversion (nelibc refuses widths and precisions
-    -- above 100000 with EOVERFLOW) ends the program
+    -- xprintf: a failed conversion (EOVERFLOW past INT_MAX) ends the program
     fatal(st, 'cannot perform formatted output: ' .. sys.errstr())
   end
   c_free(fmt)

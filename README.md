@@ -683,11 +683,9 @@ Stated here rather than worked around:
   intmax_t / long double conversions, character constants, strtoimax /
   strtold diagnostics, format reuse and the excess-argument warning; `%a`
   ports glibc's x87 printf_fphex (1 prints as 0x8p-3). \c and fatal errors
-  end the call, not the shell. `tests/printf_compare.py`: 169 fixed and
-  2000 random argument vectors, 0 mismatches (one random case hits the
-  limit below and is counted separately).
-  Difference: nelibc refuses widths and precisions above 100000
-  (EOVERFLOW), so those fail with "cannot perform formatted output".
+  end the call, not the shell. `tests/printf_compare.py`: 177 fixed and
+  2000 random argument vectors (precisions past 100000 included), 0
+  mismatches.
 - `seq` follows GNU seq 9.1: long double operands (decimal, exponent, hex,
   `inf`), output precision from the fraction digits of FIRST and INCREMENT
   (`%Lg` for hex operands), the extra last number when it prints as LAST

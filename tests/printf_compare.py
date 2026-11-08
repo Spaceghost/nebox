@@ -40,7 +40,8 @@ CASES = [
     ['%5.1f|%-8.3e|%08.2f', '3.14159', '2.5', '-1.5'], ['%x %X %o', '0xdeadbeef', '0XFF', '0777'], ['%d', '0x'], ['%d', '+'], ['%d', '-'],
     ['%d', '0b101'], ['%u', '+5'], ['%d', '9223372036854775807'], ['%d', '9223372036854775808'], ['%u', '18446744073709551615'],
     ['%f', '0x1.8p1'], ['%f', '1e400'], ['%Lg', '1.18973149535723176502e+4932'], ['%g', '4e-4951'], ['%.30f', '1'],
-    ['%1000d|', '5'], ['%.600f', '1'], ['%-600s|', 'x'],
+    ['%1000d|', '5'], ['%.600f', '1'], ['%-600s|', 'x'], ['%.150000f|', '1'], ['%.120000e|', '0.1'], ['%.25e', '1'],
+    ['%.30e', '0.5'], ['%.200000g|', '0.1'], ['%#.100001g|', '2'], ['%.200a|', '1'], ['%150000s|', 'x'],
 ]
 
 
@@ -96,14 +97,10 @@ def run(argv, which):
 
 rnd = random.Random(11)
 cases = CASES + [rand_case(rnd) for _ in range(NRAND)]
-bad = known = 0
-LIMIT = b'cannot perform formatted output: Value too large for defined data type'
+bad = 0
 for c in cases:
     g = run(c, 'gnu')
     n = run(c, 'nebox')
-    if g != n and LIMIT in n[2] and LIMIT not in g[2]:
-        known += 1  # nelibc refuses widths/precisions above 100000 (README)
-        continue
     if g != n:
         bad += 1
         if bad <= 25:
@@ -112,5 +109,5 @@ for c in cases:
                 if x != y:
                     print('  %s gnu:   %r' % (name, x if isinstance(x, int) else x[:300]))
                     print('  %s nebox: %r' % (name, y if isinstance(y, int) else y[:300]))
-print('printf_compare: %d cases, %d mismatches, %d over nelibc\'s width/precision limit' % (len(cases), bad, known))
+print('printf_compare: %d cases, %d mismatches' % (len(cases), bad))
 sys.exit(1 if bad else 0)
