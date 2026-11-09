@@ -80,6 +80,7 @@ test: $(OUT)/nebox
 	python3 tests/factor_compare.py $(abspath $(OUT)/nebox) 600
 	python3 tests/cmp_compare.py $(abspath $(OUT)/nebox) 400
 	python3 tests/od_compare.py $(abspath $(OUT)/nebox) 500
+	python3 tests/hexdump_compare.py $(abspath $(OUT)/nebox) 3000
 	python3 tests/realpath_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/sort_compare.py $(abspath $(OUT)/nebox) 500
 	python3 tests/wcid_compare.py $(abspath $(OUT)/nebox) 400

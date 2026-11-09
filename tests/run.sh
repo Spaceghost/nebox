@@ -754,14 +754,8 @@ expect hexdump-dup '00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  
 *
 00000040
 exit=0' "head -c 64 /dev/zero | hexdump -C"
-expect hexdump-b '0000000 156 157 040 164 162 141 151 154 151 156 147 040 156 145 167 154
-0000010 151 156 145
-0000013
-exit=0' "hexdump -b nonl.txt"
-expect hexdump-x '0000000    6c61    6870    0a61    6562    6174    670a    6d61    616d
-0000010    640a    6c65    6174    610a    706c    6168    000a
-000001d
-exit=0' "hexdump -x words.txt"
+same hexdump-b 'hexdump -b nonl.txt'
+same hexdump-x 'hexdump -x words.txt'
 # shuf / tsort / free
 same shuf-sorted 'shuf words.txt | sort'
 same shuf-n 'shuf -n 2 words.txt | wc -l'
@@ -923,7 +917,7 @@ exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
 # sh
 . "$(dirname -- "$0")/sh.sh"
 # dispatch
-expect list-count '99
+expect list-count '100
 exit=0' "$BIN --list | wc -l"
 
 echo "nebox tests: $pass passed, $fail failed"

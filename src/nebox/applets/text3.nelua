@@ -1,4 +1,4 @@
--- od hexdump shuf tsort free
+-- tsort free
 ## pragmas.nogc = true
 
 require 'string'
@@ -7,89 +7,6 @@ require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.longopts'
-
-
--- hexdump ---------------------------------------------------------------------
-global function applet_hexdump(args: sequence(string)): integer
-  local o = util.parse(args, 'Cvn:s:bcdox')
-  if not o:ok() then return util.optfail(o) end
-  if #o.operands == 0 then o.operands:push('-') end
-  local all: stringbuilder
-  for _, f in ipairs(o.operands) do
-    local d, ok = util.readfile(f)
-    if not ok then return 1 end
-    all:write(d)
-  end
-  local data = all:promote()
-  local skip: integer = 0
-  if o:has('s') then
-    local n, ok = util.tosize(o:get('s')); if not ok then return util.die("bad skip value") end
-    skip = n
-  end
-  local stop = (@integer)(data.size)
-  if o:has('n') then
-    local n, ok = util.tosize(o:get('n')); if not ok then return util.die("bad length value") end
-    if skip + n < stop then stop = skip + n end
-  end
-  local canonical = o:has('C')
-  local off = skip
-  local prev: string = ''
-  local star = false
-  while off < stop do
-    local n = stop - off
-    if n > 16 then n = 16 end
-    local sb: stringbuilder
-    if canonical then sb:writef('%08x ', off) else sb:writef('%07x', off) end
-    if canonical then
-      for p = 0, 15 do
-        if p == 8 then sb:write(' ') end
-        if p < n then sb:writef(' %02x', data.data[off + p]) else sb:write('   ') end
-      end
-      sb:write('  |')
-      for p = 0, < n do
-        local b = data.data[off + p]
-        sb:writebyte((b >= 32 and b < 127) and b or 46)
-      end
-      sb:write('|')
-    elseif o:has('c') then
-      for p = 0, < n do
-        local b = data.data[off + p]
-        if b == 0 then sb:write('  \\0') elseif b == 10 then sb:write('  \\n') elseif b == 9 then sb:write('  \\t')
-        elseif b == 13 then sb:write('  \\r') elseif b >= 32 and b < 127 then sb:writef('   %c', b)
-        else sb:writef(' %03o', b) end
-      end
-    elseif o:has('b') then
-      for p = 0, < n do sb:writef(' %03o', data.data[off + p]) end
-    elseif o:has('d') or o:has('o') or o:has('x') then
-      local p: integer = 0
-      while p < n do
-        local v: uint64 = (@uint64)(data.data[off + p])
-        if p + 1 < n then v = v | ((@uint64)(data.data[off + p + 1]) << 8) end
-        if o:has('d') then sb:writef('   %05d', v) elseif o:has('o') then sb:writef('  %06o', v) else sb:writef('    %04x', v) end
-        p = p + 2
-      end
-    else
-      local p: integer = 0
-      while p < n do
-        local v: uint64 = (@uint64)(data.data[off + p])
-        if p + 1 < n then v = v | ((@uint64)(data.data[off + p + 1]) << 8) end
-        sb:writef(' %04x', v)
-        p = p + 2
-      end
-    end
-    local line = sb:promote()
-    local body = line:sub(8)
-    if not o:has('v') and off > skip and n == 16 and body == prev then
-      if not star then util.line('*'); star = true end
-    else
-      util.line(line); star = false
-    end
-    prev = body
-    off = off + n
-  end
-  if canonical then util.writef('%08x\n', stop) else util.writef('%07x\n', stop) end
-  return 0
-end
 
 
 -- tsort -----------------------------------------------------------------------

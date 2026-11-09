@@ -43,7 +43,7 @@ stdout, exit status, and the resulting directory tree.
 ```
 [ awk b2sum base32 base64 basename basenc cat chgrp chmod chown cksum cmp comm
 cp cut date df dir dirname du echo env expand expr factor false find fold free
-grep groups head hexdump hostname id install join kill link ln ls md5sum mkdir
+grep groups hd head hexdump hostname id install join kill link ln ls md5sum mkdir
 mktemp mv nl nproc nsh od paste patch printenv printf pwd readlink realpath
 rev rm rmdir sed seq sh sha1sum sha224sum sha256sum sha384sum sha512sum shuf
 sleep sort split stat strings sum sync tac tail tee test timeout touch tr true
@@ -379,6 +379,52 @@ Stated here rather than worked around:
   but one known case: a pseudo-denormal long double (exponent 0 with the
   integer bit set) prints as the FPU reads it, where glibc's printf drops
   the integer bit.
+- `hexdump` (and `hd`, which is `hexdump -C` plus any other options) ports
+  util-linux 2.38.1 hexdump.c, hexdump-parse.c, hexdump-display.c and
+  hexdump-conv.c (`src/nebox/applets/hexdump.nelua`, C locale): -b -c -C
+  -d -o -x and the default format, the whole -e/-f format language
+  (iteration and byte counts, %d %i %o %u %x %X %e %f %g %E %G %c %s with
+  every flag, width and precision passed to snprintf as hexdump rewrites
+  them, %_a/%_A in d/o/x, %_c %_p %_u, escape() including its quirk of
+  not copying unescaped characters after an escape, the last unit
+  repeated to fill the block, the trailing-blank cut on the last
+  iteration, blank padding past the end of data), `_L[...]` color units
+  (names, values, strings, offsets and ranges, `!`) under -L/--color with
+  util-linux's terminal-colors.d enable/disable scoring and a terminfo
+  "colors" check for auto mode, -n/-s with parse_size suffixes and
+  fractions, -v and '*' suppression, files opened as freopen() does (a
+  failed operand closes stdin: "all input file arguments failed"), stdio's
+  buffered reads, fseek's skip and the offset glibc leaves on stdin at
+  exit, every diagnostic, --help/--version and close_stdout's write-error
+  rules. glibc's printing of an unknown conversion (a second '.' in a
+  byte-count unit, a format that ends inside a conversion) is emulated in
+  hexdump because nelibc's snprintf prints nothing for it, and so is the
+  '.' that glibc keeps in `%#.0f` for |x| >= 2^64 and nelibc drops.
+  `tests/hexdump_compare.py`: 356 fixed cases and 3000 random -e formats
+  over random inputs with -s/-n/-v, 0 mismatches. Differences, all where
+  the C code is undefined:
+  - A '%' (with only flag/width characters) or `%_a`/`%_A` at the very end
+    of a format unit, which the C code can produce through escape()'s
+    quirk, makes it read past the string into the heap; nebox reads zeros
+    and then an `A` there (the common case on the reference: "bad
+    conversion character %A"), the reference's bytes vary with the heap.
+  - `%s` with a byte count and no or a larger precision reads past the
+    block when the data has no NUL; nebox reads zeros there.
+  - A width, precision or count that overflows a long makes the C code
+    dereference NULL; nebox kills itself with SIGSEGV at the same point.
+  - A color range wider than 4 bytes on a value condition overruns an int
+    in color_cond(); nebox compares 4 bytes. A range on an address unit
+    (byte count 0) loops forever in the C code; nebox stops cloning.
+  - A value condition on a `%_A` unit dereferences NULL in the C code;
+    nebox kills itself with SIGSEGV.
+  - -n with a value of 2^63 or more (a negative ssize_t other than -1)
+    makes the C fread overrun the block; nebox reads without a limit.
+  - A size ending in a '.' with no digits after it ("1.", "1.0") reads
+    the byte after the argument's NUL in parse_size(); nebox takes it as
+    non-NUL, which gives the reference's usual "Invalid argument".
+  - With no operand and a read error on stdin, the C code names
+    `argv[optind - 1]`; nebox uses the last argument, or the applet name
+    for argv[0].
 - `xargs` ports GNU findutils 4.9.0 xargs.c and buildcmd.c
   (`src/nebox/applets/xargs.nelua`, C locale): read_line's quote,
   backslash, blank-line and trailing-blank (-L/-l continuation) rules, the
@@ -850,7 +896,6 @@ Stated here rather than worked around:
     buffer anchors out of `M` addresses for these reasons.
   - A program with back-references can exceed nebox's thread bound and
     stops with "pattern too complex" (exit 4), as in the regex entry.
-- `hexdump` offers -C -c -b -d -o -x -n -s -v only.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
   backend table; `free` reads /proc/meminfo.
 - `groups`/`whoami` know only the

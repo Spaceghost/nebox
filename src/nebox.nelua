@@ -56,6 +56,7 @@ require 'nebox.applets.expr'
 require 'nebox.applets.factor'
 require 'nebox.applets.cmp'
 require 'nebox.applets.od'
+require 'nebox.applets.hexdump'
 require 'nebox.applets.sort'
 require 'nebox.applets.mktemp'
 require 'nebox.applets.realpath'
@@ -82,7 +83,7 @@ local applets: []Applet = {
   {'echo', applet_echo}, {'env', applet_env}, {'expand', applet_expand}, {'expr', applet_expr},
   {'factor', applet_factor}, {'false', applet_false}, {'find', applet_find},
   {'fold', applet_fold}, {'free', applet_free}, {'grep', applet_grep},
-  {'groups', applet_groups}, {'head', applet_head}, {'hexdump', applet_hexdump},
+  {'groups', applet_groups}, {'hd', applet_hd}, {'head', applet_head}, {'hexdump', applet_hexdump},
   {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install}, {'join', applet_join},
   {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
   {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
