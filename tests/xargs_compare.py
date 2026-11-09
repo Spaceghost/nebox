@@ -32,6 +32,9 @@ def w(name, data, mode=0o644):
 
 
 w('args', b'#!/bin/sh\nfor a; do printf "[%s]" "$a"; done; echo\n', 0o755)
+# pargs writes its line with one write, so parallel (-P) children cannot
+# interleave partial lines (args does one printf per argument)
+w('pargs', b'#!/bin/sh\nl=\nfor a; do l="$l[$a]"; done\nprintf "%s\\n" "$l"\n', 0o755)
 w('noexec', b'#!/bin/sh\necho hi\n', 0o644)
 w('words', b'alpha beta gamma\ndelta epsilon\n\nzeta eta theta iota\nkappa\n')
 w('trail', b'a b \nc d\ne \n f\ng\n')
@@ -159,9 +162,9 @@ CASES = [
     "printf '1\\n2\\n' | xargs -n1 -P2 sh -c 'sleep 0.$0; exit 255'; echo $?",
     "printf '1\\n2\\n3\\n' | xargs -n1 -P3 sh -c 'sleep 0.$0; exit $0'",
     # -P, slots, signals (order-independent output)
-    'xargs -P 3 -n1 ./args < words | sort', 'xargs -P 0 -n2 ./args < words | sort', 'xargs -P2 -L1 ./args < trail | sort',
+    'xargs -P 3 -n1 ./pargs < words | sort', 'xargs -P 0 -n2 ./pargs < words | sort', 'xargs -P2 -L1 ./pargs < trail | sort',
     'xargs -P -1 ./args < words', 'xargs -P x ./args < words', 'xargs -P 2147483648 ./args < words',
-    'xargs -P 2147483647 -n1 ./args < words | sort', 'xargs --max-procs=4 -n1 ./args < words | sort',
+    'xargs -P 2147483647 -n1 ./pargs < words | sort', 'xargs --max-procs=4 -n1 ./pargs < words | sort',
     'xargs -n1 -P1 --process-slot-var=SLOT sh -c \'echo $SLOT $0\' < words',
     'xargs -n1 -P3 --process-slot-var=SLOT sh -c \'echo $SLOT\' < words | sort | uniq -c | wc -l',
     'SLOT=9 xargs -n1 --process-slot-var=SLOT sh -c \'echo ${SLOT-unset}\' < words',
@@ -179,7 +182,7 @@ CASES = [
     '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT=-1 xargs ./args < words', '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT=" 7z" xargs ./args < words',
     '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT=99999999999999999999999 xargs ./args < words',
     '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT= xargs ./args < words', '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT=2 xargs -I{} ./args {} < words',
-    '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT=3 xargs -P2 -n4 ./args < lines | sort',
+    '__GNU_FINDUTILS_EXEC_ARG_COUNT_LIMIT=3 xargs -P2 -n4 ./pargs < lines | sort',
     # limits and the environment
     'xargs --show-limits < empty', 'xargs --show-limits -s 1000 true < empty', 'xargs --show-limits -s 99999999 true < empty',
     'xargs -r --show-limits < empty', 'FOO=$(printf "%01000d" 0) xargs --show-limits < empty',

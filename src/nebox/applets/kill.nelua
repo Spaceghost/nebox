@@ -1,0 +1,362 @@
+-- kill: a port of procps-ng 4.0.2 src/kill.c with the local/signals.c and
+-- local/strutils.c code it uses (C locale, Linux x86-64). The first
+-- argument that starts with '-' and names a signal is taken out of argv
+-- before option parsing (skill_sig_option: names case-insensitively with
+-- or without SIG, CLD/IO/IOT, RTMIN, RTMIN+N, EXIT/NULL, and numbers up to
+-- 127 - SIGRTMIN through strtol, so "--0" and "-+9" are signals too);
+-- getopt_long "l::Ls:hVq:" with errors silenced, where an invalid option
+-- that is a digit signals the process group '0' - digit and exits with
+-- the inverted status of kill.c, and any other error prints "invalid
+-- argument C" (a NUL byte for long options) and the usage. -l/--list with
+-- an optional argument or the next operand (strtosig: number to name,
+-- name to number, "unknown signal name", and the invalid free() of
+-- "SIG<digit>..." that aborts), -L/--table, -s/--signal (an unknown name
+-- becomes signal -1 and kill(2)'s EINVAL), -q/--queue through sigqueue,
+-- strtol_or_err's messages with the errno the C code would have, pids
+-- truncated to pid_t but printed as longs in "(PID): strerror", and
+-- -h/--help, -V/--version (nebox's line).
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_syscall(n: clong, ...: cvarargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
+local SYS_rt_sigqueueinfo: clong <comptime> = 129
+local SIGRTMIN: integer <comptime> = 34
+local ERANGE: cint <comptime> = 34
+
+local SigEnt = @record{name: string, num: integer}
+-- signals.c sigtable on Linux, in its (sorted) order
+local sigtable: []SigEnt = {
+  {'ABRT', 6}, {'ALRM', 14}, {'BUS', 7}, {'CHLD', 17}, {'CONT', 18}, {'FPE', 8}, {'HUP', 1},
+  {'ILL', 4}, {'INT', 2}, {'KILL', 9}, {'PIPE', 13}, {'POLL', 29}, {'PROF', 27}, {'PWR', 30},
+  {'QUIT', 3}, {'SEGV', 11}, {'STKFLT', 16}, {'STOP', 19}, {'SYS', 31}, {'TERM', 15}, {'TRAP', 5},
+  {'TSTP', 20}, {'TTIN', 21}, {'TTOU', 22}, {'URG', 23}, {'USR1', 10}, {'USR2', 12},
+  {'VTALRM', 26}, {'WINCH', 28}, {'XCPU', 24}, {'XFSZ', 25},
+}
+
+-- the errno the C program would see (strtol overflow and failed kills set it)
+local cur_errno: cint = 0
+
+local function upper(c: byte): byte
+  if c >= 97 and c <= 122 then return c - 32 end
+  return c
+end
+
+local function caseeq(a: string, b: string): boolean
+  if #a ~= #b then return false end
+  for i = 1, #a do
+    if upper(a:byte(i)) ~= upper(b:byte(i)) then return false end
+  end
+  return true
+end
+
+local function isspace(c: byte): boolean
+  return c == 32 or (c >= 9 and c <= 13)
+end
+
+-- glibc strtol(s, &end, 10): the value, the 1-based index of the first
+-- byte not used (1 when nothing was converted), and ERANGE in cur_errno.
+local function strtol(s: string): (int64, integer)
+  local i = 1
+  while i <= #s and isspace(s:byte(i)) do i = i + 1 end
+  local neg = false
+  if i <= #s and (s:byte(i) == 43 or s:byte(i) == 45) then
+    neg = s:byte(i) == 45
+    i = i + 1
+  end
+  local start = i
+  local v: uint64 = 0
+  local over = false
+  -- the magnitude limit: 2^63 - 1, or 2^63 when negative
+  local limit: uint64 = neg and 0x8000000000000000_u64 or 0x7fffffffffffffff_u64
+  while i <= #s and s:byte(i) >= 48 and s:byte(i) <= 57 do
+    local d = (@uint64)(s:byte(i) - 48)
+    if not over then
+      if v > (limit - d) // 10 then over = true else v = v * 10 + d end
+    end
+    i = i + 1
+  end
+  if i == start then return 0, 1 end
+  if over then
+    cur_errno = ERANGE
+    if neg then return (@int64)(0x8000000000000000_u64), i end
+    return 0x7fffffffffffffff, i
+  end
+  if neg then return (@int64)(0_u64 - v), i end
+  return (@int64)(v), i
+end
+
+-- signals.c signal_name_to_number; -1 when not a signal
+local function signal_name_to_number(arg: string): integer
+  local name = arg
+  if #name >= 3 and caseeq(name:sub(1, 3), 'SIG') then name = name:sub(4) end
+  if caseeq(name, 'CLD') then return 17 end
+  if caseeq(name, 'IO') then return 29 end
+  if caseeq(name, 'IOT') then return 6 end
+  for k = 0, < #sigtable do
+    if caseeq(name, sigtable[k].name) then return sigtable[k].num end
+  end
+  if caseeq(name, 'RTMIN') then return SIGRTMIN end
+  if caseeq(name, 'EXIT') then return 0 end
+  if caseeq(name, 'NULL') then return 0 end
+  local offset = 0
+  if #name >= 6 and caseeq(name:sub(1, 6), 'RTMIN+') then
+    name = name:sub(7)
+    offset = SIGRTMIN
+  end
+  local val, e = strtol(name)
+  if e <= #name or e == 1 then return -1 end
+  -- val + SIGRTMIN > 127 in long arithmetic (wrapping for LONG_MAX)
+  if val < 0 or (@int64)((@uint64)(val) + SIGRTMIN) > 127 then return -1 end
+  return (@int32)((@uint64)(val) + (@uint64)(offset))
+end
+
+-- signal_number_to_name for 1..31: the table searched from its end
+local function signal_number_to_name(signo: integer): string
+  signo = signo & 0x7f
+  local n = #sigtable
+  while n > 0 do
+    n = n - 1
+    if sigtable[n].num == signo then return sigtable[n].name end
+  end
+  if signo == SIGRTMIN then return 'RTMIN' end
+  if signo ~= 0 then return 'RTMIN+' .. tostring(signo - SIGRTMIN) end
+  return '0'
+end
+
+-- glibc's malloc_printerr for strtosig's free() of a pointer into its copy
+local function invalid_free()
+  util.flush()
+  local m = 'free(): invalid pointer\n'
+  sys.write(2, m.data, m.size)
+  local act: sys.Sigaction
+  act.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_DFL))
+  sys.sigaction(6, &act, nilptr)
+  sys.kill(sys.getpid(), 6)
+  sys._exit(127)
+end
+
+-- strtosig: a name for a number, a number for a name, or nothing
+local function strtosig(s: string): (boolean, string)
+  local copy: stringbuilder
+  for i = 1, #s do copy:writebyte(upper(s:byte(i))) end
+  local up = copy:promote()
+  local p = up
+  local shifted = false
+  if #p >= 3 and p:sub(1, 3) == 'SIG' then p = p:sub(4); shifted = true end
+  local numsignal: int32 = 0
+  if #p > 0 and p:byte(1) >= 48 and p:byte(1) <= 57 then
+    local v, e = strtol(s)
+    if e <= #s or e == 1 then
+      if shifted then invalid_free() end
+      return false, ''
+    end
+    numsignal = (@int32)(v)
+  end
+  if numsignal ~= 0 then
+    for k = 0, < #sigtable do
+      if sigtable[k].num == numsignal then return true, sigtable[k].name end
+    end
+  else
+    -- strcmp stops at a NUL, which an argument cannot contain
+    for k = 0, < #sigtable do
+      if p == sigtable[k].name then return true, tostring(sigtable[k].num) end
+    end
+  end
+  return false, ''
+end
+
+local function unix_print_signals()
+  local pos = 0
+  for i = 1, #sigtable do
+    if i - 1 ~= 0 then
+      if pos > 73 then pos = 0; util.writebyte(10) else pos = pos + 1; util.writebyte(32) end
+    end
+    local name = signal_number_to_name(i)
+    util.write(name)
+    pos = pos + #name
+  end
+  util.writebyte(10)
+end
+
+local function pretty_print_signals()
+  local i = 0
+  while true do
+    i = i + 1
+    if i > #sigtable then break end
+    local s = string.format('%2d %s', i, signal_number_to_name(i))
+    util.write(s)
+    local n = #s
+    if n > 0 and i % 7 ~= 0 then
+      if n < 11 then util.write(string.rep(' ', 11 - n)) end
+    else
+      util.writebyte(10)
+    end
+  end
+  if (i - 1) % 7 ~= 0 then util.writebyte(10) end
+end
+
+-- glibc error(): stdout flushed, "kill: MSG[: strerror]"
+local function error_msg(errnum: cint, msg: string)
+  util.flush()
+  local sb: stringbuilder
+  sb:write(util.applet, ': ', msg)
+  if errnum ~= 0 then sb:write(': ', sys.strerror(errnum)) end
+  sb:writebyte(10)
+  local m = sb:promote()
+  sys.write(2, m.data, m.size)
+end
+
+local function print_usage(fd: cint): integer
+  local u = '\nUsage:\n ' .. util.applet .. [[ [options] <pid> [...]
+
+Options:
+ <pid> [...]            send signal to every <pid> listed
+ -<signal>, -s, --signal <signal>
+                        specify the <signal> to be sent
+ -q, --queue <value>    integer value to be sent with the signal
+ -l, --list=[<signal>]  list all signal names, or convert one to a name
+ -L, --table            list all signal names in a nice table
+
+ -h, --help     display this help and exit
+ -V, --version  output version information and exit
+
+For more details see kill(1).
+]]
+  if fd == 1 then
+    util.write(u)
+    util.flush()
+    return 0
+  end
+  util.flush()
+  sys.write(2, u.data, u.size)
+  return 1
+end
+
+-- strtol_or_err; false after printing the message
+local function strtol_or_err(s: string, msg: string): (boolean, int64)
+  if #s > 0 then
+    cur_errno = 0
+    local v, e = strtol(s)
+    if cur_errno == 0 and e ~= 1 and e > #s then return true, v end
+  end
+  error_msg(cur_errno, msg .. ": '" .. s .. "'")
+  return false, 0
+end
+
+local Siginfo = @record{
+  q_signo: cint, q_errno: cint, q_code: cint, q_pad: cint,
+  q_pid: cint, q_uid: cuint, q_value: int64, q_rest: [12]int64,
+}
+
+local function execute_kill(pid: cint, sig: integer, queue: boolean, value: cint): integer
+  local r: cint
+  if queue then
+    local info: Siginfo
+    info.q_signo = (@cint)(sig)
+    info.q_code = -1 -- SI_QUEUE
+    info.q_pid = sys.getpid()
+    info.q_uid = sys.getuid()
+    info.q_value = value
+    r = (@cint)(c_syscall(SYS_rt_sigqueueinfo, pid, (@cint)(sig), &info))
+  else
+    r = sys.kill(pid, (@cint)(sig))
+  end
+  if r ~= 0 then cur_errno = sys.errno() end
+  return r
+end
+
+global function applet_kill(args: sequence(string)): integer
+  cur_errno = 0
+  if #args < 1 then return print_usage(2) end
+  -- skill_sig_option
+  local argv: sequence(string)
+  local signo = -1
+  local taken = false
+  for i = 1, #args do
+    local a = args[i]
+    if not taken and #a > 0 and a:byte(1) == 45 then
+      signo = signal_name_to_number(a:sub(2))
+      if signo > -1 then taken = true; continue end
+    end
+    argv:push(a)
+  end
+  if signo < 0 then signo = 15 end
+  local use_sigqueue = false
+  local sigval: cint = 0
+  local longs: []util.LongOpt = {
+    {'list', 2, 108}, {'table', 0, 76}, {'signal', 1, 115}, {'help', 0, 104}, {'version', 0, 86}, {'queue', 1, 113},
+  }
+  local g = util.getopt(argv, 'l::Ls:hVq:', &longs, #longs)
+  g.quiet = true
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 108 then -- l
+      local has = false
+      local opt = ''
+      if g.has_optarg then
+        has = true; opt = g.optarg
+      elseif g.optind <= #g.args and (#g.args[g.optind] == 0 or g.args[g.optind]:byte(1) ~= 45) then
+        has = true; opt = g.args[g.optind]
+      end
+      if has then
+        local ok, s = strtosig(opt)
+        if ok then util.line(s) else error_msg(0, 'unknown signal name ' .. opt) end
+      else
+        unix_print_signals()
+      end
+      util.flush()
+      return 0
+    elseif c == 76 then -- L
+      pretty_print_signals()
+      util.flush()
+      return 0
+    elseif c == 115 then -- s
+      signo = signal_name_to_number(g.optarg)
+    elseif c == 104 then -- h
+      return print_usage(1)
+    elseif c == 86 then -- V
+      util.line('kill (nebox) after procps-ng 4.0.2')
+      util.flush()
+      return 0
+    elseif c == 113 then -- q
+      local ok, v = strtol_or_err(g.optarg, 'must be an integer value to be passed with the signal.')
+      if not ok then return 1 end
+      sigval = (@cint)(v)
+      use_sigqueue = true
+    elseif c == 63 then
+      local oc = g.optopt
+      if oc < 48 or oc > 57 then
+        -- printf's %c of the option character, a NUL byte for a long option
+        util.flush()
+        local m = util.applet .. ': invalid argument ' .. string.char(oc) .. '\n'
+        sys.write(2, m.data, m.size)
+        return print_usage(2)
+      end
+      -- kill.c signals the process group of the digit and exits 1 when
+      -- that worked, 0 when it failed
+      local pid = 48 - oc
+      if execute_kill((@cint)(pid), signo, use_sigqueue, sigval) == 0 then return 1 end
+      return 0
+    else
+      return print_usage(2)
+    end
+  end
+  local pids = g:operands()
+  if #pids < 1 then return print_usage(2) end
+  local exitvalue = 0
+  for _, a in ipairs(pids) do
+    local ok, pid = strtol_or_err(a, 'failed to parse argument')
+    if not ok then return 1 end
+    if execute_kill((@cint)(pid), signo, use_sigqueue, sigval) ~= 0 then
+      error_msg(cur_errno, '(' .. tostring(pid) .. ')')
+      exitvalue = 1
+    end
+  end
+  return exitvalue
+end

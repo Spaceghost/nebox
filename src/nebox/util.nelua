@@ -151,6 +151,7 @@ global util.Getopt = @record{
   errmsg: string,
   longname: string,    -- the long option last matched
   was_long: boolean,   -- whether the last option returned was a long one
+  optopt: integer,     -- glibc's optopt after an error: the option character, a long option's val, or 0
 }
 
 function util.getopt(args: sequence(string), shortopts: string, longopts: *[0]util.LongOpt, nlong: integer): util.Getopt
@@ -241,6 +242,7 @@ function util.Getopt:next(): integer
         end
       end
       if ambig and not exact then
+        self.optopt = 0
         local sb: stringbuilder
         sb:write("option '", a, "' is ambiguous; possibilities:")
         for i = 0, < self.nlong do
@@ -248,15 +250,15 @@ function util.Getopt:next(): integer
         end
         return getopt_err(self, sb:promote())
       end
-      if found < 0 then return getopt_err(self, "unrecognized option '" .. a .. "'") end
+      if found < 0 then self.optopt = 0; return getopt_err(self, "unrecognized option '" .. a .. "'") end
       local o = self.longopts[found]
       self.longname = o.name
       self.was_long = true
       if eq > 0 then
-        if o.has_arg == 0 then return getopt_err(self, "option '--" .. o.name .. "' doesn't allow an argument") end
+        if o.has_arg == 0 then self.optopt = o.val; return getopt_err(self, "option '--" .. o.name .. "' doesn't allow an argument") end
         self.optarg = body:sub(eq + 1); self.has_optarg = true
       elseif o.has_arg == 1 then
-        if self.optind > #self.args then return getopt_err(self, "option '--" .. o.name .. "' requires an argument") end
+        if self.optind > #self.args then self.optopt = o.val; return getopt_err(self, "option '--" .. o.name .. "' requires an argument") end
         self.optarg = self.args[self.optind]; self.has_optarg = true
         self.optind = self.optind + 1
       end
@@ -276,6 +278,7 @@ function util.Getopt:next(): integer
     end
   end
   if pos <= 0 then
+    self.optopt = c
     return getopt_err(self, "invalid option -- '" .. string.char(c) .. "'")
   end
   if pos < #self.shortopts and self.shortopts:byte(pos + 1) == 58 then
@@ -285,6 +288,7 @@ function util.Getopt:next(): integer
       self.nextchar = ''
     elseif not optional then
       if self.optind > #self.args then
+        self.optopt = c
         return getopt_err(self, "option requires an argument -- '" .. string.char(c) .. "'")
       end
       self.optarg = self.args[self.optind]; self.has_optarg = true

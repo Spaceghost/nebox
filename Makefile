@@ -97,6 +97,8 @@ test: $(OUT)/nebox
 	python3 tests/which_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/sync_compare.py $(abspath $(OUT)/nebox)
 	python3 tests/free_compare.py $(abspath $(OUT)/nebox) 300
+	python3 tests/kill_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/hostname_compare.py $(abspath $(OUT)/nebox)
 
 clean:
 	rm -rf $(OUT)

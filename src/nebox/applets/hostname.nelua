@@ -1,0 +1,1980 @@
+-- hostname: a port of Debian's hostname 3.23+nmu1 hostname.c (also run as
+-- dnsdomainname, domainname, ypdomainname and nisdomainname), with the
+-- parts of glibc 2.36 it depends on ported alongside, since nelibc has no
+-- resolver: getaddrinfo(AI_CANONNAME, SOCK_DGRAM) for -f -d -i -a
+-- (numeric names through inet_aton_exact and inet_pton, then the
+-- nsswitch.conf "hosts" services: nss_files' gethostbyname4_r with
+-- host.conf's "multi", nss_dns' parallel A/AAAA queries with resolv.conf's
+-- nameservers, search list or the domain of the host name, ndots,
+-- attempts, timeout and no-aaaa/no-tld-query, res_context_search's order
+-- and herrno_g rules and gaih_getanswer's canonical name, and the error
+-- codes getaddrinfo derives from them), the RFC 3484 sort of several
+-- results (source addresses from connect/getsockname, the netlink address
+-- list of __check_pf for prefix lengths and flags, the default label,
+-- precedence and scope tables, glibc's merge sort), gethostbyname for -a
+-- (digits_dots, nss_files with "multi" merging aliases, nss_dns' CNAME
+-- aliases), getifaddrs over netlink for -I/-A and getnameinfo
+-- (numeric, or NI_NAMEREQD through nss_files' hostbyaddr and DNS PTR
+-- queries), gai_strerror and hstrerror. hostname.c itself: the option
+-- table and getopt_long, usage on stdout (-h, an unknown option) or
+-- stderr with status 255, -V, -F's read_file (comment and blank lines, the
+-- last line read kept), -b's fallback to the current name or
+-- "localhost", set_name's trimming, RFC 1035 check and errors, and the NIS
+-- domain name with "Local domain name not set".
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_socket(d: cint, t: cint, p: cint): cint <cimport 'socket', cinclude '<sys/socket.h>'> end
+local function c_connect(fd: cint, a: pointer, l: cuint): cint <cimport 'connect', cinclude '<sys/socket.h>'> end
+local function c_getsockname(fd: cint, a: pointer, l: *cuint): cint <cimport 'getsockname', cinclude '<sys/socket.h>'> end
+local function c_send(fd: cint, b: pointer, n: csize, f: cint): clong <cimport 'send', cinclude '<sys/socket.h>'> end
+local function c_sendto(fd: cint, b: pointer, n: csize, f: cint, a: pointer, l: cuint): clong <cimport 'sendto', cinclude '<sys/socket.h>'> end
+local function c_recv(fd: cint, b: pointer, n: csize, f: cint): clong <cimport 'recv', cinclude '<sys/socket.h>'> end
+local function c_sethostname(n: cstring, l: csize): cint <cimport 'sethostname', cinclude '<unistd.h>'> end
+local function c_getdomainname(n: cstring, l: csize): cint <cimport 'getdomainname', cinclude '<unistd.h>'> end
+local function c_setdomainname(n: cstring, l: csize): cint <cimport 'setdomainname', cinclude '<unistd.h>'> end
+local PollFd = @record{fd: cint, events: cshort, revents: cshort}
+local function c_poll(p: *PollFd, n: culong, t: cint): cint <cimport 'poll', cinclude '<poll.h>'> end
+
+local AF_INET <comptime> = 2
+local AF_INET6 <comptime> = 10
+local AF_NETLINK <comptime> = 16
+local SOCK_DGRAM <comptime> = 2
+local SOCK_RAW <comptime> = 3
+local SOCK_CLOEXEC <comptime> = 0x80000
+local EPERM: cint <comptime> = 1
+local EINVAL: cint <comptime> = 22
+local ECONNREFUSED: cint <comptime> = 111
+local ETIMEDOUT: cint <comptime> = 110
+
+-- address families and the one in a tuple
+local Addr = @record{fam: integer, b: [16]byte}
+
+------------------------------------------------------------------------
+-- small text helpers (C locale ctype)
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+local function isalpha(c: byte): boolean return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) end
+local function isalnum(c: byte): boolean return isdigit(c) or isalpha(c) end
+local function isxdigit(c: byte): boolean return isdigit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102) end
+local function isspace(c: byte): boolean return c == 32 or (c >= 9 and c <= 13) end
+local function lower(c: byte): byte if c >= 65 and c <= 90 then return c + 32 end return c end
+
+local function caseeq(a: string, b: string): boolean
+  if #a ~= #b then return false end
+  for i = 1, #a do if lower(a:byte(i)) ~= lower(b:byte(i)) then return false end end
+  return true
+end
+
+local function hasbyte(s: string, c: byte): boolean
+  for i = 1, #s do if s:byte(i) == c then return true end end
+  return false
+end
+
+local function findbyte(s: string, c: byte): integer
+  for i = 1, #s do if s:byte(i) == c then return i end end
+  return 0
+end
+
+-- up to the first NUL, as C string functions see it
+local function cstrpart(s: string): string
+  local z = findbyte(s, 0)
+  if z > 0 then return s:sub(1, z - 1) end
+  return s
+end
+
+-- read a whole file quietly; false when it cannot be opened
+local function slurp(path: string): (boolean, string)
+  local fd = sys.open(path, sys.O_RDONLY, 0)
+  if fd < 0 then return false, '' end
+  local data = util.readfd(fd)
+  sys.close(fd)
+  return true, data
+end
+
+local function splitlines(data: string): sequence(string)
+  local out: sequence(string)
+  local start = 1
+  for i = 1, #data do
+    if data:byte(i) == 10 then out:push(data:sub(start, i - 1)); start = i + 1 end
+  end
+  if start <= #data then out:push(data:sub(start)) end
+  return out
+end
+
+local function words(s: string): sequence(string)
+  local out: sequence(string)
+  local i = 1
+  while i <= #s do
+    while i <= #s and isspace(s:byte(i)) do i = i + 1 end
+    if i > #s then break end
+    local j = i
+    while j <= #s and not isspace(s:byte(j)) do j = j + 1 end
+    out:push(s:sub(i, j - 1))
+    i = j
+  end
+  return out
+end
+
+------------------------------------------------------------------------
+-- inet_aton_exact, inet_pton, inet_ntop (glibc)
+
+-- strtoul(s, &end, 0) from index i for inet_aton: value, end index, overflow
+local function strtoul0(s: string, i: integer): (uint64, integer, boolean)
+  local base: uint64 = 10
+  local j = i
+  if j <= #s and s:byte(j) == 48 then
+    if j + 1 <= #s and (s:byte(j + 1) == 120 or s:byte(j + 1) == 88) and j + 2 <= #s and isxdigit(s:byte(j + 2)) then
+      base = 16; j = j + 2
+    else
+      base = 8
+    end
+  end
+  local v: uint64 = 0
+  local over = false
+  local start = j
+  while j <= #s do
+    local c = s:byte(j)
+    local d: uint64
+    if isdigit(c) then d = c - 48
+    elseif base == 16 and c >= 97 and c <= 102 then d = c - 87
+    elseif base == 16 and c >= 65 and c <= 70 then d = c - 55
+    else break end
+    if d >= base then break end
+    if v > (0xffffffffffffffff_u64 - d) // base then over = true else v = v * base + d end
+    j = j + 1
+  end
+  if j == start and base ~= 8 then return 0, i, false end
+  return v, j, over
+end
+
+local function inet_aton_exact(s: string, out: *[4]byte): boolean
+  local parts: [4]uint64
+  local np = 0
+  local i = 1
+  local val: uint64 = 0
+  local digit = false
+  local c: byte = #s >= 1 and s:byte(1) or 0
+  while true do
+    if not isdigit(c) then return false end
+    local v, e, over = strtoul0(s, i)
+    if over or v > 0xffffffff then return false end
+    val = v
+    digit = e ~= i
+    i = e
+    c = i <= #s and s:byte(i) or 0
+    if c == 46 then
+      if np > 2 or val > 0xff then return false end
+      parts[np] = val; np = np + 1
+      i = i + 1
+      c = i <= #s and s:byte(i) or 0
+    else
+      break
+    end
+  end
+  -- exact: nothing may follow (inet_aton itself allows trailing blanks)
+  if i <= #s then return false end
+  if not digit then return false end
+  local maxv: [4]uint64 = {0xffffffff, 0xffffff, 0xffff, 0xff}
+  if val > maxv[np] then return false end
+  local w: uint64 = val
+  for k = 0, < np do w = w | (parts[k] << (24 - 8 * k)) end
+  out[0] = (@byte)((w >> 24) & 0xff); out[1] = (@byte)((w >> 16) & 0xff)
+  out[2] = (@byte)((w >> 8) & 0xff); out[3] = (@byte)(w & 0xff)
+  return true
+end
+
+local function inet_pton4(s: string, out: *[0]byte): boolean
+  local tmp: [4]byte
+  local saw = false
+  local octets = 0
+  local tp = 0
+  tmp[0] = 0
+  for i = 1, #s do
+    local ch = s:byte(i)
+    if isdigit(ch) then
+      local new: integer = (@integer)(tmp[tp]) * 10 + ((@integer)(ch) - 48)
+      if saw and tmp[tp] == 0 then return false end
+      if new > 255 then return false end
+      tmp[tp] = (@byte)(new)
+      if not saw then
+        octets = octets + 1
+        if octets > 4 then return false end
+        saw = true
+      end
+    elseif ch == 46 and saw then
+      if octets == 4 then return false end
+      tp = tp + 1; tmp[tp] = 0
+      saw = false
+    else
+      return false
+    end
+  end
+  if octets < 4 then return false end
+  for k = 0, 3 do out[k] = tmp[k] end
+  return true
+end
+
+local function hexval(c: byte): integer
+  if isdigit(c) then return c - 48 end
+  if c >= 97 and c <= 102 then return c - 87 end
+  if c >= 65 and c <= 70 then return c - 55 end
+  return -1
+end
+
+-- glibc 2.36 inet_pton6
+local function inet_pton6(s: string, out: *[16]byte): boolean
+  local tmp: [16]byte
+  local tp = 0
+  local colonp = -1
+  local i = 1
+  if i <= #s and s:byte(i) == 58 then
+    i = i + 1
+    if i > #s or s:byte(i) ~= 58 then return false end
+  end
+  local curtok = i
+  local xdigits_seen = 0
+  local val = 0
+  while i <= #s do
+    local ch = s:byte(i)
+    i = i + 1
+    local d = hexval(ch)
+    if d >= 0 then
+      if xdigits_seen == 4 then return false end
+      val = val * 16 + d
+      if val > 0xffff then return false end
+      xdigits_seen = xdigits_seen + 1
+      goto cont
+    end
+    if ch == 58 then
+      curtok = i
+      if xdigits_seen == 0 then
+        if colonp >= 0 then return false end
+        colonp = tp
+        goto cont
+      elseif i > #s then
+        return false
+      end
+      if tp + 2 > 16 then return false end
+      tmp[tp] = (@byte)(val >> 8); tmp[tp + 1] = (@byte)(val & 0xff)
+      tp = tp + 2
+      xdigits_seen = 0
+      val = 0
+      goto cont
+    end
+    if ch == 46 and tp + 4 <= 16 then
+      local v4: [4]byte
+      if inet_pton4(s:sub(curtok), &v4) then
+        for k = 0, 3 do tmp[tp + k] = v4[k] end
+        tp = tp + 4
+        xdigits_seen = 0
+        goto done
+      end
+    end
+    do return false end
+    ::cont::
+  end
+  if xdigits_seen > 0 then
+    if tp + 2 > 16 then return false end
+    tmp[tp] = (@byte)(val >> 8); tmp[tp + 1] = (@byte)(val & 0xff)
+    tp = tp + 2
+  end
+  ::done::
+  if colonp >= 0 then
+    if tp == 16 then return false end
+    local n = tp - colonp
+    for k = 1, n do
+      tmp[16 - k] = tmp[colonp + n - k]
+      tmp[colonp + n - k] = 0
+    end
+    tp = 16
+  end
+  if tp ~= 16 then return false end
+  $out = tmp
+  return true
+end
+
+local function ntop4(b: *[0]byte): string
+  return string.format('%d.%d.%d.%d', b[0], b[1], b[2], b[3])
+end
+
+local function ntop6(b: *[16]byte): string
+  local w: [8]integer
+  for k = 0, 7 do w[k] = ((@integer)(b[2 * k]) << 8) | (@integer)(b[2 * k + 1]) end
+  local bestb, bestl, curb, curl = -1, 0, -1, 0
+  for k = 0, 7 do
+    if w[k] == 0 then
+      if curb == -1 then curb = k; curl = 1 else curl = curl + 1 end
+    elseif curb ~= -1 then
+      if bestb == -1 or curl > bestl then bestb = curb; bestl = curl end
+      curb = -1
+    end
+  end
+  if curb ~= -1 and (bestb == -1 or curl > bestl) then bestb = curb; bestl = curl end
+  if bestb ~= -1 and bestl < 2 then bestb = -1 end
+  local sb: stringbuilder
+  for k = 0, 7 do
+    if bestb ~= -1 and k >= bestb and k < bestb + bestl then
+      if k == bestb then sb:writebyte(58) end
+      goto next
+    end
+    if k ~= 0 then sb:writebyte(58) end
+    if k == 6 and bestb == 0 and (bestl == 6 or (bestl == 5 and w[5] == 0xffff)) then
+      sb:write(ntop4(&b[12]))
+      goto fin
+    end
+    sb:write(string.format('%x', w[k]))
+    ::next::
+  end
+  if bestb ~= -1 and bestb + bestl == 8 then sb:writebyte(58) end
+  ::fin::
+  return sb:promote()
+end
+
+local function ntop(a: Addr): string
+  if a.fam == AF_INET then return ntop4(&a.b) end
+  return ntop6(&a.b)
+end
+
+------------------------------------------------------------------------
+-- configuration: nsswitch.conf hosts, host.conf multi, resolv.conf
+
+local NSS_SUCCESS <comptime> = 0
+local NSS_NOTFOUND <comptime> = 1
+local NSS_UNAVAIL <comptime> = 2
+local NSS_TRYAGAIN <comptime> = 3
+
+local HOST_NOT_FOUND <comptime> = 1
+local TRY_AGAIN <comptime> = 2
+local NO_RECOVERY <comptime> = 3
+local NO_DATA <comptime> = 4
+local NETDB_INTERNAL <comptime> = -1
+
+-- a service with its actions: true is "return" for each status
+local Service = @record{name: string, ret: [4]boolean}
+local services: sequence(Service)
+local multi = false
+
+local Resconf = @record{
+  ns: sequence(Addr), search: sequence(string),
+  ndots: integer, attempts: integer, timeout: integer,
+  noaaaa: boolean, notld: boolean,
+}
+local res: Resconf
+local res_loaded = false
+
+local function status_index(s: string): integer
+  if caseeq(s, 'SUCCESS') then return NSS_SUCCESS end
+  if caseeq(s, 'NOTFOUND') then return NSS_NOTFOUND end
+  if caseeq(s, 'UNAVAIL') then return NSS_UNAVAIL end
+  if caseeq(s, 'TRYAGAIN') then return NSS_TRYAGAIN end
+  return -1
+end
+
+local function load_nss()
+  local ok, data = slurp('/etc/nsswitch.conf')
+  local line = ''
+  local found = false
+  if ok then
+    for _, l in ipairs(splitlines(cstrpart(data))) do
+      local h = findbyte(l, 35)
+      if h > 0 then l = l:sub(1, h - 1) end
+      local i = 1
+      while i <= #l and isspace(l:byte(i)) do i = i + 1 end
+      local c = findbyte(l, 58)
+      if c > 0 then
+        local name = l:sub(i, c - 1)
+        while #name > 0 and isspace(name:byte(#name)) do name = name:sub(1, #name - 1) end
+        if name == 'hosts' then line = l:sub(c + 1); found = true end
+      end
+    end
+  end
+  if not found then line = 'files dns' end
+  -- services and [STATUS=ACTION ...] groups
+  local i = 1
+  while i <= #line do
+    local c = line:byte(i)
+    if isspace(c) then i = i + 1; continue end
+    if c == 91 then
+      local j = i + 1
+      while j <= #line and line:byte(j) ~= 93 do j = j + 1 end
+      local body = line:sub(i + 1, j - 1)
+      i = j + 1
+      if #services == 0 then continue end
+      local svc = &services[#services]
+      for _, item in ipairs(words(body)) do
+        local neg = false
+        if item:byte(1) == 33 then neg = true; item = item:sub(2) end
+        local eq = findbyte(item, 61)
+        if eq == 0 then continue end
+        local st = status_index(item:sub(1, eq - 1))
+        local act = item:sub(eq + 1)
+        local r = caseeq(act, 'return')
+        if not r and not caseeq(act, 'continue') and not caseeq(act, 'merge') then continue end
+        if st < 0 then continue end
+        if neg then
+          for k = 0, 3 do if k ~= st then svc.ret[k] = r end end
+        else
+          svc.ret[st] = r
+        end
+      end
+    else
+      local j = i
+      while j <= #line and not isspace(line:byte(j)) and line:byte(j) ~= 91 do j = j + 1 end
+      local s: Service
+      s.name = line:sub(i, j - 1)
+      s.ret[NSS_SUCCESS] = true
+      services:push(s)
+      i = j
+    end
+  end
+  -- host.conf: the "multi" keyword
+  local hok, hdata = slurp('/etc/host.conf')
+  if hok then
+    for _, l in ipairs(splitlines(cstrpart(hdata))) do
+      local h = findbyte(l, 35)
+      if h > 0 then l = l:sub(1, h - 1) end
+      local w = words(l)
+      if #w >= 2 and caseeq(w[1], 'multi') then
+        if caseeq(w[2], 'on') then multi = true elseif caseeq(w[2], 'off') then multi = false end
+      end
+    end
+  end
+end
+
+local function localhost_name(): string
+  local buf: [256]cchar
+  if sys.gethostname(&buf[0], 255) ~= 0 then return '' end
+  return string.copy(sys.cstr(&buf[0]))
+end
+
+local function atoi(s: string): integer
+  local i = 1
+  while i <= #s and isspace(s:byte(i)) do i = i + 1 end
+  local neg = false
+  if i <= #s and (s:byte(i) == 43 or s:byte(i) == 45) then neg = s:byte(i) == 45; i = i + 1 end
+  local v = 0
+  while i <= #s and isdigit(s:byte(i)) do
+    v = v * 10 + (s:byte(i) - 48)
+    if v > 0x7fffffff then v = 0x7fffffff end
+    i = i + 1
+  end
+  return neg and -v or v
+end
+
+local function setoptions(s: string)
+  for _, w in ipairs(words(s)) do
+    if w:sub(1, 6) == 'ndots:' then
+      local n = atoi(w:sub(7))
+      if n >= 0 then res.ndots = n < 15 and n or 15 end
+    elseif w:sub(1, 8) == 'timeout:' then
+      local n = atoi(w:sub(9))
+      res.timeout = n <= 30 and n or 30
+    elseif w:sub(1, 9) == 'attempts:' then
+      local n = atoi(w:sub(10))
+      res.attempts = n <= 5 and n or 5
+    elseif w:sub(1, 7) == 'no-aaaa' then
+      res.noaaaa = true
+    elseif w:sub(1, 12) == 'no_tld_query' or w:sub(1, 12) == 'no-tld-query' then
+      res.notld = true
+    end
+  end
+end
+
+local function match_kw(l: string, kw: string): boolean
+  return #l > #kw and l:sub(1, #kw) == kw and (l:byte(#kw + 1) == 32 or l:byte(#kw + 1) == 9)
+end
+
+local function load_resolv()
+  if res_loaded then return end
+  res_loaded = true
+  res.ndots = 1; res.attempts = 2; res.timeout = 5
+  local haveenv = false
+  local ld = sys.getenv('LOCALDOMAIN')
+  if ld ~= nilptr then
+    haveenv = true
+    local s = cstrpart((@string)(ld))
+    local nl = findbyte(s, 10)
+    if nl > 0 then s = s:sub(1, nl - 1) end
+    -- blank-separated, the first name kept even when empty
+    local first = true
+    local i = 1
+    local start = 1
+    while true do
+      if i > #s or s:byte(i) == 32 or s:byte(i) == 9 then
+        if first or i > start then res.search:push(s:sub(start, i - 1)) end
+        first = false
+        if i > #s then break end
+        i = i + 1
+        while i <= #s and (s:byte(i) == 32 or s:byte(i) == 9) do i = i + 1 end
+        start = i
+        if i > #s then break end
+      else
+        i = i + 1
+      end
+    end
+  end
+  local ok, data = slurp('/etc/resolv.conf')
+  local have_search = haveenv
+  if ok then
+    for _, l in ipairs(splitlines(data)) do
+      l = cstrpart(l)
+      if #l == 0 or l:byte(1) == 59 or l:byte(1) == 35 then continue end
+      if match_kw(l, 'domain') then
+        if haveenv then continue end
+        local cp = l:sub(7)
+        local i = 1
+        while i <= #cp and (cp:byte(i) == 32 or cp:byte(i) == 9) do i = i + 1 end
+        cp = cp:sub(i)
+        if #cp == 0 then continue end
+        local j = 1
+        while j <= #cp and cp:byte(j) ~= 32 and cp:byte(j) ~= 9 do j = j + 1 end
+        res.search:clear()
+        res.search:push(cp:sub(1, j - 1))
+        have_search = true
+      elseif match_kw(l, 'search') then
+        if haveenv then continue end
+        local cp = l:sub(7)
+        local i = 1
+        while i <= #cp and (cp:byte(i) == 32 or cp:byte(i) == 9) do i = i + 1 end
+        cp = cp:sub(i)
+        if #cp == 0 then continue end
+        res.search:clear()
+        local j = 1
+        local start = 1
+        while true do
+          if j > #cp or cp:byte(j) == 32 or cp:byte(j) == 9 then
+            if j > start or #res.search == 0 then res.search:push(cp:sub(start, j - 1)) end
+            if j > #cp then break end
+            while j <= #cp and (cp:byte(j) == 32 or cp:byte(j) == 9) do j = j + 1 end
+            start = j
+            if j > #cp then break end
+          else
+            j = j + 1
+          end
+        end
+        have_search = true
+      elseif match_kw(l, 'nameserver') then
+        local cp = l:sub(11)
+        local i = 1
+        while i <= #cp and (cp:byte(i) == 32 or cp:byte(i) == 9) do i = i + 1 end
+        cp = cp:sub(i)
+        local j = 1
+        while j <= #cp and cp:byte(j) ~= 32 and cp:byte(j) ~= 9 do j = j + 1 end
+        cp = cp:sub(1, j - 1)
+        local a: Addr
+        local v4: [4]byte
+        if #cp > 0 and inet_aton_exact(cp, &v4) then
+          a.fam = AF_INET
+          for k = 0, 3 do a.b[k] = v4[k] end
+          res.ns:push(a)
+        else
+          local pct = findbyte(cp, 37)
+          if pct > 0 then cp = cp:sub(1, pct - 1) end
+          if #cp > 0 and inet_pton6(cp, &a.b) then a.fam = AF_INET6; res.ns:push(a) end
+        end
+      elseif match_kw(l, 'options') then
+        setoptions(l:sub(8))
+      end
+    end
+  end
+  if #res.ns == 0 then
+    local a: Addr
+    a.fam = AF_INET; a.b[0] = 127; a.b[3] = 1
+    res.ns:push(a)
+  end
+  if not have_search then
+    local hn = localhost_name()
+    local dot = findbyte(hn, 46)
+    if dot > 0 then res.search:push(hn:sub(dot + 1)) end
+  end
+  local ro = sys.getenv('RES_OPTIONS')
+  if ro ~= nilptr then setoptions(cstrpart((@string)(ro))) end
+  if res.attempts < 1 then res.attempts = 1 end
+end
+
+------------------------------------------------------------------------
+-- /etc/hosts (nss_files)
+
+local HostLine = @record{addr: Addr, name: string, aliases: sequence(string)}
+
+-- files-hosts.c's LINE_PARSER for the address family wanted
+local function parse_hostline(raw: string, af: integer, out: *HostLine): boolean
+  local line = cstrpart(raw)
+  local i = 1
+  while i <= #line and isspace(line:byte(i)) do i = i + 1 end
+  if i > #line or line:byte(i) == 35 then return false end
+  line = line:sub(i)
+  local h = findbyte(line, 35)
+  if h > 0 then line = line:sub(1, h - 1) end
+  local j = 1
+  while j <= #line and not isspace(line:byte(j)) do j = j + 1 end
+  local addr = line:sub(1, j - 1)
+  while j <= #line and isspace(line:byte(j)) do j = j + 1 end
+  local rest = line:sub(j)
+  local a: Addr
+  local v4: [4]byte
+  if af ~= AF_INET6 and inet_pton4(addr, &v4) then
+    a.fam = AF_INET
+    for k = 0, 3 do a.b[k] = v4[k] end
+  elseif af == AF_INET6 and inet_pton6(addr, &a.b) then
+    a.fam = AF_INET6
+  else
+    local v6: [16]byte
+    if af == AF_INET and inet_pton6(addr, &v6) then
+      local mapped = true
+      local loop = true
+      for k = 0, 9 do if v6[k] ~= 0 then mapped = false end end
+      if v6[10] ~= 0xff or v6[11] ~= 0xff then mapped = false end
+      for k = 0, 14 do if v6[k] ~= 0 then loop = false end end
+      if v6[15] ~= 1 then loop = false end
+      if mapped then
+        a.fam = AF_INET
+        for k = 0, 3 do a.b[k] = v6[12 + k] end
+      elseif loop then
+        a.fam = AF_INET
+        a.b[0] = 127; a.b[1] = 0; a.b[2] = 0; a.b[3] = 1
+      else
+        return false
+      end
+    elseif af == 0 and inet_pton6(addr, &v6) then
+      a.fam = AF_INET6
+      a.b = v6
+    else
+      return false
+    end
+  end
+  out.addr = a
+  local k = 1
+  while k <= #rest and not isspace(rest:byte(k)) do k = k + 1 end
+  out.name = rest:sub(1, k - 1)
+  out.aliases = words(rest:sub(k))
+  return true
+end
+
+local function line_matches(hl: *HostLine, name: string): boolean
+  if caseeq(name, hl.name) then return true end
+  for _, al in ipairs(hl.aliases) do if caseeq(name, al) then return true end end
+  return false
+end
+
+local Tuple = @record{name: string, has_name: boolean, addr: Addr}
+
+-- gethostbyname4_r: status, herrno
+local function files_byname4(name: string, out: *sequence(Tuple)): (integer, integer)
+  local ok, data = slurp('/etc/hosts')
+  if not ok then return NSS_UNAVAIL, NO_DATA end
+  local any = false
+  for _, l in ipairs(splitlines(data)) do
+    local hl: HostLine
+    if not parse_hostline(l, 0, &hl) then continue end
+    if not line_matches(&hl, name) then continue end
+    local t: Tuple
+    t.has_name = not any
+    t.name = hl.name
+    t.addr = hl.addr
+    out:push(t)
+    any = true
+    if not multi then return NSS_SUCCESS, 0 end
+  end
+  if any then return NSS_SUCCESS, 0 end
+  return NSS_NOTFOUND, HOST_NOT_FOUND
+end
+
+local Hostent = @record{name: string, aliases: sequence(string), addrs: sequence(Addr)}
+
+-- gethostbyname3_r(AF_INET) with gethostbyname3_multi
+local function files_byname(name: string, he: *Hostent): (integer, integer)
+  local ok, data = slurp('/etc/hosts')
+  if not ok then return NSS_UNAVAIL, NO_DATA end
+  local found = false
+  for _, l in ipairs(splitlines(data)) do
+    local hl: HostLine
+    if not parse_hostline(l, AF_INET, &hl) then continue end
+    if not line_matches(&hl, name) then continue end
+    if not found then
+      found = true
+      he.name = hl.name
+      for _, al in ipairs(hl.aliases) do he.aliases:push(al) end
+      he.addrs:push(hl.addr)
+      if not multi then break end
+    else
+      he.addrs:push(hl.addr)
+      for _, al in ipairs(hl.aliases) do he.aliases:push(al) end
+      if he.name ~= hl.name then he.aliases:push(hl.name) end
+    end
+  end
+  if found then return NSS_SUCCESS, 0 end
+  return NSS_NOTFOUND, HOST_NOT_FOUND
+end
+
+local function files_byaddr(a: Addr, name: *string): integer
+  local ok, data = slurp('/etc/hosts')
+  if not ok then return NSS_UNAVAIL end
+  for _, l in ipairs(splitlines(data)) do
+    local hl: HostLine
+    if not parse_hostline(l, a.fam, &hl) then continue end
+    if hl.addr.fam ~= a.fam then continue end
+    local n = a.fam == AF_INET and 4 or 16
+    local same = true
+    for k = 0, < n do if hl.addr.b[k] ~= a.b[k] then same = false end end
+    if same then $name = hl.name; return NSS_SUCCESS end
+  end
+  return NSS_NOTFOUND
+end
+
+------------------------------------------------------------------------
+-- DNS (nss_dns over res_send's UDP path)
+
+local herrno_g: integer = 0
+local res_errno: cint = 0
+
+-- res_hnok: labels of letters, digits, '-' and '_', none starting with '-'
+local function hnok(s: string): boolean
+  local start = true
+  for i = 1, #s do
+    local c = s:byte(i)
+    if c == 46 then start = true
+    else
+      if start and c == 45 then return false end
+      if not (isalnum(c) or c == 45 or c == 95) then return false end
+      start = false
+    end
+  end
+  return true
+end
+
+local function name_to_wire(name: string, sb: *stringbuilder): boolean
+  if name == '.' then sb:writebyte(0); return true end
+  local total = 0
+  local start = 1
+  local i = 1
+  while true do
+    if i > #name or name:byte(i) == 46 then
+      local n = i - start
+      if n == 0 then
+        if i > #name and i > 1 then break end
+        return false
+      end
+      if n > 63 then return false end
+      sb:writebyte((@byte)(n))
+      sb:write(name:sub(start, i - 1))
+      total = total + n + 1
+      if i > #name then break end
+      start = i + 1
+      if start > #name then break end
+    end
+    i = i + 1
+  end
+  sb:writebyte(0)
+  return total + 1 <= 255
+end
+
+local function mkquery(id: integer, name: string, qtype: integer): (boolean, string)
+  local sb: stringbuilder
+  sb:writebyte((@byte)(id >> 8)); sb:writebyte((@byte)(id & 0xff))
+  sb:writebyte(1); sb:writebyte(0)
+  sb:writebyte(0); sb:writebyte(1)
+  for k = 1, 6 do sb:writebyte(0) end
+  if not name_to_wire(name, &sb) then return false, '' end
+  sb:writebyte((@byte)(qtype >> 8)); sb:writebyte((@byte)(qtype & 0xff))
+  sb:writebyte(0); sb:writebyte(1)
+  return true, sb:promote()
+end
+
+local function u16(m: string, i: integer): integer
+  return ((@integer)(m:byte(i)) << 8) | (@integer)(m:byte(i + 1))
+end
+
+-- dn_expand: the name at 1-based offset i, the bytes it takes there, ok
+local function expand(m: string, i: integer): (boolean, string, integer)
+  local sb: stringbuilder
+  local p = i
+  local used = -1
+  local hops = 0
+  local first = true
+  while true do
+    if p > #m then return false, '', 0 end
+    local len = m:byte(p)
+    if len & 0xc0 == 0xc0 then
+      if p + 1 > #m then return false, '', 0 end
+      if used < 0 then used = p + 2 - i end
+      p = (((@integer)(len) & 0x3f) << 8 | (@integer)(m:byte(p + 1))) + 1
+      hops = hops + 1
+      if hops > 64 then return false, '', 0 end
+    elseif len & 0xc0 ~= 0 then
+      return false, '', 0
+    elseif len == 0 then
+      if used < 0 then used = p + 1 - i end
+      break
+    else
+      if p + len > #m then return false, '', 0 end
+      if not first then sb:writebyte(46) end
+      first = false
+      sb:write(m:sub(p + 1, p + len))
+      p = p + len + 1
+    end
+  end
+  local s = sb:promote()
+  if #s == 0 then s = '.' end
+  return true, s, used
+end
+
+local function fresh_id(): integer
+  local b: [2]byte
+  sys.getrandom(&b[0], 2, 0)
+  return ((@integer)(b[0]) << 8) | (@integer)(b[1])
+end
+
+local function sockaddr(a: Addr, port: integer, buf: *[28]byte): cuint
+  for k = 0, 27 do buf[k] = 0 end
+  if a.fam == AF_INET then
+    buf[0] = AF_INET
+    buf[2] = (@byte)(port >> 8); buf[3] = (@byte)(port & 0xff)
+    for k = 0, 3 do buf[4 + k] = a.b[k] end
+    return 16
+  end
+  buf[0] = AF_INET6
+  buf[2] = (@byte)(port >> 8); buf[3] = (@byte)(port & 0xff)
+  for k = 0, 15 do buf[8 + k] = a.b[k] end
+  return 28
+end
+
+-- whether a response answers a query: id and the question section
+local function answers(q: string, r: string): boolean
+  if #r < 12 or #q < 12 then return false end
+  if r:byte(1) ~= q:byte(1) or r:byte(2) ~= q:byte(2) then return false end
+  if r:byte(3) & 0x80 == 0 then return false end
+  if u16(r, 5) ~= 1 then return false end
+  local ok1, n1, l1 = expand(q, 13)
+  local ok2, n2, l2 = expand(r, 13)
+  if not ok1 or not ok2 or #r < 12 + l2 + 4 then return false end
+  if not caseeq(n1, n2) then return false end
+  return u16(q, 13 + l1) == u16(r, 13 + l2) and u16(q, 15 + l1) == u16(r, 15 + l2)
+end
+
+-- res_send over UDP: the answers to one or two queries; false with
+-- res_errno set when no server answered
+local function res_send(q1: string, q2: string, two: boolean): (boolean, string, string)
+  local gotsomewhere = false
+  local nscount = #res.ns
+  for try = 0, < res.attempts do
+    for nsi = 1, nscount do
+      local a = res.ns[nsi]
+      local fd = c_socket((@cint)(a.fam), SOCK_DGRAM | SOCK_CLOEXEC, 0)
+      if fd < 0 then res_errno = sys.errno(); goto nextns end
+      do
+        local sa: [28]byte
+        local sl = sockaddr(a, 53, &sa)
+        if c_connect(fd, &sa, sl) ~= 0 then sys.close(fd); goto nextns end
+        local r1, r2 = '', ''
+        local have1, have2 = false, not two
+        if c_send(fd, q1.data, q1.size, 0) < 0 or (two and c_send(fd, q2.data, q2.size, 0) < 0) then
+          res_errno = sys.errno(); sys.close(fd); goto nextns
+        end
+        local seconds = res.timeout << try
+        if nsi > 1 then seconds = seconds // nscount end
+        if seconds <= 0 then seconds = 1 end
+        local start: sys.Timespec
+        sys.clock_gettime(sys.CLOCK_MONOTONIC, &start)
+        local buf: [65536]byte
+        while not (have1 and have2) do
+          local now: sys.Timespec
+          sys.clock_gettime(sys.CLOCK_MONOTONIC, &now)
+          local spent = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) // 1000000
+          local left = seconds * 1000 - spent
+          if left <= 0 then gotsomewhere = true; break end
+          local pfd: PollFd = {fd = fd, events = 1}
+          local pr = c_poll(&pfd, 1, (@cint)(left))
+          if pr == 0 then gotsomewhere = true; break end
+          if pr < 0 then continue end
+          local n = c_recv(fd, &buf[0], #buf, 0)
+          if n < 0 then
+            res_errno = sys.errno()
+            break
+          end
+          local r = string.copy((@string){data = &buf[0], size = (@usize)(n)})
+          if not have1 and answers(q1, r) then r1 = r; have1 = true
+          elseif two and not have2 and answers(q2, r) then r2 = r; have2 = true end
+        end
+        sys.close(fd)
+        if have1 and have2 then res_errno = 0; return true, r1, r2 end
+      end
+      ::nextns::
+    end
+  end
+  res_errno = gotsomewhere and ETIMEDOUT or ECONNREFUSED
+  return false, '', ''
+end
+
+local NOERROR <comptime> = 0
+local SERVFAIL <comptime> = 2
+local NXDOMAIN <comptime> = 3
+
+local function rcode(m: string): integer
+  if #m < 12 then return NOERROR end
+  return m:byte(4) & 0xf
+end
+local function ancount(m: string): integer
+  if #m < 12 then return 0 end
+  return u16(m, 7)
+end
+
+-- __res_context_query; answers on success, herrno_g set otherwise
+local function res_query(name: string, qtype: integer, two: boolean): (boolean, string, string)
+  local ok1, q1 = mkquery(fresh_id(), name, qtype)
+  local q2 = ''
+  local ok2 = true
+  if two then ok2, q2 = mkquery(fresh_id(), name, 28) end
+  if not ok1 or not ok2 then herrno_g = NO_RECOVERY; return false, '', '' end
+  local ok, a1, a2 = res_send(q1, q2, two)
+  if not ok then herrno_g = TRY_AGAIN; return false, '', '' end
+  local h1, h2 = a1, a2
+  if not two or #a2 < 12 then h2 = a1 elseif #a1 < 12 then h1 = a2 end
+  if (rcode(h1) ~= NOERROR or ancount(h1) == 0) and (rcode(h2) ~= NOERROR or ancount(h2) == 0) then
+    local rc = rcode(h1) == NOERROR and rcode(h2) or rcode(h1)
+    if rc == NXDOMAIN then
+      herrno_g = HOST_NOT_FOUND
+    elseif rc == SERVFAIL then
+      herrno_g = TRY_AGAIN
+    elseif rc == NOERROR then
+      herrno_g = NO_DATA
+    else
+      herrno_g = NO_RECOVERY
+    end
+    return false, a1, a2
+  end
+  return true, a1, a2
+end
+
+local function querydomain(name: string, domain: string, has_domain: boolean, qtype: integer, two: boolean, a1: *string, a2: *string): boolean
+  local longname = name
+  if not has_domain then
+    if #name >= 1025 then herrno_g = NO_RECOVERY; return false end
+    if #name > 0 and name:byte(#name) == 46 then longname = name:sub(1, #name - 1) end
+  else
+    if #name + #domain + 1 >= 1025 then herrno_g = NO_RECOVERY; return false end
+    longname = name .. '.' .. domain
+  end
+  local ok, r1, r2 = res_query(longname, qtype, two)
+  $a1 = r1; $a2 = r2
+  return ok
+end
+
+-- __res_context_search
+local function res_search(name: string, qtype: integer, two: boolean, a1: *string, a2: *string): boolean
+  load_resolv()
+  res_errno = 0
+  herrno_g = HOST_NOT_FOUND
+  local dots = 0
+  for i = 1, #name do if name:byte(i) == 46 then dots = dots + 1 end end
+  local trailing = #name > 0 and name:byte(#name) == 46
+  local saved = -1
+  local tried_as_is = false
+  local got_nodata, got_servfail, root_on_list = false, false, false
+  local searched = false
+  if dots >= res.ndots or trailing then
+    local ok = querydomain(name, '', false, qtype, two, a1, a2)
+    if ok or trailing then return ok end
+    saved = herrno_g
+    tried_as_is = true
+  end
+  if dots == 0 or not trailing then
+    for _, d in ipairs(res.search) do
+      searched = true
+      local dname = d
+      if #dname > 0 and dname:byte(1) == 46 then dname = dname:sub(2) end
+      if #dname == 0 then root_on_list = true end
+      if querydomain(name, dname, true, qtype, two, a1, a2) then return true end
+      if res_errno == ECONNREFUSED then herrno_g = TRY_AGAIN; return false end
+      local done = false
+      if herrno_g == NO_DATA then got_nodata = true
+      elseif herrno_g == HOST_NOT_FOUND then
+      elseif herrno_g == TRY_AGAIN and rcode($a1) == SERVFAIL and #$a1 >= 12 then got_servfail = true
+      else done = true end
+      if done then break end
+    end
+  end
+  if (dots > 0 or not searched or not res.notld) and not (tried_as_is or root_on_list) then
+    if querydomain(name, '', false, qtype, two, a1, a2) then return true end
+  end
+  if saved ~= -1 then herrno_g = saved
+  elseif got_nodata then herrno_g = NO_DATA
+  elseif got_servfail then herrno_g = TRY_AGAIN end
+  return false
+end
+
+local A_T <comptime> = 1
+local CNAME_T <comptime> = 5
+local PTR_T <comptime> = 12
+local AAAA_T <comptime> = 28
+
+-- the question name and the offset of the answer section
+local function question(m: string): (boolean, string, integer)
+  if #m < 12 or u16(m, 5) ~= 1 then return false, '', 0 end
+  local ok, qn, used = expand(m, 13)
+  if not ok then return false, '', 0 end
+  return true, qn, 13 + used + 4
+end
+
+-- gaih_getanswer_slice: status and herrno_g
+local function getanswer_slice(m: string, out: *sequence(Tuple), first: *boolean): (integer, integer)
+  local ok, qn, p = question(m)
+  if not ok then return NSS_UNAVAIL, NO_RECOVERY end
+  if not hnok(qn) then return NSS_UNAVAIL, NO_RECOVERY end
+  local an = ancount(m)
+  local have = false
+  local had_error = false
+  local canon = ''
+  local has_canon = false
+  local h_name = ''
+  if an == 0 then return NSS_NOTFOUND, HOST_NOT_FOUND end
+  while an > 0 and p <= #m and not had_error do
+    an = an - 1
+    local okn, owner, used = expand(m, p)
+    if not okn or not hnok(owner) then had_error = true; continue end
+    if $first and not has_canon then h_name = owner end
+    p = p + used
+    if p + 10 > #m + 1 then had_error = true; continue end
+    local typ, class = u16(m, p), u16(m, p + 2)
+    local rdlen = u16(m, p + 8)
+    p = p + 10
+    if #m + 1 - p < rdlen then had_error = true; continue end
+    if class ~= 1 then p = p + rdlen; continue end
+    if typ == CNAME_T then
+      local okc, target, cu = expand(m, p)
+      if not okc or not hnok(target) then had_error = true; continue end
+      p = p + cu
+      if $first then
+        if #target + 1 >= 64 then had_error = true; continue end
+        canon = target; has_canon = true
+      end
+      continue
+    end
+    if typ == A_T or typ == AAAA_T then
+      if rdlen ~= (typ == A_T and 4 or 16) then had_error = true; continue end
+    else
+      p = p + rdlen; continue
+    end
+    local t: Tuple
+    if $first then
+      t.has_name = true
+      t.name = has_canon and canon or h_name
+      $first = false
+    end
+    t.addr.fam = typ == A_T and AF_INET or AF_INET6
+    for k = 0, < rdlen do t.addr.b[k] = m:byte(p + k) end
+    p = p + rdlen
+    out:push(t)
+    have = true
+  end
+  if have then return NSS_SUCCESS, 0 end
+  if has_canon then return NSS_NOTFOUND, HOST_NOT_FOUND end
+  return NSS_TRYAGAIN, NETDB_INTERNAL
+end
+
+local function dns_fail_status(): integer
+  if res_errno == ECONNREFUSED or res_errno == ETIMEDOUT then return NSS_UNAVAIL end
+  return NSS_NOTFOUND
+end
+
+-- _nss_dns_gethostbyname4_r: status, herrno
+local function dns_byname4(name: string, out: *sequence(Tuple)): (integer, integer)
+  if not hnok(name) then return NSS_NOTFOUND, HOST_NOT_FOUND end
+  load_resolv()
+  local a1, a2 = '', ''
+  local two = not res.noaaaa
+  if not res_search(name, A_T, two, &a1, &a2) then return dns_fail_status(), herrno_g end
+  local first = true
+  local st, he = NSS_NOTFOUND, 0
+  if #a1 > 0 then st, he = getanswer_slice(a1, out, &first) end
+  if two and (st == NSS_SUCCESS or st == NSS_NOTFOUND or st == NSS_TRYAGAIN) and #a2 > 0 then
+    local st2, he2 = getanswer_slice(a2, out, &first)
+    he = he2
+    if st ~= NSS_SUCCESS and st2 ~= NSS_NOTFOUND then st = st2 end
+  end
+  return st, he
+end
+
+-- getanswer_r for T_A (gethostbyname) and T_PTR (gethostbyaddr)
+local function getanswer(m: string, qtype: integer, he: *Hostent): (integer, integer)
+  local ok, qn, p = question(m)
+  if not ok then return NSS_UNAVAIL, NO_RECOVERY end
+  if qtype == A_T and not hnok(qn) then return NSS_UNAVAIL, NO_RECOVERY end
+  local an = ancount(m)
+  local tname = qn
+  local has_name = false
+  if qtype == A_T then
+    if #qn + 1 >= 64 then return NSS_TRYAGAIN, NO_RECOVERY end
+    he.name = qn; has_name = true
+  end
+  local have = 0
+  local had_error = false
+  while an > 0 and p <= #m and not had_error do
+    an = an - 1
+    local okn, owner, used = expand(m, p)
+    if not okn or (qtype == A_T and not hnok(owner)) then had_error = true; continue end
+    p = p + used
+    if p + 10 > #m + 1 then had_error = true; continue end
+    local typ, class = u16(m, p), u16(m, p + 2)
+    local rdlen = u16(m, p + 8)
+    p = p + 10
+    if #m + 1 - p < rdlen then had_error = true; continue end
+    if class ~= 1 then p = p + rdlen; continue end
+    if typ == CNAME_T then
+      local okc, target, cu = expand(m, p)
+      if not okc or (qtype == A_T and not hnok(target)) then had_error = true; continue end
+      p = p + cu
+      if qtype == A_T then
+        if #he.aliases >= 47 then continue end
+        if #owner + 1 >= 64 or #target + 1 >= 64 then had_error = true; continue end
+        he.aliases:push(owner)
+        he.name = target
+      else
+        if #target + 1 >= 64 then had_error = true; continue end
+        tname = target
+      end
+      continue
+    end
+    if typ ~= qtype then p = p + rdlen; continue end
+    if typ == PTR_T then
+      if not caseeq(tname, owner) then p = p + rdlen; continue end
+      local okp, target = expand(m, p)
+      if not okp or not hnok(target) then had_error = true; break end
+      he.name = target
+      return NSS_SUCCESS, 0
+    end
+    if not caseeq(he.name, owner) then p = p + rdlen; continue end
+    if rdlen ~= 4 then had_error = true; break end
+    if have == 0 then he.name = owner end
+    local a: Addr
+    a.fam = AF_INET
+    for k = 0, 3 do a.b[k] = m:byte(p + k) end
+    he.addrs:push(a)
+    p = p + 4
+    have = have + 1
+  end
+  if have > 0 then return NSS_SUCCESS, 0 end
+  if qtype == A_T and #he.aliases > 0 then return NSS_NOTFOUND, NO_RECOVERY end
+  return NSS_TRYAGAIN, NO_RECOVERY
+end
+
+local function dns_byname(name: string, he: *Hostent): (integer, integer)
+  load_resolv()
+  local a1, a2 = '', ''
+  if not res_search(name, A_T, false, &a1, &a2) then return dns_fail_status(), herrno_g end
+  return getanswer(a1, A_T, he)
+end
+
+local function dns_byaddr(a: Addr, name: *string): integer
+  load_resolv()
+  local sb: stringbuilder
+  if a.fam == AF_INET then
+    sb:write(string.format('%d.%d.%d.%d.in-addr.arpa', a.b[3], a.b[2], a.b[1], a.b[0]))
+  else
+    local hex = '0123456789abcdef'
+    for k = 15, 0, -1 do
+      sb:writebyte(hex:byte((a.b[k] & 0xf) + 1)); sb:writebyte(46)
+      sb:writebyte(hex:byte((a.b[k] >> 4) + 1)); sb:writebyte(46)
+    end
+    sb:write('ip6.arpa')
+  end
+  local q = sb:promote()
+  local ok, r1 = res_query(q, PTR_T, false)
+  if not ok then return NSS_NOTFOUND end
+  local he: Hostent
+  local st = getanswer(r1, PTR_T, &he)
+  if st == NSS_SUCCESS then $name = he.name end
+  return st
+end
+
+------------------------------------------------------------------------
+-- netlink: links and addresses
+
+local Link = @record{index: integer, flags: integer, typ: integer}
+local IfAddr = @record{index: integer, prefixlen: integer, flags: integer, addr: Addr, has_addr: boolean, pfaddr: Addr, has_pf: boolean}
+local links: sequence(Link)
+local ifaddrs: sequence(IfAddr)
+local nl_loaded = false
+local nl_ok = false
+
+local function rd32(b: *[0]byte, i: integer): integer
+  return (@integer)(b[i]) | ((@integer)(b[i + 1]) << 8) | ((@integer)(b[i + 2]) << 16) | ((@integer)(b[i + 3]) << 24)
+end
+local function rd16(b: *[0]byte, i: integer): integer
+  return (@integer)(b[i]) | ((@integer)(b[i + 1]) << 8)
+end
+
+local function nl_dump(typ: integer, family: integer, msgs: *sequence(string)): boolean
+  local fd = c_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0)
+  if fd < 0 then return false end
+  local req: [20]byte
+  for k = 0, 19 do req[k] = 0 end
+  req[0] = 20
+  req[4] = (@byte)(typ)
+  req[6] = 0x01 | 0x00; req[7] = 0x03 -- NLM_F_REQUEST, NLM_F_ROOT|NLM_F_MATCH
+  req[8] = 1
+  req[16] = (@byte)(family)
+  local sa: [12]byte
+  for k = 0, 11 do sa[k] = 0 end
+  sa[0] = AF_NETLINK
+  if c_sendto(fd, &req[0], 20, 0, &sa[0], 12) < 0 then sys.close(fd); return false end
+  local buf: [65536]byte
+  local done = false
+  while not done do
+    local n = c_recv(fd, &buf[0], #buf, 0)
+    if n < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      sys.close(fd); return false
+    end
+    if n == 0 then break end
+    local off = 0
+    while off + 16 <= n do
+      local len = rd32(&buf, off)
+      local mt = rd16(&buf, off + 4)
+      if len < 16 or off + len > n then break end
+      if mt == 3 then done = true; break end -- NLMSG_DONE
+      if mt == 2 then sys.close(fd); return false end -- NLMSG_ERROR
+      msgs:push(string.copy((@string){data = &buf[off], size = (@usize)(len)}))
+      off = off + ((len + 3) & ~3)
+    end
+  end
+  sys.close(fd)
+  return true
+end
+
+local function load_netlink(): boolean
+  if nl_loaded then return nl_ok end
+  nl_loaded = true
+  local lm: sequence(string)
+  if not nl_dump(18, 17, &lm) then return false end -- RTM_GETLINK, AF_PACKET
+  for _, m in ipairs(lm) do
+    local b = (@*[0]byte)(m.data)
+    if rd16(b, 4) ~= 16 or #m < 32 then continue end
+    local l: Link
+    l.typ = rd16(b, 18)
+    l.index = rd32(b, 20)
+    l.flags = rd32(b, 24)
+    links:push(l)
+  end
+  local am: sequence(string)
+  if not nl_dump(22, 0, &am) then return false end -- RTM_GETADDR
+  for _, m in ipairs(am) do
+    local b = (@*[0]byte)(m.data)
+    if rd16(b, 4) ~= 20 or #m < 24 then continue end
+    local fam = b[16]
+    if fam ~= AF_INET and fam ~= AF_INET6 then continue end
+    local ia: IfAddr
+    ia.prefixlen = b[17]
+    ia.flags = b[18]
+    ia.index = rd32(b, 20)
+    local alen = fam == AF_INET and 4 or 16
+    local local_a: Addr
+    local has_local = false
+    local off = 24
+    local len = rd32(b, 0)
+    while off + 4 <= len do
+      local rl = rd16(b, off)
+      local rt = rd16(b, off + 2)
+      if rl < 4 or off + rl > len then break end
+      if (rt == 1 or rt == 2) and rl - 4 >= alen then
+        local a: Addr
+        a.fam = fam
+        for k = 0, < alen do a.b[k] = b[off + 4 + k] end
+        if rt == 2 then
+          local_a = a; has_local = true
+        else
+          if not ia.has_pf then ia.pfaddr = a; ia.has_pf = true end
+          if not ia.has_addr then ia.addr = a; ia.has_addr = true end
+        end
+      end
+      off = off + ((rl + 3) & ~3)
+    end
+    if has_local then
+      ia.addr = local_a; ia.has_addr = true
+      if not ia.has_pf then ia.pfaddr = local_a; ia.has_pf = true end
+    end
+    ifaddrs:push(ia)
+  end
+  nl_ok = true
+  return true
+end
+
+local function link_of(index: integer): (boolean, Link)
+  for _, l in ipairs(links) do if l.index == index then return true, l end end
+  local none: Link
+  return false, none
+end
+
+------------------------------------------------------------------------
+-- getaddrinfo(name, NULL, {SOCK_DGRAM, AI_CANONNAME})
+
+local EAI_AGAIN <comptime> = -3
+local EAI_NONAME <comptime> = -2
+local EAI_SYSTEM <comptime> = -11
+local EAI_NODATA <comptime> = -5
+
+local function gai_strerror(e: integer): string
+  if e == EAI_NONAME then return 'Name or service not known' end
+  if e == EAI_AGAIN then return 'Temporary failure in name resolution' end
+  if e == EAI_SYSTEM then return 'System error' end
+  if e == EAI_NODATA then return 'No address associated with hostname' end
+  return 'Unknown error'
+end
+
+local function hstrerror(e: integer): string
+  if e == HOST_NOT_FOUND then return 'Unknown host' end
+  if e == TRY_AGAIN then return 'Host name lookup failure' end
+  if e == NO_RECOVERY then return 'Unknown server error' end
+  if e == NO_DATA then return 'No address associated with name' end
+  if e == NETDB_INTERNAL then return 'Resolver internal error' end
+  return 'Unknown resolver error'
+end
+
+local function service_lookup4(svc: string, name: string, out: *sequence(Tuple)): (integer, integer)
+  if svc == 'files' then return files_byname4(name, out) end
+  if svc == 'dns' then return dns_byname4(name, out) end
+  return NSS_UNAVAIL, NETDB_INTERNAL
+end
+
+-- label, precedence, scope (getaddrinfo.c defaults)
+local Prefix = @record{p: [16]byte, bits: integer, val: integer}
+local function pfx(bytes: [16]byte, bits: integer, val: integer): Prefix
+  return (@Prefix){p = bytes, bits = bits, val = val}
+end
+local labels: [8]Prefix = {
+  pfx({0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}, 128, 0), pfx({0x20,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 16, 2),
+  pfx({0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 96, 3), pfx({0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0}, 96, 4),
+  pfx({0xfe,0xc0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 10, 5), pfx({0xfc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 7, 6),
+  pfx({0x20,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 32, 7), pfx({0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 0, 1),
+}
+local precs: [5]Prefix = {
+  pfx({0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}, 128, 50), pfx({0x20,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 16, 30),
+  pfx({0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 96, 20), pfx({0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0}, 96, 10),
+  pfx({0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 0, 40),
+}
+
+local function mapped(a: Addr): [16]byte
+  local m: [16]byte
+  if a.fam == AF_INET then
+    m[10] = 0xff; m[11] = 0xff
+    for k = 0, 3 do m[12 + k] = a.b[k] end
+  else
+    m = a.b
+  end
+  return m
+end
+
+local function match_prefix(a: Addr, list: *[0]Prefix, n: integer): integer
+  local v = mapped(a)
+  for idx = 0, < n do
+    local bits = list[idx].bits
+    local k = 0
+    local ok = true
+    while bits >= 8 do
+      if list[idx].p[k] ~= v[k] then ok = false; break end
+      k = k + 1; bits = bits - 8
+    end
+    if ok and bits == 0 then return list[idx].val end
+    if ok and bits < 8 then
+      local mask = (0xff00 >> bits) & 0xff
+      if (list[idx].p[k] & mask) == (v[k] & mask) then return list[idx].val end
+    end
+  end
+  return list[n - 1].val
+end
+
+local function get_scope(a: Addr): integer
+  if a.fam == AF_INET6 then
+    local b = a.b
+    if b[0] ~= 0xff then
+      local loop = true
+      for k = 0, 14 do if b[k] ~= 0 then loop = false end end
+      if b[15] ~= 1 then loop = false end
+      if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) or loop then return 2 end
+      if b[0] == 0xfe and (b[1] & 0xc0) == 0xc0 then return 5 end
+      return 14
+    end
+    return b[1] & 0xf
+  end
+  if a.b[0] == 169 and a.b[1] == 254 then return 2 end
+  if a.b[0] == 127 then return 2 end
+  return 14
+end
+
+local SortRes = @record{dest: Addr, src: Addr, got: boolean, flags: integer, prefixlen: integer, index: integer, native: integer}
+
+local function fls(a: uint32): integer
+  local n = 0
+  local mask: uint32 = 0x80000000
+  while n < 32 do
+    if a & mask ~= 0 then break end
+    mask = mask >> 1
+    n = n + 1
+  end
+  return n
+end
+
+local function be32(b: *[0]byte, i: integer): uint32
+  return ((@uint32)(b[i]) << 24) | ((@uint32)(b[i + 1]) << 16) | ((@uint32)(b[i + 2]) << 8) | (@uint32)(b[i + 3])
+end
+
+local function native_of(index: integer): integer
+  local found, l = link_of(index)
+  if not found then return 0 end
+  if l.typ == 768 or l.typ == 769 or l.typ == 776 then return 0 end
+  return 1
+end
+
+local function rfc3484(rs: sequence(SortRes), i1: integer, i2: integer): integer
+  local a1, a2 = &rs[i1], &rs[i2]
+  if a1.got and not a2.got then return -1 end
+  if not a1.got and a2.got then return 1 end
+  local d1, d2 = get_scope(a1.dest), get_scope(a2.dest)
+  if a1.got then
+    local s1, s2 = get_scope(a1.src), get_scope(a2.src)
+    if d1 == s1 and d2 ~= s2 then return -1 end
+    if d1 ~= s1 and d2 == s2 then return 1 end
+    if a1.flags & 1 == 0 and a2.flags & 1 ~= 0 then return -1 end
+    if a1.flags & 1 ~= 0 and a2.flags & 1 == 0 then return 1 end
+    if a1.flags & 2 == 0 and a2.flags & 2 ~= 0 then return 1 end
+    if a1.flags & 2 ~= 0 and a2.flags & 2 == 0 then return -1 end
+    local l1d, l1s = match_prefix(a1.dest, &labels, 8), match_prefix(a1.src, &labels, 8)
+    local l2d, l2s = match_prefix(a2.dest, &labels, 8), match_prefix(a2.src, &labels, 8)
+    if l1d == l1s and l2d ~= l2s then return -1 end
+    if l1d ~= l1s and l2d == l2s then return 1 end
+  end
+  local p1, p2 = match_prefix(a1.dest, &precs, 5), match_prefix(a2.dest, &precs, 5)
+  if p1 > p2 then return -1 end
+  if p1 < p2 then return 1 end
+  if a1.got and a1.index ~= a2.index then
+    if a1.native == -1 then a1.native = native_of(a1.index) end
+    if a2.native == -1 then a2.native = native_of(a2.index) end
+    if a1.native ~= 0 and a2.native == 0 then return -1 end
+    if a1.native == 0 and a2.native ~= 0 then return 1 end
+  end
+  if d1 < d2 then return -1 end
+  if d1 > d2 then return 1 end
+  if a1.got and a1.dest.fam == a2.dest.fam then
+    local bit1, bit2 = 0, 0
+    if a1.dest.fam == AF_INET then
+      local dst1, src1 = be32(&a1.dest.b, 0), be32(&a1.src.b, 0)
+      local nm1: uint32 = 0xffffffff_u32 << ((32 - a1.prefixlen) & 31)
+      if (src1 & nm1) == (dst1 & nm1) then bit1 = fls(dst1 ~ src1) end
+      local dst2, src2 = be32(&a2.dest.b, 0), be32(&a2.src.b, 0)
+      local nm2: uint32 = 0xffffffff_u32 << ((32 - a2.prefixlen) & 31)
+      if (src2 & nm2) == (dst2 & nm2) then bit2 = fls(dst2 ~ src2) end
+    else
+      local i = 0
+      while i < 4 do
+        if be32(&a1.dest.b, 4 * i) ~= be32(&a1.src.b, 4 * i) or be32(&a2.dest.b, 4 * i) ~= be32(&a2.src.b, 4 * i) then break end
+        i = i + 1
+      end
+      if i < 4 then
+        bit1 = fls(be32(&a1.dest.b, 4 * i) ~ be32(&a1.src.b, 4 * i))
+        bit2 = fls(be32(&a2.dest.b, 4 * i) ~ be32(&a2.src.b, 4 * i))
+      end
+    end
+    if bit1 > bit2 then return -1 end
+    if bit1 < bit2 then return 1 end
+  end
+  return i1 < i2 and -1 or 1
+end
+
+-- glibc's msort over the index array
+local function msort(order: sequence(integer), lo: integer, n: integer, rs: sequence(SortRes), tmp: sequence(integer))
+  if n <= 1 then return end
+  local n1 = n // 2
+  local n2 = n - n1
+  msort(order, lo, n1, rs, tmp)
+  msort(order, lo + n1, n2, rs, tmp)
+  local i, j, k = lo, lo + n1, 1
+  local e1, e2 = lo + n1, lo + n
+  while i < e1 and j < e2 do
+    if rfc3484(rs, order[i], order[j]) <= 0 then tmp[k] = order[i]; i = i + 1
+    else tmp[k] = order[j]; j = j + 1 end
+    k = k + 1
+  end
+  while i < e1 do tmp[k] = order[i]; i = i + 1; k = k + 1 end
+  while j < e2 do tmp[k] = order[j]; j = j + 1; k = k + 1 end
+  for m = 1, k - 1 do order[lo + m - 1] = tmp[m] end
+end
+
+local function source_of(r: *SortRes)
+  local fd = c_socket((@cint)(r.dest.fam), SOCK_DGRAM | SOCK_CLOEXEC, 0)
+  if fd < 0 then return end
+  local sa: [28]byte
+  local sl = sockaddr(r.dest, 0, &sa)
+  if c_connect(fd, &sa, sl) == 0 then
+    local out: [28]byte
+    local ol: cuint = 28
+    if c_getsockname(fd, &out, &ol) == 0 then
+      r.got = true
+      r.src.fam = r.dest.fam
+      if r.dest.fam == AF_INET then
+        for k = 0, 3 do r.src.b[k] = out[4 + k] end
+      else
+        for k = 0, 15 do r.src.b[k] = out[8 + k] end
+      end
+    end
+  end
+  sys.close(fd)
+end
+
+local function sort_results(addrs: *sequence(Addr))
+  local rs: sequence(SortRes)
+  load_netlink()
+  -- __check_pf's list, kept only when a non-loopback IPv6 address exists
+  local seen6 = false
+  for _, ia in ipairs(ifaddrs) do
+    if ia.has_pf and ia.pfaddr.fam == AF_INET6 then
+      local loop = true
+      for k = 0, 14 do if ia.pfaddr.b[k] ~= 0 then loop = false end end
+      if ia.pfaddr.b[15] ~= 1 then loop = false end
+      if not loop then seen6 = true end
+    end
+  end
+  for _, a in ipairs($addrs) do
+    local r: SortRes
+    r.dest = a
+    r.index = 0xffffffff
+    r.native = -1
+    source_of(&r)
+    if r.got and seen6 then
+      local key = mapped(r.src)
+      if r.src.fam == AF_INET and r.src.b[0] == 127 then
+        key[12] = 127; key[13] = 0; key[14] = 0; key[15] = 1
+      end
+      for _, ia in ipairs(ifaddrs) do
+        if not ia.has_pf then continue end
+        local m = mapped(ia.pfaddr)
+        local same = true
+        for q = 0, 15 do if m[q] ~= key[q] then same = false end end
+        if same then
+          local f = 0
+          if ia.flags & (0x20 | 0x04) ~= 0 then f = f | 1 end
+          if ia.flags & 0x10 ~= 0 then f = f | 2 end
+          r.flags = f
+          r.prefixlen = ia.prefixlen
+          r.index = ia.index
+          break
+        end
+      end
+    end
+    rs:push(r)
+  end
+  local order: sequence(integer)
+  local tmp: sequence(integer)
+  for i = 1, #rs do order:push(i); tmp:push(0) end
+  msort(order, 1, #rs, rs, tmp)
+  local sorted: sequence(Addr)
+  for i = 1, #order do sorted:push(rs[order[i]].dest) end
+  $addrs = sorted
+end
+
+-- returns 0 or an EAI code; the addresses and the canonical name
+local function getaddrinfo(name: string, addrs: *sequence(Addr), canon: *string): integer
+  local v4: [4]byte
+  if inet_aton_exact(name, &v4) then
+    local a: Addr
+    a.fam = AF_INET
+    for k = 0, 3 do a.b[k] = v4[k] end
+    addrs:push(a)
+    $canon = name
+    return 0
+  end
+  do
+    local a: Addr
+    local pct = findbyte(name, 37)
+    local part = pct > 0 and name:sub(1, pct - 1) or name
+    if inet_pton6(part, &a.b) then
+      if pct > 0 then return EAI_NONAME end
+      a.fam = AF_INET6
+      addrs:push(a)
+      $canon = name
+      return 0
+    end
+  end
+  load_nss()
+  local status = NSS_UNAVAIL
+  local herr = 0
+  local no_data, no_inet6 = 0, 0
+  local got: sequence(Tuple)
+  for _, svc in ipairs(services) do
+    got:clear()
+    no_data = 0
+    local st, he = service_lookup4(svc.name, name, &got)
+    status = st
+    herr = he
+    if svc.name == 'files' or svc.name == 'dns' then
+      if st == NSS_SUCCESS then
+        no_data = #got > 0 and 0 or 1
+      elseif he == TRY_AGAIN then no_data = EAI_AGAIN
+      elseif he == NO_DATA then no_data = 1 end
+      no_inet6 = no_data
+    end
+    if svc.ret[st] then break end
+  end
+  if (status == NSS_TRYAGAIN or status == NSS_UNAVAIL) and herr == NETDB_INTERNAL then return EAI_SYSTEM end
+  if status == NSS_SUCCESS and #got > 0 then
+    for _, t in ipairs(got) do addrs:push(t.addr) end
+    $canon = got[1].name
+    if #$addrs > 1 then sort_results(addrs) end
+    return 0
+  end
+  if no_data ~= 0 and no_inet6 ~= 0 then
+    if no_data == EAI_AGAIN and no_inet6 == EAI_AGAIN then return EAI_AGAIN end
+    return EAI_NODATA
+  end
+  return EAI_NONAME
+end
+
+-- gethostbyname: true and the entry, or false with herrno_g
+local function gethostbyname(name: string, he: *Hostent): boolean
+  if #name > 0 and (isdigit(name:byte(1)) or isxdigit(name:byte(1)) or name:byte(1) == 58) then
+    if isdigit(name:byte(1)) then
+      local all = true
+      for i = 1, #name do
+        local c = name:byte(i)
+        if not isdigit(c) and c ~= 46 then all = false; break end
+      end
+      if all and name:byte(#name) ~= 46 then
+        local v4: [4]byte
+        if not inet_aton_exact(name, &v4) then herrno_g = HOST_NOT_FOUND; return false end
+        he.name = name
+        local a: Addr
+        a.fam = AF_INET
+        for k = 0, 3 do a.b[k] = v4[k] end
+        he.addrs:push(a)
+        return true
+      end
+    end
+    if (isxdigit(name:byte(1)) and hasbyte(name, 58)) or name:byte(1) == 58 then
+      herrno_g = HOST_NOT_FOUND
+      return false
+    end
+  end
+  load_nss()
+  local status = NSS_UNAVAIL
+  local herr = NO_RECOVERY
+  for _, svc in ipairs(services) do
+    local e: Hostent
+    local st, hx = NSS_UNAVAIL, NETDB_INTERNAL
+    if svc.name == 'files' then st, hx = files_byname(name, &e)
+    elseif svc.name == 'dns' then st, hx = dns_byname(name, &e) end
+    status = st
+    herr = hx
+    if st == NSS_SUCCESS then $he = e end
+    if svc.ret[st] then break end
+  end
+  if status == NSS_SUCCESS then return true end
+  herrno_g = herr
+  return false
+end
+
+-- getnameinfo(NI_NAMEREQD): the host name or false
+local function namereqd(a: Addr): (boolean, string)
+  load_nss()
+  for _, svc in ipairs(services) do
+    local st = NSS_UNAVAIL
+    local name = ''
+    if svc.name == 'files' then st = files_byaddr(a, &name)
+    elseif svc.name == 'dns' then st = dns_byaddr(a, &name) end
+    if st == NSS_SUCCESS then return true, name end
+    if svc.ret[st] then break end
+  end
+  return false, ''
+end
+
+------------------------------------------------------------------------
+-- hostname.c
+
+local DEFAULT <comptime> = 0
+local DNS <comptime> = 1
+local FQDN <comptime> = 2
+local SHORT <comptime> = 3
+local ALIAS <comptime> = 4
+local IP <comptime> = 5
+local NIS <comptime> = 6
+local NIS_DEF <comptime> = 7
+local ALL_FQDNS <comptime> = 8
+local ALL_IPS <comptime> = 9
+
+local function errx(msg: string): integer
+  util.err(msg)
+  return 1
+end
+
+local function usage(fd: cint): integer
+  local u = [[
+Usage: hostname [-b] {hostname|-F file}         set host name (from file)
+       hostname [-a|-A|-d|-f|-i|-I|-s|-y]       display formatted name
+       hostname                                 display host name
+
+       {yp,nis,}domainname {nisdomain|-F file}  set NIS domain name (from file)
+       {yp,nis,}domainname                      display NIS domain name
+
+       dnsdomainname                            display dns domain name
+
+       hostname -V|--version|-h|--help          print info and exit
+
+Program name:
+       {yp,nis,}domainname=hostname -y
+       dnsdomainname=hostname -d
+
+Program options:
+    -a, --alias            alias names
+    -A, --all-fqdns        all long host names (FQDNs)
+    -b, --boot             set default hostname if none available
+    -d, --domain           DNS domain name
+    -f, --fqdn, --long     long host name (FQDN)
+    -F, --file             read host name or NIS domain name from given file
+    -i, --ip-address       addresses for the host name
+    -I, --all-ip-addresses all addresses for the host
+    -s, --short            short host name
+    -y, --yp, --nis        NIS/YP domain name
+
+Description:
+   This command can get or set the host name or the NIS domain name. You can
+   also get the DNS domain or the FQDN (fully qualified domain name).
+   Unless you are using bind or NIS for host lookups you can change the
+   FQDN (Fully Qualified Domain Name) and the DNS domain name (which is
+   part of the FQDN) in the /etc/hosts file.
+]]
+  if fd == 1 then
+    util.write(u)
+  else
+    util.flush()
+    sys.write(2, u.data, u.size)
+  end
+  return 255
+end
+
+local function check_name(name: string): boolean
+  local len = #name
+  if len == 0 or not isalnum(name:byte(1)) or not isalnum(name:byte(len)) then return false end
+  for i = 1, len do
+    local c = name:byte(i)
+    if not isalnum(c) and c ~= 45 and c ~= 46 then return false end
+    if c == 45 and (name:byte(i - 1) == 46 or name:byte(i + 1) == 46) then return false end
+    if c == 46 and name:byte(i - 1) == 46 then return false end
+  end
+  return true
+end
+
+local function set_name(typ: integer, raw: string): integer
+  local name = cstrpart(raw)
+  if typ == DEFAULT then
+    local i = 1
+    while i <= #name and isspace(name:byte(i)) do i = i + 1 end
+    local j = #name
+    while j >= i and isspace(name:byte(j)) do j = j - 1 end
+    name = name:sub(i, j)
+    if not check_name(name) then return errx('the specified hostname is invalid') end
+    if c_sethostname(name, (@csize)(#name)) ~= 0 then
+      local e = sys.errno()
+      if e == EPERM then return errx('you must be root to change the host name') end
+      if e == EINVAL then return errx('name too long') end
+    end
+    return 0
+  elseif typ == NIS or typ == NIS_DEF then
+    if c_setdomainname(name, (@csize)(#name)) ~= 0 then
+      local e = sys.errno()
+      if e == EPERM then return errx('you must be root to change the domain name') end
+      if e == EINVAL then return errx('name too long') end
+    end
+    return 0
+  end
+  return usage(2)
+end
+
+local function localhost(): (boolean, string)
+  local buf: [1024]cchar
+  if sys.gethostname(&buf[0], 1024) ~= 0 then return false, '' end
+  return true, string.copy(sys.cstr(&buf[0]))
+end
+
+local function show_name(typ: integer): integer
+  if typ == DEFAULT or typ == SHORT then
+    local ok, p = localhost()
+    if not ok then return errx(sys.errstr()) end
+    if typ == SHORT then
+      local dot = findbyte(p, 46)
+      if dot > 0 then p = p:sub(1, dot - 1) end
+    end
+    util.line(p)
+    return 0
+  elseif typ == NIS or typ == NIS_DEF then
+    local buf: [1025]cchar
+    local r = c_getdomainname(&buf[0], typ == NIS and 1024 or 1025)
+    if r ~= 0 and typ == NIS then return errx(sys.errstr()) end
+    local d = sys.cstr(&buf[0])
+    if typ == NIS_DEF and (r ~= 0 or d == '(none)') then
+      util.line(util.applet .. ': Local domain name not set')
+      util.flush()
+      return 1
+    end
+    util.line(d)
+    return 0
+  elseif typ == ALL_IPS or typ == ALL_FQDNS then
+    if not load_netlink() then return errx(sys.errstr()) end
+    for _, ia in ipairs(ifaddrs) do
+      if not ia.has_addr then continue end
+      local found, l = link_of(ia.index)
+      if not found then continue end
+      if l.flags & 8 ~= 0 then continue end
+      if l.flags & 1 == 0 then continue end
+      local a = ia.addr
+      if a.fam == AF_INET6 then
+        if a.b[0] == 0xfe and (a.b[1] & 0xc0) == 0x80 then continue end
+        if a.b[0] == 0xff and (a.b[1] & 0xf) == 2 then continue end
+      end
+      if typ == ALL_IPS then
+        util.write(ntop(a)); util.writebyte(32)
+      else
+        local ok, n = namereqd(a)
+        if ok then util.write(n); util.writebyte(32) end
+      end
+    end
+    util.writebyte(10)
+    return 0
+  end
+  local ok, p = localhost()
+  if not ok then return errx(sys.errstr()) end
+  local addrs: sequence(Addr)
+  local canon = ''
+  local e = getaddrinfo(p, &addrs, &canon)
+  if e ~= 0 then return errx(gai_strerror(e)) end
+  if typ == ALIAS then
+    local he: Hostent
+    if not gethostbyname(p, &he) then return errx(hstrerror(herrno_g)) end
+    for i, al in ipairs(he.aliases) do
+      if i > 1 then util.writebyte(32) end
+      util.write(al)
+    end
+    util.writebyte(10)
+  elseif typ == IP then
+    for i, a in ipairs(addrs) do
+      if i > 1 then util.writebyte(32) end
+      util.write(ntop(a))
+    end
+    util.writebyte(10)
+  elseif typ == DNS then
+    local dot = findbyte(canon, 46)
+    if dot > 0 then util.line(canon:sub(dot + 1)) end
+  elseif typ == FQDN then
+    util.line(canon)
+  end
+  return 0
+end
+
+-- read_file: false when it cannot be opened (with -b), the line it keeps
+local function read_file(filename: string, boot: boolean, out: *string): integer
+  local fd = sys.open(filename, sys.O_RDONLY, 0)
+  if fd < 0 then
+    if boot then return -1 end
+    return errx(sys.errstr())
+  end
+  local st: sys.Stat
+  if sys.fstat(fd, &st) ~= 0 then sys.close(fd); return errx(sys.errstr()) end
+  local data = util.readfd(fd)
+  sys.close(fd)
+  local size = st.st_size
+  local buf = ''
+  local accepted = false
+  local pos = 1
+  -- fgets(buf, size + 1): lines of at most size bytes; at EOF the buffer
+  -- keeps the last line read
+  while true do
+    if size + 1 == 1 then buf = ''; break end
+    if pos > #data then break end
+    local e = pos
+    local limit = pos + size - 1
+    while e <= #data and e <= limit and data:byte(e) ~= 10 do e = e + 1 end
+    local piece: string
+    if e <= #data and e <= limit and data:byte(e) == 10 then piece = data:sub(pos, e); pos = e + 1
+    else piece = data:sub(pos, e - 1); pos = e end
+    buf = piece
+    if #buf > 0 and (buf:byte(1) == 10 or buf:byte(1) == 35) then continue end
+    accepted = true
+    break
+  end
+  local s = cstrpart(buf)
+  local nl = findbyte(s, 10)
+  if accepted and nl > 0 then s = s:sub(1, nl - 1) end
+  $out = s
+  return 0
+end
+
+local function hostname_main(args: sequence(string)): integer
+  local typ = DEFAULT
+  local prog = util.applet
+  if prog == 'dnsdomainname' then typ = DNS
+  elseif prog == 'domainname' then typ = NIS
+  elseif prog == 'ypdomainname' or prog == 'nisdomainname' then typ = NIS_DEF end
+  local longs: []util.LongOpt = {
+    {'domain', 0, 100}, {'boot', 0, 98}, {'file', 1, 70}, {'fqdn', 0, 102}, {'all-fqdns', 0, 65},
+    {'help', 0, 104}, {'long', 0, 102}, {'short', 0, 115}, {'version', 0, 86}, {'alias', 0, 97},
+    {'ip-address', 0, 105}, {'all-ip-addresses', 0, 73}, {'nis', 0, 121}, {'yp', 0, 121},
+  }
+  local g = util.getopt(args, 'aAdfbF:h?iIsVy', &longs, #longs)
+  local file = ''
+  local has_file = false
+  local boot = false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 100 then typ = DNS
+    elseif c == 97 then typ = ALIAS
+    elseif c == 102 then typ = FQDN
+    elseif c == 65 then typ = ALL_FQDNS
+    elseif c == 105 then typ = IP
+    elseif c == 73 then typ = ALL_IPS
+    elseif c == 115 then typ = SHORT
+    elseif c == 121 then typ = NIS_DEF
+    elseif c == 98 then boot = true
+    elseif c == 70 then file = g.optarg; has_file = true
+    elseif c == 86 then
+      util.line('hostname (nebox) after hostname 3.23')
+      return 0
+    elseif c == 63 or c == 104 then
+      return usage(1)
+    else
+      return usage(2)
+    end
+  end
+  local ops = g:operands()
+  local name = ''
+  local has_name = false
+  if has_file then
+    local r = read_file(file, boot, &name)
+    if r > 0 then return r end
+    has_name = r == 0
+    if boot and (not has_name or #name == 0) then
+      local ok, cur = localhost()
+      if not ok then return errx(sys.errstr()) end
+      name = cur
+      if #name == 0 or name == '(none)' then name = 'localhost' end
+      has_name = true
+    end
+  end
+  local k = 1
+  if k <= #ops then
+    if has_name then return usage(2) end
+    name = ops[k]; has_name = true
+    k = k + 1
+  end
+  if k <= #ops then return usage(2) end
+  if has_name then return set_name(typ, name) end
+  return show_name(typ)
+end
+
+global function applet_hostname(args: sequence(string)): integer
+  local r = hostname_main(args)
+  util.flush()
+  return r
+end

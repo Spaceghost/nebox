@@ -75,6 +75,8 @@ require 'nebox.applets.groups'
 require 'nebox.applets.which'
 require 'nebox.applets.sync'
 require 'nebox.applets.free'
+require 'nebox.applets.kill'
+require 'nebox.applets.hostname'
 
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
@@ -84,7 +86,8 @@ local applets: []Applet = {
   {'cat', applet_cat}, {'chgrp', applet_chgrp}, {'chmod', applet_chmod},
   {'chown', applet_chown}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
   {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'dd', applet_dd},
-  {'df', applet_df}, {'diff', applet_diff}, {'dir', applet_dir}, {'dirname', applet_dirname}, {'du', applet_du},
+  {'df', applet_df}, {'diff', applet_diff}, {'dir', applet_dir}, {'dirname', applet_dirname}, {'dnsdomainname', applet_hostname},
+  {'domainname', applet_hostname}, {'du', applet_du},
   {'echo', applet_echo}, {'env', applet_env}, {'expand', applet_expand}, {'expr', applet_expr},
   {'factor', applet_factor}, {'false', applet_false}, {'find', applet_find},
   {'fold', applet_fold}, {'free', applet_free}, {'grep', applet_grep},
@@ -92,7 +95,7 @@ local applets: []Applet = {
   {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install}, {'join', applet_join},
   {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
   {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
-  {'mv', applet_mv}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
+  {'mv', applet_mv}, {'nisdomainname', applet_hostname}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
   {'paste', applet_paste}, {'patch', applet_patch}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
@@ -106,7 +109,7 @@ local applets: []Applet = {
   {'tsort', applet_tsort}, {'tty', applet_tty}, {'unexpand', applet_unexpand},
   {'uname', applet_uname}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'vdir', applet_vdir}, {'wc', applet_wc},
   {'which', applet_which}, {'whoami', applet_whoami}, {'xargs', applet_xargs},
-  {'yes', applet_yes},
+  {'yes', applet_yes}, {'ypdomainname', applet_hostname},
 }
 
 local function find(name: string): integer

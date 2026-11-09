@@ -42,12 +42,13 @@ stdout, exit status, and the resulting directory tree.
 
 ```
 [ awk b2sum base32 base64 basename basenc cat chgrp chmod chown cksum cmp comm
-cp cut date df dir dirname du echo env expand expr factor false find fold free
-grep groups hd head hexdump hostname id install join kill link ln ls md5sum mkdir
-mktemp mv nl nproc nsh od paste patch printenv printf pwd readlink realpath
-rev rm rmdir sed seq sh sha1sum sha224sum sha256sum sha384sum sha512sum shuf
-sleep sort split stat strings sum sync tac tail tee test timeout touch tr true
-truncate tsort tty uname unexpand uniq unlink vdir wc which whoami xargs yes
+cp cut date df dir dirname dnsdomainname domainname du echo env expand expr
+factor false find fold free grep groups hd head hexdump hostname id install
+join kill link ln ls md5sum mkdir mktemp mv nisdomainname nl nproc nsh od paste
+patch printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
+sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
+sync tac tail tee test timeout touch tr true truncate tsort tty uname unexpand
+uniq unlink vdir wc which whoami xargs yes ypdomainname
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
@@ -532,6 +533,79 @@ Stated here rather than worked around:
   - -V/--version prints nebox's line.
   - procps re-reads the file when a second boundary passes between two
     fields of one report; nebox reads once per report.
+- `kill` ports procps-ng 4.0.2 src/kill.c with local/signals.c and
+  local/strutils.c (`src/nebox/applets/kill.nelua`, C locale; the `sh`
+  builtin `kill` is separate and keeps dash's behaviour): the first
+  argument that starts with '-' and names a signal is taken out of argv
+  before option parsing (skill_sig_option: names in any case with or
+  without SIG, CLD/IO/IOT, RTMIN and RTMIN+N, EXIT/NULL, numbers through
+  strtol up to 127 - SIGRTMIN, so `--0`, `-+9` and `"- 9"` are signals
+  and later `-SIGNAL` arguments are not), then getopt_long "l::Ls:hVq:"
+  with errors silenced: an invalid option that is a digit signals the
+  process group '0' - digit and exits 1 when that worked and 0 when it
+  failed, as kill.c does, and any other one prints "invalid argument C"
+  (a NUL byte for a long option) and the usage. -l/--list with its
+  optional argument or the next operand through strtosig (number to name,
+  name to number, "unknown signal name" with status 0, exit statuses not
+  decoded, and the invalid free() of an argument "SIG<digit>..." that
+  makes glibc print "free(): invalid pointer" and abort, which nebox
+  repeats), -L/--table, -s/--signal (an unknown name becomes signal -1 and
+  kill(2)'s EINVAL), -q/--queue through rt_sigqueueinfo as glibc's sigqueue
+  does, strtol_or_err's messages with the errno the C code would have
+  (ERANGE from overflow, ESRCH left by an earlier pid), pids truncated to
+  pid_t but printed as longs in "(PID): strerror", and -h/--help. 4.0.2
+  has no -n and no --verbose; both are invalid arguments.
+  `tests/kill_compare.py`: 264 cases as a user and as root, each in its
+  own PID namespace under setsid so that pid -1, 0, process groups and
+  wrapped pids reach only the case's own processes (a receiver reporting
+  signal, si_code, sigqueue value and sender, and sleepers whose wait
+  statuses are compared), 0 mismatches. -V/--version prints nebox's line.
+- `hostname` (also run as `dnsdomainname`, `domainname`, `ypdomainname`
+  and `nisdomainname`) ports Debian's hostname 3.23+nmu1 hostname.c
+  (`src/nebox/applets/hostname.nelua`, C locale): the option table, usage
+  on stdout for -h/-? and unknown options and on stderr for bad operands,
+  both with status 255, -V, -s, -y and the NIS domain name ("Local domain
+  name not set" on stdout with status 1 for `(none)`), -F's read_file
+  (blank and '#' lines skipped, the last line read kept with its newline
+  when nothing else is found, NUL bytes ending the line), -b falling back
+  to the current name or "localhost", set_name's whitespace trimming,
+  RFC 1035 check, "you must be root..." and "name too long" (other errors
+  ignored with status 0). nelibc has no resolver, so the glibc 2.36 code
+  hostname.c relies on is ported alongside: getaddrinfo with AI_CANONNAME
+  for -f -d -i -a (numeric names through inet_aton_exact and inet_pton,
+  the nsswitch.conf "hosts" services with their [STATUS=ACTION] items and
+  glibc's "files dns" default, nss_files with host.conf's `multi`, nss_dns
+  with resolv.conf's nameservers, search/domain list or the host name's
+  domain, ndots, attempts, timeout, no-aaaa and no-tld-query (and the
+  LOCALDOMAIN and RES_OPTIONS variables, ported but untested),
+  res_context_search's order and h_errno rules, gaih_getanswer's canonical
+  name, and the EAI codes get_nss_addresses derives, including "System
+  error" for an unknown service or an answer without addresses), the RFC
+  3484 sort of several results (source addresses through connect and
+  getsockname, __check_pf's netlink list for prefix lengths and flags,
+  the default label/precedence/scope tables, glibc's merge sort, the
+  prefix-length-0 shift as x86 computes it), gethostbyname for -a
+  (digits_dots, nss_files merging aliases under `multi`, nss_dns' CNAME
+  aliases), getifaddrs over netlink for -I/-A, and getnameinfo, numeric
+  or NI_NAMEREQD through nss_files' hostbyaddr and DNS PTR queries.
+  `tests/hostname_compare.py`: 2955 cases as a user and 2950 as root,
+  plain, in private UTS namespaces (setting host and domain names), and
+  in private user/mount/network/UTS namespaces with fixture hosts,
+  host.conf, nsswitch.conf and resolv.conf files, dummy interfaces and a
+  fixture DNS server (CNAME chains, NXDOMAIN, NODATA, a TXT-only name,
+  refused and unanswered servers, unreachable addresses for the sort),
+  0 mismatches. Differences:
+  - -V/--version prints nebox's line.
+  - The DNS client is UDP only: no TCP retry for truncated answers, no
+    EDNS0, rotate or use-vc, and a SERVFAIL, NOTIMP or REFUSED answer is
+    taken as it comes where glibc tries the next server. HOSTALIASES,
+    RES_OPTIONS' less common options, sortlist, /etc/gai.conf (the default
+    tables are used), nscd and NSS modules other than files and dns (which
+    count as unavailable, as a missing module does) are not read.
+    res_hnok is approximated as letters, digits, '-' and '_' with no label
+    starting with '-'; DNS names are not escaped the way ns_name_ntop
+    escapes special characters. Rule 7 of the sort ("native transport")
+    reads the link type from netlink. None of these paths were tested.
 - `xargs` ports GNU findutils 4.9.0 xargs.c and buildcmd.c
   (`src/nebox/applets/xargs.nelua`, C locale): read_line's quote,
   backslash, blank-line and trailing-blank (-L/-l continuation) rules, the
