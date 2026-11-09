@@ -1,0 +1,119 @@
+-- which: a port of the debianutils 5.7 which script as dash runs it.
+-- dash's getopts for "a" ("--" ends the options and is removed, "-" and
+-- the first non-option stop, any other letter is "Illegal option -X" plus
+-- the usage line and status 2), names with a slash tested as given, other
+-- names looked up in each PATH element from dash's IFS=: field splitting
+-- (a trailing ':' is one empty element, as the script's PATH="$PATH:"
+-- arranges; an empty element is "."; an empty or unset PATH has no
+-- elements; dash's built-in default PATH when PATH is not in the
+-- environment), `[ -f ] && [ -x ]` with faccessat(AT_EACCESS), -a for
+-- every match, status 0, 1 when any name was not found or none was
+-- given, 2 for a bad option. Each line is written at once as dash's
+-- printf writes it; a write error is dash's "printf: I/O error" and status
+-- 1, and a non-empty KSH_VERSION makes the script's `print` fail with
+-- status 127, as under `set -e`.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_faccessat(fd: cint, path: cstring, mode: cint, flags: cint): cint <cimport 'faccessat', cinclude '<unistd.h>'> end
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local DASH_DEFPATH <comptime> = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+local function shell_error(line: string, msg: string)
+  local m = util.applet .. ': ' .. line .. ': ' .. msg .. '\n'
+  sys.write(2, m.data, m.size)
+end
+
+-- the script's puts: print -r under ksh, printf '%s\n' otherwise
+local function puts(s: string)
+  local k = sys.getenv('KSH_VERSION')
+  if k ~= nilptr and #(@string)(k) > 0 then
+    shell_error('6', 'print: not found')
+    c_exit(127)
+  end
+  local line = s .. '\n'
+  local done: usize = 0
+  while done < line.size do
+    local r = sys.write(1, &line.data[done], line.size - done)
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      shell_error('10', 'printf: printf: I/O error')
+      c_exit(1)
+    end
+    done = done + (@usize)(r)
+  end
+end
+
+local function executable(path: string): boolean
+  local st: sys.Stat
+  if sys.stat(path, &st) ~= 0 or (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG then return false end
+  return c_faccessat(sys.AT_FDCWD, path, sys.X_OK, 0x200) == 0
+end
+
+local function has_slash(s: string): boolean
+  for i = 1, #s do if s:byte(i) == 47 then return true end end
+  return false
+end
+
+global function applet_which(args: sequence(string)): integer
+  local allmatches = false
+  local first = 1
+  -- dash getopts with optstring "a"
+  while first <= #args do
+    local a = args[first]
+    if #a < 2 or a:byte(1) ~= 45 then break end
+    first = first + 1
+    if a == '--' then break end
+    for k = 2, #a do
+      local c = a:byte(k)
+      if c == 97 then
+        allmatches = true
+      else
+        local m = 'Illegal option -' .. string.char(c) .. '\n'
+        sys.write(2, m.data, m.size)
+        puts('Usage: ' .. util.applet .. ' [-a] args')
+        return 2
+      end
+    end
+  end
+  local allret = first > #args and 1 or 0
+  local pathv = sys.getenv('PATH')
+  local path: string = pathv ~= nilptr and (@string)(pathv) or DASH_DEFPATH
+  -- IFS=: field splitting of $PATH (the script appends ':' to a PATH that
+  -- ends in one, so a trailing ':' leaves one empty field)
+  local elements: sequence(string)
+  if #path > 0 then
+    local start = 1
+    for i = 1, #path + 1 do
+      if i > #path or path:byte(i) == 58 then
+        if i <= #path or start <= #path then elements:push(path:sub(start, i - 1)) end
+        start = i + 1
+      end
+    end
+    if #path >= 2 and path:byte(#path) == 58 and path:byte(#path - 1) ~= 58 then elements:push('') end
+  end
+  for i = first, #args do
+    local program = args[i]
+    local ret = 1
+    if has_slash(program) then
+      if executable(program) then puts(program); ret = 0 end
+    else
+      for _, element in ipairs(elements) do
+        local e = #element == 0 and '.' or element
+        local full = e .. '/' .. program
+        if executable(full) then
+          puts(full)
+          ret = 0
+          if not allmatches then break end
+        end
+      end
+    end
+    if ret ~= 0 then allret = 1 end
+  end
+  return allret
+end

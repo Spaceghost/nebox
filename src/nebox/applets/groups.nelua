@@ -1,0 +1,174 @@
+-- groups: a port of GNU coreutils 9.1 src/groups.c and group-list.c over
+-- nelibc's getpwnam/getpwuid/getgrgid/getgrouplist. Without operands the
+-- real and effective group, then the supplementary groups (gnulib
+-- mgetgroups: getgroups with the effective gid in front and pairwise
+-- duplicates removed); with USERNAME operands "NAME : " and the user's
+-- primary group and getgrouplist. Unknown users ("'x': no such user"),
+-- group IDs without a name (printed as numbers with GNU's message), status
+-- 1 on either, --help without GNU's closing links, --version with nebox's
+-- line.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwnam(name: cstring): *Passwd <cimport 'getpwnam', cinclude '<pwd.h>'> end
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
+local function c_getgrouplist(user: cstring, gid: cuint, groups: *[0]cuint, n: *cint): cint <cimport 'getgrouplist', cinclude '<grp.h>'> end
+local function c_getgroups(n: cint, list: *[0]cuint): cint <cimport 'getgroups', cinclude '<unistd.h>'> end
+
+local HELP_OPTION <comptime> = 256
+local VERSION_OPTION <comptime> = 257
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+-- gnulib mgetgroups; false when it fails (errno set)
+local function xgetgroups(username: string, has_user: boolean, gid: cuint, out: *sequence(cuint)): boolean
+  out:clear()
+  if has_user then
+    local max: cint = 10
+    local buf: sequence(cuint)
+    while true do
+      buf:resize((@usize)(max))
+      local last = max
+      local ng = c_getgrouplist(username, gid, (@*[0]cuint)(&buf[1]), &max)
+      if ng < 0 and last == max then max = max * 2 end
+      if ng >= 0 then
+        buf:resize((@usize)(max))
+        for k = 1, max do out:push(buf[k]) end
+        buf:destroy()
+        return true
+      end
+    end
+  end
+  local n = c_getgroups(0, nilptr)
+  if n < 0 then return false end
+  local maxn = n
+  if maxn == 0 or gid ~= 0xffffffff then maxn = maxn + 1 end
+  local buf: sequence(cuint)
+  buf:resize((@usize)(maxn))
+  local off = gid ~= 0xffffffff and 1 or 0
+  local ng = c_getgroups(maxn - off, (@*[0]cuint)(&buf[1 + off]))
+  if ng < 0 then buf:destroy(); return false end
+  if gid ~= 0xffffffff then buf[1] = gid; ng = ng + 1 end
+  if ng > 0 then
+    local first = buf[1]
+    out:push(first)
+    for k = 2, ng do
+      local v = buf[k]
+      if v ~= first and v ~= ($out)[#$out] then out:push(v) end
+    end
+  end
+  buf:destroy()
+  return true
+end
+
+local function print_group(gid: cuint): boolean
+  local grp = c_getgrgid(gid)
+  if grp == nilptr then
+    util.err('cannot find name for group ID ' .. tostring(gid))
+    util.write(tostring(gid))
+    return false
+  end
+  util.write((@string)(grp.gr_name))
+  return true
+end
+
+local groups: sequence(cuint)
+
+local function print_group_list(username: string, has_user: boolean, ruid: cuint, rgid: cuint, egid: cuint): boolean
+  local ok = true
+  local pwd: *Passwd = nilptr
+  if has_user then
+    pwd = c_getpwuid(ruid)
+    if pwd == nilptr then ok = false end
+  end
+  if not print_group(rgid) then ok = false end
+  if egid ~= rgid then
+    util.writebyte(32)
+    if not print_group(egid) then ok = false end
+  end
+  if not xgetgroups(username, has_user, pwd ~= nilptr and pwd.pw_gid or egid, &groups) then
+    if has_user then util.err(errno_msg('failed to get groups for user ' .. util.quote(username), sys.errno()))
+    else util.err(errno_msg('failed to get groups for the current process', sys.errno())) end
+    return false
+  end
+  for _, g in ipairs(groups) do
+    if g ~= rgid and g ~= egid then
+      util.writebyte(32)
+      if not print_group(g) then ok = false end
+    end
+  end
+  return ok
+end
+
+local function close_stdout(status: integer): integer
+  if not util.flush() then
+    util.err(errno_msg('write error', sys.errno()))
+    return 1
+  end
+  return status
+end
+
+global function applet_groups(args: sequence(string)): integer
+  local longs: []util.LongOpt = { {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION} }
+  local g = util.getopt(args, '', &longs, #longs)
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == HELP_OPTION then
+      util.write([[
+Usage: groups [OPTION]... [USERNAME]...
+Print group memberships for each USERNAME or, if no USERNAME is specified, for
+the current process (which may differ if the groups database has changed).
+      --help        display this help and exit
+      --version     output version information and exit
+]])
+      return close_stdout(0)
+    elseif c == VERSION_OPTION then
+      util.write('groups (nebox) after GNU coreutils 9.1\n')
+      return close_stdout(0)
+    else
+      util.flush()
+      local m = "Try 'groups --help' for more information.\n"
+      sys.write(2, m.data, m.size)
+      return 1
+    end
+  end
+  local users = g:operands()
+  local ok = true
+  if #users == 0 then
+    local ruid = sys.getuid()
+    local egid = sys.getegid()
+    local rgid = sys.getgid()
+    if not print_group_list('', false, ruid, rgid, egid) then ok = false end
+    util.writebyte(10)
+  else
+    for _, name in ipairs(users) do
+      local pwd = c_getpwnam(name)
+      if pwd == nilptr then
+        util.err(util.quote(name) .. ': no such user')
+        ok = false
+      else
+        local ruid = pwd.pw_uid
+        local rgid = pwd.pw_gid
+        util.write(name); util.write(' : ')
+        if not print_group_list(name, true, ruid, rgid, rgid) then ok = false end
+        util.writebyte(10)
+      end
+    end
+  end
+  return close_stdout(ok and 0 or 1)
+end

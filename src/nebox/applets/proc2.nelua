@@ -1,4 +1,4 @@
--- More process applets: whoami groups tty, and spawn_wait (run a command, wait for it)
+-- More process applets: whoami tty, and spawn_wait (run a command, wait for it)
 ## pragmas.nogc = true
 
 require 'string'
@@ -16,22 +16,6 @@ global function applet_whoami(args: sequence(string)): integer
   local name = util.username(uid)
   if name.size == 0 then return util.die(string.format("cannot find name for user ID %d", uid)) end
   util.line(name)
-  return 0
-end
-
-global function applet_groups(args: sequence(string)): integer
-  if #args > 0 then return util.die("looking up other users is not supported") end
-  local list: [256]cuint
-  local n = sys.getgroups(256, &list[0])
-  if n < 0 then return util.die('cannot get groups: ' .. sys.errstr()) end
-  local egid = (@integer)(sys.getegid())
-  util.write(util.idname(util.groupname(egid), egid))
-  for i: integer = 0, < n do
-    local g = (@integer)(list[i])
-    if g == egid then continue end
-    util.write(' ' .. util.idname(util.groupname(g), g))
-  end
-  util.writebyte(10)
   return 0
 end
 

@@ -91,6 +91,12 @@ test: $(OUT)/nebox
 	python3 tests/date_compare.py $(abspath $(OUT)/nebox) 3000
 	python3 tests/grep_compare.py $(abspath $(OUT)/nebox) 3000
 	python3 tests/sed_compare.py $(abspath $(OUT)/nebox) 3000
+	python3 tests/rev_compare.py $(abspath $(OUT)/nebox) 400
+	python3 tests/strings_compare.py $(abspath $(OUT)/nebox) 400
+	python3 tests/groups_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/which_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/sync_compare.py $(abspath $(OUT)/nebox)
+	python3 tests/free_compare.py $(abspath $(OUT)/nebox) 300
 
 clean:
 	rm -rf $(OUT)

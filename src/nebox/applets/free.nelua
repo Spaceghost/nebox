@@ -1,0 +1,473 @@
+-- free: a port of procps-ng 4.0.2 src/free.c with the meminfo.c reader it
+-- uses. /proc/meminfo is read with one read(2) of up to 8191 bytes and
+-- parsed as meminfo.c does (each "Key:" looked up, strtoul after the
+-- colon, parsing stopping at a line without a colon), with its derived
+-- values: MemAvailable falling back to MemFree, used = total - available
+-- (total - free when that goes negative), buff/cache = Buffers + Cached +
+-- SReclaimable, Low* defaulting to Mem*, and the clamped used columns.
+-- scale_size's arithmetic in the same types (unsigned long kB times 1024
+-- as long long, float bases, the %.1f of a float in -h), -b -k -m -g
+-- --tera --peta --kilo --mega --giga --tebi --pebi with "Multiple unit
+-- options don't make sense.", -h --si -l -t -v (Comm: with its unsigned
+-- difference) -w, -s (strtod_nol_or_err: '.' or ',' as the radix) and -c
+-- with their messages and repeats, usage on stderr for bad options and
+-- operands, --help, -V/--version with nebox's line, and close_stdout's
+-- "write error". There is no -L/--line in 4.0.2.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local FREE_HUMANREADABLE <comptime> = 2
+local FREE_LOHI <comptime> = 4
+local FREE_WIDE <comptime> = 8
+local FREE_TOTAL <comptime> = 16
+local FREE_SI <comptime> = 32
+local FREE_REPEAT <comptime> = 64
+local FREE_REPEATCOUNT <comptime> = 128
+local FREE_COMMITTED <comptime> = 256
+
+local SI_OPTION <comptime> = 128
+local KILO_OPTION <comptime> = 129
+local MEGA_OPTION <comptime> = 130
+local GIGA_OPTION <comptime> = 131
+local TERA_OPTION <comptime> = 132
+local PETA_OPTION <comptime> = 133
+local TEBI_OPTION <comptime> = 134
+local PEBI_OPTION <comptime> = 135
+local HELP_OPTION <comptime> = 136
+
+local ERANGE: cint <comptime> = 34
+local EINVAL: cint <comptime> = 22
+local EIO: cint <comptime> = 5
+
+-- stdout as stdio buffers it; flushed after each report
+local obuf: sequence(byte)
+local oerror = false
+local opending_error: cint = 0
+
+local function owrite(s: string)
+  for i = 1, #s do obuf:push(s:byte(i)) end
+end
+
+local function oflush(): boolean
+  local done = 0
+  while done < #obuf do
+    local r = sys.write(1, &obuf[done + 1], (@usize)(#obuf - done))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      opending_error = sys.errno()
+      obuf:clear()
+      return false
+    end
+    done = done + r
+  end
+  obuf:clear()
+  return true
+end
+
+-- close_stdout: a failed earlier flush reports no errno
+local function exit_close(status: integer)
+  local failed = oerror
+  local e: cint = 0
+  if not failed and #obuf > 0 then
+    if not oflush() then failed = true; e = opending_error end
+  end
+  if failed and e ~= sys.EPIPE then
+    if e ~= 0 then util.err('write error: ' .. sys.strerror(e)) else util.err('write error') end
+    c_exit(1)
+  end
+  c_exit((@cint)(status))
+end
+
+-- glibc error(): stdout flushed, "free: MSG[: strerror]"
+local function error_exit(msg: string, e: cint)
+  if #obuf > 0 and not oflush() then oerror = true end
+  if e ~= 0 then util.err(msg .. ': ' .. sys.strerror(e)) else util.err(msg) end
+  c_exit(1)
+end
+
+local function usage(to_stderr: boolean)
+  local u = [[
+
+Usage:
+ free [options]
+
+Options:
+ -b, --bytes         show output in bytes
+     --kilo          show output in kilobytes
+     --mega          show output in megabytes
+     --giga          show output in gigabytes
+     --tera          show output in terabytes
+     --peta          show output in petabytes
+ -k, --kibi          show output in kibibytes
+ -m, --mebi          show output in mebibytes
+ -g, --gibi          show output in gibibytes
+     --tebi          show output in tebibytes
+     --pebi          show output in pebibytes
+ -h, --human         show human-readable output
+     --si            use powers of 1000 not 1024
+ -l, --lohi          show detailed low and high memory statistics
+ -t, --total         show total for RAM + swap
+ -v, --committed     show committed memory and commit limit
+ -s N, --seconds N   repeat printing every N seconds
+ -c N, --count N     repeat printing N times, then exit
+ -w, --wide          wide output
+
+     --help     display this help and exit
+ -V, --version  output version information and exit
+
+For more details see free(1).
+]]
+  if to_stderr then
+    if #obuf > 0 and not oflush() then oerror = true end
+    sys.write(2, u.data, u.size)
+    exit_close(1)
+  end
+  owrite(u)
+  exit_close(0)
+end
+
+local function isspace(c: byte): boolean return c == 32 or (c >= 9 and c <= 13) end
+local function isdigit(c: byte): boolean return c >= 48 and c <= 57 end
+
+-- local/strutils.c strtod_nol_or_err
+local function strtod_nol_or_err(str: string, errmesg: string): float64
+  if #str > 0 then
+    local num: float64 = 0.0
+    local cp = 1
+    local function at(k: integer): byte
+      if k > #str then return 0 end
+      return str:byte(k)
+    end
+    while isspace(at(cp)) do cp = cp + 1 end
+    local negative = false
+    if at(cp) == 45 then negative = true; cp = cp + 1
+    elseif at(cp) == 43 then cp = cp + 1 end
+    local radix = cp
+    local mult: float64 = 0.1
+    while isdigit(at(radix)) do radix = radix + 1; mult = mult * 10 end
+    while isdigit(at(cp)) do
+      num = num + (at(cp) - 48) * mult
+      mult = mult / 10
+      cp = cp + 1
+    end
+    if at(cp) == 0 then return negative and -num or num end
+    if at(cp) ~= 46 and at(cp) ~= 44 then error_exit(errmesg .. ": '" .. str .. "'", EINVAL) end
+    cp = cp + 1
+    mult = 0.1
+    while isdigit(at(cp)) do
+      num = num + (at(cp) - 48) * mult
+      mult = mult / 10
+      cp = cp + 1
+    end
+    if at(cp) == 0 then return negative and -num or num end
+  end
+  error_exit(errmesg .. ": '" .. str .. "'", 0)
+  return 0
+end
+
+-- strtol(str, &end, 10) for strtol_or_err: (value, consumed all, overflow)
+local function strtol10(str: string): (int64, boolean, boolean)
+  local i = 1
+  while i <= #str and isspace(str:byte(i)) do i = i + 1 end
+  local neg = false
+  if i <= #str and (str:byte(i) == 45 or str:byte(i) == 43) then neg = str:byte(i) == 45; i = i + 1 end
+  local start = i
+  local v: uint64 = 0
+  local over = false
+  local limit: uint64 = neg and 0x8000000000000000_u64 or 0x7fffffffffffffff_u64
+  while i <= #str and isdigit(str:byte(i)) do
+    local d: uint64 = str:byte(i) - 48
+    if v > (limit - d) // 10 then over = true end
+    if not over then v = v * 10 + d end
+    i = i + 1
+  end
+  if i == start then return 0, false, false end
+  local r: int64
+  if over then r = neg and (@int64)(0x8000000000000000_u64) or 0x7fffffffffffffff
+  elseif neg then r = -(@int64)(v) else r = (@int64)(v) end
+  return r, i > #str, over
+end
+
+-- strtoul(head, NULL, 10)
+local function strtoul10(s: string, i: integer): uint64
+  while i <= #s and isspace(s:byte(i)) do i = i + 1 end
+  local neg = false
+  if i <= #s and (s:byte(i) == 45 or s:byte(i) == 43) then neg = s:byte(i) == 45; i = i + 1 end
+  local v: uint64 = 0
+  local over = false
+  while i <= #s and isdigit(s:byte(i)) do
+    local d: uint64 = s:byte(i) - 48
+    if v > (0xffffffffffffffff_u64 - d) // 10 then over = true end
+    if not over then v = v * 10 + d end
+    i = i + 1
+  end
+  if over then return 0xffffffffffffffff_u64 end
+  if neg then return (~v) + 1 end
+  return v
+end
+
+local Mem = @record{
+  MemTotal: uint64, MemFree: uint64, MemAvailable: uint64, Buffers: uint64, Cached: uint64,
+  SReclaimable: uint64, Shmem: uint64, SwapTotal: uint64, SwapFree: uint64, LowTotal: uint64,
+  LowFree: uint64, HighTotal: uint64, HighFree: uint64, CommitLimit: uint64, Committed_AS: uint64,
+  cached: uint64, used: uint64, hi_used: uint64, lo_used: uint64, swap_used: uint64,
+}
+
+local meminfo_fd: cint = -1
+local rbuf: [8192]byte
+
+-- meminfo_read_failed: false when the read fails
+local function meminfo_read(m: *Mem): boolean
+  $m = {}
+  if meminfo_fd == -1 then
+    meminfo_fd = sys.open('/proc/meminfo', sys.O_RDONLY, 0)
+    if meminfo_fd == -1 then return false end
+  end
+  if sys.lseek(meminfo_fd, 0, sys.SEEK_SET) == -1 then return false end
+  local size: clong
+  while true do
+    size = sys.read(meminfo_fd, &rbuf[0], 8191)
+    if size < 0 then
+      local e = sys.errno()
+      if e == sys.EINTR or e == 11 then continue end
+      return false
+    end
+    break
+  end
+  if size == 0 then sys.seterrno(EIO); return false end
+  local n: integer = size
+  for k = 0, < size do if rbuf[k] == 0 then n = k; break end end
+  local s: string = (@string){data = &rbuf[0], size = (@usize)(n)}
+  local head = 1
+  while true do
+    local colon = 0
+    for k = head, #s do if s:byte(k) == 58 then colon = k; break end end
+    if colon == 0 then break end
+    local key = s:sub(head, colon - 1)
+    head = colon + 1
+    local p: *uint64 = nilptr
+    if key == 'MemTotal' then p = &m.MemTotal
+    elseif key == 'MemFree' then p = &m.MemFree
+    elseif key == 'MemAvailable' then p = &m.MemAvailable
+    elseif key == 'Buffers' then p = &m.Buffers
+    elseif key == 'Cached' then p = &m.Cached
+    elseif key == 'SReclaimable' then p = &m.SReclaimable
+    elseif key == 'Shmem' then p = &m.Shmem
+    elseif key == 'SwapTotal' then p = &m.SwapTotal
+    elseif key == 'SwapFree' then p = &m.SwapFree
+    elseif key == 'LowTotal' then p = &m.LowTotal
+    elseif key == 'LowFree' then p = &m.LowFree
+    elseif key == 'HighTotal' then p = &m.HighTotal
+    elseif key == 'HighFree' then p = &m.HighFree
+    elseif key == 'CommitLimit' then p = &m.CommitLimit
+    elseif key == 'Committed_AS' then p = &m.Committed_AS end
+    if p ~= nilptr then $p = strtoul10(s, head) end
+    local nl = 0
+    for k = head, #s do if s:byte(k) == 10 then nl = k; break end end
+    if nl == 0 then break end
+    head = nl + 1
+  end
+  if m.MemAvailable == 0 then m.MemAvailable = m.MemFree end
+  m.cached = m.Cached + m.SReclaimable
+  if m.MemAvailable > m.MemTotal then m.MemAvailable = m.MemFree end
+  local mem_used = (@int64)(m.MemTotal - m.MemAvailable)
+  if mem_used < 0 then mem_used = (@int64)(m.MemTotal - m.MemFree) end
+  m.used = (@uint64)(mem_used)
+  if m.HighFree < m.HighTotal then m.hi_used = m.HighTotal - m.HighFree end
+  if m.LowTotal == 0 then m.LowTotal = m.MemTotal; m.LowFree = m.MemFree end
+  if m.LowFree < m.LowTotal then m.lo_used = m.LowTotal - m.LowFree end
+  if m.SwapFree < m.SwapTotal then m.swap_used = m.SwapTotal - m.SwapFree end
+  return true
+end
+
+local flags = 0
+local exponent = 0
+
+local function power(base: uint32, expo: uint32): float64
+  if expo == 0 then return 1 end
+  return base * power(base, expo - 1)
+end
+
+-- C's truncating int64 division
+local function tdiv(a: int64, b: int64): int64
+  local q = a // b
+  if q < 0 and q * b ~= a then q = q + 1 end
+  return q
+end
+
+-- "%.1f" of a float: v*10 is exact in a double, rounded half to even
+local function fmt1(v: float32): string
+  local x: float64 = v
+  local neg = x < 0
+  if neg then x = -x end
+  x = x * 10
+  local r = (@int64)(x)
+  local frac = x - (@float64)(r)
+  if frac > 0.5 or (frac == 0.5 and r % 2 == 1) then r = r + 1 end
+  return (neg and '-' or '') .. tostring(r // 10) .. '.' .. tostring(r % 10)
+end
+
+local function scale_size(size: uint64): string
+  local base: float32 = (flags & FREE_SI) ~= 0 and 1000.0 or 1024.0
+  local bytes = (@int64)(size * 1024)
+  if (flags & FREE_HUMANREADABLE) == 0 then
+    if exponent == 0 then return tostring(tdiv(bytes, (@int64)(base)))
+    elseif exponent == 1 then return tostring(bytes)
+    else return tostring((@int64)((@float64)(bytes) / power((@uint32)(base), exponent - 1))) end
+  end
+  local buf = tostring(bytes) .. 'B'
+  if #buf <= 4 then return buf end
+  local up: []string = {'B', 'K', 'M', 'G', 'T', 'P'}
+  for i = 1, 5 do
+    local q: float64 = (@float64)(bytes) / power((@uint32)(base), i)
+    if (flags & FREE_SI) ~= 0 then
+      buf = fmt1((@float32)(q)) .. up[i]
+      if #buf <= 4 then return buf end
+      buf = tostring((@int64)(q)) .. up[i]
+      if #buf <= 4 then return buf end
+    else
+      buf = fmt1((@float32)(q)) .. up[i] .. 'i'
+      if #buf <= 5 then return buf end
+      buf = tostring((@int64)(q)) .. up[i] .. 'i'
+      if #buf <= 5 then return buf end
+    end
+  end
+  return buf
+end
+
+local function col(v: uint64, first: boolean)
+  local s = scale_size(v)
+  if not first then obuf:push(32) end
+  for _ = #s + 1, 11 do obuf:push(32) end
+  owrite(s)
+end
+
+local function head_col(s: string)
+  owrite(s)
+  for _ = #s + 1, 9 do obuf:push(32) end
+end
+
+local function check_unit_set(unit_set: *boolean)
+  if $unit_set then error_exit("Multiple unit options don't make sense.", 0) end
+  $unit_set = true
+end
+
+global function applet_free(args: sequence(string)): integer
+  local longs: []util.LongOpt = {
+    {'bytes', 0, 98}, {'kilo', 0, KILO_OPTION}, {'mega', 0, MEGA_OPTION}, {'giga', 0, GIGA_OPTION},
+    {'tera', 0, TERA_OPTION}, {'peta', 0, PETA_OPTION}, {'kibi', 0, 107}, {'mebi', 0, 109},
+    {'gibi', 0, 103}, {'tebi', 0, TEBI_OPTION}, {'pebi', 0, PEBI_OPTION}, {'human', 0, 104},
+    {'si', 0, SI_OPTION}, {'lohi', 0, 108}, {'total', 0, 116}, {'committed', 0, 118},
+    {'seconds', 1, 115}, {'count', 1, 99}, {'wide', 0, 119}, {'help', 0, HELP_OPTION},
+    {'version', 0, 86},
+  }
+  local g = util.getopt(args, 'bkmghltvc:ws:V', &longs, #longs)
+  local unit_set = false
+  local repeat_interval: float32 = 1000000
+  local repeat_counter: int32 = 0
+  flags = 0; exponent = 0
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 98 then check_unit_set(&unit_set); exponent = 1
+    elseif c == 107 then check_unit_set(&unit_set); exponent = 2
+    elseif c == 109 then check_unit_set(&unit_set); exponent = 3
+    elseif c == 103 then check_unit_set(&unit_set); exponent = 4
+    elseif c == TEBI_OPTION then check_unit_set(&unit_set); exponent = 5
+    elseif c == PEBI_OPTION then check_unit_set(&unit_set); exponent = 6
+    elseif c >= KILO_OPTION and c <= PETA_OPTION then
+      check_unit_set(&unit_set); exponent = c - KILO_OPTION + 2; flags = flags | FREE_SI
+    elseif c == 104 then flags = flags | FREE_HUMANREADABLE
+    elseif c == SI_OPTION then flags = flags | FREE_SI
+    elseif c == 108 then flags = flags | FREE_LOHI
+    elseif c == 116 then flags = flags | FREE_TOTAL
+    elseif c == 118 then flags = flags | FREE_COMMITTED
+    elseif c == 115 then
+      flags = flags | FREE_REPEAT
+      repeat_interval = (@float32)(1000000 * strtod_nol_or_err(g.optarg, 'seconds argument failed'))
+      if repeat_interval < 1 then
+        error_exit("seconds argument `" .. g.optarg .. "' is not positive number", 0)
+      end
+    elseif c == 99 then
+      flags = flags | FREE_REPEAT | FREE_REPEATCOUNT
+      local v, all, over = strtol10(g.optarg)
+      if #g.optarg == 0 or not all or over then
+        error_exit("failed to parse count argument: '" .. g.optarg .. "'", over and ERANGE or 0)
+      end
+      repeat_counter = (@int32)(v)
+      if repeat_counter < 1 then error_exit("failed to parse count argument: '" .. g.optarg .. "'", ERANGE) end
+    elseif c == 119 then flags = flags | FREE_WIDE
+    elseif c == HELP_OPTION then usage(false)
+    elseif c == 86 then
+      owrite('free (nebox) after procps-ng 4.0.2\n')
+      exit_close(0)
+    else
+      usage(true)
+    end
+  end
+  if #g:operands() > 0 then usage(true) end
+  local m: Mem
+  if not meminfo_read(&m) then
+    if sys.errno() == sys.ENOENT then error_exit('Memory information file /proc/meminfo does not exist', 0)
+    else error_exit('Unable to create meminfo structure', 0) end
+  end
+  repeat
+    if not meminfo_read(&m) then m = {} end
+    if (flags & FREE_WIDE) ~= 0 then
+      owrite('               total        used        free      shared     buffers       cache   available')
+    else
+      owrite('               total        used        free      shared  buff/cache   available')
+    end
+    owrite('\n')
+    head_col('Mem:')
+    col(m.MemTotal, true); col(m.used, false); col(m.MemFree, false); col(m.Shmem, false)
+    if (flags & FREE_WIDE) ~= 0 then
+      col(m.Buffers, false); col(m.cached, false)
+    else
+      col(m.Buffers + m.cached, false)
+    end
+    col(m.MemAvailable, false)
+    owrite('\n')
+    if (flags & FREE_LOHI) ~= 0 then
+      head_col('Low:')
+      col(m.LowTotal, true); col(m.lo_used, false); col(m.LowFree, false)
+      owrite('\n')
+      head_col('High:')
+      col(m.HighTotal, true); col(m.hi_used, false); col(m.HighFree, false)
+      owrite('\n')
+    end
+    head_col('Swap:')
+    col(m.SwapTotal, true); col(m.swap_used, false); col(m.SwapFree, false)
+    owrite('\n')
+    if (flags & FREE_TOTAL) ~= 0 then
+      head_col('Total:')
+      col(m.MemTotal + m.SwapTotal, true); col(m.used + m.swap_used, false); col(m.MemFree + m.SwapFree, false)
+      owrite('\n')
+    end
+    if (flags & FREE_COMMITTED) ~= 0 then
+      head_col('Comm:')
+      col(m.CommitLimit, true); col(m.Committed_AS, false); col(m.CommitLimit - m.Committed_AS, false)
+      owrite('\n')
+    end
+    if not oflush() then oerror = true end
+    if (flags & FREE_REPEATCOUNT) ~= 0 then
+      repeat_counter = repeat_counter - 1
+      if repeat_counter < 1 then exit_close(0) end
+    end
+    if (flags & FREE_REPEAT) ~= 0 then
+      owrite('\n')
+      -- usleep((useconds_t) repeat_interval)
+      local us: uint32 = (@uint32)((@int64)(repeat_interval))
+      local ts: sys.Timespec = {tv_sec = us // 1000000, tv_nsec = (us % 1000000) * 1000}
+      sys.nanosleep(&ts, nilptr)
+    end
+  until (flags & FREE_REPEAT) == 0
+  exit_close(0)
+  return 0
+end

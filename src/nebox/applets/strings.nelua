@@ -1,0 +1,1092 @@
+-- strings: a port of GNU binutils 2.40 binutils/strings.c (C locale), with
+-- libiberty's expandargv/buildargv for @file response files and, for -d,
+-- BFD's ELF reader as far as it decides which sections are data. The whole
+-- file is scanned by default (-a, "-" before later files) and with -d when
+-- the file is not an ELF object or has no loaded data section; -d prints
+-- the strings of each SHF_ALLOC section with contents in BFD's section
+-- order. get_char/unget_part_char for -e s S b l B L, STRING_ISGRAPHIC
+-- with -w, -n/--bytes and -NUM through strtoul (base 0, truncated to an
+-- unsigned int, the digit option read back from argv after getopt's
+-- permutation as strings.c does), -t o/d/x and -o with "%7llo"-style
+-- addresses, -f, -s, -U/--unicode d l e i x h with print_unicode_stream's
+-- and print_unicode_buffer's walks (and their quirks: 'locale' prints the
+-- lead byte only, 'escape' miscomputes 4-byte sequences), -T with BFD's
+-- target names, the usage text on stdout (-h -H --help, without the
+-- bug-report line) or stderr (bad options and arguments), -v/-V/--version
+-- with nebox's line, and binutils' file messages. stdout is buffered as
+-- stdio buffers it and write errors are not reported, as in GNU.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
+
+local unicode_default <comptime> = 0
+local unicode_locale <comptime> = 1
+local unicode_escape <comptime> = 2
+local unicode_hex <comptime> = 3
+local unicode_highlight <comptime> = 4
+local unicode_invalid <comptime> = 5
+
+local TARGETS <comptime> = 'elf64-x86-64 elf32-i386 elf32-iamcu elf32-x86-64 pei-i386 pe-x86-64 pei-x86-64 elf64-little elf64-big elf32-little elf32-big pe-bigobj-x86-64 pe-i386 pdb srec symbolsrec verilog tekhex binary ihex plugin'
+
+local unicode_display = unicode_default
+local address_radix = 0
+local string_min: uint32 = 4
+local include_all_whitespace = false
+local print_addresses = false
+local print_filenames = false
+local datasection_only = false
+local target: string = ''
+local has_target = false
+local encoding: byte = 115
+local encoding_bytes = 1
+local output_separator: string = ''
+local has_separator = false
+local program_name: string = 'strings'
+
+-- stdout: stdio's full buffering in st_blksize blocks, errors ignored
+local obuf: sequence(byte)
+local ocap: integer = 4096
+
+local function oflush()
+  local done = 0
+  while done < #obuf do
+    local r = sys.write(1, &obuf[done + 1], (@usize)(#obuf - done))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      break
+    end
+    done = done + r
+  end
+  obuf:clear()
+end
+
+local function ochar(c: byte)
+  if #obuf >= ocap then oflush() end
+  obuf:push(c)
+end
+
+local function ostr(s: string)
+  for i = 1, #s do ochar(s:byte(i)) end
+end
+
+local function estr(s: string)
+  sys.write(2, s.data, s.size)
+end
+
+local function non_fatal(msg: string)
+  estr(program_name .. ': ' .. msg .. '\n')
+end
+
+local function xexit(status: integer)
+  oflush()
+  c_exit((@cint)(status))
+end
+
+local function fatal(msg: string)
+  non_fatal(msg)
+  xexit(1)
+end
+
+local function usage(to_stderr: boolean, status: integer)
+  local u = 'Usage: ' .. program_name .. [[ [option(s)] [file(s)]
+ Display printable strings in [file(s)] (stdin by default)
+ The options are:
+  -a - --all                Scan the entire file, not just the data section [default]
+  -d --data                 Only scan the data sections in the file
+  -f --print-file-name      Print the name of the file before each string
+  -n <number>               Locate & print any sequence of at least <number>
+    --bytes=<number>         displayable characters.  (The default is 4).
+  -t --radix={o,d,x}        Print the location of the string in base 8, 10 or 16
+  -w --include-all-whitespace Include all whitespace as valid string characters
+  -o                        An alias for --radix=o
+  -T --target=<BFDNAME>     Specify the binary file format
+  -e --encoding={s,S,b,l,B,L} Select character size and endianness:
+                            s = 7-bit, S = 8-bit, {b,l} = 16-bit, {B,L} = 32-bit
+  --unicode={default|show|invalid|hex|escape|highlight}
+  -U {d|s|i|x|e|h}          Specify how to treat UTF-8 encoded unicode characters
+  -s --output-separator=<string> String used to separate strings in output.
+  @<file>                   Read options from <file>
+  -h --help                 Display this information
+  -v -V --version           Print the program's version number
+]] .. program_name .. ': supported targets: ' .. TARGETS .. '\n'
+  if to_stderr then estr(u) else ostr(u) end
+  xexit(status)
+end
+
+local function isspace(c: byte): boolean return c == 32 or (c >= 9 and c <= 13) end
+
+-- STRING_ISGRAPHIC
+local function graphic(c: int64): boolean
+  if c < 0 or c > 255 then return false end
+  return c == 9 or (c >= 32 and c <= 126) or (encoding == 83 and c > 127)
+    or (include_all_whitespace and (c == 32 or (c >= 9 and c <= 13)))
+end
+
+-- strtoul(s, &end, 0): the value and whether the whole string was used
+local function strtoul0(s: string): (uint64, boolean)
+  local i = 1
+  local n = #s
+  while i <= n and isspace(s:byte(i)) do i = i + 1 end
+  local neg = false
+  if i <= n and (s:byte(i) == 43 or s:byte(i) == 45) then neg = s:byte(i) == 45; i = i + 1 end
+  local base: uint64 = 10
+  if i <= n and s:byte(i) == 48 then
+    if i + 1 <= n and (s:byte(i + 1) == 120 or s:byte(i + 1) == 88) and i + 2 <= n and util.hexval(s:byte(i + 2)) >= 0 then
+      base = 16; i = i + 2
+    else
+      base = 8
+    end
+  end
+  local start = i
+  local v: uint64 = 0
+  local over = false
+  while i <= n do
+    local d = util.hexval(s:byte(i))
+    if d < 0 or (@uint64)(d) >= base then break end
+    if v > (0xffffffffffffffff_u64 - (@uint64)(d)) // base then over = true end
+    if not over then v = v * base + (@uint64)(d) end
+    i = i + 1
+  end
+  if i == start then
+    -- no digits: end points at the start of the string
+    return 0, n == 0
+  end
+  if over then v = 0xffffffffffffffff_u64 elseif neg then v = (~v) + 1 end
+  return v, i > n
+end
+
+-- "%7llo " and friends
+local function print_filename_and_address(filename: string, address: int64)
+  if print_filenames then ostr(filename); ostr(': ') end
+  if not print_addresses then return end
+  local u = (@uint64)(address)
+  local digits: [24]byte
+  local nd = 0
+  local base: uint64 = (@uint64)(address_radix)
+  if address_radix == 10 then
+    -- %7ld: signed
+    local neg = address < 0
+    if neg then u = (~u) + 1 end
+    repeat digits[nd] = (@byte)(48 + u % 10); u = u // 10; nd = nd + 1 until u == 0
+    if neg then digits[nd] = 45; nd = nd + 1 end
+  else
+    repeat
+      local d = (@integer)(u % base)
+      digits[nd] = (@byte)(d < 10 and 48 + d or 87 + d)
+      u = u // base; nd = nd + 1
+    until u == 0
+  end
+  for _ = nd + 1, 7 do ochar(32) end
+  for k = nd - 1, 0, -1 do ochar(digits[k]) end
+  ochar(32)
+end
+
+local function separator()
+  if has_separator then ostr(output_separator) else ochar(10) end
+end
+
+-- input: a file descriptor or a section buffer, with the bytes that
+-- unget_part_char puts back in front
+local in_fd: cint = -1
+local in_mem: *[0]byte = nilptr
+local in_memlen: integer = 0
+local in_mempos: integer = 0
+local rbuf: [65536]byte
+local rlen = 0
+local rpos = 0
+local reof = false
+local pushback: [8]byte
+local npush = 0
+local pushpos = 0
+
+local function getbyte(): integer
+  if pushpos < npush then
+    local c = pushback[pushpos]
+    pushpos = pushpos + 1
+    return c
+  end
+  if in_mem ~= nilptr then
+    if in_mempos >= in_memlen then return -1 end
+    local c = in_mem[in_mempos]
+    in_mempos = in_mempos + 1
+    return c
+  end
+  if in_fd < 0 then return -1 end
+  if rpos >= rlen then
+    if reof then return -1 end
+    while true do
+      local r = sys.read(in_fd, &rbuf[0], #rbuf)
+      if r < 0 and sys.errno() == sys.EINTR then continue end
+      if r <= 0 then reof = true; return -1 end
+      rlen = r; rpos = 0
+      break
+    end
+  end
+  local c = rbuf[rpos]
+  rpos = rpos + 1
+  return c
+end
+
+local function set_input_fd(fd: cint)
+  in_fd = fd; in_mem = nilptr; in_memlen = 0; in_mempos = 0
+  rlen = 0; rpos = 0; reof = false; npush = 0; pushpos = 0
+end
+
+local function set_input_mem(p: *[0]byte, n: integer)
+  in_fd = -1; in_mem = p; in_memlen = n; in_mempos = 0
+  npush = 0; pushpos = 0
+end
+
+local lastbytes: [4]byte
+
+-- get_char: -1 at EOF (a partial character is lost)
+local function get_char(address: *int64): int64
+  local r: int64 = 0
+  for i = 0, < encoding_bytes do
+    local c = getbyte()
+    if c < 0 then return -1 end
+    lastbytes[i] = (@byte)(c)
+    $address = $address + 1
+    r = (r << 8) | c
+  end
+  if encoding == 108 then
+    r = ((r & 0xff) << 8) | ((r & 0xff00) >> 8)
+  elseif encoding == 76 then
+    r = ((r & 0xff) << 24) | ((r & 0xff00) << 8) | ((r & 0xff0000) >> 8) | ((r & 0xff000000) >> 24)
+  end
+  return r
+end
+
+-- unget_part_char: the last encoding_bytes - 1 bytes are read again
+local function unget_part_char(address: *int64)
+  if encoding_bytes > 1 then
+    $address = $address - (encoding_bytes - 1)
+    local keep: [8]byte
+    local nk = 0
+    for i = 1, encoding_bytes - 1 do keep[nk] = lastbytes[i]; nk = nk + 1 end
+    for i = pushpos, < npush do keep[nk] = pushback[i]; nk = nk + 1 end
+    for i = 0, < nk do pushback[i] = keep[i] end
+    npush = nk; pushpos = 0
+  end
+end
+
+-- Unicode display ------------------------------------------------------
+
+-- printf "%02x"
+local function hex2(v: integer)
+  local h = '0123456789abcdef'
+  local digits: [8]byte
+  local n = 0
+  repeat digits[n] = h:byte((v & 15) + 1); v = v >> 4; n = n + 1 until v == 0
+  if n < 2 then ochar(48) end
+  for k = n - 1, 0, -1 do ochar(digits[k]) end
+end
+
+local function display_utf8_char(b: *[0]byte): integer
+  local utf8_len: integer
+  local k = b[0] & 0x30
+  if k == 0 or k == 0x10 then utf8_len = 2 elseif k == 0x20 then utf8_len = 3 else utf8_len = 4 end
+  if unicode_display == unicode_escape or unicode_display == unicode_highlight then
+    local colour = unicode_display == unicode_highlight and sys.isatty(1) == 1
+    if colour then ostr('\x1B[31;47m') end
+    ostr('\\u')
+    if utf8_len == 2 then
+      hex2((b[0] & 0x1c) >> 2)
+      hex2(((b[0] & 0x03) << 6) | (b[1] & 0x3f))
+    elseif utf8_len == 3 then
+      hex2(((b[0] & 0x0f) << 4) | ((b[1] & 0x3c) >> 2))
+      hex2(((b[1] & 0x03) << 6) | (b[2] & 0x3f))
+    else
+      hex2(((b[0] & 0x07) << 6) | ((b[1] & 0x3c) >> 2))
+      hex2(((b[1] & 0x03) << 6) | ((b[2] & 0x3c) >> 2))
+      hex2(((b[2] & 0x03) << 6) | (b[3] & 0x3f))
+    end
+    if colour then ostr('\x1B[0m') end
+  elseif unicode_display == unicode_hex then
+    ochar(60); ostr('0x')
+    for j = 0, < utf8_len do hex2(b[j]) end
+    ochar(62)
+  elseif unicode_display == unicode_locale then
+    ochar(b[0])
+  end
+  return utf8_len
+end
+
+local function is_valid_utf8(b: *[0]byte, buflen: integer): integer
+  if b[0] < 0xc0 then return 0 end
+  if buflen < 2 then return 0 end
+  if (b[1] & 0xc0) ~= 0x80 then return 0 end
+  if (b[0] & 0x20) == 0 then return 2 end
+  if buflen < 3 then return 0 end
+  if (b[2] & 0xc0) ~= 0x80 then return 0 end
+  if (b[0] & 0x10) == 0 then return 3 end
+  if buflen < 4 then return 0 end
+  if (b[3] & 0xc0) ~= 0x80 then return 0 end
+  return 4
+end
+
+-- print_unicode_buffer, its tail recursion as a loop
+local function print_unicode_buffer(filename: string, address: int64, buffer: *[0]byte, buflen: integer)
+  local pos = 0
+  while buflen - pos > 0 do
+    local b = (@*[0]byte)(&buffer[pos])
+    local len = buflen - pos
+    local start_point = 0
+    local i = 0
+    local char_len = 1
+    local num_found: uint32 = 0
+    while i < len do
+      local c = b[i]
+      char_len = 1
+      if not graphic(c) then
+        num_found = 0
+      elseif c > 126 and c < 0xc0 then
+        num_found = 0
+      else
+        local skip = false
+        if c > 126 then
+          char_len = is_valid_utf8((@*[0]byte)(&b[i]), len - i)
+          if char_len == 0 then
+            char_len = 1; num_found = 0; skip = true
+          elseif unicode_display == unicode_invalid then
+            num_found = 0; skip = true
+          end
+        end
+        if not skip then
+          if num_found == 0 then start_point = i end
+          num_found = num_found + 1
+          if num_found >= string_min then break end
+        end
+      end
+      i = i + char_len
+    end
+    if num_found < string_min then return end
+    print_filename_and_address(filename, address + start_point)
+    i = start_point
+    while i < len do
+      local c = b[i]
+      char_len = 1
+      if not graphic(c) then break
+      elseif c < 127 then ochar(c)
+      elseif is_valid_utf8((@*[0]byte)(&b[i]), len - i) == 0 then break
+      elseif unicode_display == unicode_invalid then break
+      else char_len = display_utf8_char((@*[0]byte)(&b[i])) end
+      i = i + char_len
+    end
+    separator()
+    address = address + i
+    pos = pos + i
+  end
+end
+
+local putback_buf: [5]byte
+local num_putback: uint32 = 0
+local print_buf: sequence(byte)
+
+local function get_unicode_byte(num_read: *uint32): integer
+  if num_putback > 0 then
+    num_putback = num_putback - 1
+    return putback_buf[num_putback]
+  end
+  $num_read = $num_read + 1
+  return getbyte()
+end
+
+local function pb(c: byte)
+  putback_buf[num_putback] = c
+  num_putback = num_putback + 1
+end
+
+-- print_unicode_stream_body, its tail recursion as a loop
+local function print_unicode_stream(filename: string, address: int64)
+  num_putback = 0
+  while true do
+    local start_point: int64 = 0
+    local num_read: uint32 = 0
+    local num_chars: uint32 = 0
+    local num_print = 0
+    local c: integer = 0
+    print_buf:clear()
+    while true do
+      if num_chars >= string_min then break end
+      c = get_unicode_byte(&num_read)
+      if c < 0 then break end
+      if not graphic(c) then
+        num_chars = 0; num_print = 0; print_buf:clear()
+        continue
+      end
+      -- unsigned int arithmetic: a byte from the putback buffer makes it 2^32 - 1
+      if num_chars == 0 then start_point = (@int64)((@uint32)(num_read - 1)) end
+      if c < 127 then
+        print_buf:push((@byte)(c)); num_chars = num_chars + 1; num_print = num_print + 1
+        continue
+      end
+      if c < 0xc0 then
+        num_chars = 0; num_print = 0; print_buf:clear()
+        continue
+      end
+      local u0 = (@byte)(c)
+      c = get_unicode_byte(&num_read)
+      if c < 0 then break end
+      local u1 = (@byte)(c)
+      if (u1 & 0xc0) ~= 0x80 then
+        pb(u1); num_chars = 0; num_print = 0; print_buf:clear()
+        continue
+      elseif (u0 & 0x20) == 0 then
+        if unicode_display == unicode_invalid then
+          pb(u1); num_chars = 0; num_print = 0; print_buf:clear()
+        else
+          print_buf:push(u0); print_buf:push(u1); num_print = num_print + 2; num_chars = num_chars + 1
+        end
+        continue
+      end
+      c = get_unicode_byte(&num_read)
+      if c < 0 then break end
+      local u2 = (@byte)(c)
+      if (u2 & 0xc0) ~= 0x80 then
+        pb(u2); pb(u1); num_chars = 0; num_print = 0; print_buf:clear()
+        continue
+      elseif (u0 & 0x10) == 0 then
+        if unicode_display == unicode_invalid then
+          pb(u2); pb(u1); num_chars = 0; num_print = 0; print_buf:clear()
+        else
+          print_buf:push(u0); print_buf:push(u1); print_buf:push(u2); num_print = num_print + 3; num_chars = num_chars + 1
+        end
+        continue
+      end
+      c = get_unicode_byte(&num_read)
+      if c < 0 then break end
+      local u3 = (@byte)(c)
+      if (u3 & 0xc0) ~= 0x80 then
+        pb(u3); pb(u2); pb(u1); num_chars = 0; num_print = 0; print_buf:clear()
+      elseif unicode_display == unicode_invalid then
+        pb(u3); pb(u1); pb(u2); num_chars = 0; num_print = 0; print_buf:clear()
+      else
+        print_buf:push(u0); print_buf:push(u1); print_buf:push(u2); print_buf:push(u3)
+        num_print = num_print + 4; num_chars = num_chars + 1
+      end
+    end
+    if num_chars >= string_min then
+      print_filename_and_address(filename, address + start_point)
+      local i = 0
+      while i < num_print do
+        if print_buf[i + 1] < 127 then
+          ochar(print_buf[i + 1]); i = i + 1
+        else
+          i = i + display_utf8_char((@*[0]byte)(&print_buf[i + 1]))
+        end
+      end
+      local u: [4]byte
+      while true do
+        c = get_unicode_byte(&num_read)
+        if c < 0 then break end
+        if not graphic(c) then break end
+        if c < 127 then ochar((@byte)(c)); continue end
+        if c < 0xc0 then break end
+        u[0] = (@byte)(c)
+        c = get_unicode_byte(&num_read)
+        if c < 0 then break end
+        u[1] = (@byte)(c)
+        if (u[1] & 0xc0) ~= 0x80 then pb(u[1]); break
+        elseif (u[0] & 0x20) == 0 then
+          if unicode_display == unicode_invalid then pb(u[1]); break end
+          display_utf8_char(&u)
+          continue
+        end
+        c = get_unicode_byte(&num_read)
+        if c < 0 then break end
+        u[2] = (@byte)(c)
+        if (u[2] & 0xc0) ~= 0x80 then pb(u[2]); pb(u[1]); break
+        elseif (u[0] & 0x10) == 0 then
+          if unicode_display == unicode_invalid then pb(u[2]); pb(u[1]); break end
+          display_utf8_char(&u)
+          continue
+        end
+        c = get_unicode_byte(&num_read)
+        if c < 0 then break end
+        u[3] = (@byte)(c)
+        if (u[3] & 0xc0) ~= 0x80 or unicode_display == unicode_invalid then
+          pb(u[3]); pb(u[2]); pb(u[1]); break
+        end
+        display_utf8_char(&u)
+      end
+      separator()
+    end
+    if c < 0 then return end
+    address = address + num_read
+  end
+end
+
+-- print_strings; MEM non-nil for a section's contents
+local strbuf: sequence(byte)
+
+local function print_strings(filename: string, address: int64, mem: *[0]byte, memlen: integer, from_fd: cint)
+  if mem ~= nilptr then set_input_mem(mem, memlen) else set_input_fd(from_fd) end
+  if unicode_display ~= unicode_default then
+    if mem ~= nilptr then print_unicode_buffer(filename, address, mem, memlen)
+    else print_unicode_stream(filename, address) end
+    return
+  end
+  while true do
+    ::tryline::
+    local start = address
+    strbuf:clear()
+    local n: uint32 = 0
+    while n < string_min do
+      local c = get_char(&address)
+      if c < 0 then return end
+      if not graphic(c) then
+        unget_part_char(&address)
+        goto tryline
+      end
+      strbuf:push((@byte)(c))
+      n = n + 1
+    end
+    print_filename_and_address(filename, start)
+    for i = 1, #strbuf do ochar(strbuf[i]) end
+    while true do
+      local c = get_char(&address)
+      if c < 0 then break end
+      if not graphic(c) then
+        unget_part_char(&address)
+        break
+      end
+      ochar((@byte)(c))
+    end
+    separator()
+  end
+end
+
+-- ELF, as far as BFD's elf_object_p and bfd_section_from_shdr decide the
+-- data sections ---------------------------------------------------------
+
+local Shdr = @record{
+  name: uint32, type: uint32, flags: uint64, addr: uint64, offset: uint64, size: uint64,
+  link: uint32, info: uint32, entsize: uint64, done: boolean, busy: boolean,
+}
+
+local elf_fd: cint = -1
+local elf_big = false
+local elf64 = false
+local hdrbuf: [64]byte
+
+local function read_at(off: uint64, p: *[0]byte, n: integer): boolean
+  if off > 0x7fffffffffffffff_u64 then return false end
+  if sys.lseek(elf_fd, (@clong)(off), sys.SEEK_SET) < 0 then return false end
+  local got = 0
+  while got < n do
+    local r = sys.read(elf_fd, &p[got], (@usize)(n - got))
+    if r < 0 and sys.errno() == sys.EINTR then continue end
+    if r <= 0 then return false end
+    got = got + r
+  end
+  return true
+end
+
+local function get16(p: *[0]byte, o: integer): uint64
+  if elf_big then return ((@uint64)(p[o]) << 8) | p[o + 1] end
+  return ((@uint64)(p[o + 1]) << 8) | p[o]
+end
+local function get32(p: *[0]byte, o: integer): uint64
+  if elf_big then return (get16(p, o) << 16) | get16(p, o + 2) end
+  return (get16(p, o + 2) << 16) | get16(p, o)
+end
+local function get64(p: *[0]byte, o: integer): uint64
+  if elf_big then return (get32(p, o) << 32) | get32(p, o + 4) end
+  return (get32(p, o + 4) << 32) | get32(p, o)
+end
+local function getword(p: *[0]byte, o32: integer, o64: integer): uint64
+  if elf64 then return get64(p, o64) end
+  return get32(p, o32)
+end
+
+local shdrs: sequence(Shdr)
+local order: sequence(integer)
+local onesymtab: integer = 0
+local dynsymtab: integer = 0
+local e_shstrndx: uint64 = 0
+local elf_exec_or_dyn = false
+local elf_dyn = false
+
+local shstrtab_size: uint64 = 0
+
+local function make_section(i: integer)
+  order:push(i)
+end
+
+local section_from_shdr: function(integer): boolean
+
+local function section_from_shdr_impl(i: integer): boolean
+  local num = #shdrs
+  local h = &shdrs[i + 1]
+  if h.done then return true end
+  if h.busy then return false end
+  h.busy = true
+  local ok = true
+  local t = h.type
+  local function mark(): boolean h.busy = false; h.done = true; return true end
+  if h.name >= shstrtab_size then h.busy = false; return false end
+  if t == 0 then return mark() end
+  if t == 2 then -- SHT_SYMTAB
+    if onesymtab == i or onesymtab ~= 0 then return mark() end
+    onesymtab = i
+    if h.link < num and not section_from_shdr(h.link) then return false end
+    if (h.flags & 2) ~= 0 and elf_dyn then make_section(i) end
+    return mark()
+  elseif t == 11 then -- SHT_DYNSYM
+    if dynsymtab == i or dynsymtab ~= 0 then return mark() end
+    dynsymtab = i
+    make_section(i)
+    return mark()
+  elseif t == 3 then -- SHT_STRTAB
+    if (@uint64)(i) == e_shstrndx then return mark() end
+    if shdrs[onesymtab + 1].link == i then return mark() end
+    if shdrs[dynsymtab + 1].link == i then make_section(i); return mark() end
+    if onesymtab == 0 or dynsymtab == 0 then
+      for k = 1, < num do
+        if shdrs[k + 1].link == i then
+          if k == i then return false end
+          if not section_from_shdr(k) then return false end
+          if onesymtab == k then return mark() end
+          if dynsymtab == k then make_section(i); return mark() end
+        end
+      end
+    end
+    make_section(i)
+    return mark()
+  elseif t == 9 or t == 4 or t == 19 then -- SHT_REL, SHT_RELA, SHT_RELR
+    local size: uint64 = t == 9 and (elf64 and 16 or 8) or (t == 4 and (elf64 and 24 or 12) or (elf64 and 8 or 4))
+    if h.entsize ~= size then return false end
+    local link = h.link
+    if link >= num then make_section(i); return mark() end
+    local lt = shdrs[link + 1].type
+    if (lt == 2 or lt == 11) and not section_from_shdr(link) then return false end
+    local info = h.info
+    if (elf_exec_or_dyn and (h.flags & 2) ~= 0) or t == 19 or link == 0 or link ~= onesymtab or info == 0
+       or info >= num or shdrs[info + 1].type == 9 or shdrs[info + 1].type == 4 then
+      make_section(i)
+      return mark()
+    end
+    if not section_from_shdr(info) then return false end
+    return mark()
+  elseif t == 18 or t == 10 then -- SHT_SYMTAB_SHNDX, SHT_SHLIB
+    return mark()
+  end
+  make_section(i)
+  return mark()
+end
+section_from_shdr = section_from_shdr_impl
+
+-- false when BFD would not take FILE as an ELF object for the target
+local function elf_sections(file: string, fd: cint, filesize: int64): boolean
+  elf_fd = fd
+  shdrs:clear(); order:clear(); onesymtab = 0; dynsymtab = 0
+  if not read_at(0, &hdrbuf, 16) then return false end
+  if hdrbuf[0] ~= 0x7f or hdrbuf[1] ~= 69 or hdrbuf[2] ~= 76 or hdrbuf[3] ~= 70 then return false end
+  if hdrbuf[6] ~= 1 then return false end
+  local class = hdrbuf[4]
+  local data = hdrbuf[5]
+  if class ~= 1 and class ~= 2 then return false end
+  if data ~= 1 and data ~= 2 then return false end
+  elf64 = class == 2
+  elf_big = data == 2
+  local ehsize = elf64 and 64 or 52
+  if not read_at(0, &hdrbuf, ehsize) then return false end
+  local e_type = get16(&hdrbuf, 16)
+  local e_machine = get16(&hdrbuf, 18)
+  local e_phoff = getword(&hdrbuf, 28, 32)
+  local e_shoff = getword(&hdrbuf, 32, 40)
+  local e_phentsize = get16(&hdrbuf, elf64 and 54 or 42)
+  local e_phnum = get16(&hdrbuf, elf64 and 56 or 44)
+  local e_shentsize = get16(&hdrbuf, elf64 and 58 or 46)
+  local e_shnum = get16(&hdrbuf, elf64 and 60 or 48)
+  e_shstrndx = get16(&hdrbuf, elf64 and 62 or 50)
+  if e_type == 4 then return false end
+  if e_shoff < (@uint64)(ehsize) and e_type == 1 then return false end
+  local shsize = elf64 and 64 or 40
+  if e_shentsize ~= (@uint64)(shsize) and e_shnum ~= 0 then return false end
+  if e_shoff < (@uint64)(ehsize) and e_shnum ~= 0 then return false end
+  elf_exec_or_dyn = e_type == 2 or e_type == 3
+  elf_dyn = e_type == 3
+  local sb: [64]byte
+  local function parse(p: *[0]byte): Shdr
+    local s: Shdr
+    s.name = (@uint32)(get32(p, 0))
+    s.type = (@uint32)(get32(p, 4))
+    s.flags = getword(p, 8, 8)
+    s.addr = getword(p, 12, 16)
+    s.offset = getword(p, 16, 24)
+    s.size = getword(p, 20, 32)
+    s.link = (@uint32)(get32(p, elf64 and 40 or 24))
+    s.info = (@uint32)(get32(p, elf64 and 44 or 28))
+    s.entsize = getword(p, 36, 56)
+    return s
+  end
+  if e_shoff >= (@uint64)(ehsize) then
+    if not read_at(e_shoff, &sb, shsize) then return false end
+    local s0 = parse(&sb)
+    if e_shnum == 0 then
+      e_shnum = s0.size
+      if e_shnum >= 0xff00 or e_shnum == 0 or e_shnum > 0xffffffff then return false end
+    end
+    if e_shstrndx == 0xffff then
+      e_shstrndx = s0.link
+    end
+    if e_phnum == 0xffff and s0.info ~= 0 then e_phnum = s0.info end
+    if e_shnum ~= 1 then
+      local where = e_shoff + (e_shnum - 1) * (@uint64)(shsize)
+      if where <= e_shoff then return false end
+      if not read_at(where, &sb, shsize) then return false end
+    end
+    shdrs:push(s0)
+    for k = 1, < (@integer)(e_shnum) do
+      if not read_at(e_shoff + (@uint64)(k) * (@uint64)(shsize), &sb, shsize) then return false end
+      local s = parse(&sb)
+      if s.link >= e_shnum then
+        local x86 = e_machine == 3 or e_machine == 6 or e_machine == 62
+        if not (x86 and (s.link == 0xff00 or s.link == 0xff01)) then return false end
+      end
+      if ((s.flags & 0x40) ~= 0 or s.type == 4 or s.type == 9) and s.info >= e_shnum then return false end
+      shdrs:push(s)
+    end
+    if e_shstrndx >= e_shnum or shdrs[e_shstrndx + 1].type ~= 3 then
+      e_shstrndx = 0
+      non_fatal('warning: ' .. file .. ' has a corrupt string table index')
+    end
+  elseif e_shnum ~= 0 then
+    -- e_shoff below the header with sections was rejected above
+    return false
+  elseif e_shstrndx ~= 0 then
+    return false
+  end
+  if e_phnum > 0 then
+    local phsize: uint64 = elf64 and 56 or 32
+    if filesize ~= 0 and e_phnum > (@uint64)(filesize) // phsize then return false end
+    local pb64: [56]byte
+    for k = 0, < (@integer)(e_phnum) do
+      if not read_at(e_phoff + (@uint64)(k) * phsize, &pb64, (@integer)(phsize)) then return false end
+    end
+  end
+  if e_shstrndx ~= 0 and e_shoff >= (@uint64)(ehsize) then
+    local ss = &shdrs[e_shstrndx + 1]
+    if ss.offset + ss.size > (@uint64)(filesize) or ss.offset + ss.size < ss.offset then return false end
+    shstrtab_size = ss.size
+    for k = 1, < #shdrs do
+      if not section_from_shdr(k) then return false end
+    end
+  end
+  return true
+end
+
+-- strings_object_file: true when data sections were printed
+local function strings_object_file(file: string): boolean
+  if has_target then
+    local known = false
+    local t: string = TARGETS
+    local start = 1
+    for i = 1, #t + 1 do
+      if i > #t or t:byte(i) == 32 then
+        if t:sub(start, i - 1) == target then known = true end
+        start = i + 1
+      end
+    end
+    if not known then return false end
+  end
+  local fd = sys.open(file, sys.O_RDONLY, 0)
+  if fd < 0 then return false end
+  local st: sys.Stat
+  local filesize: int64 = 0
+  if sys.fstat(fd, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFREG then filesize = st.st_size end
+  local got_a_section = false
+  if has_target and target == 'binary' then
+    -- the binary target: the whole file as one .data section
+    if filesize > 0 then
+      local mem: sequence(byte)
+      mem:resize((@usize)(filesize))
+      elf_fd = fd
+      if read_at(0, (@*[0]byte)(&mem[1]), (@integer)(filesize)) then
+        got_a_section = true
+        print_strings(file, 0, (@*[0]byte)(&mem[1]), (@integer)(filesize), -1)
+      end
+      mem:destroy()
+    end
+    sys.close(fd)
+    return got_a_section
+  end
+  local ok = elf_sections(file, fd, filesize)
+  if ok then
+    for _, i in ipairs(order) do
+      local s = &shdrs[i + 1]
+      if (s.flags & 2) == 0 or s.type == 8 or s.size == 0 then continue end
+      if s.offset + s.size > (@uint64)(filesize) or s.offset + s.size < s.offset then continue end
+      local n = (@integer)(s.size)
+      local mem: sequence(byte)
+      mem:resize((@usize)(n))
+      elf_fd = fd
+      if read_at(s.offset, (@*[0]byte)(&mem[1]), n) then
+        got_a_section = true
+        print_strings(file, (@int64)(s.offset), (@*[0]byte)(&mem[1]), n, -1)
+      end
+      mem:destroy()
+    end
+  end
+  sys.close(fd)
+  return got_a_section
+end
+
+local function strings_file(file: string): boolean
+  local st: sys.Stat
+  if sys.stat(file, &st) < 0 then
+    if sys.errno() == sys.ENOENT then non_fatal("'" .. file .. "': No such file")
+    else non_fatal("Warning: could not locate '" .. file .. "'.  reason: " .. sys.errstr()) end
+    return false
+  elseif (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+    non_fatal("Warning: '" .. file .. "' is a directory")
+    return false
+  end
+  if not datasection_only or not strings_object_file(file) then
+    local fd = sys.open(file, sys.O_RDONLY, 0)
+    if fd < 0 then
+      estr(program_name .. ': ' .. file .. ': ' .. sys.errstr() .. '\n')
+      return false
+    end
+    print_strings(file, 0, nilptr, 0, fd)
+    sys.close(fd)
+  end
+  return true
+end
+
+-- libiberty expandargv/buildargv --------------------------------------------
+
+local function buildargv(input: string, out: *sequence(string))
+  local i = 1
+  local n = #input
+  local copy: sequence(byte)
+  local squote, dquote, bsquote = false, false, false
+  repeat
+    while i <= n and isspace(input:byte(i)) do i = i + 1 end
+    copy:clear()
+    while i <= n do
+      local c = input:byte(i)
+      if isspace(c) and not squote and not dquote and not bsquote then break end
+      if bsquote then bsquote = false; copy:push(c)
+      elseif c == 92 then bsquote = true
+      elseif squote then
+        if c == 39 then squote = false else copy:push(c) end
+      elseif dquote then
+        if c == 34 then dquote = false else copy:push(c) end
+      else
+        if c == 39 then squote = true
+        elseif c == 34 then dquote = true
+        else copy:push(c) end
+      end
+      i = i + 1
+    end
+    local s: string = #copy > 0 and string.copy((@string){data = &copy[1], size = (@usize)(#copy)}) or ''
+    out:push(s)
+    while i <= n and isspace(input:byte(i)) do i = i + 1 end
+  until i > n
+  copy:destroy()
+end
+
+local function expandargv(argv: *sequence(string)): boolean
+  local i = 1
+  local limit = 2000
+  local expanded = false
+  while i <= #$argv do
+    local a = ($argv)[i]
+    if #a == 0 or a:byte(1) ~= 64 then i = i + 1; continue end
+    limit = limit - 1
+    if limit == 0 then
+      non_fatal('error: too many @-files encountered')
+      xexit(1)
+    end
+    local fname = a:sub(2)
+    local st: sys.Stat
+    if sys.stat(fname, &st) < 0 then i = i + 1; continue end
+    if (st.st_mode & sys.S_IFMT) == sys.S_IFDIR then
+      non_fatal('error: @-file refers to a directory')
+      xexit(1)
+    end
+    local fd = sys.open(fname, sys.O_RDONLY, 0)
+    if fd < 0 then i = i + 1; continue end
+    -- fseek(SEEK_END) as glibc does it: st_size for a regular file
+    local pos: clong
+    local fst: sys.Stat
+    if sys.fstat(fd, &fst) == 0 and (fst.st_mode & sys.S_IFMT) == sys.S_IFREG then
+      pos = fst.st_size
+      if sys.lseek(fd, pos, sys.SEEK_SET) < 0 then pos = -1 end
+    else
+      pos = sys.lseek(fd, 0, 2)
+    end
+    if pos < 0 or sys.lseek(fd, 0, sys.SEEK_SET) < 0 then sys.close(fd); i = i + 1; continue end
+    local data: sequence(byte)
+    data:resize((@usize)(pos))
+    local got = 0
+    local failed = false
+    while got < pos do
+      local r = sys.read(fd, &data[got + 1], (@usize)(pos - got))
+      if r < 0 and sys.errno() == sys.EINTR then continue end
+      if r < 0 then failed = true; break end
+      if r == 0 then break end
+      got = got + r
+    end
+    sys.close(fd)
+    if failed then data:destroy(); i = i + 1; continue end
+    local len = 0
+    while len < got and data[len + 1] ~= 0 do len = len + 1 end
+    local content: string = len > 0 and (@string){data = &data[1], size = (@usize)(len)} or ''
+    local file_argv: sequence(string)
+    local only_ws = true
+    for k = 1, #content do if not isspace(content:byte(k)) then only_ws = false; break end end
+    if not only_ws then buildargv(content, &file_argv) end
+    data:destroy()
+    local rest: sequence(string)
+    for k = i + 1, #$argv do rest:push(($argv)[k]) end
+    argv:resize((@usize)(i - 1))
+    for _, s in ipairs(file_argv) do argv:push(s) end
+    for _, s in ipairs(rest) do argv:push(s) end
+    rest:destroy(); file_argv:destroy()
+    expanded = true
+  end
+  return expanded
+end
+
+-- main --------------------------------------------------------------------
+
+global function applet_strings(args0: sequence(string)): integer
+  local args: sequence(string)
+  for _, a in ipairs(args0) do args:push(a) end
+  local ost: sys.Stat
+  if sys.fstat(1, &ost) == 0 and ost.st_blksize > 0 then ocap = ost.st_blksize end
+  local expanded = expandargv(&args)
+  string_min = 4; include_all_whitespace = false; print_addresses = false; print_filenames = false
+  datasection_only = false; has_target = false; encoding = 115; has_separator = false
+  unicode_display = unicode_default
+  local longs: []util.LongOpt = {
+    {'all', 0, 97}, {'bytes', 1, 110}, {'data', 0, 100}, {'encoding', 1, 101}, {'help', 0, 104},
+    {'include-all-whitespace', 0, 119}, {'output-separator', 1, 115}, {'print-file-name', 0, 102},
+    {'radix', 1, 116}, {'target', 1, 84}, {'unicode', 1, 85}, {'version', 0, 118},
+  }
+  local g = util.getopt(args, 'adfhHn:wot:e:T:s:U:Vv0123456789', &longs, #longs)
+  -- getopt's final argv: option elements first, then the operands
+  local optelems: sequence(integer)
+  local numeric_opt = 0
+  -- the byte after an empty option argument, as it lies in argv's memory
+  local function byte_after_empty(optind: integer): byte
+    if expanded then return 1 end
+    if optind <= #args then
+      local nx = args[optind]
+      return #nx > 0 and nx:byte(1) or 0
+    end
+    if environ[0] ~= nilptr then
+      local e = (@string)(environ[0])
+      return #e > 0 and e:byte(1) or 0
+    end
+    return 1
+  end
+  while true do
+    local old_optind = g.optind
+    local old_nskip = #g.skipped
+    local had_cluster = #g.nextchar > 0
+    local c = g:next()
+    if not had_cluster then
+      local first_opt = old_optind + (#g.skipped - old_nskip)
+      for k = first_opt, g.optind - 1 do optelems:push(k) end
+    elseif g.optind > old_optind then
+      for k = old_optind, g.optind - 1 do optelems:push(k) end
+    end
+    if c == -1 then break end
+    if c == 97 then datasection_only = false
+    elseif c == 100 then datasection_only = true
+    elseif c == 102 then print_filenames = true
+    elseif c == 72 or c == 104 then usage(false, 0)
+    elseif c == 110 then
+      local v, all = strtoul0(g.optarg)
+      string_min = (@uint32)(v)
+      if not all then fatal('invalid integer argument ' .. g.optarg) end
+    elseif c == 119 then include_all_whitespace = true
+    elseif c == 111 then print_addresses = true; address_radix = 8
+    elseif c == 116 then
+      print_addresses = true
+      local a = g.optarg
+      local second: byte = 0
+      if #a >= 2 then second = a:byte(2) elseif #a == 0 then second = byte_after_empty(g.optind) end
+      if second ~= 0 then usage(true, 1) end
+      local first: byte = 0
+      if #a > 0 then first = a:byte(1) end
+      if first == 111 then address_radix = 8
+      elseif first == 100 then address_radix = 10
+      elseif first == 120 then address_radix = 16
+      else usage(true, 1) end
+    elseif c == 84 then target = g.optarg; has_target = true
+    elseif c == 101 then
+      local a = g.optarg
+      local second: byte = 0
+      if #a >= 2 then second = a:byte(2) elseif #a == 0 then second = byte_after_empty(g.optind) end
+      if second ~= 0 then usage(true, 1) end
+      encoding = 0
+      if #a > 0 then encoding = a:byte(1) end
+    elseif c == 115 then output_separator = g.optarg; has_separator = true
+    elseif c == 85 then
+      local a = g.optarg
+      if a == 'default' or a == 'd' then unicode_display = unicode_default
+      elseif a == 'locale' or a == 'l' then unicode_display = unicode_locale
+      elseif a == 'escape' or a == 'e' then unicode_display = unicode_escape
+      elseif a == 'invalid' or a == 'i' then unicode_display = unicode_invalid
+      elseif a == 'hex' or a == 'x' then unicode_display = unicode_hex
+      elseif a == 'highlight' or a == 'h' then unicode_display = unicode_highlight
+      else fatal('invalid argument to -U/--unicode: ' .. a) end
+    elseif c == 86 or c == 118 then
+      ostr('strings (nebox) after GNU Binutils 2.40\n')
+      xexit(0)
+    elseif c >= 48 and c <= 57 then
+      numeric_opt = #optelems + #g.skipped + (#g.nextchar == 0 and 1 or 0)
+    else
+      usage(true, 1)
+    end
+  end
+  local operands = g:operands()
+  if unicode_display ~= unicode_default then encoding = 83 end
+  if numeric_opt ~= 0 then
+    -- argv[numeric_opt - 1] in the permuted vector
+    local idx = numeric_opt - 1
+    local s: string
+    if idx == 0 then s = util.applet
+    elseif idx <= #optelems then s = args[optelems[idx]]
+    else s = operands[idx - #optelems] end
+    local rest = #s > 0 and s:sub(2) or ''
+    local v, all = strtoul0(rest)
+    string_min = (@uint32)(v)
+    if not all then fatal('invalid integer argument ' .. rest) end
+  end
+  if string_min < 1 then fatal('invalid minimum string length ' .. tostring(string_min)) end
+  if encoding == 83 or encoding == 115 then encoding_bytes = 1
+  elseif encoding == 98 or encoding == 108 then encoding_bytes = 2
+  elseif encoding == 66 or encoding == 76 then encoding_bytes = 4
+  else usage(true, 1) end
+  local exit_status = 0
+  local files_given = false
+  if #operands == 0 then
+    datasection_only = false
+    print_strings('{standard input}', 0, nilptr, 0, 0)
+    files_given = true
+  else
+    for _, f in ipairs(operands) do
+      if f == '-' then
+        datasection_only = false
+      else
+        files_given = true
+        if not strings_file(f) then exit_status = 1 end
+      end
+    end
+  end
+  if not files_given then usage(true, 1) end
+  oflush()
+  return exit_status
+end

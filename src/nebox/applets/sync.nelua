@@ -1,0 +1,122 @@
+-- sync: a port of GNU coreutils 9.1 src/sync.c. With no operand sync(2);
+-- with operands each FILE is opened read-only (write-only when that fails,
+-- reporting the read-only errno), O_NONBLOCK is cleared again, and the file
+-- is fsync'd, fdatasync'd (-d/--data) or its file system syncfs'd
+-- (-f/--file-system); GNU's "error opening", "couldn't reset non-blocking
+-- mode", "error syncing" and "failed to close" messages, the conflicting
+-- -d/-f and operand-less -d errors, --help without GNU's closing links and
+-- --version with nebox's line.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function c_fsync(fd: cint): cint <cimport 'fsync', cinclude '<unistd.h>'> end
+local function c_fdatasync(fd: cint): cint <cimport 'fdatasync', cinclude '<nelibc_syscall.h>'> end
+local function c_syncfs(fd: cint): cint <cimport 'syncfs', cinclude '<nelibc_syscall.h>'> end
+
+local O_NONBLOCK: cint <comptime> = 0x800
+local F_SETFL: cint <comptime> = 4
+local MODE_FILE <comptime> = 0
+local MODE_DATA <comptime> = 1
+local MODE_FILE_SYSTEM <comptime> = 2
+local HELP_OPTION <comptime> = 256
+local VERSION_OPTION <comptime> = 257
+
+local function errno_msg(msg: string, e: cint): string
+  if e == 0 then return msg end
+  return msg .. ': ' .. sys.strerror(e)
+end
+
+local function sync_arg(mode: integer, file: string): boolean
+  local ret = true
+  local fd = sys.open(file, sys.O_RDONLY | O_NONBLOCK, 0)
+  if fd < 0 then
+    local rd_errno = sys.errno()
+    fd = sys.open(file, sys.O_WRONLY | O_NONBLOCK, 0)
+    if fd < 0 then
+      util.err(errno_msg('error opening ' .. util.quoteaf(file), rd_errno))
+      return false
+    end
+  end
+  local fdflags = sys.fcntl(fd, sys.F_GETFL, 0)
+  if fdflags == -1 or sys.fcntl(fd, F_SETFL, fdflags & ~O_NONBLOCK) < 0 then
+    util.err(errno_msg("couldn't reset non-blocking mode " .. util.quoteaf(file), sys.errno()))
+    ret = false
+  end
+  if ret then
+    local st: cint
+    if mode == MODE_DATA then st = c_fdatasync(fd)
+    elseif mode == MODE_FILE then st = c_fsync(fd)
+    else st = c_syncfs(fd) end
+    if st < 0 then
+      util.err(errno_msg('error syncing ' .. util.quoteaf(file), sys.errno()))
+      ret = false
+    end
+  end
+  if sys.close(fd) < 0 then
+    util.err(errno_msg('failed to close ' .. util.quoteaf(file), sys.errno()))
+    ret = false
+  end
+  return ret
+end
+
+local function close_stdout(status: integer): integer
+  if not util.flush() then
+    util.err(errno_msg('write error', sys.errno()))
+    return 1
+  end
+  return status
+end
+
+global function applet_sync(args: sequence(string)): integer
+  local longs: []util.LongOpt = {
+    {'data', 0, 100}, {'file-system', 0, 102}, {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
+  }
+  local g = util.getopt(args, 'df', &longs, #longs)
+  local arg_data, arg_file_system = false, false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 100 then arg_data = true
+    elseif c == 102 then arg_file_system = true
+    elseif c == HELP_OPTION then
+      util.write([[
+Usage: sync [OPTION] [FILE]...
+Synchronize cached writes to persistent storage
+
+If one or more files are specified, sync only them,
+or their containing file systems.
+
+  -d, --data             sync only file data, no unneeded metadata
+  -f, --file-system      sync the file systems that contain the files
+      --help        display this help and exit
+      --version     output version information and exit
+]])
+      return close_stdout(0)
+    elseif c == VERSION_OPTION then
+      util.write('sync (nebox) after GNU coreutils 9.1\n')
+      return close_stdout(0)
+    else
+      util.flush()
+      local m = "Try 'sync --help' for more information.\n"
+      sys.write(2, m.data, m.size)
+      return 1
+    end
+  end
+  local files = g:operands()
+  if arg_data and arg_file_system then return util.die('cannot specify both --data and --file-system') end
+  if #files == 0 and arg_data then return util.die('--data needs at least one argument') end
+  if #files == 0 then
+    sys.sync()
+    return 0
+  end
+  local mode = arg_file_system and MODE_FILE_SYSTEM or (arg_data and MODE_DATA or MODE_FILE)
+  local ok = true
+  for _, f in ipairs(files) do
+    if not sync_arg(mode, f) then ok = false end
+  end
+  return ok and 0 or 1
+end

@@ -425,6 +425,113 @@ Stated here rather than worked around:
   - With no operand and a read error on stdin, the C code names
     `argv[optind - 1]`; nebox uses the last argument, or the applet name
     for argv[0].
+- `rev` ports util-linux 2.38.1 text-utils/rev.c in the C locale, where
+  glibc's fgetws takes bytes 0-127 as characters and fails with EILSEQ on
+  any other byte: the BUFSIZ buffer that doubles for long lines and stays
+  doubled (each doubling tried as an untouched allocation, so an
+  impossible one fails with "cannot allocate N bytes" as xrealloc does),
+  wcslen deciding the length so a NUL cuts the line and pulls the next
+  one in, lines starting with NUL dropped, the in-place reversal and
+  fputws up to the first NUL (which shows what a failed read left in the
+  buffer), "FILE: LINES: strerror" for conversion and read errors, "cannot
+  open", SIGINT/SIGTERM exiting 0, close_stdout's "write error" (with
+  strerror only when the last flush failed; EBADF ignored), --help, and
+  -V/--version. util-linux 2.38.1 has no -0/--zero, so neither does nebox.
+  `tests/rev_compare.py`: 93 fixed and 400 random cases, 0 mismatches.
+  Differences:
+  - `--version` prints nebox's line.
+  - Memory past what was read is taken to be zero, as fresh glibc heap
+    and mmap memory is; where glibc's realloc hands back reused memory,
+    the bytes a failed read exposes can differ.
+  - A buffer size that wraps size_t (some 50 NUL-merged lines without an
+    address-space limit) is undefined in rev.c; nebox stops reading.
+- `strings` ports GNU binutils 2.40 binutils/strings.c with libiberty's
+  expandargv/buildargv: the whole file by default (-a, and "-" before
+  later files; "-" never means standard input), -d with BFD's ELF reader
+  (elf_object_p's header and section-table checks, bfd_section_from_shdr's
+  choice and order of sections, the corrupt e_shstrndx warning, a file
+  with no loaded section scanned whole), -T (BFD tries every target when
+  the named one does not match; `binary` takes the whole file as one
+  section; an unknown name scans the whole file), -e s/S/b/l/B/L with
+  get_char/unget_part_char, -w, -n/--bytes and -NUM through strtoul with
+  base 0 and the unsigned-int truncation (`-n 4294967297` is 1, `-n -1`
+  never prints), -NUM read back from getopt's permuted argv as strings.c
+  does (`strings f1 -3` takes 1 from "f1"; `-5a` reads "trings"), -t
+  o/d/x and -o, -f, -s, -U d/l/e/i/x/h with print_unicode_stream's and
+  print_unicode_buffer's walks and their quirks (`locale` prints the lead
+  byte only, `escape` prints 4-byte sequences with GNU's arithmetic, a
+  string starting at a put-back byte gets GNU's address 2^32 - 1 too
+  large), empty -t/-e arguments judged by the byte after them in argv's
+  memory, @file response files (quotes, backslashes, nesting, the 2000-file
+  limit, directories, files removed when empty), every usage path on
+  stdout or stderr, binutils' file messages, stdio buffering and no
+  write-error check. `tests/strings_compare.py`: 1048 fixed and 400 random
+  cases (ELF executables, objects, a shared library, a big-endian ELF32,
+  broken ELF headers, an archive, UTF-8/16/32 text), 0 mismatches.
+  Differences:
+  - `-v`/`-V`/`--version` print nebox's line; the usage on stdout has no
+    bug-report line.
+  - -d recognizes ELF only. Files BFD reads as PE/COFF, S-records,
+    Intel/Tektronix hex, PDB or LTO plugin objects are scanned whole.
+    ELF section types BFD rejects or warns about, invalid section-name
+    offsets, sections that extend past the end of the file and BFD's
+    other diagnostics for malformed ELF are not reproduced.
+  - An empty -t/-e argument from a response file reads heap memory in
+    GNU; nebox treats it as followed by a non-NUL byte.
+  - `-n` values at or near 2^32 make GNU's buffers overflow (malloc of
+    size+1 or 4*size+1 wraps); nebox allocates as needed.
+- `groups` ports GNU coreutils 9.1 groups.c and group-list.c over nelibc's
+  getpwnam/getpwuid/getgrgid/getgrouplist: the current process (real and
+  effective gid, then getgroups through gnulib mgetgroups) or "NAME : "
+  and each user's groups, "'x': no such user", "cannot find name for
+  group ID N" with the number printed, status 1 for either, write errors,
+  --help without GNU's closing links and --version with nebox's line.
+  `tests/groups_compare.py`: 40 cases as a user and 54 as root, including
+  fixture passwd/group files bound in a private mount namespace and
+  setpriv-set real/effective/supplementary gids, 0 mismatches.
+- `which` ports the debianutils 5.7 which script as dash runs it: dash's
+  getopts for `-a` ("Illegal option -X" and the usage line, status 2;
+  `--` ends options, `-` and the first name stop them), `[ -f ] && [ -x ]`
+  with faccessat(AT_EACCESS), PATH split as dash splits it with IFS=:
+  after the script's trailing-colon fix (empty elements are ".", an
+  empty PATH searches nothing, an unset one uses dash's default), -a,
+  status 1 when a name is missing or none is given, each line written at
+  once, a write error as dash's "printf: I/O error" with status 1, and a
+  non-empty KSH_VERSION failing the script's `print` with status 127.
+  debianutils 5.7 has no -s. `tests/which_compare.py`: 81 cases, 0
+  mismatches. One difference: the script names itself by the path dash
+  was given ($0, normally /usr/bin/which); nebox says `which`.
+- `sync` ports GNU coreutils 9.1 sync.c: sync(2) without operands; per
+  file an O_RDONLY|O_NONBLOCK open (O_WRONLY when that fails, reporting the
+  first errno), O_NONBLOCK cleared, then fsync, -d/--data fdatasync or
+  -f/--file-system syncfs; "error opening", "couldn't reset non-blocking
+  mode", "error syncing" and "failed to close", the -d/-f conflict and
+  "--data needs at least one argument", --help without GNU's closing links
+  and --version with nebox's line. `tests/sync_compare.py`: 182 cases as
+  a user and as root (FIFOs, sockets, devices, /proc, unreadable files),
+  0 mismatches. Whether data reaches the disk is not observable there and
+  was not tested.
+- `free` ports procps-ng 4.0.2 src/free.c and the meminfo.c reader: one
+  read of up to 8191 bytes of /proc/meminfo parsed as meminfo.c parses it
+  (a line without a colon ends parsing, strtoul after the colon, the last
+  duplicate wins), its derived values (MemAvailable falling back to
+  MemFree, used as total minus available or free, buff/cache with
+  SReclaimable, Low* defaulting to Mem*, clamped used columns), scale_size
+  in the same types (kB times 1024 as long long, float bases, -h's "%.1f"
+  of a float rounded half to even), -b -k -m -g --tera --peta --kilo
+  --mega --giga --tebi --pebi with "Multiple unit options don't make
+  sense.", -h --si -l -t -v -w, -s (strtod_nol_or_err, '.' or ',') and -c
+  with their messages, int truncation and repeats, usage on stderr for
+  bad options and operands, the error for an empty file (the one for a
+  missing file is ported but untested),
+  --help, and close_stdout's "write error". procps-ng 4.0.2 has no
+  -L/--line. `tests/free_compare.py`: 836 fixed and 300 random cases on
+  fixture files bound over /proc/meminfo in a private mount namespace
+  (plus the live file with changing columns masked), 0 mismatches.
+  Differences:
+  - -V/--version prints nebox's line.
+  - procps re-reads the file when a second boundary passes between two
+    fields of one report; nebox reads once per report.
 - `xargs` ports GNU findutils 4.9.0 xargs.c and buildcmd.c
   (`src/nebox/applets/xargs.nelua`, C locale): read_line's quote,
   backslash, blank-line and trailing-blank (-L/-l continuation) rules, the
@@ -897,9 +1004,8 @@ Stated here rather than worked around:
   - A program with back-references can exceed nebox's thread bound and
     stops with "pattern too complex" (exit 4), as in the regex entry.
 - `df` reads mounts from /proc/self/mounts and statfs through nelibc's
-  backend table; `free` reads /proc/meminfo.
-- `groups`/`whoami` know only the
-  current process.
+  backend table.
+- `whoami` knows only the current process.
 - Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)
   comes from nelibc's `localtime_r` (and `mktime`, except in `date` and
   `touch`, which use a port of glibc's mktime over localtime_r): TZif zone files, POSIX TZ

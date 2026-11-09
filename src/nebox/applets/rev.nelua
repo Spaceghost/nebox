@@ -1,0 +1,253 @@
+-- rev: a port of util-linux 2.38.1 text-utils/rev.c in the C locale, where
+-- glibc's fgetws takes bytes 0-127 as characters and stops with EILSEQ at
+-- any other byte. The same fgetws loop: lines read into a BUFSIZ buffer
+-- that doubles (and stays doubled) for long lines, wcslen deciding the
+-- length so a NUL truncates the line and pulls the next one in, a line
+-- starting with NUL dropped, a missing final newline kept missing, and a
+-- conversion or read error ending the file with "rev: FILE: LINES:
+-- strerror" (status 1, the next file still read). "cannot open" for
+-- unopenable files, SIGINT/SIGTERM exit 0 at once, stdout buffered in
+-- st_blksize blocks with util-linux's close_stdout ("write error", with
+-- strerror when only the final flush failed), --help, and --version with
+-- nebox's line. There is no -0/--zero in 2.38.1.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local SIGTERM: cint <comptime> = 15
+local SA_RESTART: cint <comptime> = 0x10000000
+
+-- stdout as glibc buffers it
+local obuf: sequence(byte)
+local ocap: integer = 4096
+local oerror = false
+
+local function oflush(): boolean
+  local done = 0
+  while done < #obuf do
+    local r = sys.write(1, &obuf[done + 1], (@usize)(#obuf - done))
+    if r < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      obuf:clear()
+      return false
+    end
+    done = done + r
+  end
+  obuf:clear()
+  return true
+end
+
+local function obyte(c: byte)
+  if #obuf >= ocap then
+    if not oflush() then oerror = true end
+  end
+  obuf:push(c)
+end
+
+-- the input stream: bytes with EOF and error flags, both sticky
+local fd: cint = 0
+local rbuf: [65536]byte
+local rlen: integer = 0
+local rpos: integer = 0
+local eof = false
+local err = false
+local err_errno: cint = 0
+local EILSEQ: cint <comptime> = 84
+
+-- next character, -1 at end of file, -2 on an error
+local function getwc(): integer
+  if err then return -2 end
+  if rpos >= rlen then
+    if eof then return -1 end
+    while true do
+      local r = sys.read(fd, &rbuf[0], #rbuf)
+      if r < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        err = true; err_errno = sys.errno()
+        return -2
+      end
+      if r == 0 then eof = true; return -1 end
+      rlen = r; rpos = 0
+      break
+    end
+  end
+  local c = rbuf[rpos]
+  if c >= 128 then
+    err = true; err_errno = EILSEQ
+    return -2
+  end
+  rpos = rpos + 1
+  return c
+end
+
+local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
+local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
+
+-- buf holds what was read; bufsiz is the size rev.c believes it has (in
+-- wide characters), each doubling tried as an untouched allocation of
+-- that many wchar_t, so an impossible one fails as xrealloc does
+local buf: sequence(byte)
+local bufsiz: uint64 = 8192
+
+local function ensure(n: integer)
+  if #buf < n then
+    local m = #buf * 2
+    if m < n then m = n end
+    buf:resize((@usize)(m))
+  end
+end
+
+-- fgetws(&buf[off], n, fp)
+local function fgetws(off: integer, nz: uint64): boolean
+  -- the size_t count reaches fgetws as an int
+  local n = (@int32)(nz)
+  local count = 0
+  local failed = false
+  if n <= 0 then return false end
+  while count < n - 1 do
+    local c = getwc()
+    if c == -1 then break end
+    if c == -2 then failed = true; break end
+    ensure(off + count + 2)
+    buf[off + count + 1] = (@byte)(c)
+    count = count + 1
+    if c == 10 then break end
+  end
+  -- a failed call returns NULL but leaves what it read in the buffer
+  if count == 0 or failed then return false end
+  ensure(off + count + 2)
+  buf[off + count + 1] = 0
+  return true
+end
+
+local function wcslen_from(k: integer): integer
+  while buf[k + 1] ~= 0 do k = k + 1 end
+  return k
+end
+
+local function sig_handler(sig: cint)
+  sys._exit(0)
+end
+
+local function try_help(): integer
+  util.flush()
+  local m = "Try 'rev --help' for more information.\n"
+  sys.write(2, m.data, m.size)
+  return 1
+end
+
+local function close_stdout(status: integer): integer
+  local ok = not oerror
+  local e: cint = 0
+  if ok and not oflush() then
+    e = sys.errno()
+    -- util-linux's flush_standard_stream lets EBADF pass
+    if e ~= sys.EBADF then ok = false end
+  end
+  if not ok then
+    if e ~= 0 then util.err('write error: ' .. sys.strerror(e)) else util.err('write error') end
+    return 1
+  end
+  return status
+end
+
+global function applet_rev(args: sequence(string)): integer
+  local longs: []util.LongOpt = { {'version', 0, 86}, {'help', 0, 104} }
+  local g = util.getopt(args, 'Vh', &longs, #longs)
+  local act: sys.Sigaction = {}
+  act.sa_handler = sig_handler
+  act.sa_flags = SA_RESTART
+  sys.sigaction(sys.SIGINT, &act, nilptr)
+  sys.sigaction(SIGTERM, &act, nilptr)
+  local ost: sys.Stat
+  if sys.fstat(1, &ost) == 0 and ost.st_blksize > 0 then ocap = ost.st_blksize end
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 86 then
+      local v = 'rev (nebox) after util-linux 2.38.1\n'
+      for i = 1, #v do obyte(v:byte(i)) end
+      return close_stdout(0)
+    elseif c == 104 then
+      local u = [[
+Usage: rev [options] [file ...]
+
+Reverse lines characterwise.
+
+Options:
+ -h, --help     display this help
+ -V, --version  display version
+
+For more details see rev(1).
+]]
+      for i = 1, #u do obyte(u:byte(i)) end
+      return close_stdout(0)
+    else
+      return try_help()
+    end
+  end
+  local files = g:operands()
+  local rval = 0
+  buf:resize(8194)
+  local fi = 1
+  repeat
+    local filename = 'stdin'
+    fd = 0
+    if fi <= #files then
+      local name = files[fi]
+      fi = fi + 1
+      fd = sys.open(name, sys.O_RDONLY, 0)
+      if fd < 0 then
+        util.err('cannot open ' .. name .. ': ' .. sys.errstr())
+        rval = 1
+        goto next_file
+      end
+      filename = name
+    end
+    rlen = 0; rpos = 0; eof = false; err = false
+    do
+      local line: uint64 = 0
+      while fgetws(0, bufsiz) do
+        local len = wcslen_from(0)
+        if len == 0 then continue end
+        while buf[len] ~= 10 and not eof do
+          bufsiz = bufsiz * 2
+          local bytes: uint64 = bufsiz * 4
+          if bytes ~= 0 then
+            local p = c_malloc((@csize)(bytes))
+            if p == nilptr then
+              util.err('cannot allocate ' .. tostring(bytes) .. ' bytes: Cannot allocate memory')
+              return close_stdout(1)
+            end
+            c_free(p)
+          end
+          if not fgetws(len, bufsiz // 2) then break end
+          len = wcslen_from(len)
+        end
+        local n = len
+        if buf[len] == 10 then n = len - 1 end
+        -- reverse_str in place, then fputws up to the first NUL, which a
+        -- failed fgetws may have left past LEN (with what earlier lines
+        -- left in the buffer behind it)
+        local lo, hi = 1, n
+        while lo < hi do
+          buf[lo], buf[hi] = buf[hi], buf[lo]
+          lo = lo + 1; hi = hi - 1
+        end
+        local k = 1
+        while k <= #buf and buf[k] ~= 0 do obyte(buf[k]); k = k + 1 end
+        line = line + 1
+      end
+      if err then
+        util.err(filename .. ': ' .. tostring(line) .. ': ' .. sys.strerror(err_errno))
+        rval = 1
+      end
+      if fd ~= 0 then sys.close(fd) end
+    end
+    ::next_file::
+  until fi > #files
+  return close_stdout(rval)
+end

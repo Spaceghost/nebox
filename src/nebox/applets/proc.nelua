@@ -1,5 +1,5 @@
 -- Process and system applets: true false sleep env printenv uname hostname id
--- kill which sync nproc
+-- kill nproc
 ## pragmas.nogc = true
 
 require 'string'
@@ -126,40 +126,3 @@ global function applet_kill(args: sequence(string)): integer
   end
   return rc
 end
-
-global function applet_which(args: sequence(string)): integer
-  local o = util.parse(args, '+a')
-  if not o:ok() then return util.optfail(o) end
-  local path = sys.getenv('PATH')
-  local pathstr: string = '/usr/local/bin:/usr/bin:/bin'
-  if path ~= nilptr then pathstr = path end
-  local rc: integer = 0
-  for _, name in ipairs(o.operands) do
-    local found = false
-    if name:find('/', 1, true) > 0 then
-      if sys.access(name, sys.X_OK) == 0 and not util.isdir(name) then util.line(name); found = true end
-    else
-      local start: usize = 1
-      for i: usize = 1, pathstr.size + 1 do
-        if i > pathstr.size or pathstr:byte(i) == 58 then
-          local dir = i > start and pathstr:sub(start, i - 1) or '.'
-          local full = util.join(dir, name)
-          if sys.access(full, sys.X_OK) == 0 and not util.isdir(full) then
-            util.line(full)
-            found = true
-            if not o:has('a') then break end
-          end
-          start = i + 1
-        end
-      end
-    end
-    if not found then rc = 1 end
-  end
-  return rc
-end
-
-global function applet_sync(args: sequence(string)): integer
-  sys.sync()
-  return 0
-end
-

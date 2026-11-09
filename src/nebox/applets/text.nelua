@@ -1,4 +1,4 @@
--- Text applets: echo cat head tail wc uniq tee tr cut rev yes seq printf nl
+-- Text applets: echo cat head tail wc uniq tee tr cut yes seq printf nl
 ## pragmas.nogc = true
 
 require 'string'
@@ -280,24 +280,6 @@ local function inlist(list: sequence(Range), n: integer): boolean
 end
 
 
-global function applet_rev(args: sequence(string)): integer
-  if #args == 0 then args:push('-') end
-  local rc: integer = 0
-  for _, path in ipairs(args) do
-    local data, ok = util.readfile(path)
-    if not ok then rc = 1; continue end
-    local start: usize = 0
-    for i: usize = 0, data.size do
-      if i == data.size or data.data[i] == 10 then
-        local j: isize = (@isize)(i) - 1
-        while j >= (@isize)(start) do util.writebyte(data.data[j]); j = j - 1 end
-        if i < data.size then util.writebyte(10) end
-        start = i + 1
-      end
-    end
-  end
-  return rc
-end
 
 global function applet_yes(args: sequence(string)): integer
   local s: string = 'y'
