@@ -2178,6 +2178,8 @@ local SORT_OPTION <comptime> = 270
 local TIME_OPTION <comptime> = 271
 local TIME_STYLE_OPTION <comptime> = 272
 local ZERO_OPTION <comptime> = 273
+local HELP_OPTION <comptime> = 274
+local VERSION_OPTION <comptime> = 275
 
 local long_options: []util.LongOpt = {
   {'all', 0, 97}, {'escape', 0, 98}, {'directory', 0, 100}, {'dired', 0, 68},
@@ -2193,7 +2195,7 @@ local long_options: []util.LongOpt = {
   {'sort', 1, SORT_OPTION}, {'tabsize', 1, 84}, {'time', 1, TIME_OPTION}, {'time-style', 1, TIME_STYLE_OPTION},
   {'zero', 0, ZERO_OPTION}, {'color', 2, COLOR_OPTION}, {'hyperlink', 2, HYPERLINK_OPTION},
   {'block-size', 1, BLOCK_SIZE_OPTION}, {'context', 0, 90}, {'author', 0, AUTHOR_OPTION},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  {'help', 0, HELP_OPTION}, {'version', 0, VERSION_OPTION},
 }
 
 local format_args: []string = {'verbose', 'long', 'commas', 'horizontal', 'across', 'vertical', 'single-column'}
@@ -2384,6 +2386,25 @@ local function decode_switches(args: sequence(string)): sequence(string)
       if format_opt ~= long_format then format_opt = one_per_line end
       print_with_color = false
       quoting_style_opt = quotearg.LITERAL
+    elseif c == HELP_OPTION then
+      util.line('Usage: ' .. util.applet .. ' [OPTION]... [FILE]...')
+      util.line([[List information about files, or the current directory by default.
+  -a, --all                    include names beginning with .
+  -l                           display a long listing
+  -C                           list entries in columns
+  -d, --directory              list directories themselves
+  -R, --recursive              list subdirectories recursively
+  -t                           sort by modification time
+  -r, --reverse                reverse the sort order
+      --color[=WHEN]           use color for displayed names
+      --help                   display this help
+      --version                display version information]])
+      util.flush()
+      c_exit(0)
+    elseif c == VERSION_OPTION then
+      util.line(util.applet .. ' (nebox) after GNU coreutils 9.1')
+      util.flush()
+      c_exit(0)
     elseif c == util.UNSUPPORTED then
       util.err("option '--" .. g.longname .. "' is not supported")
       usage_fail(2)

@@ -5,8 +5,8 @@
 -- GNU, a decimal bignum here) with truncating / and %, strintcmp for
 -- integer comparisons, anchored BRE matching with GNU's syntax bits
 -- (RE_SYNTAX_POSIX_BASIC without RE_CONTEXT_INVALID_DUP and
--- RE_NO_EMPTY_RANGES) and glibc's messages, exit statuses 0/1/2/3. The C
--- locale only: lengths and positions count bytes.
+-- RE_NO_EMPTY_RANGES) and glibc's messages, exit statuses 0/1/2/3.
+-- Character operations follow LC_CTYPE.
 ## pragmas.nogc = true
 
 require 'string'
@@ -14,6 +14,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.regex'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
@@ -245,7 +246,7 @@ local function docolon(sv: *Value, pv: *Value): Value
       if caps.at[3] < 0 or caps.at[2] < 0 then return str_value('') end
       return str_value(sv.s:sub(caps.at[2] + 1, caps.at[3]))
     end
-    return int_value(big_small(caps.at[1] - caps.at[0]))
+    return int_value(big_small((@integer)(nlocale.length(sv.s:subview(caps.at[0] + 1, caps.at[1])))))
   end
   if prog.nsub > 0 then return str_value('') end
   return int_value(big_small(0))
@@ -274,7 +275,7 @@ local function eval6(evaluate: boolean): Value
   elseif nextarg('length') then
     local r = eval6(evaluate)
     tostr(&r)
-    return int_value(big_small(#r.s))
+    return int_value(big_small((@integer)(nlocale.length(r.s))))
   elseif nextarg('match') then
     local l = eval6(evaluate)
     local r = eval6(evaluate)
@@ -284,13 +285,21 @@ local function eval6(evaluate: boolean): Value
     local l = eval6(evaluate)
     local r = eval6(evaluate)
     tostr(&l); tostr(&r)
-    local pos = 0
-    if #r.s > 0 then
-      for k = 1, #l.s do
-        if r.s:find(string.char(l.s:byte(k)), 1, true) > 0 then pos = k; break end
+    local start: usize = 0
+    local pos = 1
+    while start < l.s.size and r.s.size ~= 0 do
+      local past = nlocale.advance(l.s, start, 1)
+      local needle = l.s:subview(start + 1, past)
+      local at: usize = 0
+      while at < r.s.size do
+        local next_at = nlocale.advance(r.s, at, 1)
+        if needle == r.s:subview(at + 1, next_at) then return int_value(big_small(pos)) end
+        at = next_at
       end
+      start = past
+      pos = pos + 1
     end
-    return int_value(big_small(pos))
+    return int_value(big_small(0))
   elseif nextarg('substr') then
     local l = eval6(evaluate)
     local i1 = eval6(evaluate)
@@ -299,11 +308,13 @@ local function eval6(evaluate: boolean): Value
     if not toarith(&i1) or not toarith(&i2) then return str_value('') end
     local pos = getsize(i1.n)
     local len = getsize(i2.n)
-    local llen: uint64 = #l.s
+    local llen: uint64 = nlocale.length(l.s)
     if llen < pos or pos == 0 or len == 0 or len == SIZE_MAX then return str_value('') end
     local vlen = llen - pos + 1
     if len < vlen then vlen = len end
-    return str_value(l.s:sub((@integer)(pos), (@integer)(pos + vlen - 1)))
+    local start = nlocale.advance(l.s, 0, (@usize)(pos - 1))
+    local stop = nlocale.advance(l.s, start, (@usize)(vlen))
+    return str_value(l.s:sub(start + 1, stop))
   end
   return eval7(evaluate)
 end

@@ -371,6 +371,9 @@ function awklex.Lexer:op()
   elseif c == #[B'-']# and d == #[B'-']# then kind = awklex.DECR
   elseif c == #[B'+']# and d == #[B'=']# then kind = awklex.ADD_ASSIGN
   elseif c == #[B'-']# and d == #[B'=']# then kind = awklex.SUB_ASSIGN
+  elseif c == #[B'*']# and d == #[B'*']# then
+    kind = awklex.CARET
+    if self:peek(2) == #[B'=']# then kind = awklex.POW_ASSIGN; len = 3 end
   elseif c == #[B'*']# and d == #[B'=']# then kind = awklex.MUL_ASSIGN
   elseif c == #[B'/']# and d == #[B'=']# then kind = awklex.DIV_ASSIGN
   elseif c == #[B'%']# and d == #[B'=']# then kind = awklex.MOD_ASSIGN

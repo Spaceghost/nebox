@@ -166,6 +166,7 @@ local ototal: uint64 = 0
 local ofail: cint = 0
 local oblksize: uint64 = 8192
 local output_fd: cint = 1
+local compress_program: string
 local outname = 'standard output'
 
 local function die_write(what: string)
@@ -1217,10 +1218,46 @@ local function temp_run(): cint
     die_errno(e, 'cannot unlink temporary file ' .. util.quotef(name))
   end
   name:destroy()
+  if fd < 3 then
+    local safe = sys.fcntl(fd, sys.F_DUPFD_CLOEXEC, 3)
+    sys.close(fd)
+    if safe < 0 then die('cannot reserve temporary file descriptor') end
+    fd = safe
+  elseif sys.fcntl(fd, sys.F_SETFD, sys.FD_CLOEXEC) < 0 then
+    die('cannot protect temporary file descriptor')
+  end
   return fd
 end
 
+-- Filters run without a shell and receive -d on decode. Rewind the
+-- source before forking so the filtered transfer can use ordinary stdio.
+local function filter_run(input: cint, output: cint, decode: boolean)
+  if sys.lseek(input, 0, sys.SEEK_SET) < 0 then sort_die('cannot rewind', 'temporary run') end
+  local pid = sys.fork()
+  if pid < 0 then die('cannot fork compression program') end
+  if pid == 0 then
+    if sys.dup2(input, 0) < 0 or sys.dup2(output, 1) < 0 then sys._exit(126) end
+    local program = (@cstring)(compress_program)
+    local args: [3]cstring = {program, nilptr, nilptr}
+    if decode then args[1] = (@cstring)('-d') end
+    sys.execvp(program, &args[0])
+    sys._exit(127)
+  end
+  local status: cint
+  local waited: cint
+  repeat waited = sys.waitpid(pid, &status, 0) until waited >= 0 or sys.errno() ~= sys.EINTR
+  if waited < 0 or status ~= 0 then
+    die('compression program failed: ' .. util.quotef(compress_program))
+  end
+end
+
 local function run_source(fd: cint): *Source
+  if compress_program.size > 0 then
+    local uncompressed = temp_run()
+    filter_run(fd, uncompressed, true)
+    sys.close(fd)
+    fd = uncompressed
+  end
   local src = new_source('temporary run', true)
   src.fd = fd
   src.temporary = true
@@ -1229,10 +1266,18 @@ local function run_source(fd: cint): *Source
 end
 
 local function begin_temp_output(fd: cint)
-  output_fd = fd
+  output_fd = compress_program.size > 0 and temp_run() or fd
   outname = 'temporary run'
   ototal = 0
   out_start()
+end
+
+local function finish_temp_output(fd: cint)
+  out_finish()
+  if output_fd ~= fd then
+    filter_run(output_fd, fd, false)
+    sys.close(output_fd)
+  end
 end
 
 -- Merge one batch into a temporary run.
@@ -1243,7 +1288,7 @@ local function mergefiles(group: sequence(*Source)): *Source
   debug = false
   begin_temp_output(fd)
   mergefps(group)
-  out_finish()
+  finish_temp_output(fd)
   debug = was_debug
   for i = 1, #group do free_source(group[i]) end
   return run_source(fd)
@@ -1399,7 +1444,7 @@ local function write_run(ar: *Arena, fd: cint)
   local group: sequence(*Source)
   group:push(src)
   mergefps(group)
-  out_finish()
+  finish_temp_output(fd)
   group:destroy()
   free_source(src)
   debug = was_debug
@@ -1419,7 +1464,7 @@ local function retain_run(levels: *sequence(cint), fd: cint)
     debug = false
     begin_temp_output(fd)
     mergefps(group)
-    out_finish()
+    finish_temp_output(fd)
     debug = was_debug
     group:destroy()
     free_source(left); free_source(right)
@@ -1830,7 +1875,7 @@ global function applet_sort(args: sequence(string)): integer
   local traditional_usage = not (200112 <= posix_ver and posix_ver < 200809)
   local files_from = ''
   local have_ff = false
-  local compress_program = ''
+  compress_program = ''
   local have_cp = false
   local longs: []util.LongOpt = {
     {'ignore-leading-blanks', 0, 98}, {'check', 2, CHECK_OPTION},

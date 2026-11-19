@@ -1,4 +1,4 @@
--- awk: POSIX.1-2017 awk. Options -F fs, -f progfile (repeatable), -v
+-- awk: POSIX.1-2017 awk. Options -F fs, -f progfile, -e program, -v
 -- assignment (repeatable), -- ; operands are files, "-" for stdin, or
 -- var=value assignments processed when reached.
 ## pragmas.nogc = true
@@ -16,22 +16,30 @@ require 'nebox.awk.interp'
 
 local function usage(): integer
   util.err('usage: awk [-F fs] [-v assignment]... program [argument...]')
-  util.err('       awk [-F fs] [-v assignment]... -f progfile... [argument...]')
+  util.err('       awk [-F fs] [-v assignment]... (-e program | -f progfile)... [argument...]')
   return 2
 end
 
--- The program text: the -f files joined by newlines, else the first operand.
+-- Combine fragments in argument order so -e and -f may be interleaved.
 local function program_text(o: *util.Opts): (string, boolean)
-  local files = o:all('f')
-  if #files > 0 then
+  if o:has('f') or o:has('e') then
     local sb: stringbuilder
-    for i = 1, #files do
-      local data, ok = util.readfile(files[i])
-      if not ok then
-        util.err("cannot open source file `" .. files[i] .. "' for reading")
-        return '', false
+    for i = 1, #o.keys do
+      local key, value = o.keys[i], o.vals[i]
+      if key == 102 then
+        local data, ok = util.readfile(value)
+        if not ok then
+          sb:destroy()
+          util.err("cannot open source file `" .. value .. "' for reading")
+          return '', false
+        end
+        sb:write(data)
+        data:destroy()
+      elseif key == 101 then
+        sb:write(value)
+      else
+        continue
       end
-      sb:write(data)
       sb:writebyte(10)
     end
     return sb:promote(), true
@@ -42,8 +50,12 @@ local function program_text(o: *util.Opts): (string, boolean)
   return src, true
 end
 
+local awk_options: []util.LongOpt = {
+  {'field-separator', 1, 70}, {'source', 1, 101}, {'file', 1, 102}, {'assign', 1, 118},
+}
+
 global function applet_awk(args: sequence(string)): integer
-  local o = util.parse(args, '+F:f:v:')
+  local o = util.parsel(args, '+F:e:f:v:', &awk_options, #awk_options)
   if not o:ok() then
     util.optfail(o)
     return 2

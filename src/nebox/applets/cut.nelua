@@ -1,5 +1,5 @@
 -- cut: a port of GNU coreutils 9.1 src/cut.c and set-fields.c. -b/-c
--- (bytes; -n is ignored as in GNU), -f with -d, -s, --complement,
+-- (UTF-8 characters with -c), -f with -d, -s, --complement,
 -- --output-delimiter (empty means NUL), -z, GNU's list syntax and errors,
 -- and its handling of -d$'\n' and lines without a trailing delimiter.
 ## pragmas.nogc = true
@@ -8,6 +8,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 
 local UMAX: uint64 <comptime> = 0xffffffffffffffff
 
@@ -24,16 +25,27 @@ local out_delim_given: boolean
 
 local Input = @record{fd: cint, buf: [65536]byte, pos: integer, len: integer, eof: boolean, err: cint, back: integer}
 
+-- Keep an incomplete character at the buffer boundary when extending a read.
+local function refill(r: *Input): boolean
+  if r.eof then return false end
+  local left = r.len - r.pos
+  for i = 0, < left do r.buf[i] = r.buf[r.pos + i] end
+  r.pos, r.len = 0, left
+  local n: clong
+  repeat n = sys.read(r.fd, &r.buf[left], #r.buf - left)
+  until n >= 0 or sys.errno() ~= sys.EINTR
+  if n <= 0 then
+    if n < 0 then r.err = sys.errno() end
+    r.eof = true
+    return false
+  end
+  r.len = r.len + n
+  return true
+end
+
 local function getc(r: *Input): integer
   if r.back >= 0 then local c = r.back; r.back = -1; return c end
-  if r.pos >= r.len then
-    if r.eof then return -1 end
-    local n: clong
-    repeat n = sys.read(r.fd, &r.buf[0], #r.buf) until not (n < 0 and sys.errno() == sys.EINTR)
-    if n < 0 then r.err = sys.errno(); r.eof = true; return -1 end
-    if n == 0 then r.eof = true; return -1 end
-    r.pos = 0; r.len = n
-  end
+  if r.pos >= r.len and not refill(r) then return -1 end
   local c = r.buf[r.pos]
   r.pos = r.pos + 1
   return c
@@ -157,12 +169,23 @@ local function set_fields(fieldstr: string, pos_msgs: boolean): string
   return ''
 end
 
-local function cut_bytes(r: *Input)
+local function cut_units(r: *Input, characters: boolean)
   local byte_idx: uint64 = 0
   local print_delimiter = false
   cur = 1
   while true do
-    local c = getc(r)
+    local c: integer = -1
+    local size: usize = 1
+    if r.pos < r.len or refill(r) then
+      c = r.buf[r.pos]
+      if characters and c ~= line_delim then
+        while true do
+          local text: string = {data = &r.buf[0], size = (@usize)(r.len)}
+          local _, used, partial = nlocale.decode(text, (@usize)(r.pos))
+          if not partial or not refill(r) then size = used; break end
+        end
+      end
+    end
     if c == line_delim then
       util.writebyte((@byte)(c))
       byte_idx = 0; print_delimiter = false; cur = 1
@@ -176,9 +199,10 @@ local function cut_bytes(r: *Input)
           if print_delimiter and is_range_start_index(byte_idx) then util.write(out_delim) end
           print_delimiter = true
         end
-        util.writebyte((@byte)(c))
+        util.writebytes(&r.buf[r.pos], size)
       end
     end
+    r.pos = r.pos + (@integer)(size)
   end
 end
 
@@ -275,6 +299,7 @@ global function applet_cut(args: sequence(string)): integer
   out_delim = ''; out_delim_given = false
   local delim_specified = false
   local byte_mode = false
+  local characters = false
   local spec: string = ''
   local have_spec = false
   local g = util.getopt(args, 'b:c:d:f:nsz', &cut_longs, #cut_longs)
@@ -286,6 +311,7 @@ global function applet_cut(args: sequence(string)): integer
     if c == util.UNSUPPORTED then return usage_fail("option '--" .. g.longname .. "' is not supported") end
     if c == 98 or c == 99 or c == 102 then
       if c ~= 102 then byte_mode = true end
+      characters = c == 99 and nlocale.multibyte
       if have_spec then return usage_fail('only one list may be specified') end
       spec = g.optarg; have_spec = true
     elseif c == 100 then
@@ -322,7 +348,7 @@ global function applet_cut(args: sequence(string)): integer
       r.fd = sys.open(file, sys.O_RDONLY, 0)
       if r.fd < 0 then util.err(util.quotef(file) .. ': ' .. sys.errstr()); ok = false; continue end
     end
-    if byte_mode then cut_bytes(&r) else cut_fields(&r) end
+    if byte_mode then cut_units(&r, characters) else cut_fields(&r) end
     if r.fd ~= 0 then sys.close(r.fd) end
     if r.err ~= 0 then util.err(util.quotef(file) .. ': ' .. sys.strerror(r.err)); ok = false end
   end

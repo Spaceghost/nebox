@@ -165,6 +165,7 @@ local Parser = @record{
   err: string,
   depth: integer,
   newline: boolean, -- REG_NEWLINE: '.' and [^...] do not match a newline
+  negated_newline: boolean, -- negated lists can match newlines
   empty_ranges: boolean, -- a range like z-a is empty instead of an error
   glibc_errors: boolean, -- glibc's re_compile_pattern diagnostics (expr)
 }
@@ -351,7 +352,7 @@ function Parser:parse_bracket(): Frag
   end
   if negate then
     invert(&s)
-    if self.newline then s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7)) end
+    if self.newline and not self.negated_newline then s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7)) end
   end
   self.sets:push(s)
   out:push(inst(OP_CLASS, 0, #self.sets, 0))
@@ -581,6 +582,7 @@ end
 -- newline); `nlanchor` makes ^ and $ match at embedded newlines too.
 global regex.EMPTY_RANGES: integer <comptime> = 1
 global regex.GLIBC_ERRORS: integer <comptime> = 2
+global regex.NEGATED_NEWLINE: integer <comptime> = 4
 
 -- compile_nl with option bits: EMPTY_RANGES (glibc without
 -- RE_NO_EMPTY_RANGES) and GLIBC_ERRORS (re_compile_pattern's messages for
@@ -588,6 +590,7 @@ global regex.GLIBC_ERRORS: integer <comptime> = 2
 function regex.compile_opts(pat: string, ere: boolean, icase: boolean, newline: boolean, nlanchor: boolean,
                             flags: integer): (regex.Prog, string)
   local p: Parser = {pat = pat, pos = 1, ere = ere, icase = icase, newline = newline,
+                     negated_newline = (flags & regex.NEGATED_NEWLINE) ~= 0,
                      empty_ranges = (flags & regex.EMPTY_RANGES) ~= 0, glibc_errors = (flags & regex.GLIBC_ERRORS) ~= 0}
   local prog: regex.Prog
   prog.icase = icase

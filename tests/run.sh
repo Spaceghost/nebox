@@ -146,6 +146,44 @@ same sort-u-key 'printf "01 x\n1 y\n2 z\n" | sort -nu; printf "01 x\n1 y\n" | so
 same sort-fu 'sort -fu case.txt; printf "_\na\nA\n[\n" | sort -f; printf "x _\ny a\n" | sort -k2f'
 same sort-n-edge 'printf "+5\n3\nabc\n-2\n0\n 7\n-0\n.5\n1e3\n-.5\n0.50\n00\n-\n" | sort -n; printf "12345678901234567890\n2345678901234567890\n12345678901234567891\n" | sort -n'
 # GNU references also have C.UTF-8 installed in the test container.
+expect cut-utf8-characters 'é|界
+exit=0' 'printf "aéz界\n" | LC_ALL=C.UTF-8 cut -c 2,4 --output-delimiter="|"'
+expect cut-utf8-buffer-edge '界
+exit=0' 'head -c 65535 /dev/zero | tr "\\000" x > long; printf "界\n" >> long; LC_ALL=C.UTF-8 cut -c 65536 long'
+expect uniq-utf8-fold 'Élan
+exit=0' 'printf "Élan\nélan\n" | LC_ALL=C.UTF-8 uniq -i'
+expect uniq-utf8-width 'éx
+exit=0' 'printf "éx\néy\n" | LC_ALL=C.UTF-8 uniq -w 1'
+expect uniq-utf8-skip 'élan
+exit=0' 'printf "élan\n世lan\n" | LC_ALL=C.UTF-8 uniq -s 1'
+expect join-utf8-fold 'É one two
+exit=0' 'printf "É one\n" > left; printf "é two\n" > right; LC_ALL=C.UTF-8 join -i left right'
+expect expr-utf8-characters '3
+2
+世
+2
+exit=0' 'export LC_ALL=C.UTF-8; expr length "a世é"; expr index "a世é" "é世"; expr substr "a世é" 2 1; expr "é世" : ".."'
+expect sh-utf8-ifs '2:a:b
+aéb
+a:b
+aéb:c
+exit=0' 'LC_ALL=C.UTF-8 sh -c '"'"'IFS=é; value=aéb; set -- $value; printf "%d:%s:%s\n" "$#" "$1" "$2"; printf "%s\n" "$*"; read x y <<EOF
+aéb
+EOF
+printf "%s:%s\n" "$x" "$y"; read x y <<EOF
+a\ébéc
+EOF
+printf "%s:%s\n" "$x" "$y"'"'"''
+same diff-minimal-horizon 'printf "z\na\nb\nb\nc\nz\n" > a; printf "z\nb\nb\na\nc\nz\n" > b; diff --minimal --horizon-lines=2 a b; diff -d -u --label a --label b a b'
+same diff-tab-output 'printf "a\t1\n\ncommon\n" > a; printf "b\t2\ntext\ncommon\n" > b; for opts in -t -T -tT -uT -cT -nt -et; do diff "$opts" --label a --label b a b; done'
+expect ls-help-version 'Usage: ls [OPTION]... [FILE]...
+dir (nebox) after GNU coreutils 9.1
+vdir (nebox) after GNU coreutils 9.1
+exit=0' 'ls --help | head -n 1; dir --version; vdir --version'
+expect seq-help-version 'Usage: seq [OPTION]... LAST
+seq (nebox) after GNU coreutils 9.1
+exit=0' 'seq --help | head -n 1; seq --version'
+same tac-regex-negated-newline 'printf "a\nb" | tac -r -s "[^a-z]"'
 same locale-utf8-wc 'printf "é 世é\n" | LC_ALL=C.UTF-8 wc -cmwL'
 same locale-utf8-grep 'printf "élan\n日本語\nfoo\n" | LC_ALL=C.UTF-8 grep -Eio "ÉL[[:alpha:]]+|^...$"'
 same locale-utf8-grep-fixed 'printf "élan\npréélan\n" | LC_ALL=C.UTF-8 grep -Fiwo ÉLAN'
@@ -166,6 +204,7 @@ expect locale-german-sort 'a
 ä
 z
 exit=0' 'printf "z\nä\na\n" | LC_ALL=de_DE.UTF-8 sort'
+same sort-compressed-runs 'mkdir scratch; printf "#!/bin/sh\necho \"\${1:-encode}\" >> filter.log\nexec gzip \"\$@\"\n" > filter; chmod +x filter; seq 12000 | sort -S 16K --parallel=1 -T scratch --compress-program=./filter > sorted && grep -q "^encode$" filter.log && grep -q -- "^-d$" filter.log && rm filter.log && cksum sorted'
 same sort-external-stable 'mkdir scratch; seq 12000 | awk "{ print \$1 % 11, \$1 }" > numbers; sort --parallel=3 -S 16K -T scratch -s -k1,1n -o numbers numbers; cksum numbers'
 same sort-external-unique-zero 'mkdir scratch; seq 12000 | awk "{ printf \"%d %s%c\", \$1 % 173, \$1, 0 }" | sort -z -S 16K --parallel=2 -T scratch -u -k1,1n | cksum'
 same sort-external-merge-output 'mkdir scratch; printf "a\nc\n" > a; printf "b\nd\n" > b; printf "c\ne\n" > c; sort -m --batch-size=2 -T scratch -o c a b c; cat c'

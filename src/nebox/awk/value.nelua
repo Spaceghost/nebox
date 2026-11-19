@@ -256,12 +256,23 @@ end
 
 -- Comparison rule: numeric when both operands are numeric (number, numeric
 -- string or uninitialized), otherwise as strings.
-function awkval.compare(a: awkval.Cell, b: awkval.Cell, convfmt: string): integer
+function awkval.compare(a: awkval.Cell, b: awkval.Cell, convfmt: string, icase: boolean, collate: boolean): integer
   if is_numeric_kind(a) and is_numeric_kind(b) then
     local x, y = awkval.to_num(a), awkval.to_num(b)
     if x < y then return -1 elseif x > y then return 1 else return 0 end
   end
-  return strcmp(awkval.to_str(a, convfmt), awkval.to_str(b, convfmt))
+  local left, right = awkval.to_str(a, convfmt), awkval.to_str(b, convfmt)
+  if not icase then
+    if collate and nlocale.collating then return nlocale.compare(left, right) end
+    return strcmp(left, right)
+  end
+  local folded_left, folded_right = nlocale.casemap(left, false), nlocale.casemap(right, false)
+  local result: integer
+  if collate and nlocale.collating then result = nlocale.compare(folded_left, folded_right)
+  else result = strcmp(folded_left, folded_right) end
+  folded_left:destroy()
+  folded_right:destroy()
+  return result
 end
 
 -- Pad `s` to `width` with spaces; left-justified when `left`.
