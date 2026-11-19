@@ -11,7 +11,7 @@ directory, standard input, every option and option error, output to
 inputs over a small alphabet with NUL, newline and high bytes. stdout,
 stderr and exit status must match. --version output differs by design
 (nebox's line); only its status is compared."""
-import os, random, shutil, subprocess, sys, tempfile
+import os, random, shutil, signal, subprocess, sys, tempfile, time
 
 NEBOX = os.path.abspath(sys.argv[1])
 NRAND = int(sys.argv[2]) if len(sys.argv) > 2 else 400
@@ -62,10 +62,8 @@ CASES += [
     '@ a > /dev/full; echo $?', '@ bigout > /dev/full; echo $?', '@ manylines > /dev/full; echo $?',
     '@ -h > /dev/full; echo $?', '@ nosuch > /dev/full; echo $?', '@ a >&-; echo $?',
     '@ manylines | head -2', '@ a 2>&1 nosuch hi1 nonl',
-    'sleep 2 | timeout --preserve-status -s TERM 0.3 @; echo $?',
-    'sleep 2 | timeout --preserve-status -s INT 0.3 @; echo $?',
-    '(printf "abc\\n"; sleep 2) | timeout --preserve-status -s TERM 0.3 @; echo $?',
 ]
+SIGNAL_CASES = [(signal.SIGTERM, b''), (signal.SIGINT, b''), (signal.SIGTERM, b'abc\n')]
 NOVERSION = {'@ -V', '@ --version', '@ --v', '@ -Vh'}
 
 for k in range(NRAND):
@@ -96,12 +94,46 @@ def run(c, which):
     return p.returncode, p.stdout, p.stderr
 
 
+def run_signaled(sig, data, which):
+    argv = ['rev'] if which == 'gnu' else [NEBOX, 'rev']
+    with subprocess.Popen(argv, cwd=d, env=env, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+        # Exec and applet dispatch can take longer under load. Send the
+        # signal once rev is ready, while the input pipe is still open.
+        caught_bit = 1 << (sig - 1)
+        deadline = time.monotonic() + 30
+        try:
+            while p.poll() is None:
+                with open(f'/proc/{p.pid}/status') as status:
+                    caught = next(int(line.split()[1], 16) for line in status if line.startswith('SigCgt:'))
+                if caught & caught_bit:
+                    if data:
+                        p.stdin.write(data)
+                        p.stdin.flush()
+                    p.send_signal(sig)
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'{argv!r} did not install its {sig.name} handler')
+                time.sleep(0.01)
+            return p.wait(timeout=30), p.stdout.read(), p.stderr.read()
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=30)
+
+
 bad = 0
-for c in CASES:
-    g = run(c, 'gnu')
-    n = run(c, 'nebox')
-    if c in NOVERSION:
-        g, n = (g[0], b'', g[2]), (n[0], b'', n[2])
+for c in CASES + SIGNAL_CASES:
+    if isinstance(c, tuple):
+        sig, data = c
+        g = run_signaled(sig, data, 'gnu')
+        n = run_signaled(sig, data, 'nebox')
+        c = f'{sig.name} with input {data!r}'
+    else:
+        g = run(c, 'gnu')
+        n = run(c, 'nebox')
+        if c in NOVERSION:
+            g, n = (g[0], b'', g[2]), (n[0], b'', n[2])
     if g != n:
         bad += 1
         if bad <= 25:
@@ -110,7 +142,7 @@ for c in CASES:
                 if x != y:
                     print('  %s gnu:   %r' % (name, x if isinstance(x, int) else x[:300]))
                     print('  %s nebox: %r' % (name, y if isinstance(y, int) else y[:300]))
-print('rev_compare: %d cases, %d mismatches' % (len(CASES), bad))
+print('rev_compare: %d cases, %d mismatches' % (len(CASES) + len(SIGNAL_CASES), bad))
 os.chmod(os.path.join(d, 'noread'), 0o600)
 shutil.rmtree(d)
 sys.exit(1 if bad else 0)
