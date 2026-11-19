@@ -299,3 +299,5 @@ same awk-ignorecase-dynamic 'printf "xAayBBz" | awk '"'"'BEGIN { IGNORECASE=1; R
 same awk-ignorecase-utf8 'printf "firstÉÉsecond\n" | LC_ALL=C.UTF-8 awk '"'"'BEGIN { IGNORECASE=1; FS="é+" } {print NF,$1,$2,("É"=="é"),("é"~/É/),index("xé", "É")}'"'"''
 expect awk-locale-relational '1 0
 exit=0' 'LC_ALL=de_DE.UTF-8 awk '"'"'BEGIN { print ("ä" < "z"), ("ä" == "a") }'"'"''
+same awk-ignorecase-named-classes 'awk '"'"'BEGIN { IGNORECASE=1; print ("a"~/[[:upper:]]/),("A"~/[[:lower:]]/),("9"~/[[:upper:]]/) }'"'"''
+REFPATH=""

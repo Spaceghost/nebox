@@ -448,7 +448,7 @@ Individual applets below list the operations that still use byte semantics.
   - `--compress-program` compresses spilled runs and intermediate merges.
     The filter is executed directly and called with `-d` to decode. Plain
     data is staged in an unlinked temporary file during each conversion.
-    `--debug` prints the C-locale comparison message in all locales.
+    `--debug` reports which collation is active.
   - Two NaNs under -g: GNU memcmps the whole 16-byte long double, whose six
     padding bytes its compiler leaves uninitialized (sort.c's memset is a
     dead store), so their order and whether -u merges them depend on the
@@ -1047,9 +1047,10 @@ Individual applets below list the operations that still use byte semantics.
   templates support line numbers, character literals, and nested numeric
   conditionals. `-d`/`--minimal` searches for the smallest edit script,
   and `--horizon-lines` preserves extra common lines during the search.
+  `--speed-large-files` uses GNU's shortcut for long matching stretches.
   `-t` expands tabs in standard, context, unified, ed and RCS output.
   `-T` aligns the output prefixes in normal, context and unified formats.
-  Remaining gaps include `-l`, `--speed-large-files` and tab expansion
+  Remaining gaps include `-l` and tab expansion
   in custom templates.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
@@ -1323,9 +1324,9 @@ Individual applets below list the operations that still use byte semantics.
   with one `e f g a E F G A` conversion and `%%`, `-s` strings, the long
   options, and exact decimal counting for integer operands with a step up
   to 200 (`seq 18446744073709551614 18446744073709551617`, `seq 1 inf`)
-  (`seq-*`). One difference, from nelibc's printf: `-f %a` prints the
-  normalized `0x1p+0` where glibc prints `0x8p-3` (`seq-f-hexfloat`); both
-  are valid C. `--help` is shorter than GNU's. `--version` prints nebox's line.
+  (`seq-*`). `-f %a` and `-f %A` share the printf applet's glibc-style
+  x87 formatter, including precision and padding (`seq-f-hexfloat`).
+  `--help` is shorter than GNU's. `--version` prints nebox's line.
 
 Everything in the applet list has at least one passing case in
 `tests/run.sh`; see the test names for the exact flags covered. The result

@@ -8,6 +8,7 @@ require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.longopts'
 require 'nebox.regex'
+require 'nebox.fphex'
 
 
 -- cat: GNU coreutils 9.1 cat.c. -b -n -s -v -E -T -A -e -t (-u ignored);
@@ -450,10 +451,38 @@ local function at(s: string, i: usize): byte
   return s:byte(i)
 end
 
+local SeqHexFormat = @record{
+  enabled: boolean, upper: boolean,
+  left: boolean, plus: boolean, space: boolean, alternate: boolean, zero: boolean,
+  width: integer, precision: integer,
+  before: string, after: string,
+}
+
+-- The prefix and suffix were checked to contain only doubled percent signs.
+local function undouble_percents(text: string): string
+  local out: stringbuilder
+  local i: usize = 1
+  while i <= text.size do
+    local ch = text:byte(i)
+    out:writebyte(ch)
+    i = i + (ch == '%'_b and 2 or 1)
+  end
+  return out:promote()
+end
+
+local function seq_format_integer(text: string): integer
+  local value: integer = 0
+  for i: usize = 1, text.size do
+    value = value * 10 + (text:byte(i) - '0'_b)
+    if value > 0x7fffffff then return value end
+  end
+  return value
+end
+
 -- coreutils long_double_format: check -f's FORMAT and add the L modifier.
 -- Returns the format, the output length of its prefix and suffix, and an
 -- error message.
-local function seq_ldformat(fmt: string): (string, integer, integer, string)
+local function seq_ldformat(fmt: string, hex: *SeqHexFormat): (string, integer, integer, string)
   local i: usize = 1
   local prefix: integer = 0
   while not (at(fmt, i) == '%'_b and at(fmt, i + 1) ~= '%'_b) do
@@ -461,13 +490,19 @@ local function seq_ldformat(fmt: string): (string, integer, integer, string)
     prefix = prefix + 1
     i = i + (at(fmt, i) == '%'_b and 2 or 1)
   end
+  local directive_start = i
   i = i + 1
   local flags_start = i
   i = seq_span(fmt, i, "-+#0 '")
   local flags = fmt:sub(flags_start, i - 1)
   local rest_start = i
   i = seq_span(fmt, i, '0123456789')
-  if at(fmt, i) == '.'_b then i = seq_span(fmt, i + 1, '0123456789') end
+  local width_end = i
+  local precision_start: usize = 0
+  if at(fmt, i) == '.'_b then
+    precision_start = i + 1
+    i = seq_span(fmt, precision_start, '0123456789')
+  end
   local lmo = i
   local hasL = at(fmt, i) == 'L'_b
   if hasL then i = i + 1 end
@@ -477,6 +512,7 @@ local function seq_ldformat(fmt: string): (string, integer, integer, string)
     return '', 0, 0, "format '" .. fmt .. "' has unknown %" .. string.char(conv) .. ' directive'
   end
   i = i + 1
+  local directive_end = i
   local suffix: integer = 0
   while at(fmt, i) ~= 0 do
     if at(fmt, i) == '%'_b and at(fmt, i + 1) ~= '%'_b then
@@ -484,6 +520,24 @@ local function seq_ldformat(fmt: string): (string, integer, integer, string)
     end
     suffix = suffix + 1
     i = i + (at(fmt, i) == '%'_b and 2 or 1)
+  end
+  if conv == 'a'_b or conv == 'A'_b then
+    local width, precision: integer = 0, -1
+    if rest_start < width_end then width = seq_format_integer(fmt:subview(rest_start, width_end - 1)) end
+    if precision_start ~= 0 then
+      precision = precision_start < lmo and seq_format_integer(fmt:subview(precision_start, lmo - 1)) or 0
+    end
+    if width <= 0x7fffffff and precision < 0x7fffffff - 24 then
+      hex.enabled, hex.upper = true, conv == 'A'_b
+      hex.left = flags:find('-', 1, true) ~= 0
+      hex.plus = flags:find('+', 1, true) ~= 0
+      hex.space = flags:find(' ', 1, true) ~= 0
+      hex.alternate = flags:find('#', 1, true) ~= 0
+      hex.zero = flags:find('0', 1, true) ~= 0
+      hex.width, hex.precision = width, precision
+      if directive_start > 1 then hex.before = undouble_percents(fmt:subview(1, directive_start - 1)) end
+      if directive_end <= fmt.size then hex.after = undouble_percents(fmt:subview(directive_end, fmt.size)) end
+    end
   end
   -- the ' flag (thousands grouping) does nothing in the C locale
   local sb: stringbuilder
@@ -493,7 +547,21 @@ local function seq_ldformat(fmt: string): (string, integer, integer, string)
   return ldfmt, prefix, suffix, ''
 end
 
-local function seq_print(fmt: string, prefix: integer, suffix: integer, first: clongdouble, step: clongdouble,
+local function seq_print_value(fmt: string, hex: *SeqHexFormat, x: clongdouble, buf: *[512]byte): (string, boolean)
+  if not hex.enabled then
+    local text = seq_fmt(fmt, x, buf)
+    return text, text.size >= 512
+  end
+  local number = fphex.format(x, hex.upper, hex.left, hex.plus, hex.space,
+      hex.alternate, hex.zero, hex.width, hex.precision)
+  if hex.before.size == 0 and hex.after.size == 0 then return number, true end
+  local text: stringbuilder
+  text:write(hex.before, number, hex.after)
+  number:destroy()
+  return text:promote(), true
+end
+
+local function seq_print(fmt: string, hex: *SeqHexFormat, prefix: integer, suffix: integer, first: clongdouble, step: clongdouble,
     last: clongdouble, sep: string)
   local out_of_range: boolean
   if step < 0 then out_of_range = first < last else out_of_range = last < first end
@@ -503,7 +571,9 @@ local function seq_print(fmt: string, prefix: integer, suffix: integer, first: c
   local i: clongdouble = 1
   while true do
     local x0 = x
-    util.write(seq_fmt(fmt, x, &buf))
+    local text, owned = seq_print_value(fmt, hex, x, &buf)
+    util.write(text)
+    if owned then text:destroy() end
     if out_of_range then break end
     x = first + i * step
     i = i + 1
@@ -512,12 +582,15 @@ local function seq_print(fmt: string, prefix: integer, suffix: integer, first: c
       -- print one more number when it prints as LAST and differently from
       -- the previous one (rounding: seq 0 0.1 1 ends with 1.0)
       local extra = false
-      local xs = string.copy(seq_fmt(fmt, x, &buf))
+      local xs, owned = seq_print_value(fmt, hex, x, &buf)
+      if not owned then xs = string.copy(xs) end
       local xv, ok = seq_strtold(xs:sub((@usize)(prefix) + 1, xs.size - (@usize)(suffix)))
       if ok and xv == last then
-        local x0s = seq_fmt(fmt, x0, &buf)
-        extra = x0s:sub(1, x0s.size - (@usize)(suffix)) ~= xs:sub(1, xs.size - (@usize)(suffix))
+        local x0s, previous_owned = seq_print_value(fmt, hex, x0, &buf)
+        extra = x0s:subview(1, x0s.size - (@usize)(suffix)) ~= xs:subview(1, xs.size - (@usize)(suffix))
+        if previous_owned then x0s:destroy() end
       end
+      xs:destroy()
       if not extra then break end
     end
     util.write(sep)
@@ -703,9 +776,10 @@ Print numbers between FIRST and LAST, stepping by INCREMENT.
     end
   end
   local prefix, suffix: integer = 0, 0
+  local hex: SeqHexFormat
   if has_fmt then
     local err: string
-    fmt, prefix, suffix, err = seq_ldformat(fmt)
+    fmt, prefix, suffix, err = seq_ldformat(fmt, &hex)
     if err.size > 0 then return util.die(err) end
   else
     local prec = first.precision > step.precision and first.precision or step.precision
@@ -723,7 +797,7 @@ Print numbers between FIRST and LAST, stepping by INCREMENT.
       end
     end
   end
-  seq_print(fmt, prefix, suffix, first.value, step.value, last.value, sep)
+  seq_print(fmt, &hex, prefix, suffix, first.value, step.value, last.value, sep)
   return util.flush() and 0 or 1
 end
 

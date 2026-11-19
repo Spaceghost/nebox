@@ -175,6 +175,7 @@ a\ébéc
 EOF
 printf "%s:%s\n" "$x" "$y"'"'"''
 same diff-minimal-horizon 'printf "z\na\nb\nb\nc\nz\n" > a; printf "z\nb\nb\na\nc\nz\n" > b; diff --minimal --horizon-lines=2 a b; diff -d -u --label a --label b a b'
+same diff-speed-large 'awk "BEGIN { for(i=1;i<=24000;i++) print i }" > a; awk "BEGIN { for(i=1;i<=24000;i++) print (i%35==1 && i<24000 ? i+1 : i%35==2 ? i-1 : i) }" > b; diff --speed-large-files -u --label a --label b a b | cksum'
 same diff-tab-output 'printf "a\t1\n\ncommon\n" > a; printf "b\t2\ntext\ncommon\n" > b; for opts in -t -T -tT -uT -cT -nt -et; do diff "$opts" --label a --label b a b; done'
 expect ls-help-version 'Usage: ls [OPTION]... [FILE]...
 dir (nebox) after GNU coreutils 9.1
@@ -204,6 +205,10 @@ expect locale-german-sort 'a
 ä
 z
 exit=0' 'printf "z\nä\na\n" | LC_ALL=de_DE.UTF-8 sort'
+expect sort-debug-locale 'sort: text ordering performed using ‘C.UTF-8’ sorting rules
+x
+_
+exit=0' 'printf "x\n" | LC_ALL=C.UTF-8 sort --debug 2>&1'
 same sort-compressed-runs 'mkdir scratch; printf "#!/bin/sh\necho \"\${1:-encode}\" >> filter.log\nexec gzip \"\$@\"\n" > filter; chmod +x filter; seq 12000 | sort -S 16K --parallel=1 -T scratch --compress-program=./filter > sorted && grep -q "^encode$" filter.log && grep -q -- "^-d$" filter.log && rm filter.log && cksum sorted'
 same sort-external-stable 'mkdir scratch; seq 12000 | awk "{ print \$1 % 11, \$1 }" > numbers; sort --parallel=3 -S 16K -T scratch -s -k1,1n -o numbers numbers; cksum numbers'
 same sort-external-unique-zero 'mkdir scratch; seq 12000 | awk "{ printf \"%d %s%c\", \$1 % 173, \$1, 0 }" | sort -z -S 16K --parallel=2 -T scratch -u -k1,1n | cksum'
@@ -995,11 +1000,7 @@ same seq-big 'seq 18446744073709551614 18446744073709551617; seq 999999999999999
 same seq-inf 'seq 1 inf | head -3; seq 1 inf inf | head -2; seq inf | head -2; seq 5 1 inf | head -2'
 same seq-tiny 'seq 1e-5000 1 | cksum'
 same seq-negzero 'seq -0 1'
-# pinned (README): nelibc's %La prints the normalized 0x1p+0 where glibc
-# prints 0x8p-3; both are valid C
-expect seq-f-hexfloat '0x1p+0
-0X1P+1
-exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
+same seq-f-hexfloat 'seq -f %a 1 1; seq -f %A 2 2; seq -f "%%%#018.3La%%" -0.75 0.125 0.75; seq -f "[%-+#18.2A]" 0x1.ffcp+5 0x1p+4 0x1.ffcp+6; seq -f "%a" 1 inf inf | head -2; seq -f "prefix %a suffix" 0 0.1 0.3'
 # awk
 . "$(dirname -- "$0")/awk.sh"
 # sh

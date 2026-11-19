@@ -15,7 +15,7 @@ require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.quotearg'
-require 'memory'
+require 'nebox.fphex'
 
 local function c_snprintf(buf: cstring, n: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
 local function c_strtoimax(s: cstring, e: *cstring, base: cint): int64 <cimport 'strtoimax', cinclude '<inttypes.h>'> end
@@ -197,100 +197,6 @@ local function emit(st: *State, spec: string, kind: integer, v: NumVal, ch: cint
   c_free(fmt)
 end
 
--- glibc's printf_fphex for the x87 80-bit long double (ldbl-96): the
--- leading hex digit is the top nibble of the 64-bit mantissa, so 1 prints
--- as 0x8p-3; denormals use exponent -16385; rounding to a precision is to
--- nearest with ties to even, a carry out of 'f' giving leading 1 and +4.
-local function fphex(ld: clongdouble, upper: boolean, left: boolean, plus: boolean, space: boolean,
-                     alt: boolean, zero: boolean, width: integer, precision: integer): string
-  local raw: [2]uint64
-  memory.copy(&raw, &ld, 10)
-  local mant: uint64 = raw[0]
-  local se: uint64 = raw[1] & 0xffff
-  local negative = (se & 0x8000) ~= 0
-  local expo_field: integer = (@integer)(se & 0x7fff)
-  local sb: stringbuilder
-  local signch: byte = 0
-  if negative then signch = 45 elseif plus then signch = 43 elseif space then signch = 32 end
-  if expo_field == 0x7fff then
-    local word: string
-    if (mant << 1) ~= 0 then word = upper and 'NAN' or 'nan' else word = upper and 'INF' or 'inf' end
-    local w = width - 3 - (signch ~= 0 and 1 or 0)
-    if not left then for _ = 1, w do sb:writebyte(32) end end
-    if signch ~= 0 then sb:writebyte(signch) end
-    sb:write(word)
-    if left then for _ = 1, w do sb:writebyte(32) end end
-    return sb:promote()
-  end
-  local alphabet = upper and '0123456789ABCDEF' or '0123456789abcdef'
-  local digits: [16]byte
-  for k = 0, 15 do digits[k] = alphabet:byte(((mant >> (60 - 4 * k)) & 15) + 1) end
-  local leading = digits[0]
-  local expnegative = false
-  local exponent: integer
-  if expo_field == 0 then
-    if mant == 0 then exponent = 0
-    else expnegative = true; exponent = 16382 + 3 end
-  elseif expo_field >= 16383 + 3 then
-    exponent = expo_field - (16383 + 3)
-  else
-    expnegative = true
-    exponent = -(expo_field - (16383 + 3))
-  end
-  local numend = 15 -- digits[1..numend] are the fraction digits kept
-  while numend > 0 and digits[numend] == 48 do numend = numend - 1 end
-  local function val(c: byte): integer
-    if c >= 97 then return c - 87 elseif c >= 65 then return c - 55 end
-    return c - 48
-  end
-  if precision < 0 then
-    precision = numend
-  elseif precision < numend then
-    local last = precision > 0 and digits[precision] or leading
-    local nextd = val(digits[precision + 1])
-    local more_bits = (nextd & 7) ~= 0 or precision + 1 < numend
-    if nextd >= 8 and ((val(last) & 1) ~= 0 or more_bits) then
-      local k = precision
-      local carry = true
-      while carry and k >= 1 do
-        local d = val(digits[k])
-        if d == 15 then digits[k] = 48; k = k - 1
-        else digits[k] = alphabet:byte(d + 2); carry = false end
-      end
-      if carry then
-        if leading == 57 then leading = upper and 65 or 97
-        elseif val(leading) < 15 then leading = alphabet:byte(val(leading) + 2)
-        else
-          leading = 49
-          if expnegative then
-            exponent = exponent - 4
-            if exponent <= 0 then exponent = -exponent; expnegative = false end
-          else
-            exponent = exponent + 4
-          end
-        end
-      end
-    end
-  end
-  local expstr = tostring(exponent)
-  local point = precision > 0 or alt
-  local w = width - ((signch ~= 0 and 1 or 0) + 2 + 1 + (point and 1 or 0) + precision + 2 + #expstr)
-  local zpad = zero and not left
-  if not left and not zpad then for _ = 1, w do sb:writebyte(32) end end
-  if signch ~= 0 then sb:writebyte(signch) end
-  sb:writebyte(48); sb:writebyte(upper and 88 or 120)
-  if zpad then for _ = 1, w do sb:writebyte(48) end end
-  sb:writebyte(leading)
-  if point then sb:writebyte(46) end
-  for k = 1, precision do sb:writebyte(k <= 15 and digits[k] or 48) end
-  sb:writebyte(upper and 80 or 112)
-  sb:writebyte(expnegative and 45 or 43)
-  sb:write(expstr)
-  if left then for _ = 1, w do sb:writebyte(32) end end
-  return sb:promote()
-end
-
--- print_direc: the directive text runs from position ds for dl bytes.
 local function print_direc(st: *State, f: string, ds: integer, dl: integer, conversion: byte,
                            have_fw: boolean, fw: integer, have_prec: boolean, prec: integer, argument: string)
   local sb: stringbuilder
@@ -351,7 +257,9 @@ local function print_direc(st: *State, f: string, ds: integer, dl: integer, conv
       end
     end
     if width < 0 then left = true; width = -width end
-    util.write(fphex(v.ld, conversion == 65, left, plus, space, alt, zero, width, precision))
+    local text = fphex.format(v.ld, conversion == 65, left, plus, space, alt, zero, width, precision)
+    util.write(text)
+    text:destroy()
     return
   else
     sb:write('L'); kind = KIND_LD; v = vstrto(st, argument, 2)
