@@ -313,6 +313,20 @@ def _():
     sh.close()
 
 
+@case('wide characters and combining marks use terminal cell widths')
+def _():
+    sh = Shell()
+    try:
+        sh.send('echo 界e\u0301')
+        sh.expect('echo 界e\u0301\r\x1b[10C')
+        sh.send(LEFT + LEFT)
+        sh.expect('echo 界e\u0301\r\x1b[9C')
+        sh.send('X\r')
+        sh.expect('界Xe\u0301\r\n')
+    finally:
+        sh.close()
+
+
 @case('Ctrl-D on an empty line exits with the last status')
 def _():
     sh = Shell()

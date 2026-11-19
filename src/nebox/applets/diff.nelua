@@ -18,13 +18,16 @@ require 'hashmap'
 require 'nebox.sys'
 require 'nebox.util'
 require 'nebox.regex'
+require 'nebox.fnmatch'
+require 'nebox.diff_format'
 
 local Opt = @record{
   fmt: byte,          -- normal, context, unified, ed, ifdef, or side by side
   context: integer,
   icase: boolean, space_change: boolean, all_space: boolean, blank_lines: boolean,
   text: boolean, new_file: boolean, brief: boolean, same: boolean, recursive: boolean,
-  labels: sequence(string), ifdef_name: string,
+  labels: sequence(string), excludes: sequence(string),
+  formats: difffmt.Format, line_format_set: [3]boolean, group_format_set: [4]boolean,
   width: integer, tabsize: integer, expand_tabs: boolean,
   left_column: boolean, suppress_common: boolean,
   ignore_rules: sequence(regex.Prog), function_rules: sequence(regex.Prog),
@@ -786,29 +789,44 @@ local function print_context(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change
   end
 end
 
-local function write_lines(f: *DFile, first: integer, stop: integer)
-  for i = first, < stop do util.line(f.lines[i + 1]) end
+local function print_rcs(b: *DFile, ch: *sequence(Change))
+  for i = 1, #ch do
+    local change = &ch[i]
+    if change.ignore then continue end
+    if change.deleted > 0 then util.writef('d%d %d\n', change.line0 + 1, change.deleted) end
+    if change.inserted > 0 then
+      util.writef('a%d %d\n', change.line0 + change.deleted, change.inserted)
+      for j = change.line1 + 1, change.line1 + change.inserted do
+        util.write(b.lines[j])
+        if j < #b.lines or not b.missing_nl then util.writebyte(10) end
+      end
+    end
+  end
 end
 
-local function print_ifdef(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
-  local pos = 0
-  for k = 1, #ch do
-    local c = &ch[k]
-    if c.ignore then continue end
-    write_lines(a, pos, c.line0)
-    pos = c.line0 + c.deleted
-    if c.deleted > 0 then
-      util.line('#ifndef ' .. o.ifdef_name)
-      write_lines(a, c.line0, pos)
-      if c.inserted > 0 then util.line('#else /* ' .. o.ifdef_name .. ' */') end
-    else
-      util.line('#ifdef ' .. o.ifdef_name)
+local function print_merged(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
+  local old: difffmt.Side = {lines = &a.lines, incomplete = a.missing_nl}
+  local new: difffmt.Side = {lines = &b.lines, incomplete = b.missing_nl}
+  for i = 1, #ch do
+    local change = &ch[i]
+    if change.ignore then continue end
+    old.stop, new.stop = change.line0, change.line1
+    if old.first < old.stop or new.first < new.stop then
+      difffmt.write(&o.formats, difffmt.SAME, &old, &new)
     end
-    write_lines(b, c.line1, c.line1 + c.inserted)
-    local negation = c.inserted == 0 and '! ' or ''
-    util.line('#endif /* ' .. negation .. o.ifdef_name .. ' */')
+    old.first, new.first = old.stop, new.stop
+    old.stop = old.stop + change.deleted
+    new.stop = new.stop + change.inserted
+    local kind = difffmt.CHANGED
+    if change.deleted == 0 then kind = difffmt.NEW
+    elseif change.inserted == 0 then kind = difffmt.OLD end
+    difffmt.write(&o.formats, kind, &old, &new)
+    old.first, new.first = old.stop, new.stop
   end
-  write_lines(a, pos, #a.lines)
+  old.stop, new.stop = #a.lines, #b.lines
+  if old.first < old.stop or new.first < new.stop then
+    difffmt.write(&o.formats, difffmt.SAME, &old, &new)
+  end
 end
 
 -- Side-by-side layout uses a gutter of at least three columns and aligns
@@ -967,7 +985,7 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
   if a.data == b.data then
     local no_changes: sequence(Change)
     if not o.brief then
-      if o.fmt == 'D'_b then print_ifdef(o, &a, &b, &no_changes)
+      if o.fmt == 'D'_b then print_merged(o, &a, &b, &no_changes)
       elseif o.fmt == 'y'_b then print_side(o, &a, &b, &no_changes) end
     end
     if o.same then util.writef('Files %s and %s are identical\n', p0, p1) end
@@ -990,7 +1008,7 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
   end
   if not any then
     if not o.brief then
-      if o.fmt == 'D'_b then print_ifdef(o, &a, &b, &ch)
+      if o.fmt == 'D'_b then print_merged(o, &a, &b, &ch)
       elseif o.fmt == 'y'_b then print_side(o, &a, &b, &ch) end
     end
     if o.same then util.writef('Files %s and %s are identical\n', p0, p1) end
@@ -1006,7 +1024,9 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
     print_file_header(o, '+++ ', &b, 2)
     print_unified(o, &a, &b, &ch)
   elseif o.fmt == 'D'_b then
-    print_ifdef(o, &a, &b, &ch)
+    print_merged(o, &a, &b, &ch)
+  elseif o.fmt == 'R'_b then
+    print_rcs(&b, &ch)
   elseif o.fmt == 'y'_b then
     print_side(o, &a, &b, &ch)
   elseif o.fmt == 99 then
@@ -1026,6 +1046,24 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
   return 1
 end
 
+local function excluded(o: *Opt, name: string): boolean
+  for i = 1, #o.excludes do
+    if fnmatch.match(o.excludes[i], name, 0) == 0 then return true end
+  end
+  return false
+end
+
+local function read_excludes(o: *Opt, path: string): boolean
+  local data, ok = util.readfile(path)
+  if not ok then return false end
+  for _, line in ipairs(util.lines(data)) do
+    local last = #line
+    while last > 0 and is_space(line:byte(last)) do last = last - 1 end
+    if last > 0 then o.excludes:push(line:subview(1, last)) end
+  end
+  return true
+end
+
 local function diff_dirs(o: *Opt, d0: string, d1: string): integer
   local n0, ok0 = util.readnames(d0, true)
   local n1, ok1 = util.readnames(d1, true)
@@ -1043,6 +1081,7 @@ local function diff_dirs(o: *Opt, d0: string, d1: string): integer
   util.sort(names, util.name_less)
   local rc = 0
   for _, n in ipairs(names) do
+    if excluded(o, n) then continue end
     local where = seen[n]
     local p0, p1 = util.join(d0, n), util.join(d1, n)
     local st0: sys.Stat
@@ -1079,8 +1118,8 @@ local LONGOPTS: []util.LongOpt = {
   {'unified', 2, 'U'_b}, {'ignore-all-space', 0, 'w'_b},
   {'strip-trailing-cr', 0, util.UNSUPPORTED}, {'ignore-tab-expansion', 0, util.UNSUPPORTED},
   {'ignore-trailing-space', 0, util.UNSUPPORTED}, {'ignore-file-name-case', 0, util.UNSUPPORTED},
-  {'no-ignore-file-name-case', 0, util.UNSUPPORTED}, {'exclude', 1, util.UNSUPPORTED},
-  {'exclude-from', 1, util.UNSUPPORTED}, {'from-file', 1, util.UNSUPPORTED},
+  {'no-ignore-file-name-case', 0, util.UNSUPPORTED}, {'exclude', 1, 'x'_b},
+  {'exclude-from', 1, 'X'_b}, {'from-file', 1, util.UNSUPPORTED},
   {'to-file', 1, util.UNSUPPORTED}, {'starting-file', 1, util.UNSUPPORTED},
   {'side-by-side', 0, 'y'_b}, {'width', 1, 'W'_b},
   {'left-column', 0, 129}, {'suppress-common-lines', 0, 130},
@@ -1089,7 +1128,11 @@ local LONGOPTS: []util.LongOpt = {
   {'paginate', 0, util.UNSUPPORTED}, {'no-dereference', 0, util.UNSUPPORTED},
   {'unidirectional-new-file', 0, util.UNSUPPORTED}, {'ifdef', 1, 'D'_b},
   {'minimal', 0, util.UNSUPPORTED}, {'horizon-lines', 1, util.UNSUPPORTED},
-  {'speed-large-files', 0, util.UNSUPPORTED}, {'rcs', 0, util.UNSUPPORTED},
+  {'speed-large-files', 0, util.UNSUPPORTED}, {'rcs', 0, 'n'_b},
+  {'old-line-format', 1, 132}, {'new-line-format', 1, 133},
+  {'unchanged-line-format', 1, 134}, {'line-format', 1, 135},
+  {'old-group-format', 1, 136}, {'new-group-format', 1, 137},
+  {'unchanged-group-format', 1, 138}, {'changed-group-format', 1, 139},
   {'color', 2, util.UNSUPPORTED}, {'palette', 1, util.UNSUPPORTED},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
@@ -1101,8 +1144,58 @@ local function add_rule(rules: *sequence(regex.Prog), pat: string): boolean
   return true
 end
 
+local function set_template(p: *string, present: *boolean, option: string, value: string): boolean
+  if $present and $p ~= value then
+    util.err('conflicting ' .. option .. ' option value ' .. util.quote(value))
+    util.err("Try 'diff --help' for more information.")
+    return false
+  end
+  $p = value
+  $present = true
+  return true
+end
+
+local function set_ifdef(o: *Opt, name: string): boolean
+  local endif = '#endif /* ' .. name .. ' */\n'
+  local old = '#ifndef ' .. name .. '\n%<'
+  local option = '-D'
+  return set_template(&o.formats.group[0], &o.group_format_set[0], option,
+                      old .. '#endif /* ! ' .. name .. ' */\n')
+     and set_template(&o.formats.group[1], &o.group_format_set[1], option, '#ifdef ' .. name .. '\n%>' .. endif)
+     and set_template(&o.formats.group[3], &o.group_format_set[3], option,
+                      old .. '#else /* ' .. name .. ' */\n%>' .. endif)
+end
+
+local function default_templates(o: *Opt)
+  for i = 0, 2 do if not o.line_format_set[i] then o.formats.line[i] = '%l\n' end end
+  if not o.group_format_set[0] then o.formats.group[0] = o.group_format_set[3] and o.formats.group[3] or '%<' end
+  if not o.group_format_set[1] then o.formats.group[1] = o.group_format_set[3] and o.formats.group[3] or '%>' end
+  if not o.group_format_set[2] then o.formats.group[2] = '%=' end
+  if not o.group_format_set[3] then o.formats.group[3] = o.formats.group[0] .. o.formats.group[1] end
+end
+
+-- Directory headers quote each command-line option as a shell word.
+local function write_switch(sb: *stringbuilder, word: string)
+  sb:writebyte(32)
+  local plain = #word > 0
+  for i = 1, #word do
+    local c = word:byte(i)
+    if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+       or c == 43 or c == 45 or c == 46 or c == 47 or c == 95 then continue end
+    plain = false
+    break
+  end
+  if plain then sb:write(word); return end
+  sb:writebyte(39)
+  for i = 1, #word do
+    local c = word:byte(i)
+    if c == 39 then sb:write("'\\''") else sb:writebyte(c) end
+  end
+  sb:writebyte(39)
+end
+
 global function applet_diff(args: sequence(string)): integer
-  local g = util.getopt(args, 'abBcC:D:eiI:F:L:NpqrstuU:W:wy', &LONGOPTS[0], #LONGOPTS)
+  local g = util.getopt(args, 'abBcC:D:eiI:F:L:nNpqrstuU:W:wx:X:y', &LONGOPTS[0], #LONGOPTS)
   local opt: Opt = {context = 3, width = 130, tabsize = 8}
   local sw: stringbuilder
   local last_switch = 0
@@ -1115,14 +1208,32 @@ global function applet_diff(args: sequence(string)): integer
     -- getopt retains each option's input index, including for clusters and
     -- options that followed an operand before permutation.
     for i = g.arg_index, < g.optind do
-      if i > last_switch then sw:write(' ', args[i]); last_switch = i end
+      if i > last_switch then write_switch(&sw, args[i]); last_switch = i end
     end
     local fmt: byte = 0
     if c == 'c'_b or c == 'C'_b then fmt = 'c'_b
     elseif c == 'u'_b or c == 'U'_b then fmt = 'u'_b
     elseif c == 'e'_b then fmt = 'e'_b
     elseif c == 'y'_b then fmt = 'y'_b
-    elseif c == 'D'_b then fmt = 'D'_b; opt.ifdef_name = g.optarg
+    elseif c == 'n'_b then fmt = 'R'_b
+    elseif c == 'x'_b then opt.excludes:push(g.optarg)
+    elseif c == 'X'_b then
+      if not read_excludes(&opt, g.optarg) then return 2 end
+    elseif c == 'D'_b then
+      fmt = 'D'_b
+      if not set_ifdef(&opt, g.optarg) then return 2 end
+    elseif c >= 132 and c <= 139 then
+      fmt = 'D'_b
+      local option = '--' .. g.longname
+      if c >= 136 then
+        if not set_template(&opt.formats.group[c - 136], &opt.group_format_set[c - 136], option, g.optarg) then return 2 end
+      else
+        local first = c == 135 and 0 or c - 132
+        local last = c == 135 and 2 or first
+        for i = first, last do
+          if not set_template(&opt.formats.line[i], &opt.line_format_set[i], option, g.optarg) then return 2 end
+        end
+      end
     elseif c == 128 then fmt = 'n'_b
     elseif c == 129 then opt.left_column = true
     elseif c == 130 then opt.suppress_common = true
@@ -1171,6 +1282,7 @@ global function applet_diff(args: sequence(string)): integer
   end
   opt.switches = sw:promote()
   if opt.fmt == 0 then opt.fmt = c_function and 'c'_b or 'n'_b end
+  if opt.fmt == 'D'_b then default_templates(&opt) end
   if opt.fmt ~= 'y'_b and opt.expand_tabs then
     util.err('tab expansion is only supported for side-by-side output'); return 2
   end

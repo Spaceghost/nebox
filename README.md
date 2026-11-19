@@ -735,8 +735,10 @@ Stated here rather than worked around:
   Also supports `fflush` for all or selected output streams, `gensub`
   (an occurrence or all matches, with capture replacements), `systime`,
   `strftime` (local time or UTC) and bracket expressions containing a
-  literal slash. GNU extension cases use gawk without `--posix`.
-  Remaining gaps include `**`, `BEGINFILE`/`ENDFILE`, `IGNORECASE`, `-e`, long
+  literal slash. `BEGINFILE` and `ENDFILE` bracket each input file, including
+  empty files. In `BEGINFILE`, `ERRNO` and `nextfile` can skip an unreadable
+  file. GNU extension cases use gawk without `--posix`.
+  Remaining gaps include `**`, `IGNORECASE`, `-e`, long
   options, the `PROCINFO["strftime"]` override and a regex `RS` (only the
   first byte is used). Strings, collation and character classes use the C
   locale. Hexadecimal/`inf`/`nan` spellings in numeric strings are
@@ -794,9 +796,9 @@ Stated here rather than worked around:
   Up/Down history, Ctrl-R incremental search, Tab completion of commands
   (built-ins, functions, aliases, reserved words, `PATH`), file names and
   `$NAME`s, bracketed paste and lines wrapping past the terminal width.
-  Character width is one column per code point (no wide or combining
-  characters). Job control (`-m`, `set -o monitor`; on by default in an
-  interactive shell with a terminal): each pipeline, subshell or external
+  Redraw uses Nelibc’s UTF-8 width tables for wide characters and combining
+  marks. Cursor motion operates on code points. Job control is on by default in an
+  interactive shell with a terminal. With job control enabled, each pipeline, subshell or external
   command the shell forks is a job in its own process group, and the
   foreground one owns the terminal; ^Z stops it (status 148) and the shell
   takes the terminal back with its own modes, restoring the job's modes on
@@ -946,9 +948,11 @@ Stated here rather than worked around:
   the file names and timestamps in patch headers. `-p`/`-F` add function
   headings. `-D` emits an ifdef merge, and `-y` prints side by side with
   `--width`, `--tabsize`, `--expand-tabs`, `--left-column` and
-  `--suppress-common-lines`. Remaining gaps include tab expansion outside side
-  by side, `-T`, `-x`/`-X`, `-l`, `-n` (RCS), custom line and group formats,
-  `--minimal` and `--speed-large-files`.
+  `--suppress-common-lines`. `-n` emits an RCS script, and `-x` / `-X` exclude
+  basenames at every level of directory comparison. Line and group
+  templates support line numbers, character literals, and nested numeric
+  conditionals. Remaining gaps include tab expansion outside side by side,
+  `-T`, `-l`, `--minimal` and `--speed-large-files`.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
   patches are kept (the `stray \` warnings appear only when

@@ -3,8 +3,8 @@
 -- wrapping past the terminal width, UTF-8 aware cursor motion, emacs keys,
 -- a kill buffer, history with incremental reverse search, completion through
 -- a callback, and bracketed paste. Output goes to fd 2, as POSIX wants for
--- prompts. Character width is one column per code point (no wide or
--- zero-width tables).
+-- prompts. Rendering uses Nelibc's UTF-8 character widths, including
+-- double-width characters and zero-width combining marks.
 ## pragmas.nogc = true
 
 require 'string'
@@ -66,9 +66,43 @@ end
 
 local function is_cont(b: byte): boolean return b >= 0x80 and b < 0xc0 end
 
--- Display width: one column per code point; ANSI CSI and OSC sequences and
+local function newlocale(mask: cint, name: cstring, base: pointer): pointer <cimport, cinclude '<locale.h>'> end
+local function uselocale(locale: pointer): pointer <cimport, cinclude '<locale.h>'> end
+local function wcwidth(value: cwchar_t): cint <cimport, cinclude '<wchar.h>'> end
+local width_locale: pointer
+
+-- The editor decodes UTF-8 regardless of the shell's text locale. Scope
+-- the locale change to rendering, so commands still see their own locale.
+local function use_width_locale(): pointer
+  if width_locale == nilptr then width_locale = newlocale(1, 'C.UTF-8', nilptr) end
+  if width_locale == nilptr then return nilptr end
+  return uselocale(width_locale)
+end
+
+local function glyph(data: *[0]byte, n: usize): (integer, usize)
+  local lead = data[0]
+  if lead < 128 then return 1, 1 end
+  local span: usize
+  local min, mask: integer
+  if lead >= 0xc2 and lead <= 0xdf then span, min, mask = 2, 0x80, 0x1f
+  elseif lead >= 0xe0 and lead <= 0xef then span, min, mask = 3, 0x800, 0x0f
+  elseif lead >= 0xf0 and lead <= 0xf4 then span, min, mask = 4, 0x10000, 0x07
+  else return 1, 1 end
+  if n < span then return 1, 1 end
+  local code: integer = lead & mask
+  for i: usize = 1, < span do
+    if not is_cont(data[i]) then return 1, 1 end
+    code = (code << 6) | (data[i] & 0x3f)
+  end
+  if code < min or code > 0x10ffff or (code >= 0xd800 and code <= 0xdfff) then return 1, 1 end
+  local width = wcwidth((@cwchar_t)(code))
+  return width >= 0 and width or 1, span
+end
+
+-- Display width in terminal cells. ANSI CSI and OSC sequences and
 -- \001..\002 brackets (readline-style invisible markers) count zero.
 function lineedit.width(s: string): integer
+  local saved = use_width_locale()
   local w = 0
   local i: usize = 0
   local hidden = false
@@ -91,10 +125,12 @@ function lineedit.width(s: string): integer
         i = i + 1
       end
     else
-      if not is_cont(c) then w = w + 1 end
-      i = i + 1
+      local width, span = glyph(&s.data[i], s.size - i)
+      w = w + width
+      i = i + span
     end
   end
+  if saved ~= nilptr then uselocale(saved) end
   return w
 end
 
@@ -166,14 +202,6 @@ function lineedit.Editor:set_text(s: string)
   self.cursor = (@integer)(s.size)
 end
 
-local function bytes_width(buf: *sequence(byte), from: integer, to: integer): integer
-  local w = 0
-  for i = from + 1, to do
-    if not is_cont(buf[i]) then w = w + 1 end
-  end
-  return w
-end
-
 -- Redraw prompt and buffer, which may span several terminal rows.
 function lineedit.Editor:refresh()
   local cols = self.cols
@@ -187,7 +215,9 @@ function lineedit.Editor:refresh()
   local row, col = self.prompt_w // cols, self.prompt_w % cols
   local crow, ccol = row, col
   local pending = false   -- the last character filled its row; the terminal has not wrapped yet
-  for i = 1, #self.buf do
+  local saved = use_width_locale()
+  local i = 1
+  while i <= #self.buf do
     if i - 1 == self.cursor then crow, ccol = row, col end
     local b = self.buf[i]
     if b == 10 then
@@ -195,14 +225,25 @@ function lineedit.Editor:refresh()
       if not pending then row = row + 1 end
       col = 0
       pending = false
+      i = i + 1
     else
-      sb:writebyte(b)
-      if not is_cont(b) then
-        col = col + 1
-        if col == cols then row = row + 1; col = 0; pending = true else pending = false end
+      local width, span = glyph((@*[0]byte)(&self.buf[i]), (@usize)(#self.buf - i + 1))
+      if width > 0 then
+        if width > cols then width = 1 end
+        if col + width > cols then
+          row = row + 1
+          col = 0
+          if i - 1 == self.cursor then crow, ccol = row, col end
+        end
+        col = col + width
+        pending = col == cols
+        if pending then row = row + 1; col = 0 end
       end
+      for j = i, < i + span do sb:writebyte(self.buf[j]) end
+      i = i + span
     end
   end
+  if saved ~= nilptr then uselocale(saved) end
   if self.cursor >= #self.buf then crow, ccol = row, col end
   -- at an exact multiple of the width the terminal holds the cursor on the
   -- last column; force the wrap so row arithmetic stays right

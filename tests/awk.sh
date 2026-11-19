@@ -280,3 +280,9 @@ same awk-gensub 'awk '"'"'BEGIN { t="abc 12 ab 34"; print gensub(/([a-z]+) ([0-9
 same awk-gensub-record 'printf "a b a\nc\n" | awk '"'"'{ print gensub(/a/,"z",2),$0; print gensub(/a/,"<\\q\\&\\>","g") }'"'"''
 same awk-strftime 'TZ=EST5 awk '"'"'BEGIN { print strftime("%F %T %Z %z",0); print strftime("%F %T %Z %z",-1,1); print "[" strftime("",0) "]"; print systime()>0; print length(strftime())>10 }'"'"''
 same awk-fflush 'awk '"'"'BEGIN { print "first" > "seen"; print fflush("seen"); getline s < "seen"; print s; print "second" > "seen"; print fflush(""); print "stdout"; print fflush(); print fflush("/dev/stderr"); print fflush("absent") }'"'"' 2>/dev/null'
+
+same awk-file-hooks 'awk '"'"'BEGINFILE {print "begin", FILENAME,FNR,"[" $0 "]",NF; if (ERRNO != "") { print ERRNO; nextfile }} ENDFILE {print "end",FILENAME,FNR,$0} {print NR,$0; nextfile}'"'"' left.txt /dev/null absent-file right.txt'
+same awk-file-hooks-getline 'awk '"'"'BEGIN { getline line; print line,NR } BEGINFILE {print "first",FILENAME} ENDFILE {print "last",FILENAME,FNR} {print $0} END {print NR}'"'"' left.txt right.txt'
+same awk-file-hooks-only 'awk '"'"'BEGINFILE {print FILENAME,FNR,mode; nextfile} ENDFILE {print "done",FNR}'"'"' mode=one left.txt mode=two right.txt'
+same awk-file-hooks-exit 'awk '"'"'BEGINFILE {print FILENAME; exit 7} ENDFILE {print "unexpected"} END {print "end", NR}'"'"' left.txt; echo $?'
+same awk-file-hooks-exit-getline 'awk '"'"'BEGIN { getline line; print "unexpected" } BEGINFILE { exit 6 } END { print "end", NR }'"'"' left.txt; echo $?'

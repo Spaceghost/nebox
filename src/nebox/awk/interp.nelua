@@ -62,6 +62,7 @@ local State = @record{
   -- main input
   main: awkio.Reader,
   main_open: boolean,
+  file_hooks: boolean,
   argi: integer,
   saw_file: boolean,
   stdin_done: boolean,
@@ -177,6 +178,7 @@ end
 
 local function eval(node: integer): Cell <forwarddecl> end
 local function exec(node: integer): integer <forwarddecl> end
+local function run_stage(kind: byte): integer <forwarddecl> end
 
 -- Subscript: one expression, or several joined with SUBSEP.
 local function subscript(start: integer, count: integer): string
@@ -636,42 +638,6 @@ local function argv_at(i: integer): string
   return str_of(cell_value(arr:get(key)))
 end
 
--- Advance to the next input file named by ARGV, processing assignment
--- operands on the way. Returns false when the operands are exhausted.
-local function open_next_file(): boolean
-  while true do
-    local argc = (@integer)(global_num(awkast.V_ARGC))
-    if st.argi >= argc then break end
-    local arg = argv_at(st.argi)
-    st.argi = st.argi + 1
-    if arg.size == 0 then continue end
-    if awkrun_assign_operand(arg, false) then continue end
-    local fd: cint = 0
-    if arg ~= '-' then
-      if util.isdir(cstr(arg)) then fatal("cannot open file `" .. arg .. "' for reading: Is a directory") end
-      fd = sys.open(cstr(arg), sys.O_RDONLY, 0)
-      if fd < 0 then fatal("cannot open file `" .. arg .. "' for reading: " .. sys.errstr()) end
-    else
-      st.stdin_done = true
-    end
-    st.main:init(arg, fd, 0, false)
-    st.main_open = true
-    st.saw_file = true
-    set_global_str(awkast.V_FILENAME, arg)
-    set_global_num(awkast.V_FNR, 0)
-    return true
-  end
-  if not st.saw_file and not st.stdin_done then
-    st.stdin_done = true
-    st.main:init('-', 0, 0, false)
-    st.main_open = true
-    set_global_str(awkast.V_FILENAME, '-')
-    set_global_num(awkast.V_FNR, 0)
-    return true
-  end
-  return false
-end
-
 local function close_main()
   if st.main_open then
     st.main:close()
@@ -679,12 +645,61 @@ local function close_main()
   end
 end
 
--- Next main-input record as a view; false at the end of all input.
+local function finish_main()
+  if st.main_open and st.file_hooks then run_stage(awkast.ITEM_ENDFILE) end
+  close_main()
+end
+
+local function enter_file(name: string): boolean
+  local fd: cint = 0
+  local err: string = ''
+  if name ~= '-' then
+    if util.isdir(cstr(name)) then fd = -1; err = 'Is a directory'
+    else
+      fd = sys.open(cstr(name), sys.O_RDONLY, 0)
+      if fd < 0 then err = sys.errstr() end
+    end
+  else
+    st.stdin_done = true
+  end
+  st.saw_file = true
+  set_global_str(awkast.V_FILENAME, name)
+  set_global_num(awkast.V_FNR, 0)
+  if st.file_hooks then
+    set_record('')
+    set_global_str(awkast.V_ERRNO, err)
+    local flow = run_stage(awkast.ITEM_BEGINFILE)
+    if flow == FLOW_NEXTFILE or st.exiting then
+      if flow == FLOW_NEXTFILE and fd >= 0 then run_stage(awkast.ITEM_ENDFILE) end
+      if fd > 0 then sys.close(fd) end
+      return false
+    end
+  end
+  if fd < 0 then fatal("cannot open file `" .. name .. "' for reading: " .. err) end
+  st.main:init(name, fd, 0, false)
+  st.main_open = true
+  return true
+end
+
+-- ARGV assignments take effect before the file hook for the next operand.
+local function open_next_file(): boolean
+  while not st.exiting do
+    local argc = (@integer)(global_num(awkast.V_ARGC))
+    if st.argi >= argc then break end
+    local arg = argv_at(st.argi)
+    st.argi = st.argi + 1
+    if arg.size == 0 or awkrun_assign_operand(arg, false) then continue end
+    if enter_file(arg) then return true end
+  end
+  if not st.exiting and not st.saw_file and not st.stdin_done then return enter_file('-') end
+  return false
+end
+
 local function next_record(out: *string): boolean
-  while true do
+  while not st.exiting do
     if not st.main_open and not open_next_file() then return false end
     if st.main:record(global_str(awkast.V_RS), out) then return true end
-    close_main()
+    finish_main()
   end
   return false
 end
@@ -1056,7 +1071,13 @@ end
 local function eval_getline(n: *Node): Cell
   local view: string
   if n.a == 0 then
-    if not next_record(&view) then return awkval.num(0) end
+    if st.stage == awkast.ITEM_BEGINFILE or st.stage == awkast.ITEM_ENDFILE then
+      fatal('unredirected getline in a file action')
+    end
+    if not next_record(&view) then
+      if st.exiting then st.jump = FLOW_EXIT end
+      return awkval.num(0)
+    end
     if n.b < 0 then set_record(view) else assign(n.b, awkval.strnum(view, true)) end
     bump_nr()
     return awkval.num(1)
@@ -1367,7 +1388,9 @@ function exec(node: integer): integer
     if st.stage ~= awkast.ITEM_MAIN then fatal("`next' used in " .. (st.stage == awkast.ITEM_BEGIN and 'BEGIN' or 'END') .. ' action') end
     return FLOW_NEXT
   elseif k == awkast.NEXTFILE then
-    if st.stage ~= awkast.ITEM_MAIN then fatal("`nextfile' used in " .. (st.stage == awkast.ITEM_BEGIN and 'BEGIN' or 'END') .. ' action') end
+    if st.stage ~= awkast.ITEM_MAIN and st.stage ~= awkast.ITEM_BEGINFILE then
+      fatal("`nextfile' used outside a record or BEGINFILE action")
+    end
     return FLOW_NEXTFILE
   elseif k == awkast.EXIT then
     if n.a >= 0 then
@@ -1421,16 +1444,20 @@ local function run_action(item: *awkast.Item): integer
   return exec(item.action)
 end
 
--- Execute BEGIN or END rules in order; exit stops the sequence.
-local function run_stage(kind: byte)
+-- Restore the caller's stage when a getline crosses a file boundary.
+function run_stage(kind: byte): integer
+  local previous = st.stage
+  local flow = FLOW_NORMAL
   st.stage = kind
   for i = 1, #st.prog.items do
     if st.prog.items[i].kind == kind then
-      run_action(&st.prog.items[i])
+      flow = run_action(&st.prog.items[i])
       st.jump = 0
-      if st.exiting then return end
+      if st.exiting or flow == FLOW_NEXTFILE then break end
     end
   end
+  st.stage = previous
+  return flow
 end
 
 local function has_items(kind: byte): boolean
@@ -1453,14 +1480,14 @@ local function run_main()
       if st.jump ~= 0 then
         local f = st.jump
         st.jump = 0
-        if f == FLOW_NEXTFILE then close_main() end
+        if f == FLOW_NEXTFILE then finish_main() end
         break
       end
       if not m then continue end
       local f = run_action(item)
       st.jump = 0
       if f == FLOW_NEXT then break end
-      if f == FLOW_NEXTFILE then close_main(); break end
+      if f == FLOW_NEXTFILE then finish_main(); break end
       if f == FLOW_EXIT then break end
     end
   end
@@ -1484,6 +1511,7 @@ local function setup(prog: *awkast.Program, argv: sequence(string), fs: string, 
   set_global_str(awkast.V_CONVFMT, '%.6g')
   set_global_str(awkast.V_OFMT, '%.6g')
   set_global_str(awkast.V_FILENAME, '')
+  set_global_str(awkast.V_ERRNO, '')
   set_global_num(awkast.V_NR, 0)
   set_global_num(awkast.V_FNR, 0)
   set_global_num(awkast.V_RSTART, 0)
@@ -1519,8 +1547,9 @@ end
 global function awkrun_run(prog: *awkast.Program, assigns: sequence(string), argv: sequence(string), fs: string, has_fs: boolean): integer
   setup(prog, argv, fs, has_fs)
   for i = 1, #assigns do awkrun_assign_operand(assigns[i], true) end
+  st.file_hooks = has_items(awkast.ITEM_BEGINFILE) or has_items(awkast.ITEM_ENDFILE)
   run_stage(awkast.ITEM_BEGIN)
-  if not st.exiting and (has_items(awkast.ITEM_MAIN) or has_items(awkast.ITEM_END)) then
+  if not st.exiting and (st.file_hooks or has_items(awkast.ITEM_MAIN) or has_items(awkast.ITEM_END)) then
     run_main()
   end
   if st.exiting then

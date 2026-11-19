@@ -23,6 +23,8 @@ global awklex.NAME: byte <comptime> = 5
 global awklex.FUNC_NAME: byte <comptime> = 6   -- NAME immediately followed by '('
 global awklex.BUILTIN: byte <comptime> = 7     -- builtin function name (s holds it)
 -- keywords
+global awklex.BEGINFILE: byte <comptime> = 80
+global awklex.ENDFILE: byte <comptime> = 81
 global awklex.BEGIN: byte <comptime> = 10
 global awklex.END: byte <comptime> = 11
 global awklex.FUNCTION: byte <comptime> = 12
@@ -130,6 +132,8 @@ end
 local function keyword(s: string): byte
   if s == 'BEGIN' then return awklex.BEGIN
   elseif s == 'END' then return awklex.END
+  elseif s == 'BEGINFILE' then return awklex.BEGINFILE
+  elseif s == 'ENDFILE' then return awklex.ENDFILE
   elseif s == 'function' then return awklex.FUNCTION
   elseif s == 'if' then return awklex.IF
   elseif s == 'else' then return awklex.ELSE
