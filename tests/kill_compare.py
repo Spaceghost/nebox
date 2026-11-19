@@ -27,7 +27,7 @@ ROOT = os.geteuid() == 0
 NS = ['unshare', '-pf', '--kill-child'] if ROOT else ['unshare', '-rpf', '--kill-child']
 
 RECV = r'''
-import ctypes, signal, sys, time
+import ctypes, os, signal, sys
 libc = ctypes.CDLL(None, use_errno=True)
 signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
 out = sys.argv[2]
@@ -38,14 +38,15 @@ info = ctypes.create_string_buffer(128)
 class TS(ctypes.Structure):
     _fields_ = [('s', ctypes.c_long), ('ns', ctypes.c_long)]
 got = []
-end = time.monotonic() + 0.7
 while True:
-    left = end - time.monotonic()
-    if left <= 0:
-        break
-    ts = TS(int(left), int((left - int(left)) * 1e9))
+    done = os.path.exists(sys.argv[3])
+    # Once the command is finished, drain all queued signals without waiting
+    # for new ones. Signals sent before the marker are already pending.
+    ts = TS(0, 0 if done else 20_000_000)
     r = libc.sigtimedwait(mask, info, ctypes.byref(ts))
     if r < 0:
+        if done:
+            break
         continue
     code = int.from_bytes(info.raw[8:12], 'little', signed=True)
     pid = int.from_bytes(info.raw[16:20], 'little', signed=True)
@@ -56,12 +57,24 @@ while True:
 '''
 open(os.path.join(d, 'recv.py'), 'w').write(RECV)
 
-# R receiver, A sleeper in sh's group, G sleeper leading its own group
-SETUP = ('{ rm -f $D/r.out; mkfifo $D/fifo; python3 -I $D/../recv.py $D/fifo $D/r.out & R=$!; read x < $D/fifo; '
-         'sleep 1 & A=$!; setsid sleep 1 & G=$!; until kill -0 -$G; do :; done; } 2>/dev/null; ')
-# the shell's own job messages (a sleeper's "Killed") depend on timing
-AFTER = ('; echo "rc=$?"; { kill -CONT $A $G; wait $A; echo "A=$?"; wait $G; echo "G=$?"; '
-         'wait $R; echo "R=$?"; cat $D/r.out; } 2>/dev/null; echo "R pid=$R A pid=$A G pid=$G"')
+# R receives signals until the command finishes. A and G wait on FIFOs so
+# they remain alive until signaled or released. A shares sh's process group,
+# and G starts a new session. The read/write descriptors also let cleanup
+# write to a FIFO whose reader was killed without blocking on open.
+SETUP = (
+    '{ rm -f "$D/r.out" "$D/done"; mkfifo "$D/fifo" "$D/a" "$D/g"; '
+    'exec 3<>"$D/a" 4<>"$D/g"; '
+    'python3 -I "$D/../recv.py" "$D/fifo" "$D/r.out" "$D/done" & R=$!; read x < "$D/fifo"; '
+    'sh -c "read x <&3" & A=$!; setsid sh -c "read x <&4" & G=$!; '
+    'until kill -0 -$G; do :; done; } 2>/dev/null; '
+)
+# The cleanup uses builtins, and the shell's job messages can vary by timing.
+AFTER = (
+    '; echo "rc=$?"; { : > "$D/done"; kill -CONT $A $G; '
+    'printf "done\\n" >&3; printf "done\\n" >&4; '
+    'wait $A; echo "A=$?"; wait $G; echo "G=$?"; '
+    'wait $R; echo "R=$?"; cat "$D/r.out"; } 2>/dev/null; echo "R pid=$R A pid=$A G pid=$G"'
+)
 
 CASES = []
 LIST = ['', '-l', '-L', '--list', '--table', '-l 9', '-l 0', '-l 00', '-l 1', '-l 31', '-l 32', '-l 64', '-l 137',
