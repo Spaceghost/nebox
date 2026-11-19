@@ -4,11 +4,13 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 
-def run(binary, root, *targets, error=None):
+def run(binary, root, *targets, error=None, jobs=None):
+    options = [] if jobs is None else ["-j", str(jobs)]
     result = subprocess.run(
-        [binary, "build.ne", *targets], cwd=root, capture_output=True, text=True
+        [binary, *options, "build.ne", *targets], cwd=root, capture_output=True, text=True
     )
     if error is None:
         assert result.returncode == 0, result
@@ -74,7 +76,53 @@ def main(binary, root):
             (root / "resume").touch()
         assert active.wait(timeout=10) == 0
 
-    print("nebuild clean, incremental, target selection, locking, and failure recovery passed")
+    run(binary, root, jobs=0, error="job count must be positive")
+    run(binary, root, jobs="two", error="invalid job count")
+
+    manifest.write_text(
+        "default joined\nbuild joined left right\n\tcat left right > joined\n"
+        + "".join(
+            f"build {name}\n\ttouch {name}.ready; while [ ! -f release ]; "
+            f"do sleep 0.01; done; printf {name} > {name}\n"
+            for name in ("left", "right")
+        )
+    )
+    with subprocess.Popen([binary, "-j", "2", "build.ne"], cwd=root) as active:
+        try:
+            deadline = time.monotonic() + 10
+            while not all((root / f"{name}.ready").is_file() for name in ("left", "right")):
+                assert time.monotonic() < deadline, "independent jobs did not overlap"
+                time.sleep(0.01)
+            assert not (root / "joined").exists()
+        finally:
+            (root / "release").touch()
+        assert active.wait(timeout=10) == 0
+    assert (root / "joined").read_text() == "leftright"
+    assert run(binary, root, jobs=2) == []
+
+    manifest.write_text(
+        "default blocked\nbuild blocked broken survivor\n\ttouch blocked\n"
+        "build broken\n\tfalse\nbuild survivor\n\tsleep 0.05; touch survivor\n"
+    )
+    run(binary, root, jobs=2, error="command failed for broken")
+    assert (root / "survivor.nebuild-command").is_file()
+    assert not (root / "blocked").exists()
+
+    cache_recipe = "test -f reuse || cp source reuse"
+    consumer_recipe = "cp reuse cached"
+    manifest.write_text(
+        f"default cached\nbuild cached reuse\n\t{consumer_recipe}\n"
+        f"build reuse source\n\t{cache_recipe}\n"
+    )
+    assert run(binary, root) == [cache_recipe, consumer_recipe]
+    timestamp = (root / "reuse").stat().st_mtime_ns
+    source.touch()
+    assert run(binary, root, "reuse") == [cache_recipe]
+    assert (root / "reuse").stat().st_mtime_ns == timestamp
+    assert run(binary, root, jobs=2) == [consumer_recipe]
+    assert run(binary, root, jobs=2) == []
+
+    print("nebuild clean, incremental, target selection, parallel jobs, cache hits, locking, and failure recovery passed")
 
 
 with tempfile.TemporaryDirectory(prefix="nebuild-") as directory:

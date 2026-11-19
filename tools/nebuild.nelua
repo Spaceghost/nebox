@@ -21,6 +21,9 @@ local Edge = @record{
   visiting: boolean,
   planned: boolean,
   rebuilt: boolean,
+  waiting: usize,
+  consumers: sequence(usize),
+  completed_at: sys.Timespec,
 }
 
 local edges: sequence(Edge)
@@ -133,6 +136,8 @@ local function visit(index: usize)
     local producer = producers[input]
     if producer ~= 0 then
       visit(producer)
+      edge.waiting = edge.waiting + 1
+      edges[producer].consumers:push(index)
     else
       local info: sys.Stat
       if not file_status(input, &info) then fail('missing input ' .. input .. ' for ' .. edge.output) end
@@ -161,31 +166,51 @@ local function signature_matches(stamp: string, signature: string): boolean
   return closed and previous == signature
 end
 
-local function build(edge: *Edge)
+local function needs_build(edge: *Edge): boolean
   local stamp = edge.output .. stamp_suffix
   local info: sys.Stat
   local exists = file_status(edge.output, &info)
   if exists and (info.st_mode & sys.S_IFMT) ~= sys.S_IFREG then fail('expected file output ' .. edge.output) end
-  local dirty = not exists or not signature_matches(stamp, edge.signature)
+  local saved: sys.Stat
+  local dirty = not exists or not file_status(stamp, &saved) or not signature_matches(stamp, edge.signature)
+  -- A cached recipe may succeed without changing the output's timestamp.
+  edge.completed_at = info.st_mtim
+  if newer(saved.st_mtim, edge.completed_at) then edge.completed_at = saved.st_mtim end
   for i: usize = 1, #edge.inputs do
     local input = edge.inputs[i]
     local dependency: sys.Stat
     if not file_status(input, &dependency) then fail('missing input ' .. input .. ' for ' .. edge.output) end
     local producer = producers[input]
-    dirty = dirty or (producer ~= 0 and edges[producer].rebuilt) or newer(dependency.st_mtim, info.st_mtim)
+    local modified_at = dependency.st_mtim
+    if producer ~= 0 and newer(edges[producer].completed_at, modified_at) then
+      modified_at = edges[producer].completed_at
+    end
+    dirty = dirty or (producer ~= 0 and edges[producer].rebuilt) or newer(modified_at, edge.completed_at)
   end
-  if not dirty then return end
+  return dirty
+end
 
+local function launch(edge: *Edge): cint
+  local stamp = edge.output .. stamp_suffix
   -- Invalidate the previous completion record before starting the recipe.
   if sys.unlink(stamp) ~= 0 and sys.errno() ~= sys.ENOENT then fail(stamp .. ': ' .. sys.errstr()) end
   print(edge.command)
   io.stdout:flush()
-  local ok = os.execute(edge.command)
-  if not ok then fail('command failed for ' .. edge.output) end
+  local pid = sys.fork()
+  if pid == 0 then
+    local argv: [4]cstring = {'sh', '-c', (@cstring)(edge.command), nilptr}
+    sys.execvp('/bin/sh', (@*[0]cstring)(&argv))
+    sys._exit(127)
+  end
+  return pid
+end
+
+local function record_completion(edge: *Edge)
+  local info: sys.Stat
   if not file_status(edge.output, &info) or (info.st_mode & sys.S_IFMT) ~= sys.S_IFREG then
     fail('command did not produce file ' .. edge.output)
   end
-
+  local stamp = edge.output .. stamp_suffix
   local output, reason = io.open(stamp, 'wb')
   if not output then fail(stamp .. ': ' .. reason) end
   local written = output:write(edge.signature)
@@ -194,16 +219,90 @@ local function build(edge: *Edge)
     sys.unlink(stamp)
     fail('cannot record command for ' .. edge.output)
   end
+  local completion: sys.Stat
+  if not file_status(stamp, &completion) then fail('missing completion record for ' .. edge.output) end
+  edge.completed_at = newer(completion.st_mtim, info.st_mtim) and completion.st_mtim or info.st_mtim
   edge.rebuilt = true
 end
 
-if #arg < 1 then fail('usage: nebuild MANIFEST [TARGET ...]') end
+local function release(edge: *Edge, ready: *sequence(usize))
+  for i: usize = 1, #edge.consumers do
+    local consumer = edge.consumers[i]
+    local next_edge = &edges[consumer]
+    next_edge.waiting = next_edge.waiting - 1
+    if next_edge.waiting == 0 then ready:push(consumer) end
+  end
+end
+
+local function run(jobs: usize)
+  local ready: sequence(usize)
+  for i: usize = 1, #order do
+    local index = order[i]
+    if edges[index].waiting == 0 then ready:push(index) end
+  end
+
+  local children: hashmap(cint, usize)
+  local head: usize = 1
+  local failure: string
+  while (head <= #ready and #failure == 0) or children.size > 0 do
+    while head <= #ready and children.size < jobs and #failure == 0 do
+      local index = ready[head]
+      head = head + 1
+      local edge = &edges[index]
+      if needs_build(edge) then
+        local pid = launch(edge)
+        if pid < 0 then
+          failure = 'cannot start ' .. edge.output .. ': ' .. sys.errstr()
+        else
+          children[pid] = index
+        end
+      else
+        release(edge, &ready)
+      end
+    end
+    if children.size > 0 then
+      local status: cint
+      local pid = sys.waitpid(-1, &status, 0)
+      while pid < 0 and sys.errno() == sys.EINTR do pid = sys.waitpid(-1, &status, 0) end
+      if pid < 0 then fail('wait: ' .. sys.errstr()) end
+      local index = children[pid]
+      children:remove(pid)
+      local edge = &edges[index]
+      if status == 0 then
+        record_completion(edge)
+        release(edge, &ready)
+      elseif #failure == 0 then
+        failure = 'command failed for ' .. edge.output
+      end
+    end
+  end
+  if #failure > 0 then fail(failure) end
+end
+
+local function job_count(value: string): usize
+  local count: usize = 0
+  for i: usize = 1, #value do
+    local digit = value:byte(i)
+    if digit < 48 or digit > 57 or count > ((@usize)(-1) - 9) // 10 then fail('invalid job count ' .. value) end
+    count = count * 10 + (@usize)(digit - 48)
+  end
+  if count == 0 then fail('job count must be positive') end
+  return count
+end
+
+local jobs: usize = 1
+local manifest: usize = 1
+if #arg >= 2 and arg[1] == '-j' then
+  jobs = job_count(arg[2])
+  manifest = 3
+end
+if #arg < manifest then fail('usage: nebuild [-j JOBS] MANIFEST [TARGET ...]') end
 lock_build_directory()
-read_manifest(arg[1])
-if #arg > 1 then
-  for i: usize = 2, #arg do plan(arg[i]) end
+read_manifest(arg[manifest])
+if #arg > manifest then
+  for i: usize = manifest + 1, #arg do plan(arg[i]) end
 else
   if #defaults == 0 then fail('no default target') end
   for i: usize = 1, #defaults do plan(defaults[i]) end
 end
-for i: usize = 1, #order do build(&edges[order[i]]) end
+run(jobs)

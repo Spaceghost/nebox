@@ -55,11 +55,14 @@ Run `build/nebuild build.ne` from the build directory, with the manifest at
 after the manifest to select targets. Each `build` line lists one output
 followed by its inputs and is followed by a tab-prefixed shell command.
 Paths are separated by spaces or tabs and must be spelled consistently.
-Recipes run serially through `/bin/sh`. The runner locks the working
+Recipes run through `/bin/sh`. Use `-j JOBS` before the manifest to run
+independent recipes concurrently. The runner locks the working
 directory, so invocations that share outputs must use the same working
 directory. An output rebuilds when it is missing, a dependency is newer or
 just rebuilt, or its edge and command differ from the last successful run
-recorded in the adjacent `.nebuild-command` file. List headers, command
+recorded in the adjacent `.nebuild-command` file. The record's timestamp
+also tracks successful cache hits that preserve the output's timestamp.
+List headers, command
 tools and configuration files as inputs when they affect an output.
 
 For the x86-64 bootstrap image, stage the Nelua, Nelibc, Nebox and
