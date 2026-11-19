@@ -10,7 +10,7 @@ import tempfile
 import time
 
 
-def write_initramfs(path, nebox, lua=None, necc=None):
+def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None):
     entries = [
         ("bin", stat.S_IFDIR | 0o755, b"", 0, 0),
         ("dev", stat.S_IFDIR | 0o755, b"", 0, 0),
@@ -21,10 +21,15 @@ def write_initramfs(path, nebox, lua=None, necc=None):
         ("bin/nebox", stat.S_IFREG | 0o755, nebox.read_bytes(), 0, 0),
         ("init", stat.S_IFLNK | 0o777, b"/bin/nebox", 0, 0),
     ]
+    if lua or nebuild:
+        entries.append(("bin/sh", stat.S_IFLNK | 0o777, b"nebox", 0, 0))
     if lua:
+        entries.append(("bin/nelua-lua", stat.S_IFREG | 0o755, lua.read_bytes(), 0, 0))
+    if nebuild:
         entries.extend([
-            ("bin/sh", stat.S_IFLNK | 0o777, b"nebox", 0, 0),
-            ("bin/nelua-lua", stat.S_IFREG | 0o755, lua.read_bytes(), 0, 0),
+            ("bin/nebuild", stat.S_IFREG | 0o755, nebuild.read_bytes(), 0, 0),
+            ("demo.ne", stat.S_IFREG | 0o644,
+             b"build answer\n\tprintf 42 > answer\ndefault answer\n", 0, 0),
         ])
     if necc:
         entries.extend([
@@ -44,7 +49,7 @@ def write_initramfs(path, nebox, lua=None, necc=None):
             archive.write(b"\0" * (-archive.tell() % 4))
 
 
-def smoke(kernel, initramfs, lua=False, necc=False):
+def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False):
     vm = subprocess.Popen(
         ["qemu-system-x86_64", "-nodefaults", "-display", "none",
          "-serial", "stdio", "-m", "256M", "-no-reboot",
@@ -93,6 +98,15 @@ def smoke(kernel, initramfs, lua=False, necc=False):
                 )
                 vm.stdin.flush()
                 expect(b"THESEUS_NECC_OK", 15)
+            if nebuild:
+                vm.stdin.write(
+                    b"(cd /mnt && /bin/nebuild /demo.ne && "
+                    b"test \"$(/bin/nebox cat answer)\" = 42 && "
+                    b"/bin/nebuild /demo.ne > noop.log && test ! -s noop.log) && "
+                    b"printf 'THESEUS_%s\\n' NEBUILD_OK\n"
+                )
+                vm.stdin.flush()
+                expect(b"THESEUS_NEBUILD_OK", 15)
             vm.stdin.write(
                 b"/bin/nebox sh -c '/bin/nebox sleep 3 & echo $! > /mnt/orphan'; "
                 b"read pid < /mnt/orphan; "
@@ -120,6 +134,8 @@ def smoke(kernel, initramfs, lua=False, necc=False):
         print("Lua arithmetic, filesystem access, and Nebox shell execution passed")
     if necc:
         print("necc compiled C to x86-64 assembly inside the guest")
+    if nebuild:
+        print("nebuild built a target and skipped a no-op rebuild inside the guest")
 
 
 if __name__ == "__main__":
@@ -128,9 +144,10 @@ if __name__ == "__main__":
     parser.add_argument("nebox", type=Path)
     parser.add_argument("--lua", type=Path, help="standalone Nelua Lua interpreter")
     parser.add_argument("--necc", type=Path, help="standalone necc compiler")
+    parser.add_argument("--nebuild", type=Path, help="standalone nebuild runner")
     parser.add_argument("--initramfs-out", type=Path, help="retain the initramfs at this path")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="theseus-boot-") as tmp:
         image = args.initramfs_out or Path(tmp) / "initramfs.cpio"
-        write_initramfs(image, args.nebox, args.lua, args.necc)
-        smoke(args.kernel, image, bool(args.lua), bool(args.necc))
+        write_initramfs(image, args.nebox, args.lua, args.necc, args.nebuild)
+        smoke(args.kernel, image, bool(args.lua), bool(args.necc), bool(args.nebuild))
