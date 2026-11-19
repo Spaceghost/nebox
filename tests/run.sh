@@ -917,8 +917,15 @@ exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
 # sh
 . "$(dirname -- "$0")/sh.sh"
 # dispatch
-expect list-count '104
+if [ -L "$W/bin/init" ]; then
+  expect list-count-theseus '106
 exit=0' "$BIN --list | wc -l"
+  expect init-requires-pid1 'exit=2' 'init'
+  expect mount-rejects-unknown-option 'exit=2' 'mount -t tmpfs -x /mnt'
+else
+  expect list-count '104
+exit=0' "$BIN --list | wc -l"
+fi
 
 echo "nebox tests: $pass passed, $fail failed"
 [ -n "$failed" ] && echo "failed:$failed"

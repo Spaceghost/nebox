@@ -78,6 +78,10 @@ require 'nebox.applets.free'
 require 'nebox.applets.kill'
 require 'nebox.applets.hostname'
 
+## if THESEUS_BOOT then
+require 'theseus.earlyboot'
+## end
+
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
 local applets: []Applet = {
@@ -112,9 +116,25 @@ local applets: []Applet = {
   {'yes', applet_yes}, {'ypdomainname', applet_hostname},
 }
 
+## if THESEUS_BOOT then
+local boot_applets: []Applet = {
+  {'init', theseus_boot.init}, {'mount', theseus_boot.mount},
+}
+local applet_count <comptime> = #applets + #boot_applets
+## else
+local applet_count <comptime> = #applets
+## end
+
+local function applet_at(index: integer): Applet
+  ## if THESEUS_BOOT then
+  if index >= #applets then return boot_applets[index - #applets] end
+  ## end
+  return applets[index]
+end
+
 local function find(name: string): integer
-  for i: integer = 0, < #applets do
-    if applets[i].name == name then return i end
+  for i: integer = 0, < applet_count do
+    if applet_at(i).name == name then return i end
   end
   return -1
 end
@@ -125,10 +145,10 @@ local function usage(): integer
   util.line('       nebox --install [-s] DIR')
   util.line('')
   util.line('Applets:')
-  for i: integer = 0, < #applets do
+  for i: integer = 0, < applet_count do
     util.write(i % 8 == 0 and '  ' or ' ')
-    util.write(applets[i].name)
-    if i % 8 == 7 or i == #applets - 1 then util.writebyte(10) end
+    util.write(applet_at(i).name)
+    if i % 8 == 7 or i == applet_count - 1 then util.writebyte(10) end
   end
   return 0
 end
@@ -143,8 +163,8 @@ local function install(dir: string, symbolic: boolean): integer
     return util.die("cannot create directory '" .. dir .. "': " .. sys.errstr())
   end
   local rc: integer = 0
-  for i: integer = 0, < #applets do
-    local link = util.join(dir, applets[i].name)
+  for i: integer = 0, < applet_count do
+    local link = util.join(dir, applet_at(i).name)
     sys.unlink(link)
     local r: cint
     if symbolic then r = sys.symlink(self, link) else r = sys.link(self, link) end
@@ -161,7 +181,7 @@ local function main(): integer
     name = arg[1]
     first = 2
     if name == '--list' then
-      for i: integer = 0, < #applets do util.line(applets[i].name) end
+      for i: integer = 0, < applet_count do util.line(applet_at(i).name) end
       return 0
     elseif name == '--install' then
       local symbolic = false
@@ -180,7 +200,7 @@ local function main(): integer
   util.applet = name
   local args: sequence(string)
   for i: integer = first, #arg do args:push(arg[i]) end
-  return applets[idx].run(args)
+  return applet_at(idx).run(args)
 end
 
 local rc = main()

@@ -11,10 +11,17 @@ NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-zig.a
 # the archive given in --ldflags: the archive's checksum goes into the C
 # flags so that a rebuilt nelibc is linked instead of a cached binary.
 NELIBC_STAMP = $(shell sha256sum $(NELIBC_LIB) 2>/dev/null | cut -c1-16)
-OUT ?= build
+OUT ?= $(if $(THESEUS_FLAGS),build-theseus,build)
 NM ?= nm
 
+# Opt in to Theseus early boot with a checkout and the Spaceghost Nelua fork.
+ifneq ($(strip $(THESEUS)),)
+THESEUS_FLAGS := -L $(THESEUS)/src -D THESEUS_BOOT=true
+endif
+
 SOURCES := src/nebox.nelua $(wildcard src/nebox/*.nelua) $(wildcard src/nebox/applets/*.nelua) $(wildcard src/nebox/awk/*.nelua) $(wildcard src/nebox/sh/*.nelua)
+
+SOURCES += $(if $(THESEUS_FLAGS),$(THESEUS)/src/theseus/earlyboot.nelua)
 
 CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-protector \
   -ffreestanding -fno-builtin -fno-sanitize=all -Wl,-e,_start -Wl,--build-id=none \
@@ -29,7 +36,7 @@ all: nebox
 nebox: $(OUT)/nebox
 
 $(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) | $(OUT)
-	$(NELUA) -r -L src --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(LDFLAGS)' -o $@ src/nebox.nelua
+	$(NELUA) -r -L src $(THESEUS_FLAGS) --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(LDFLAGS)' -o $@ src/nebox.nelua
 	@test -z "$$($(NM) -u $@)" || { echo "undefined symbols:"; $(NM) -u $@; exit 1; }
 	@echo "built $@ ($$(stat -c %s $@) bytes, static, no host libc)"
 

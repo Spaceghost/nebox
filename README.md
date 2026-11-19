@@ -1219,3 +1219,28 @@ Everything in the applet list has at least one passing case in
 `tests/run.sh`; see the test names for the exact flags covered. The result
 of the last container run is recorded in the commit message of each commit
 that changed behavior.
+
+## Boot with Theseus
+
+Build inside the Linux x86-64 build container. Point `NELUA` at the
+Spaceghost Nelua fork (tested at `4707e21`), `THESEUS` at the
+[theseus-init checkout](https://github.com/Spaceghost/theseus-init), and
+`NELIBC` at a checkout with the standalone Zig archive already built.
+
+```sh
+make THESEUS="$THESEUS" NELUA="$NELUA" NELIBC="$NELIBC" ZIG="$ZIG"
+```
+
+The opt-in build produces `build-theseus/nebox`. For an initramfs, install
+it as `/bin/nebox`, link `/init` to it, and include `/proc`, `/sys` and the
+`/dev/console` character device. The `mount` applet accepts
+`mount [-r] -t TYPE [--] SOURCE TARGET`. It needs an explicit type, source
+and existing target. fstab, automatic filesystem detection and filesystem
+options are outside this applet's current scope.
+
+On the QEMU host, pass a Linux x86-64 bzImage with initramfs, serial console,
+procfs, sysfs and tmpfs support built in:
+
+```sh
+python3 tests/theseus_boot.py "$KERNEL" build-theseus/nebox
+```
