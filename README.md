@@ -112,6 +112,9 @@ qemu-system-x86_64 -nodefaults -display none -serial stdio -m 512M -no-reboot \
   -kernel "$KERNEL" -initrd rootfs.cpio -append 'console=ttyS0 rdinit=/init quiet'
 ```
 
+Use `python3 tests/theseus_boot.py "$KERNEL" --boot-image rootfs.cpio`
+to verify the packaged shell, applet commands, C, Lua and Nelua.
+
 The final build invocation uses the newly built runner. Omit the Theseus argument
 for the ordinary multicall binary. This graph uses the SDK's Nelua frontend,
 TinyCC backend, and standalone Nelibc archive. The compiler and all source

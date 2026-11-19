@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import nullcontext
+import math
 import os
 from pathlib import Path
 import selectors
@@ -127,7 +128,7 @@ def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None,
 
 
 def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
-          sdk=False, compiler_source=False, runtime_source=False, serial_log=None, distro=False):
+          sdk=False, compiler_source=False, runtime_source=False, serial_log=None, distro=False, timeout_scale=1):
     vm = subprocess.Popen(
         ["qemu-system-x86_64", "-nodefaults", "-display", "none",
          "-serial", "stdio", "-m", "512M" if sdk or distro else "256M", "-no-reboot",
@@ -141,7 +142,7 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
             selector.register(vm.stdout, selectors.EVENT_READ)
 
             def expect(marker, timeout, failure=None):
-                deadline = time.monotonic() + timeout
+                deadline = time.monotonic() + timeout * timeout_scale
                 while marker not in output:
                     if failure and failure in output:
                         raise RuntimeError(f"Guest command reported {failure!r}")
@@ -167,8 +168,9 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
             expect(b"THESEUS_BOOT_OK", 15)
             if distro:
                 vm.stdin.write(
-                    b"export PATH=/bin:/usr/bin HOME=/root TMPDIR=/tmp; "
-                    b"(cd /mnt && test -x /usr/bin/ls && test -c /dev/null && test -d /root && "
+                    b"(cd /mnt && for applet in $(/bin/nebox --list); do "
+                    b"test -x /bin/\"$applet\" || exit 1; done && "
+                    b"test -x /usr/bin/ls && test -c /dev/null && test -d /root && "
                     b"test \"$(id -un)\" = root && test \"$(lua -e 'print(_VERSION)')\" = 'Lua 5.4' && "
                     b"printf 'int main(void) {return 42;}\\n' > check.c && "
                     b"printf 'build check check.c\\n\\tcc check.c -o check\\ndefault check\\n' > build.ne && "
@@ -291,7 +293,7 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
     if compiler_source:
         print("Two guest rebuilds of necc matched byte for byte and the rebuilt compiler compiled a working C program")
     if runtime_source:
-        print("The guest rebuilt the complete Lua runtime with nebuild, compiled its lexer table with necc, and used the new runtime to compile Nelua")
+        print("The guest rebuilt the complete Lua runtime with nebuild and used the new runtime to compile Nelua")
 
 
 if __name__ == "__main__":
@@ -308,11 +310,15 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-source", type=Path, help="rebuild the bundled Lua interpreter from this Nelua checkout in the guest")
     parser.add_argument("--serial-log", type=Path, help="save the guest serial console as it runs")
     parser.add_argument("--initramfs-out", type=Path, help="retain the initramfs at this path")
+    parser.add_argument("--timeout-scale", type=float, default=1,
+                        help="multiply guest deadlines for slow QEMU hosts")
     args = parser.parse_args()
+    if not math.isfinite(args.timeout_scale) or args.timeout_scale <= 0:
+        parser.error("--timeout-scale must be finite and positive")
     if args.boot_image:
         if any((args.nebox, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source, args.initramfs_out)):
             parser.error("--boot-image accepts a kernel and an optional --serial-log")
-        smoke(args.kernel, args.boot_image, serial_log=args.serial_log, distro=True)
+        smoke(args.kernel, args.boot_image, serial_log=args.serial_log, distro=True, timeout_scale=args.timeout_scale)
         parser.exit()
     if not args.nebox:
         parser.error("supply a Nebox executable or --boot-image")
@@ -325,4 +331,5 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="theseus-boot-") as tmp:
         image = args.initramfs_out or Path(tmp) / "initramfs.cpio"
         write_initramfs(image, args.nebox, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source)
-        smoke(args.kernel, image, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source, args.serial_log)
+        smoke(args.kernel, image, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source, args.serial_log,
+              timeout_scale=args.timeout_scale)
