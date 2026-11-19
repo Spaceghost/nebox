@@ -60,7 +60,9 @@ independent recipes concurrently. The runner locks the working
 directory, so invocations that share outputs must use the same working
 directory. An output rebuilds when it is missing, a dependency is newer or
 just rebuilt, or its edge and command differ from the last successful run
-recorded in the adjacent `.nebuild-command` file. List headers, command
+recorded in the adjacent `.nebuild-command` file. The record's timestamp
+also tracks successful cache hits that preserve the output's timestamp.
+List headers, command
 tools and configuration files as inputs when they affect an output.
 
 For the x86-64 bootstrap image, stage the Nelua, Nelibc, Nebox and

@@ -108,7 +108,21 @@ def main(binary, root):
     assert (root / "survivor.nebuild-command").is_file()
     assert not (root / "blocked").exists()
 
-    print("nebuild clean, incremental, target selection, parallel jobs, locking, and failure recovery passed")
+    cache_recipe = "test -f reuse || cp source reuse"
+    consumer_recipe = "cp reuse cached"
+    manifest.write_text(
+        f"default cached\nbuild cached reuse\n\t{consumer_recipe}\n"
+        f"build reuse source\n\t{cache_recipe}\n"
+    )
+    assert run(binary, root) == [cache_recipe, consumer_recipe]
+    timestamp = (root / "reuse").stat().st_mtime_ns
+    source.touch()
+    assert run(binary, root, "reuse") == [cache_recipe]
+    assert (root / "reuse").stat().st_mtime_ns == timestamp
+    assert run(binary, root, jobs=2) == [consumer_recipe]
+    assert run(binary, root, jobs=2) == []
+
+    print("nebuild clean, incremental, target selection, parallel jobs, cache hits, locking, and failure recovery passed")
 
 
 with tempfile.TemporaryDirectory(prefix="nebuild-") as directory:

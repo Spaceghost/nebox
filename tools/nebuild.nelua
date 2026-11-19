@@ -23,6 +23,7 @@ local Edge = @record{
   rebuilt: boolean,
   waiting: usize,
   consumers: sequence(usize),
+  completed_at: sys.Timespec,
 }
 
 local edges: sequence(Edge)
@@ -170,13 +171,21 @@ local function needs_build(edge: *Edge): boolean
   local info: sys.Stat
   local exists = file_status(edge.output, &info)
   if exists and (info.st_mode & sys.S_IFMT) ~= sys.S_IFREG then fail('expected file output ' .. edge.output) end
-  local dirty = not exists or not signature_matches(stamp, edge.signature)
+  local saved: sys.Stat
+  local dirty = not exists or not file_status(stamp, &saved) or not signature_matches(stamp, edge.signature)
+  -- A cached recipe may succeed without changing the output's timestamp.
+  edge.completed_at = info.st_mtim
+  if newer(saved.st_mtim, edge.completed_at) then edge.completed_at = saved.st_mtim end
   for i: usize = 1, #edge.inputs do
     local input = edge.inputs[i]
     local dependency: sys.Stat
     if not file_status(input, &dependency) then fail('missing input ' .. input .. ' for ' .. edge.output) end
     local producer = producers[input]
-    dirty = dirty or (producer ~= 0 and edges[producer].rebuilt) or newer(dependency.st_mtim, info.st_mtim)
+    local modified_at = dependency.st_mtim
+    if producer ~= 0 and newer(edges[producer].completed_at, modified_at) then
+      modified_at = edges[producer].completed_at
+    end
+    dirty = dirty or (producer ~= 0 and edges[producer].rebuilt) or newer(modified_at, edge.completed_at)
   end
   return dirty
 end
@@ -210,6 +219,9 @@ local function record_completion(edge: *Edge)
     sys.unlink(stamp)
     fail('cannot record command for ' .. edge.output)
   end
+  local completion: sys.Stat
+  if not file_status(stamp, &completion) then fail('missing completion record for ' .. edge.output) end
+  edge.completed_at = newer(completion.st_mtim, info.st_mtim) and completion.st_mtim or info.st_mtim
   edge.rebuilt = true
 end
 
