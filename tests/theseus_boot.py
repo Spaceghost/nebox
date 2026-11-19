@@ -39,7 +39,7 @@ def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None):
     if nlc:
         entries.extend([
             ("bin/nlc", stat.S_IFREG | 0o755, nlc.read_bytes(), 0, 0),
-            ("answer.nelua", stat.S_IFREG | 0o644, b"return 42\n", 0, 0),
+            ("answer.nelua", stat.S_IFREG | 0o644, b"do return 42 end\n", 0, 0),
         ])
     entries.append(("TRAILER!!!", 0, b"", 0, 0))
     with path.open("wb") as archive:
