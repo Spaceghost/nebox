@@ -150,13 +150,16 @@ same locale-utf8-wc 'printf "é 世é\n" | LC_ALL=C.UTF-8 wc -cmwL'
 same locale-utf8-grep 'printf "élan\n日本語\nfoo\n" | LC_ALL=C.UTF-8 grep -Eio "ÉL[[:alpha:]]+|^...$"'
 same locale-utf8-grep-fixed 'printf "élan\npréélan\n" | LC_ALL=C.UTF-8 grep -Fiwo ÉLAN'
 same locale-utf8-sed 'printf "élan\n" | LC_ALL=C.UTF-8 sed "s/^./X/; s/[éÉ]/Y/g"'
-same locale-utf8-diff 'printf "Été\n" > upper; printf "été\n" > lower; LC_ALL=C.UTF-8 diff -i upper lower'
+expect locale-utf8-diff 'exit=0' 'printf "Été\n" > upper; printf "été\n" > lower; LC_ALL=C.UTF-8 diff -i upper lower'
 same locale-utf8-awk 'printf "aéébé" | LC_ALL=C.UTF-8 gawk '"'"'BEGIN {RS="é+"} { print length($0), toupper($0), RT }'"'"' > reference; printf "aéébé" | LC_ALL=C.UTF-8 awk '"'"'BEGIN {RS="é+"} { print length($0), toupper($0), RT }'"'"' > actual; diff reference actual'
 expect locale-utf8-shell '2
 z
 class
 exit=0' 'LC_ALL=C.UTF-8 sh -c '"'"'x=éz; echo "${#x}"; echo "${x#?}"; case é in [[:alpha:]]) echo class;; esac'"'"''
-same locale-utf8-regex-empty 'printf "é世\n" | LC_ALL=C.UTF-8 sed "s/x*/_/g"; LC_ALL=C.UTF-8 awk '"'"'BEGIN { s="é世"; gsub(/x*/, "_", s); print s }'"'"''
+# GNU 3.8 diff and the GNU versions in Debian 12 use bytes in these paths.
+expect locale-utf8-regex-empty '_é_世_
+_é_世_
+exit=0' 'printf "é世\n" | LC_ALL=C.UTF-8 sed "s/x*/_/g"; LC_ALL=C.UTF-8 awk '"'"'BEGIN { s="é世"; gsub(/x*/, "_", s); print s }'"'"''
 same locale-utf8-rev 'printf "é世\ná\n" | LC_ALL=C.UTF-8 rev'
 same locale-utf8-ls 'mkdir unicode; touch unicode/é unicode/日本語 unicode/apple unicode/abcdef; LC_ALL=C.UTF-8 ls -C -w 20 unicode'
 expect locale-german-sort 'a
