@@ -997,11 +997,7 @@ same seq-big 'seq 18446744073709551614 18446744073709551617; seq 999999999999999
 same seq-inf 'seq 1 inf | head -3; seq 1 inf inf | head -2; seq inf | head -2; seq 5 1 inf | head -2'
 same seq-tiny 'seq 1e-5000 1 | cksum'
 same seq-negzero 'seq -0 1'
-# pinned (README): nelibc's %La prints the normalized 0x1p+0 where glibc
-# prints 0x8p-3; both are valid C
-expect seq-f-hexfloat '0x1p+0
-0X1P+1
-exit=0' 'seq -f %a 1 1; seq -f %A 2 2'
+same seq-f-hexfloat 'seq -f %a 1 1; seq -f %A 2 2; seq -f "%%%#018.3La%%" -0.75 0.125 0.75; seq -f "[%-+#18.2A]" 0x1.ffcp+5 0x1p+4 0x1.ffcp+6; seq -f "%a" 1 inf inf | head -2; seq -f "prefix %a suffix" 0 0.1 0.3'
 # awk
 . "$(dirname -- "$0")/awk.sh"
 # sh

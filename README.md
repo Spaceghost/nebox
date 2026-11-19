@@ -1295,9 +1295,9 @@ Individual applets below list the operations that still use byte semantics.
   with one `e f g a E F G A` conversion and `%%`, `-s` strings, the long
   options, and exact decimal counting for integer operands with a step up
   to 200 (`seq 18446744073709551614 18446744073709551617`, `seq 1 inf`)
-  (`seq-*`). One difference, from nelibc's printf: `-f %a` prints the
-  normalized `0x1p+0` where glibc prints `0x8p-3` (`seq-f-hexfloat`); both
-  are valid C. `--help` is shorter than GNU's. `--version` prints nebox's line.
+  (`seq-*`). `-f %a` and `-f %A` share the printf applet's glibc-style
+  x87 formatter, including precision and padding (`seq-f-hexfloat`).
+  `--help` is shorter than GNU's. `--version` prints nebox's line.
 
 Everything in the applet list has at least one passing case in
 `tests/run.sh`; see the test names for the exact flags covered. The result
