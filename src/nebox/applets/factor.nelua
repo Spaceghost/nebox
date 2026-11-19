@@ -147,6 +147,7 @@ end
 -- 2^128 built from 64x64->128 multiplies, so no 128-bit division (which
 -- would need compiler-rt) is used.
 
+## if ccinfo.has_int128 then
 local M64: uint128 <comptime> = 0xffffffffffffffff
 
 -- the 256-bit product hi:lo of a and b
@@ -314,6 +315,8 @@ local function rho128(n: uint128): uint128
 end
 
 ----------------------------------------------------------------------------
+## end
+
 -- bignum path: little-endian base-2^32 limbs, no high zero limbs. The
 -- program does not collect garbage, so every operation writes into a
 -- caller's buffer and the loops reuse theirs; temporaries are destroyed
@@ -673,6 +676,24 @@ local function brho(g: *Big, n: *Big)
   end
 end
 
+-- Find a proper factor, or return false for a probable prime.
+local function bfindfactor(n: *Big, d: *Big): boolean
+  ## if ccinfo.has_int128 then
+  if #n.l <= 4 then
+    local v: uint128 = 0
+    for k = #n.l, 1, -1 do v = (v << 32) | n.l[k] end
+    if isprime128(v) then return false end
+    local g = rho128(v)
+    d.l:clear()
+    while g > 0 do d.l:push((@uint32)(g & 0xffffffff)); g = g >> 32 end
+    return true
+  end
+  ## end
+  if bisprime(n) then return false end
+  brho(d, n)
+  return true
+end
+
 -- The factors of n go to out as decimal strings (n is consumed).
 local function bfactor_rec(n: *Big, out: *sequence(string))
   if bfits64(n) then
@@ -686,17 +707,7 @@ local function bfactor_rec(n: *Big, out: *sequence(string))
   local qt: Big
   local rm: Big
   defer d.l:destroy(); qt.l:destroy(); rm.l:destroy() end
-  if #n.l <= 4 then
-    local v: uint128 = 0
-    for k = #n.l, 1, -1 do v = (v << 32) | n.l[k] end
-    if isprime128(v) then out:push(btodec(n)); return end
-    local g = rho128(v)
-    d.l:clear()
-    while g > 0 do d.l:push((@uint32)(g & 0xffffffff)); g = g >> 32 end
-  else
-    if bisprime(n) then out:push(btodec(n)); return end
-    brho(&d, n)
-  end
+  if not bfindfactor(n, &d) then out:push(btodec(n)); return end
   bdivmod(&qt, &rm, n, &d)
   bfactor_rec(&d, out)
   bfactor_rec(&qt, out)

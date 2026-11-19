@@ -92,6 +92,31 @@ the standalone Nelibc archive, links Nelua's Lua runtime against it, and
 uses that runtime to compile Theseus-enabled Nebox. GNU Make and Python
 generate the manifest on the staging host.
 
+With a staged necc SDK, build Nebox and nebuild directly from their Nelua sources:
+
+```sh
+export NECC_SYSROOT="$SDK"
+cd "$BUILD_DIR"
+"$NECC" --lua "$NEBOX_SRC/tools/distro_manifest.lua" "$NECC" "$SDK" "$NEBOX_SRC" "$THESEUS" > build.ne
+"$NEBUILD" -j 2 build.ne
+./nebuild -j 2 build.ne
+```
+
+With Theseus, the default target writes `rootfs.cpio`. The image installs
+every applet listed by the built Nebox, `cc`, `necc`, `nebuild`, Lua,
+and the SDK. The archive uses deterministic paths, modes, timestamps and
+file order. Boot the resulting image with a Linux x86-64 kernel:
+
+```sh
+qemu-system-x86_64 -nodefaults -display none -serial stdio -m 512M -no-reboot \
+  -kernel "$KERNEL" -initrd rootfs.cpio -append 'console=ttyS0 rdinit=/init quiet'
+```
+
+The final build invocation uses the newly built runner. Omit the Theseus argument
+for the ordinary multicall binary. This graph uses the SDK's Nelua frontend,
+TinyCC backend, and standalone Nelibc archive. The compiler and all source
+and include files are prerequisites of the generated targets.
+
 ## Applets
 
 ```
@@ -1324,3 +1349,17 @@ procfs, sysfs and tmpfs support built in:
 ```sh
 python3 tests/theseus_boot.py "$KERNEL" build-theseus/nebox
 ```
+
+The boot test can also install the necc SDK and rebuild the development
+tools inside the guest. Pass a staged SDK, its matching executables, and
+source checkouts to retain an interactive development image:
+
+```sh
+python3 tests/theseus_boot.py "$KERNEL" "$NEBOX" --necc "$NECC" --nebuild "$NEBUILD" \
+  --sdk "$SDK" --necc-source "$NECC_SRC" --runtime-source "$NELUA_SRC" \
+  --initramfs-out distro.cpio --serial-log console.log
+```
+
+The guest compiles and runs C and Nelua programs, runs Lua scripts, rebuilds
+necc twice and compares the binaries. It then uses the rebuilt compiler and
+nebuild to rebuild the complete Lua runtime from source.

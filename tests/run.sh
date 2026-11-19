@@ -603,6 +603,7 @@ same expr-plus-kw 'expr + match'
 same factor-basic 'factor 1 2 12 97 360 1001'
 same factor-stdin 'echo "100 65537" | factor'
 same factor-big 'factor 600851475143'
+same factor-wide 'factor 18446744073709551629 18447025548687638549 170141183460469231731687303715884105727'
 same factor-bad 'factor abc 2>/dev/null; echo $?'
 # sed
 same sed-s 'sed "s/a/X/" words.txt'
