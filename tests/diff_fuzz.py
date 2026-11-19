@@ -9,7 +9,9 @@ import os, random, subprocess, sys, tempfile
 NEBOX = os.path.abspath(sys.argv[1])
 CASES = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 rng = random.Random(int(sys.argv[3]) if len(sys.argv) > 3 else 20261107)
-FLAGS = [[], ['-u'], ['-U1'], ['-U0'], ['-c'], ['-C2'], ['-e'], ['-b'], ['-w', '-u'], ['-i'], ['-B', '-u'], ['-B']]
+FLAGS = [[], ['-u'], ['-U1'], ['-U0'], ['-c'], ['-C2'], ['-e'], ['-b'], ['-w', '-u'], ['-i'], ['-B', '-u'], ['-B'],
+         ['-I', '^a', '-u'], ['-U1', '-F', '^b'], ['-D', 'FEATURE'],
+         ['-y'], ['-yW20', '--left-column'], ['-tyW18', '--suppress-common-lines']]
 d = tempfile.mkdtemp(prefix='diff-fuzz-')
 a, b = os.path.join(d, 'a'), os.path.join(d, 'b')
 env = dict(os.environ, TZ='UTC', LC_ALL='C')

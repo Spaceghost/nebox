@@ -595,17 +595,23 @@ shf sh-wait-twice 'sleep 0.1 & p=$!; wait $p; echo $?; wait $p; echo $?'
 shf sh-echo-builtin 'echo -n a; echo; echo -e x; echo "a\tb\\nc"; echo "\0101\0102"; echo a\\cb c; echo -n; echo -- x; echo -E y; echo - z; echo "\x41"; echo "\c"; echo x; echo -n -n y; echo'
 shf sh-printf-builtin 'printf "%s %d %5.2f|%-3s|%03d|%x|%o|%c|%b|%%\n" a 42 3.14159 b 7 255 8 hi "x\ty"; printf "%s\n" a b c; printf "%d\n" "" 0x1f 010; printf "\101\102\n"; printf "%5s|%-5s|\n" ab cd; printf "a\n" extra; echo st=$?; printf "%.3s\n" abcdef; printf "%d\n" abc 2>/dev/null; echo st=$?'
 shf sh-test-builtin '[ -t 1 ]; echo $?; test -n ""; echo $?; [ 1 -eq 1 ] && echo eq; [ ]; echo $?; [ a = a -a b = b ]; echo $?; [ ! x ]; echo $?; [ -e /tmp ]; echo $?; test 1 -lt 2 -o 3 -lt 2; echo $?; [ -z "" -a -n a ]; echo $?; [ "(" = "(" ]; echo $?; [ 1 ]; echo $?; [ -f words.txt -a -d sub -a ! -d words.txt ]; echo $?; [ x 2>/dev/null; echo $?; test; echo $?'
-# jobs lists nothing and bg/fg find no current job (status 2, as dash);
-# ulimit is unimplemented and local is not POSIX: each reports an error with
-# status 2 and the script continues (dash implements ulimit, and exits on
-# local outside a function)
+# jobs lists nothing and bg/fg find no current job (status 2, as dash).
+# local is intentionally unsupported and returns without exiting the script.
 shx sh-unsupported-builtins 'st=0
 st=2
 st=2
 st=2
-st=2
 continues
-exit=0' 'jobs 2>/dev/null; echo st=$?; bg 2>/dev/null; echo st=$?; fg 2>/dev/null; echo st=$?; local x 2>/dev/null; echo st=$?; ulimit 2>/dev/null; echo st=$?; echo continues'
+exit=0' 'jobs 2>/dev/null; echo st=$?; bg 2>/dev/null; echo st=$?; fg 2>/dev/null; echo st=$?; local x 2>/dev/null; echo st=$?; echo continues'
+
+shc sh-ulimit-query 'ulimit; ulimit -Hf; ulimit -Sn; ulimit -a; ulimit -Ha'
+shc sh-ulimit-inherit 'ulimit -Sn 64; ulimit -Sn; ulimit -Hn; sh -c "ulimit -Sn"; (ulimit -Sn 32; ulimit -Sn); ulimit -Sn'
+shc sh-ulimit-hard-soft 'ulimit -n 64; ulimit -Sn 32; ulimit -SHn; ulimit -HSn; ulimit -Hn; ulimit -Sn'
+shc sh-ulimit-units 'ulimit -Sf 12; ulimit -Sf; ulimit -Sc 3; ulimit -Sc; ulimit -Ss 4096; ulimit -Ss; ulimit -Sf unlimited; ulimit -Sf'
+shc sh-ulimit-invalid 'for arg in nope -? 64x; do (ulimit -n "$arg") 2>/dev/null; echo $?; done; (ulimit -a 2) 2>/dev/null; echo $?; (ulimit -Sf 1 2) 2>/dev/null; echo $?'
+shx sh-ulimit-overflow '2
+2
+exit=0' '(ulimit -Sf 18446744073709551615) 2>/dev/null; echo $?; (ulimit -Sn 18446744073709551616) 2>/dev/null; echo $?'
 
 # traps
 shf sh-trap-exit 'trap "echo exiting \$?" EXIT; echo body; exit 3'

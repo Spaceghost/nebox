@@ -1197,12 +1197,106 @@ end
 local function bi_fg(args: sequence(string)): integer return fg_bg(args, true) end
 local function bi_bg(args: sequence(string)): integer return fg_bg(args, false) end
 
-local function bi_unsupported(args: sequence(string)): integer
-  local what = 'job control'
-  if args[1] == 'local' then what = 'the local builtin (not POSIX)'
-  elseif args[1] == 'ulimit' then what = 'ulimit (not POSIX)' end
-  shexec.errmsg(args[1] .. ': ' .. what .. ' is not supported')
-  return 2
+-- Resource order, labels, units and option selection follow dash.
+local Limit = @record{name: string, option: byte, resource: cint, unit: culong}
+local LIMITS: []Limit = {
+  {'time(seconds)', 116, 0, 1},
+  {'file(blocks)', 102, 1, 512},
+  {'data(kbytes)', 100, 2, 1024},
+  {'stack(kbytes)', 115, 3, 1024},
+  {'coredump(blocks)', 99, sys.RLIMIT_CORE, 512},
+  {'memory(kbytes)', 109, 5, 1024},
+  {'locked memory(kbytes)', 108, 8, 1024},
+  {'process', 112, 6, 1},
+  {'nofiles', 110, 7, 1},
+  {'vmemory(kbytes)', 118, 9, 1024},
+  {'locks', 119, 10, 1},
+  {'rtprio', 114, 14, 1},
+}
+
+local function parse_limit(value: string, unit: culong): (culong, boolean)
+  if value == 'unlimited' then return sys.RLIM_INFINITY, true end
+  if value.size == 0 then return 0, false end
+  -- Reserve the all-ones sentinel for the literal unlimited and check
+  -- overflow before accumulating digits or converting the printed unit.
+  local max = (sys.RLIM_INFINITY - 1) // unit
+  local n: culong = 0
+  for i: usize = 1, value.size do
+    local digit = value:byte(i)
+    if digit < 48 or digit > 57 then return 0, false end
+    local d = (@culong)(digit - 48)
+    if n > (max - d) // 10 then return 0, false end
+    n = n * 10 + d
+  end
+  return n * unit, true
+end
+
+local function print_limit(entry: *Limit, limit: *sys.Rlimit, hard: boolean, label: boolean)
+  local value = hard and limit.max or limit.cur
+  if label then
+    util.write(entry.name)
+    for i: usize = entry.name.size, < 20 do util.write(' ') end
+    util.write(' ')
+  end
+  util.line(value == sys.RLIM_INFINITY and 'unlimited' or tostring(value // entry.unit))
+end
+
+local function bi_ulimit(args: sequence(string)): integer
+  local selected: integer = 1 -- -f
+  local all = false
+  local hard, soft = true, true
+  local i = 2
+  while i <= #args do
+    local opt = args[i]
+    if opt == '--' then i = i + 1; break end
+    if opt.size < 2 or opt:byte(1) ~= 45 then break end
+    for j: usize = 2, opt.size do
+      local c = opt:byte(j)
+      if c == 72 then hard, soft = true, false -- -H
+      elseif c == 83 then hard, soft = false, true -- -S
+      elseif c == 97 then all = true -- -a
+      else
+        local found = false
+        for k: integer = 0, < #LIMITS do
+          if LIMITS[k].option == c then selected = k; found = true; break end
+        end
+        if not found then return rberr('ulimit: Illegal option -' .. opt:subview(j, j)) end
+      end
+    end
+    i = i + 1
+  end
+
+  local setting = i <= #args
+  if setting and (all or i < #args) then return rberr('ulimit: too many arguments') end
+  if all then
+    for k: integer = 0, < #LIMITS do
+      local entry = &LIMITS[k]
+      local limit: sys.Rlimit
+      if sys.getrlimit(entry.resource, &limit) ~= 0 then return rberr('ulimit: ' .. sys.errstr()) end
+      print_limit(entry, &limit, not soft, true)
+    end
+    return 0
+  end
+
+  local entry = &LIMITS[selected]
+  local limit: sys.Rlimit
+  if sys.getrlimit(entry.resource, &limit) ~= 0 then return rberr('ulimit: ' .. sys.errstr()) end
+  if not setting then
+    print_limit(entry, &limit, not soft, false)
+    return 0
+  end
+  local value, ok = parse_limit(args[i], entry.unit)
+  if not ok then return rberr('ulimit: bad number') end
+  if soft then limit.cur = value end
+  if hard then limit.max = value end
+  if sys.setrlimit(entry.resource, &limit) ~= 0 then
+    return rberr('ulimit: error setting limit (' .. sys.errstr() .. ')')
+  end
+  return 0
+end
+
+local function bi_local(args: sequence(string)): integer
+  return rberr('local: the local builtin (not POSIX) is not supported')
 end
 
 -- type / command -v / command -V
@@ -1322,7 +1416,7 @@ local BUILTINS: []Builtin = {
   {'[', bi_test, false}, {'true', bi_true, false}, {'type', bi_type, false}, {'umask', bi_umask, false},
   {'unalias', bi_unalias, false}, {'wait', bi_wait, false},
   {'bg', bi_bg, false}, {'fg', bi_fg, false}, {'jobs', bi_jobs, false},
-  {'local', bi_unsupported, false}, {'ulimit', bi_unsupported, false},
+  {'local', bi_local, false}, {'ulimit', bi_ulimit, false},
 }
 
 local function lookup(name: string): (integer, boolean)

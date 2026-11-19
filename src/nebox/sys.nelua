@@ -243,6 +243,12 @@ global sys._SC_CLK_TCK: cint <comptime> = 2
 function sys.sigaction(sig: cint, act: *sys.Sigaction, old: *sys.Sigaction): cint <cimport 'sigaction', cinclude '<signal.h>'> end
 function sys.fcntl(fd: cint, cmd: cint, arg: cint): cint <cimport 'fcntl', cinclude '<fcntl.h>'> end
 function sys.dup(fd: cint): cint <cimport 'dup', cinclude '<unistd.h>'> end
+-- Linux x86-64 rlimit ABI, exposed by nelibc.
+global sys.Rlimit = @record{cur: culong, max: culong}
+global sys.RLIMIT_CORE: cint <comptime> = 4
+global sys.RLIM_INFINITY: culong <comptime> = 0xffffffffffffffff
+function sys.getrlimit(resource: cint, limit: *sys.Rlimit): cint <cimport 'getrlimit', cinclude '<sys/resource.h>'> end
+function sys.setrlimit(resource: cint, limit: *sys.Rlimit): cint <cimport 'setrlimit', cinclude '<sys/resource.h>'> end
 function sys.times(buf: *sys.Tms): clong <cimport 'times', cinclude '<sys/times.h>'> end
 function sys.sysconf(name: cint): clong <cimport 'sysconf', cinclude '<unistd.h>'> end
 function sys.getpgrp(): cint <cimport 'getpgrp', cinclude '<unistd.h>'> end

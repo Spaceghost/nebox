@@ -97,9 +97,11 @@ Stated here rather than worked around:
   pipe strategies, -q -v -z, and following: `-f`, `-F`/`--follow=name`,
   `--retry`, `--pid`, `-s`, `--max-unchanged-stats`, truncation, rotation,
   removal and reappearance messages, and exit when a piped reader goes away.
-  It always polls, as GNU does with `---disable-inotify` (GNU uses inotify
-  when it can). `tests/tail_compare.py`: 662 cases including scripted
-  follow scenarios against GNU, 0 mismatches.
+  Linux inotify wakes the follow loop when a watched descriptor changes
+  or a followed name is replaced. Periodic checks cover unavailable
+  watches, missed events and `--pid`. `---disable-inotify` selects polling.
+  `tests/tail_compare.py` compares polling with GNU and checks descriptor
+  and name following against a 15-second polling interval.
 - `nl`, `comm` and `paste` port nl.c, comm.c and paste.c: nl's styles
   (`a t n pBRE`), -v -i -p -l -s -w -n -d with GNU's in-place delimiter
   quirk and section handling; comm's -123 -z --check-order --nocheck-order
@@ -730,13 +732,15 @@ Stated here rather than worked around:
   opinion); the regex engine is the shared `src/nebox/regex.nelua`.
   Extensions kept because gawk --posix accepts them: `nextfile`,
   `delete array`, `length(array)`, printf `*` width/precision.
-  Not supported: every other GNU extension (`**`, `fflush`, `gensub`,
-  `strftime`, `systime`, `BEGINFILE`, `IGNORECASE`, `-e`, long options),
-  a regex `RS` (only the first character of RS is used),
-  locales and multibyte characters (strings are bytes, collation is byte
-  order), `[/]` inside a regex literal (the first unescaped `/` ends it),
-  and hexadecimal/`inf`/`nan` spellings in numeric strings (they are
-  strings; gawk treats "0x1A" as 26). Choices where references disagree:
+  Also supports `fflush` for all or selected output streams, `gensub`
+  (an occurrence or all matches, with capture replacements), `systime`,
+  `strftime` (local time or UTC) and bracket expressions containing a
+  literal slash. GNU extension cases use gawk without `--posix`.
+  Remaining gaps include `**`, `BEGINFILE`/`ENDFILE`, `IGNORECASE`, `-e`, long
+  options, the `PROCINFO["strftime"]` override and a regex `RS` (only the
+  first byte is used). Strings, collation and character classes use the C
+  locale. Hexadecimal/`inf`/`nan` spellings in numeric strings are
+  strings (gawk treats "0x1A" as 26). Choices where references disagree:
   every error exits 2 (gawk exits 1 for syntax errors and division by
   zero); `cmd | getline` increments NR as the POSIX table says (gawk and
   mawk do not); `substr` truncates its arguments and clamps a start below
@@ -803,8 +807,12 @@ Stated here rather than worked around:
   stopped jobs warns once, and leaving sends them SIGHUP and SIGCONT. A
   job's text is its command line. Without a terminal `-m` changes nothing;
   `fg`/`bg` with no job say `No current job`, status 2, as dash does.
-  Unimplemented: `fc`, vi mode; `ulimit`;
-  locales and multibyte characters (bytes only, C-locale classes and byte
+  `ulimit` queries and changes Linux resource limits with dash's units,
+  resource options and soft/hard selection. Children inherit the limit.
+  Changes in a subshell stay in that subshell. Overflowing decimal values
+  are rejected before they reach the kernel.
+  Unimplemented: `fc`, vi mode, locales and multibyte characters
+  (bytes only, C-locale classes and byte
   order for globbing). Not POSIX and refused: `local`, `;&` in `case`,
   `${!name}` and other bash expansions (an invalid `${...}` is reported
   when it is expanded, as dash does). Choices where dash differs:
@@ -931,10 +939,16 @@ Stated here rather than worked around:
   input; a directory and a file compare the file of the same name; directory
   comparison prints `Only in`, `Common subdirectories`, `File ... is a ...
   while file ... is a ...` and `diff OPTIONS a/x b/x` headers. Binary files
-  (a NUL byte) are reported as differing unless -a. Not supported: long
-  options (`--label` and the rest), -p/-F function headers, -y side by side,
-  -t/-T, -I, -x/-X, -l, -n (RCS), -D (ifdef), --minimal and
-  --speed-large-files.
+  (a NUL byte) are reported as differing unless -a. Supported long aliases
+  include `--context`, `--unified`, `--recursive` and `--ignore-matching-lines`.
+  `-I` ignores changes whose added and deleted lines all match the supplied
+  basic regular expressions (or are blank with `-B`). `--label` replaces
+  the file names and timestamps in patch headers. `-p`/`-F` add function
+  headings. `-D` emits an ifdef merge, and `-y` prints side by side with
+  `--width`, `--tabsize`, `--expand-tabs`, `--left-column` and
+  `--suppress-common-lines`. Remaining gaps include tab expansion outside side
+  by side, `-T`, `-x`/`-X`, `-l`, `-n` (RCS), custom line and group formats,
+  `--minimal` and `--speed-large-files`.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
   patches are kept (the `stray \` warnings appear only when

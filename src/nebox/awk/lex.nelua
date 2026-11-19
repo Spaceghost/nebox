@@ -156,6 +156,7 @@ global function awklex_is_builtin(s: string): boolean
     or s == 'gsub' or s == 'match' or s == 'sprintf' or s == 'tolower' or s == 'toupper'
     or s == 'int' or s == 'sqrt' or s == 'exp' or s == 'log' or s == 'sin' or s == 'cos'
     or s == 'atan2' or s == 'rand' or s == 'srand' or s == 'system' or s == 'close'
+    or s == 'gensub' or s == 'fflush' or s == 'systime' or s == 'strftime'
 end
 
 -- Expand the escape sequences of a string literal, a -v value or a command
@@ -299,15 +300,45 @@ function awklex.Lexer:str()
   self:push(awklex.STRING, awklex_unescape(raw), 0)
 end
 
--- Lex /ere/: ends at the first unescaped '/'.
+-- A slash delimits a regexp only outside a bracket expression. The
+-- initial ']' (after an optional '^') is literal, as are the closing
+-- brackets of POSIX character classes, collating symbols and equivalences.
 function awklex.Lexer:ere()
   self.pos = self.pos + 1
   local start = self.pos
+  local in_bracket, first = false, false
+  local bracket_op: byte = 0
   while true do
     local c = self:peek(0)
     if c == 0 or c == 10 then self:fail('unterminated regexp'); return end
-    if c == #[B'/']# then break end
-    if c == #[B'\\']# then self.pos = self.pos + 1 end
+    if c == #[B'\\']# then
+      self.pos = self.pos + 2
+      first = false
+      continue
+    end
+    if bracket_op ~= 0 then
+      if c == bracket_op and self:peek(1) == #[B']']# then
+        bracket_op = 0
+        self.pos = self.pos + 1
+      end
+    elseif in_bracket then
+      if c == #[B'[']# then
+        local op = self:peek(1)
+        if op == #[B':']# or op == #[B'.']# or op == #[B'=']# then
+          bracket_op = op
+          self.pos = self.pos + 1
+        end
+      elseif c == #[B']']# and not first then
+        in_bracket = false
+      end
+      first = false
+    elseif c == #[B'/']# then
+      break
+    elseif c == #[B'[']# then
+      in_bracket = true
+      first = true
+      if self:peek(1) == #[B'^']# then self.pos = self.pos + 1 end
+    end
     self.pos = self.pos + 1
   end
   local raw = self.src:subview(start, self.pos - 1)

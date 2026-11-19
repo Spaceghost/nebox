@@ -10,6 +10,7 @@ require 'span'
 require 'allocators.default'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.clock'
 require 'nebox.regex'
 require 'nebox.awk.lex'
 require 'nebox.awk.ast'
@@ -469,9 +470,12 @@ end
 -- Output streams and processes
 ----------------------------------------------------------------------
 
-local function flush_all()
-  util.flush()
-  for i = 1, #st.outs do st.outs[i]:flush() end
+local function flush_all(): boolean
+  local ok = util.flush()
+  for i = 1, #st.outs do
+    if not st.outs[i]:flush() then ok = false end
+  end
+  return ok
 end
 
 local function find_out(name: string): integer
@@ -725,15 +729,35 @@ local function expand_repl(repl: string, matched: string, sb: *stringbuilder)
   end
 end
 
--- sub/gsub core: returns the new text and the number of replacements. An
--- empty match directly after a non-empty match is skipped.
-local function substitute(re: *regex.Prog, repl: string, text: string, all: boolean): (string, integer)
+-- gensub replacement syntax is distinct from the POSIX sub/gsub rules.
+local function expand_gensub(repl: string, text: string, caps: *regex.Caps, sb: *stringbuilder)
+  local i: usize = 1
+  while i <= repl.size do
+    local c = repl:byte(i)
+    local group = -1
+    if c == 38 then group = 0 -- &
+    elseif c == 92 and i < repl.size then
+      i = i + 1
+      c = repl:byte(i)
+      if c >= 48 and c <= 57 then group = (@integer)(c - 48) end
+    end
+    if group < 0 then sb:writebyte(c)
+    elseif caps.at[2 * group] >= 0 then
+      sb:write(text:subview(caps.at[2 * group] + 1, caps.at[2 * group + 1]))
+    end
+    i = i + 1
+  end
+end
+
+-- occurrence zero replaces all matches. An empty match directly after a
+-- non-empty match is skipped, even when only one occurrence is selected.
+local function substitute(re: *regex.Prog, repl: string, text: string, occurrence: integer, captures: boolean): (string, integer)
   local sb: stringbuilder
   local caps: regex.Caps
   local pos: isize = 0
   local len = (@isize)(text.size)
   local last_end: isize = -1
-  local count: integer = 0
+  local seen, count = 0, 0
   while pos <= len do
     if not re:search(text, pos, &caps) then break end
     local ms, me = caps.at[0], caps.at[1]
@@ -742,9 +766,15 @@ local function substitute(re: *regex.Prog, repl: string, text: string, all: bool
       pos = ms + 1
       continue
     end
+    seen = seen + 1
     sb:write(text:subview(pos + 1, ms))
-    expand_repl(repl, text:subview(ms + 1, me), &sb)
-    count = count + 1
+    if occurrence == 0 or seen == occurrence then
+      if captures then expand_gensub(repl, text, &caps, &sb)
+      else expand_repl(repl, text:subview(ms + 1, me), &sb) end
+      count = count + 1
+    else
+      sb:write(text:subview(ms + 1, me))
+    end
     if me > ms then
       pos = me
       last_end = me
@@ -752,7 +782,7 @@ local function substitute(re: *regex.Prog, repl: string, text: string, all: bool
       if ms < len then sb:writebyte(text.data[ms]) end
       pos = ms + 1
     end
-    if not all then break end
+    if occurrence ~= 0 and seen == occurrence then break end
   end
   if pos <= len then sb:write(text:subview(pos + 1, len)) end
   if count == 0 then sb:destroy(); return text, 0 end
@@ -883,12 +913,58 @@ local function bi_sub(n: *Node, all: boolean): Cell
     ensure_rec()
     text = st.rec
   end
-  local result, count = substitute(re, repl, text, all)
+  local result, count = substitute(re, repl, text, all and 0 or 1, false)
   if count > 0 then
     if n.c == 3 then ref_set(r, awkval.str(result, false))
     else set_record(result) end
   end
   return awkval.num(count)
+end
+
+local function bi_gensub(n: *Node): Cell
+  local re = regex_of(L(n.b))
+  local repl = str_of(arg(n.b, 1))
+  local how = arg(n.b, 2)
+  local mode = str_of(how)
+  local occurrence: integer = 0
+  if mode.size == 0 or (mode:byte(1) ~= 103 and mode:byte(1) ~= 71) then
+    local num = trunc(num_of(how))
+    if num == 0 then util.err("warning: gensub: third argument `" .. mode .. "' treated as 1") end
+    if num < 1 then num = 1 end
+    occurrence = num >= 0x1p63 and 0x7fffffffffffffff or (@integer)(num)
+  end
+  local text: string
+  if n.c == 4 then text = str_of(arg(n.b, 3))
+  else ensure_rec(); text = st.rec end
+  local result = substitute(re, repl, text, occurrence, true)
+  return awkval.str(result, false)
+end
+
+local function bi_fflush(n: *Node): Cell
+  local name = n.c == 0 and '' or str_of(arg(n.b, 0))
+  local ok: boolean
+  if name == '' then ok = flush_all()
+  elseif name == '/dev/stdout' then ok = util.flush()
+  elseif name == '/dev/stderr' then ok = true
+  else
+    local idx = find_out(name)
+    if idx > 0 then ok = st.outs[idx]:flush()
+    else util.err("warning: fflush: `" .. name .. "' is not an open file, pipe or co-process") end
+  end
+  return awkval.num(ok and 0 or -1)
+end
+
+local function bi_strftime(n: *Node): Cell
+  local fmt = n.c > 0 and str_of(arg(n.b, 0)) or '%a %b %e %H:%M:%S %Z %Y'
+  local ts = n.c > 1 and num_of(arg(n.b, 1)) or (@float64)(sys.time(nilptr))
+  local utc = n.c > 2 and num_of(arg(n.b, 2)) ~= 0
+  if ts ~= ts or ts < -0x1p63 or ts >= 0x1p63 then return awkval.str('', false) end
+  local broken, ok = util.breaktime((@integer)(ts), 0, utc)
+  if not ok then return awkval.str('', false) end
+  if utc then broken.zone = 'GMT' end
+  local result = util.timestr(fmt, &broken)
+  if not utc then broken.zone:destroy() end
+  return awkval.str(result, false)
 end
 
 local function bi_match(n: *Node): Cell
@@ -936,6 +1012,10 @@ local function eval_builtin(n: *Node): Cell
   elseif name == 'split' then return bi_split(n)
   elseif name == 'sub' then return bi_sub(n, false)
   elseif name == 'gsub' then return bi_sub(n, true)
+  elseif name == 'gensub' then return bi_gensub(n)
+  elseif name == 'fflush' then return bi_fflush(n)
+  elseif name == 'systime' then return awkval.num(sys.time(nilptr))
+  elseif name == 'strftime' then return bi_strftime(n)
   elseif name == 'match' then return bi_match(n)
   elseif name == 'sprintf' then
     local args: sequence(Cell)

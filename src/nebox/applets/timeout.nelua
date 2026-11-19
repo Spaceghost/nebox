@@ -21,8 +21,6 @@ local function c_sigsuspend(set: *SigSet): cint <cimport 'sigsuspend', cinclude 
 local Timeval = @record{tv_sec: clong, tv_usec: clong}
 local Itimerval = @record{it_interval: Timeval, it_value: Timeval}
 local function c_setitimer(which: cint, new: *Itimerval, old: *Itimerval): cint <cimport 'setitimer', cinclude '<sys/time.h>'> end
-local Rlimit = @record{cur: culong, max: culong}
-local function c_setrlimit(res: cint, rl: *Rlimit): cint <cimport 'setrlimit', cinclude '<sys/resource.h>'> end
 local function c_setpgid(pid: cint, pgid: cint): cint <cimport 'setpgid', cinclude '<unistd.h>'> end
 local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', cinclude '<sys/wait.h>'> end
 
@@ -246,8 +244,8 @@ global function applet_timeout(args: sequence(string)): integer
     local n: cint = status & 0x7f
     if (status & 0x80) ~= 0 then util.err('the monitored command dumped core') end
     if not timed_out then
-      local rl: Rlimit = {0, 0}
-      if c_setrlimit(4, &rl) == 0 then
+      local rl: sys.Rlimit = {0, 0}
+      if sys.setrlimit(sys.RLIMIT_CORE, &rl) == 0 then
         util.flush()
         set_disposition(n, false)
         unblock_signal(n)

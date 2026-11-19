@@ -1,9 +1,8 @@
 -- tail: a port of GNU coreutils 9.1 src/tail.c. -n/-c with GNU's suffixes
 -- and +N, the obsolete [+-]N[bcl][f] form, the file and pipe strategies,
 -- -q -v -z, and following: -f (descriptor), -F/--follow=name, --retry,
--- --pid, -s, --max-unchanged-stats, with GNU's polling loop (its
--- ---disable-inotify mode) and messages for truncated, replaced, removed
--- and reappearing files.
+-- --pid, -s and --max-unchanged-stats. Inotify wakes the follow loop on
+-- changes, with polling for unsupported filesystems and missed events.
 ## pragmas.nogc = true
 
 require 'string'
@@ -15,6 +14,17 @@ local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', nore
 local function c_strtod(s: cstring, e: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
 local PollFd = @record{fd: cint, events: int16, revents: int16}
 local function c_poll(fds: *PollFd, n: culong, timeout: cint): cint <cimport 'poll', cinclude '<poll.h>'> end
+local function linux_syscall(n: clong, ...: varargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
+local SYS_INOTIFY_ADD_WATCH: clong <comptime> = 254
+local SYS_INOTIFY_INIT1: clong <comptime> = 294
+local IN_MODIFY: cuint <comptime> = 0x002
+local IN_ATTRIB: cuint <comptime> = 0x004
+local IN_MOVED_FROM: cuint <comptime> = 0x040
+local IN_MOVED_TO: cuint <comptime> = 0x080
+local IN_CREATE: cuint <comptime> = 0x100
+local IN_DELETE: cuint <comptime> = 0x200
+local IN_DELETE_SELF: cuint <comptime> = 0x400
+local IN_MOVE_SELF: cuint <comptime> = 0x800
 
 local UMAX: uint64 <comptime> = 0xffffffffffffffff
 local COPY_TO_EOF: uint64 <comptime> = 0xffffffffffffffff
@@ -457,19 +467,68 @@ local function any_live_files(fs: *sequence(Spec)): boolean
   return false
 end
 
-local function tail_forever(fs: *sequence(Spec), sleep_interval: float64)
+-- For descriptor mode a /proc fd path pins the inode across renames.
+-- For name mode watch the containing directory so replacements wake us too.
+local function follow_watch(fs: *sequence(Spec)): cint
+  local fd = (@cint)(linux_syscall(SYS_INOTIFY_INIT1, sys.O_CLOEXEC | O_NONBLOCK))
+  if fd < 0 then return -1 end
+  local watching = false
+  for i = 1, #fs do
+    local f = &fs[i]
+    if f.ignore or (f.fd >= 0 and (f.mode & sys.S_IFMT) ~= sys.S_IFREG) then continue end
+    local path: string
+    local flags = IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF
+    if follow_mode == FOLLOW_NAME then
+      path = util.dirname(f.name)
+      flags = flags | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
+    elseif f.fd >= 0 then
+      path = '/proc/self/fd/' .. tostring(f.fd)
+    else
+      continue
+    end
+    if linux_syscall(SYS_INOTIFY_ADD_WATCH, fd, (@cstring)(path), flags) >= 0 then watching = true end
+    if path ~= '.' then path:destroy() end
+  end
+  if watching then return fd end
+  sys.close(fd)
+  return -1
+end
+
+local function wait_for_follow(watch: cint, interval: float64): boolean
+  local fds: [2]PollFd = {{fd = watch, events = 1}, {fd = monitor_output and 1 or -1}}
+  local millis = interval * 1000
+  if millis > 0x7fffffff then millis = 0x7fffffff end
+  local timeout = (@cint)(millis)
+  if timeout < millis then timeout = timeout + 1 end
+  if c_poll(&fds[0], 2, timeout) <= 0 then return false end
+  check_output_alive()
+  if (fds[0].revents & 1) == 0 then return false end
+  -- The current file/descriptor state is the authority. A batch can also
+  -- include IN_Q_OVERFLOW, so recheck every name after a wakeup.
+  local events: [8192]byte
+  return read_some(watch, &events[0], #events) > 0
+end
+
+local function tail_forever(fs: *sequence(Spec), sleep_interval: float64, disable_inotify: boolean)
   local t = $fs
   local n_files = #t
   local blocking = pid == 0 and follow_mode == FOLLOW_DESCRIPTOR and n_files == 1 and t[1].fd ~= -1
                    and (t[1].mode & sys.S_IFMT) ~= sys.S_IFREG
   local last = n_files
   local writer_is_dead = false
+  local watch: cint = -1
+  if not blocking and not disable_inotify then watch = follow_watch(fs) end
+  local event = false
   while true do
     local any_input = false
     for i = 1, n_files do
       local f = &t[i]
       if f.ignore then continue end
-      if f.fd < 0 then recheck(f, blocking); continue end
+      if f.fd < 0 or (event and follow_mode == FOLLOW_NAME) then
+        recheck(f, blocking)
+        f.n_unchanged_stats = 0
+        if f.fd < 0 then continue end
+      end
       local fd = f.fd
       local name = pretty_name(f)
       local mode = f.mode
@@ -528,17 +587,14 @@ local function tail_forever(fs: *sequence(Spec), sleep_interval: float64)
     end
     util.flush()
     check_output_alive()
+    event = false
     if not any_input then
       if writer_is_dead then break end
       writer_is_dead = pid ~= 0 and sys.kill(pid, 0) ~= 0 and sys.errno() ~= 1
-      if not writer_is_dead then
-        local ts: sys.Timespec
-        ts.tv_sec = (@clong)(sleep_interval)
-        ts.tv_nsec = (@clong)((sleep_interval - (@float64)(ts.tv_sec)) * 1e9)
-        sys.nanosleep(&ts, nilptr)
-      end
+      if not writer_is_dead then event = wait_for_follow(watch, sleep_interval) end
     end
   end
+  if watch >= 0 then sys.close(watch) end
 end
 
 -- xdectoumax(s, 0, UINTMAX_MAX, suffixes, msg, 0); suffixes "" or GNU's.
@@ -606,6 +662,7 @@ global function applet_tail(args: sequence(string)): integer
   local header_mode = MULTIPLE
   local n_units: uint64 = 10
   local sleep_interval: float64 = 1.0
+  local disable_inotify = false
   reopen_inaccessible_files = false; count_lines = true; follow_mode = FOLLOW_DESCRIPTOR
   forever = false; from_start = false; print_headers = false; line_end = 10
   max_n_unchanged = 5; pid = 0; have_read_stdin = false; presume_input_pipe = false
@@ -710,7 +767,7 @@ global function applet_tail(args: sequence(string)): integer
     elseif c == RETRY_OPTION then reopen_inaccessible_files = true
     elseif c == MAX_UNCHANGED_STATS_OPTION then
       max_n_unchanged = dectoumax(g.optarg, false, 'invalid maximum number of unchanged stats between opens', UMAX)
-    elseif c == DISABLE_INOTIFY_OPTION then
+    elseif c == DISABLE_INOTIFY_OPTION then disable_inotify = true
     elseif c == PID_OPTION then pid = (@cint)(dectoumax(g.optarg, false, 'invalid PID', 0x7fffffff))
     elseif c == PRESUME_INPUT_PIPE_OPTION then presume_input_pipe = true
     elseif c == 113 then header_mode = NEVER
@@ -773,7 +830,7 @@ global function applet_tail(args: sequence(string)): integer
       if sys.fstat(1, &ost) < 0 then die('standard output: ' .. sys.errstr()) end
       monitor_output = (ost.st_mode & sys.S_IFMT) == 0x1000
       util.flush()
-      tail_forever(&fs, sleep_interval)
+      tail_forever(&fs, sleep_interval, disable_inotify)
     end
   end
   util.flush()

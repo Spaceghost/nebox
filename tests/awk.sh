@@ -267,9 +267,16 @@ expect awk-posix-fs-empty '3 b
 exit=0' "printf 'abc\\n' | awk 'BEGIN { FS = \"\" } { print NF, \$2 }'"
 expect awk-posix-hex-not-numeric '0 0 1
 exit=0' "printf '0x1A\\n' | awk '{ print \$1 + 0, (\$1 == 26), (\$1 < 3) }'"
-expect awk-posix-regex-slash-in-bracket 'failed
-exit=0' "awk '/[/]/' /dev/null 2>/dev/null || echo failed"
 expect awk-posix-srand-first '1 42
 exit=0' "awk 'BEGIN { print srand(42), srand() }'"
 
 REFPATH=""
+
+same awk-bracket-slash 'awk '"'"'BEGIN { print ("/"~/[/]/), ("]"~/[]/]/), ("/"~/[^]/]/), ("/"~/[[:alpha:]/]/), ("x"~/[[:alpha:]/]/), ("/"~/[/]$/), 8/2 }'"'"
+
+# GNU extensions use gawk without the compatibility flag.
+printf '#!/bin/sh\nexec gawk "$@"\n' > "$W/refbin/awk"
+same awk-gensub 'awk '"'"'BEGIN { t="abc 12 ab 34"; print gensub(/([a-z]+) ([0-9]+)/,"<\\2:\\1:&: \\0>","g",t); print gensub(/[a-z]+/,"X",2,t),t; print gensub(/(a)?b/,"<\\1,\\7>","G","b ab"); print gensub(//,"X","g","abc"); print gensub(/a/,"X",10,"abc") }'"'"''
+same awk-gensub-record 'printf "a b a\nc\n" | awk '"'"'{ print gensub(/a/,"z",2),$0; print gensub(/a/,"<\\q\\&\\>","g") }'"'"''
+same awk-strftime 'TZ=EST5 awk '"'"'BEGIN { print strftime("%F %T %Z %z",0); print strftime("%F %T %Z %z",-1,1); print "[" strftime("",0) "]"; print systime()>0; print length(strftime())>10 }'"'"''
+same awk-fflush 'awk '"'"'BEGIN { print "first" > "seen"; print fflush("seen"); getline s < "seen"; print s; print "second" > "seen"; print fflush(""); print "stdout"; print fflush(); print fflush("/dev/stderr"); print fflush("absent") }'"'"' 2>/dev/null'

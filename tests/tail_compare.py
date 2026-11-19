@@ -4,9 +4,9 @@ Usage: tests/tail_compare.py path/to/nebox [random-cases] [seed]
 Random -n/-c counts (with +N, suffixes, the obsolete [+-]N[bcl] form) over
 files and pipes, then scripted follow scenarios: appends, truncation,
 --pid exit, -F with a rotated or removed file, a reader that goes away.
-GNU follows with polling here (---disable-inotify), as nebox does.
+Polling comparisons explicitly disable inotify. Separate event checks use a long polling interval.
 Output, diagnostics (minus "Try --help") and exit status must match."""
-import os, random, shutil, subprocess, sys, tempfile
+import os, random, select, shutil, subprocess, sys, tempfile, time
 
 NEBOX = os.path.abspath(sys.argv[1])
 CASES = int(sys.argv[2]) if len(sys.argv) > 2 else 400
@@ -97,7 +97,7 @@ FOLLOW = [
 
 def run(cmd, which, follow=False):
     if which == 'nebox':
-        c = cmd.replace('@tail', NEBOX + ' tail')
+        c = cmd.replace('@tail', NEBOX + (' tail ---disable-inotify' if follow else ' tail'))
     elif follow:
         c = cmd.replace('@tail', 'tail ---disable-inotify')
     else:
@@ -122,6 +122,58 @@ for c, follow in cases:
                 if x != y:
                     print('  %s gnu:   %r' % (name, x[:400] if isinstance(x, bytes) else x))
                     print('  %s nebox: %r' % (name, y[:400] if isinstance(y, bytes) else y))
-print('tail_compare: %d cases, %d mismatches' % (len(cases), bad))
+
+def event_case(follow_name):
+    w('watched', b'initial\n')
+    p = subprocess.Popen([NEBOX, 'tail', '-F' if follow_name else '-f',
+                          '--sleep-interval=15', 'watched'],
+                         cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def expect(data):
+        ready, _, _ = select.select([p.stdout], [], [], 5)
+        if not ready or p.stdout.readline() != data:
+            raise AssertionError('did not receive %r before the poll interval' % data)
+
+    try:
+        expect(b'initial\n')
+        deadline = time.monotonic() + 5
+        while True:
+            proc_path = '/proc/%d/fd' % p.pid
+            if 'anon_inode:inotify' in [os.readlink(os.path.join(proc_path, f)) for f in os.listdir(proc_path)]:
+                # An inotify fd can exist briefly before its first watch.
+                for f in os.listdir('/proc/%d/fdinfo' % p.pid):
+                    with open('/proc/%d/fdinfo/%s' % (p.pid, f)) as info:
+                        if 'inotify wd:' in info.read():
+                            break
+                else:
+                    f = None
+                if f is not None:
+                    break
+            if time.monotonic() >= deadline:
+                raise AssertionError('inotify watch did not start')
+            time.sleep(0.01)
+
+        os.rename(os.path.join(d, 'watched'), os.path.join(d, 'rotated'))
+        if follow_name:
+            w('watched', b'replacement\n')
+            expect(b'replacement\n')
+        else:
+            with open(os.path.join(d, 'rotated'), 'ab') as f:
+                f.write(b'descriptor\n')
+            expect(b'descriptor\n')
+    finally:
+        p.terminate()
+        p.communicate(timeout=5)
+        for f in ('watched', 'rotated'):
+            if os.path.exists(os.path.join(d, f)):
+                os.remove(os.path.join(d, f))
+
+for follow_name in (False, True):
+    try:
+        event_case(follow_name)
+    except (AssertionError, OSError, subprocess.TimeoutExpired) as error:
+        bad += 1
+        print('MISMATCH: inotify follow_name=%s: %s' % (follow_name, error))
+print('tail_compare: %d cases, %d mismatches' % (len(cases) + 2, bad))
 shutil.rmtree(d)
 sys.exit(1 if bad else 0)

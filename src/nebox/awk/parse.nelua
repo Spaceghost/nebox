@@ -139,8 +139,10 @@ function Parser:check_builtin(name: string, start: integer, count: integer)
   elseif name == 'index' or name == 'match' or name == 'atan2' then lo, hi = 2, 2
   elseif name == 'split' or name == 'sub' or name == 'gsub' then lo, hi = 2, 3
   elseif name == 'sprintf' then lo, hi = 1, 1000
-  elseif name == 'rand' then lo, hi = 0, 0
-  elseif name == 'srand' then lo, hi = 0, 1
+  elseif name == 'rand' or name == 'systime' then lo, hi = 0, 0
+  elseif name == 'srand' or name == 'fflush' then lo, hi = 0, 1
+  elseif name == 'strftime' then lo, hi = 0, 3
+  elseif name == 'gensub' then lo, hi = 3, 4
   else lo, hi = 1, 1 end
   if count < lo or count > hi then
     self:fail(string.format('%d is invalid as number of arguments for %s', count, name))
