@@ -24,7 +24,7 @@ require 'nebox.diff_format'
 
 local Opt = @record{
   fmt: byte,          -- normal, context, unified, ed, ifdef, or side by side
-  context: integer, horizon: integer, minimal: boolean, initial_tab: boolean,
+  context: integer, horizon: integer, minimal: boolean, initial_tab: boolean, speed_large: boolean,
   icase: boolean, space_change: boolean, all_space: boolean, blank_lines: boolean,
   text: boolean, new_file: boolean, brief: boolean, same: boolean, recursive: boolean,
   labels: sequence(string), excludes: sequence(string),
@@ -170,7 +170,7 @@ end
 local Ctx = @record{
   xv: IArr, yv: IArr,          -- undiscarded equivalence classes
   fd: IArr, bd: IArr,          -- forward/backward furthest points per diagonal
-  too_expensive: integer,
+  too_expensive: integer, speed_large: boolean,
   changed0: IArr, changed1: IArr,   -- over the middle region, sentinels at -1 and len
   real0: IArr, real1: IArr,
 }
@@ -178,6 +178,43 @@ local Ctx = @record{
 local Partition = @record{ xmid: integer, ymid: integer, lo_minimal: boolean, hi_minimal: boolean }
 
 local OFFSET_MAX: integer <comptime> = 0x3fffffffffffffff
+
+local SNAKE_LIMIT: integer <comptime> = 20
+
+-- Accept a diagonal far ahead of the current edit cost when its endpoint
+-- is backed by a long matching stretch. Search in the same order as diag.
+local function fast_partition(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, ylim: integer,
+                              cost: integer, dmin: integer, dmax: integer, backward: boolean,
+                              part: *Partition): boolean
+  local points = backward and &c.bd or &c.fd
+  local middle = backward and (xlim - ylim) or (xoff - yoff)
+  local best = 0
+  for d = dmax, dmin, -2 do
+    local delta = d - middle
+    local x = points:get(d)
+    local y = x - d
+    local score = backward and ((xlim - x) * 2 + delta) or ((x - xoff) * 2 - delta)
+    if score <= best or score <= 12 * (cost + (delta < 0 and -delta or delta)) then continue end
+    if backward then
+      if x <= xoff or y <= yoff or x > xlim - SNAKE_LIMIT or y > ylim - SNAKE_LIMIT then continue end
+    else
+      if x < xoff + SNAKE_LIMIT or y < yoff + SNAKE_LIMIT or x >= xlim or y >= ylim then continue end
+    end
+    local matched = 0
+    for k = 0, < SNAKE_LIMIT do
+      local step = backward and k or (-k - 1)
+      if c.xv:get(x + step) ~= c.yv:get(y + step) then break end
+      matched = matched + 1
+    end
+    if matched == SNAKE_LIMIT then
+      best = score
+      part.xmid, part.ymid = x, y
+    end
+  end
+  if best == 0 then return false end
+  part.lo_minimal, part.hi_minimal = not backward, backward
+  return true
+end
 
 local function diag(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, ylim: integer,
                     find_minimal: boolean, part: *Partition)
@@ -193,6 +230,7 @@ local function diag(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, ylim: 
   bd:set(bmid, xlim)
   local cost = 1
   while true do
+    local long_match = false
     -- extend the top-down search by an edit step in each diagonal
     if fmin > dmin then fmin = fmin - 1; fd:set(fmin - 1, -1) else fmin = fmin + 1 end
     if fmax < dmax then fmax = fmax + 1; fd:set(fmax + 1, -1) else fmax = fmax - 1 end
@@ -202,6 +240,7 @@ local function diag(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, ylim: 
       local x0 = tlo < thi and thi or tlo + 1
       local x, y = x0, x0 - d
       while x < xlim and y < ylim and c.xv:get(x) == c.yv:get(y) do x = x + 1; y = y + 1 end
+      if x - x0 > SNAKE_LIMIT then long_match = true end
       fd:set(d, x)
       if odd and bmin <= d and d <= bmax and bd:get(d) <= x then
         part.xmid = x; part.ymid = y
@@ -219,6 +258,7 @@ local function diag(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, ylim: 
       local x0 = tlo < thi and tlo or thi - 1
       local x, y = x0, x0 - d
       while xoff < x and yoff < y and c.xv:get(x - 1) == c.yv:get(y - 1) do x = x - 1; y = y - 1 end
+      if x0 - x > SNAKE_LIMIT then long_match = true end
       bd:set(d, x)
       if not odd and fmin <= d and d <= fmax and x <= fd:get(d) then
         part.xmid = x; part.ymid = y
@@ -226,6 +266,10 @@ local function diag(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, ylim: 
         return
       end
       d = d - 2
+    end
+    if c.speed_large and not find_minimal and cost > 200 and long_match then
+      if fast_partition(c, xoff, xlim, yoff, ylim, cost, fmin, fmax, false, part)
+          or fast_partition(c, xoff, xlim, yoff, ylim, cost, bmin, bmax, true, part) then return end
     end
     if not find_minimal and cost >= c.too_expensive then
       -- give up and report halfway between the best results so far
@@ -539,6 +583,7 @@ local function analyze(o: *Opt, a: *DFile, b: *DFile, horizon: integer): sequenc
     end
   end
   local c: Ctx
+  c.speed_large = o.speed_large
   c.changed0 = iarr(-1, len[0] + 1)
   c.changed1 = iarr(-1, len[1] + 1)
   discard_confusing(&c, &eq, &len, nclass, o.minimal)
@@ -1173,7 +1218,7 @@ local LONGOPTS: []util.LongOpt = {
   {'paginate', 0, util.UNSUPPORTED}, {'no-dereference', 0, util.UNSUPPORTED},
   {'unidirectional-new-file', 0, util.UNSUPPORTED}, {'ifdef', 1, 'D'_b},
   {'minimal', 0, 'd'_b}, {'horizon-lines', 1, 140},
-  {'speed-large-files', 0, util.UNSUPPORTED}, {'rcs', 0, 'n'_b},
+  {'speed-large-files', 0, 141}, {'rcs', 0, 'n'_b},
   {'old-line-format', 1, 132}, {'new-line-format', 1, 133},
   {'unchanged-line-format', 1, 134}, {'line-format', 1, 135},
   {'old-group-format', 1, 136}, {'new-group-format', 1, 137},
@@ -1285,6 +1330,7 @@ global function applet_diff(args: sequence(string)): integer
     elseif c == 't'_b then opt.expand_tabs = true
     elseif c == 'T'_b then opt.initial_tab = true
     elseif c == 'd'_b then opt.minimal = true
+    elseif c == 141 then opt.speed_large = true
     elseif c == 140 then
       local value, ok = util.toint(g.optarg)
       if not ok or value < 0 then

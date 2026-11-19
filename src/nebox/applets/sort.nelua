@@ -2151,7 +2151,14 @@ global function applet_sort(args: sequence(string)): integer
     if checkonly ~= 0 or have_outfile then
       incompatible_options(string.char(checkonly ~= 0 and checkonly or 111) .. ' --debug')
     end
-    util.err('text ordering performed using simple byte comparison')
+    if nlocale.collation_unavailable then util.err('failed to set locale') end
+    if nlocale.collation_name ~= 'C' and nlocale.collation_name ~= 'POSIX' then
+      local name = nlocale.multibyte and ('‘' .. nlocale.collation_name .. '’')
+          or util.quote(nlocale.collation_name)
+      util.err('text ordering performed using ' .. name .. ' sorting rules')
+    else
+      util.err('text ordering performed using simple byte comparison')
+    end
     key_warnings(&gkey, gkey_only)
   end
 

@@ -6,6 +6,8 @@ require 'nebox.sys'
 global nlocale = @record{}
 global nlocale.multibyte: boolean
 global nlocale.collating: boolean
+global nlocale.collation_name: string
+global nlocale.collation_unavailable: boolean
 global nlocale.INVALID: cuint <comptime> = 0xffffffff
 
 local function c_setlocale(category: cint, name: cstring): cstring <cimport 'setlocale', cinclude '<locale.h>'> end
@@ -43,6 +45,11 @@ function nlocale.init()
   nlocale.multibyte = c_mbmax() > 1
   c_setlocale(3, 'C')
   local chosen = c_setlocale(3, (@cstring)(collate))
+  -- C.UTF-8 sorts by byte value just as C does. Accept its spelling
+  -- even on Nelibc builds that expose C.UTF-8 only for character handling.
+  local c_utf8 = collate == 'C.UTF-8' or collate == 'C.utf8' or collate == 'C.UTF8'
+  nlocale.collation_unavailable = chosen == nilptr and not c_utf8
+  nlocale.collation_name = not nlocale.collation_unavailable and collate or 'C'
   nlocale.collating = chosen ~= nilptr and (@string)(chosen) ~= 'C'
 end
 

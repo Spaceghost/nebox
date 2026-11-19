@@ -330,8 +330,12 @@ function Parser:parse_bracket(): Frag
       local close = self.pat:find(':]', self.pos + 2, true)
       if close <= 0 then self.err = 'Unmatched [, [^, [:, [., or [='; return out end
       local name = self.pat:sub(self.pos + 2, close - 1)
-      if s.nocase and (name == 'upper' or name == 'lower') then name = 'alpha' end
-      if not set_named(&s, name) then self.err = 'Invalid character class name'; return out end
+      if self.icase and (name == 'upper' or name == 'lower') then
+        set_named(&s, 'upper')
+        set_named(&s, 'lower')
+      elseif not set_named(&s, name) then
+        self.err = 'Invalid character class name'; return out
+      end
       self.pos = (@usize)(close) + 2
       continue
     end
