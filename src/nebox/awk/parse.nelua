@@ -758,10 +758,14 @@ function Parser:parse_item()
     return
   end
   local item: awkast.Item = {kind = awkast.ITEM_MAIN, pat = -1, pat2 = -1, action = -1}
-  if k == T.BEGIN or k == T.END then
+  if k == T.BEGIN or k == T.END or k == T.BEGINFILE or k == T.ENDFILE then
     self:advance()
-    item.kind = k == T.BEGIN and awkast.ITEM_BEGIN or awkast.ITEM_END
-    if self:peek() ~= T.LBRACE then self:fail((k == T.BEGIN and 'BEGIN' or 'END') .. ' blocks must have an action part'); return end
+    local label: string
+    if k == T.BEGIN then item.kind = awkast.ITEM_BEGIN; label = 'BEGIN'
+    elseif k == T.END then item.kind = awkast.ITEM_END; label = 'END'
+    elseif k == T.BEGINFILE then item.kind = awkast.ITEM_BEGINFILE; label = 'BEGINFILE'
+    else item.kind = awkast.ITEM_ENDFILE; label = 'ENDFILE' end
+    if self:peek() ~= T.LBRACE then self:fail(label .. ' blocks must have an action part'); return end
     item.action = self:parse_block()
     self.prog.items:push(item)
     return

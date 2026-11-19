@@ -849,6 +849,13 @@ same diff-ignore-case-regex 'printf "a\n" > a; printf "A\nB\n" > b; diff -iI "^b
 same diff-function-unified 'printf "void sample()\na\nb\nold\n" > a; sed s/old/new/ a > b; diff --show-c-function -U0 -L A -L B a b'
 same diff-function-context 'printf "//// Setup\na\nb\nold\n" > a; sed s/old/new/ a > b; diff --context=1 --show-function-line="^/" --label=A --label=B a b'
 
+same diff-rcs 'printf "one\nold\nx\nremove\nz\n" > a; printf "one\nnew\nx\nz\nappend" > b; diff --rcs a b'
+same diff-rcs-missing-newline 'printf hello > a; printf "hello\n" > b; diff -n a b'
+same diff-excludes 'mkdir -p a/inner/generated b/inner/generated; touch a/inner/skip.o b/inner/skip2.o a/inner/generated/new; echo a > a/inner/main; echo b > b/inner/main; printf "*.o  \ngenerated\n" > excludes; diff -r --exclude-from=excludes a b; echo $?; diff -rX - -x main a b < excludes; echo $?'
+same diff-line-templates 'printf "same\nleft\nend" > a; printf "same\nright\nend" > b; diff --old-line-format="[-%02dn]%l%%" --new-line-format="[+%xn]%L" --unchanged-line-format="%L" a b'
+same diff-group-templates 'printf "a\nb\nc\nd\n" > a; printf "a\nx\ny\nc\nd\ne\n" > b; diff --changed-group-format="[old:%df-%dl/new:%dF-%dL]%(n=N?even:%(n=1?one:many))%<%>" --unchanged-group-format="[%dn/%dN]%=" --new-group-format="add:%>" a b'
+same diff-template-character-literal 'printf "a\n" > a; printf "b\n" > b; diff --old-line-format="%c'"'"'X'"'"'%l%c'"'"'\012'"'"'" --new-line-format="%c'"'"'\011'"'"'%L" a b'
+same diff-template-empty 'printf "a\n" > a; printf "b\n" > b; diff --line-format= a b; echo $?; diff --changed-group-format="%% %q" a b; echo $?'
 same diff-ifdef 'printf "same\nold\nkeep\nremove\nend\n" > a; printf "same\nnew\nkeep\nend\nadd\n" > b; diff --ifdef=CHOICE a b'
 same diff-ifdef-ignored 'printf "same\nOLD" > a; printf "same\nNEW" > b; diff -D SYMBOL -I "^\(OLD\|NEW\)$" a b; diff -D SYMBOL -s a a'
 same diff-ifdef-nonl 'printf left > a; printf right > b; diff -D CHOICE a b'

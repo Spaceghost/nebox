@@ -1,0 +1,178 @@
+-- GNU diff line and group templates. Offsets are zero-based and half-open.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'allocators.default'
+require 'nebox.util'
+
+global difffmt = @record{}
+global difffmt.Side = @record{lines: *sequence(string), first: integer, stop: integer, incomplete: boolean}
+global difffmt.Format = @record{line: [3]string, group: [4]string}
+global difffmt.OLD: integer <comptime> = 0
+global difffmt.NEW: integer <comptime> = 1
+global difffmt.SAME: integer <comptime> = 2
+global difffmt.CHANGED: integer <comptime> = 3
+
+local function byte_at(s: string, i: integer): byte
+  if i > #s then return 0 end
+  return s:byte(i)
+end
+
+local function digit(c: byte): boolean return c >= 48 and c <= 57 end
+
+local function group_value(a: *difffmt.Side, b: *difffmt.Side, c: byte): integer
+  local side = a
+  if c >= 65 and c <= 90 then side = b; c = c + 32 end
+  if c == 'e'_b then return side.first
+  elseif c == 'f'_b then return side.first + 1
+  elseif c == 'l'_b then return side.stop
+  elseif c == 'm'_b then return side.stop + 1
+  elseif c == 'n'_b then return side.stop - side.first end
+  return -1
+end
+
+local function c_snprintf(buf: cstring, size: csize, fmt: cstring, ...: cvarargs): cint <cimport 'snprintf', cinclude '<stdio.h>'> end
+
+local function write_number(fmt: string, value: integer, decimal: boolean)
+  local small: [128]byte
+  local n: cint
+  if decimal then n = c_snprintf((@cstring)(&small[0]), #small, fmt, (@clonglong)(value))
+  else n = c_snprintf((@cstring)(&small[0]), #small, fmt, (@culonglong)(value)) end
+  if n <= 0 then return end
+  if n < #small then
+    util.writebytes(&small[0], (@usize)(n))
+    return
+  end
+  local size = (@usize)(n) + 1
+  local buf = (@*[0]byte)(default_allocator:alloc(size))
+  local actual: cint
+  if decimal then actual = c_snprintf((@cstring)(buf), size, fmt, (@clonglong)(value))
+  else actual = c_snprintf((@cstring)(buf), size, fmt, (@culonglong)(value)) end
+  if actual == n then util.writebytes(buf, (@usize)(n)) end
+  default_allocator:dealloc(buf)
+end
+
+-- Only pass a validated single integer conversion to the formatter.
+-- Character literals are handled here, without going through printf.
+local function conversion(s: string, start: integer, a: *difffmt.Side, b: *difffmt.Side,
+                          line: integer, emit: boolean): integer
+  local i = start + 1
+  local c = byte_at(s, i)
+  while c == 45 or c == 39 or c == 48 do i = i + 1; c = byte_at(s, i) end
+  while digit(c) do i = i + 1; c = byte_at(s, i) end
+  if c == 46 then
+    i = i + 1; c = byte_at(s, i)
+    while digit(c) do i = i + 1; c = byte_at(s, i) end
+  end
+  local suffix = byte_at(s, i + 1)
+  if c == 'c'_b and suffix == 39 then
+    local j = i + 2
+    local value = byte_at(s, j)
+    if value == 0 or value == 39 then return start end
+    if value == 92 then
+      value = 0
+      for k = j + 1, j + 3 do
+        local d = byte_at(s, k)
+        if d < 48 or d > 55 then return start end
+        value = (@byte)(8 * value + d - 48)
+      end
+      j = j + 3
+    end
+    if byte_at(s, j + 1) ~= 39 then return start end
+    if emit then util.writebyte(value) end
+    return j + 2
+  end
+  if c ~= 'd'_b and c ~= 'o'_b and c ~= 'x'_b and c ~= 'X'_b then return start end
+  local value: integer
+  if a == nilptr then
+    if suffix ~= 'n'_b then return start end
+    value = line
+  else
+    value = group_value(a, b, suffix)
+    if value < 0 then return start end
+  end
+  if emit then
+    local fmt = s:subview(start, i - 1) .. 'll' .. string.char(c)
+    write_number(fmt, value, c == 'd'_b)
+    fmt:destroy()
+  end
+  return i + 2
+end
+
+local function write_lines(side: *difffmt.Side, fmt: string)
+  if #fmt == 0 then return end
+  for n = side.first + 1, side.stop do
+    local text = side.lines[n]
+    local i = 1
+    while i <= #fmt do
+      local c = fmt:byte(i)
+      if c == 37 then
+        local token = byte_at(fmt, i + 1)
+        if token == 'l'_b or token == 'L'_b then
+          util.write(text)
+          if token == 'L'_b and (n < #side.lines or not side.incomplete) then util.writebyte(10) end
+          i = i + 2
+          continue
+        elseif token == 37 then
+          i = i + 1
+        else
+          local nexti = conversion(fmt, i, nilptr, nilptr, n, true)
+          if nexti ~= i then i = nexti; continue end
+        end
+      end
+      util.writebyte(c)
+      i = i + 1
+    end
+  end
+end
+
+local function condition_value(fmt: string, i: integer, a: *difffmt.Side, b: *difffmt.Side): (integer, integer)
+  if not digit(byte_at(fmt, i)) then return group_value(a, b, byte_at(fmt, i)), i + 1 end
+  local first = i
+  while digit(byte_at(fmt, i)) do i = i + 1 end
+  local status, value = util.xstrtoumax_base(fmt:subview(first, i - 1), 10, '')
+  if status ~= 0 or value > 0x7fffffffffffffff then return -1, i end
+  return (@integer)(value), i
+end
+
+local function group(f: *difffmt.Format, a: *difffmt.Side, b: *difffmt.Side,
+                     fmt: string, i: integer, stop: byte, emit: boolean): integer
+  while i <= #fmt do
+    local c = fmt:byte(i)
+    if c == stop then break end
+    if c == 37 then
+      local token = byte_at(fmt, i + 1)
+      if token == '<'_b or token == '>'_b or token == '='_b then
+        if emit then
+          local kind = token == '<'_b and difffmt.OLD or (token == '>'_b and difffmt.NEW or difffmt.SAME)
+          write_lines(kind == difffmt.NEW and b or a, f.line[kind])
+        end
+        i = i + 2
+        continue
+      elseif token == '('_b then
+        local lhs, eq = condition_value(fmt, i + 2, a, b)
+        local rhs, question = condition_value(fmt, eq + 1, a, b)
+        if lhs >= 0 and rhs >= 0 and byte_at(fmt, eq) == '='_b and byte_at(fmt, question) == '?'_b then
+          i = group(f, a, b, fmt, question + 1, ':'_b, emit and lhs == rhs)
+          if i <= #fmt then
+            i = group(f, a, b, fmt, i + 1, ')'_b, emit and lhs ~= rhs)
+            if i <= #fmt then i = i + 1 end
+          end
+          continue
+        end
+      elseif token == 37 then
+        i = i + 1
+      else
+        local nexti = conversion(fmt, i, a, b, 0, emit)
+        if nexti ~= i then i = nexti; continue end
+      end
+    end
+    if emit then util.writebyte(c) end
+    i = i + 1
+  end
+  return i
+end
+
+function difffmt.write(f: *difffmt.Format, kind: integer, a: *difffmt.Side, b: *difffmt.Side)
+  group(f, a, b, f.group[kind], 1, 0, true)
+end
