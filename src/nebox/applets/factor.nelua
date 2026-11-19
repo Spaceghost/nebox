@@ -314,9 +314,9 @@ local function rho128(n: uint128): uint128
   return n
 end
 
-----------------------------------------------------------------------------
 ## end
 
+----------------------------------------------------------------------------
 -- bignum path: little-endian base-2^32 limbs, no high zero limbs. The
 -- program does not collect garbage, so every operation writes into a
 -- caller's buffer and the loops reuse theirs; temporaries are destroyed
@@ -676,8 +676,34 @@ local function brho(g: *Big, n: *Big)
   end
 end
 
+-- Integer Newton iteration from an upper bound on sqrt(n). When the quotient
+-- reaches the root, the quotient and remainder tell us whether n is a square.
+local function bsquarefactor(n: *Big, root: *Big): boolean
+  local residue = n.l[1] & 15
+  if residue ~= 0 and residue ~= 1 and residue ~= 4 and residue ~= 9 then return false end
+  local bit = (bbits(n) + 1) // 2
+  root.l:resize(bit // 32 + 1)
+  for i = 1, #root.l do root.l[i] = 0 end
+  root.l[#root.l] = (@uint32)(1) << (bit % 32)
+  local quotient: Big
+  local remainder: Big
+  defer quotient.l:destroy(); remainder.l:destroy() end
+  while true do
+    bdivmod(&quotient, &remainder, n, root)
+    local order = bcmp(&quotient, root)
+    if order >= 0 then return order == 0 and #remainder.l == 0 end
+    -- floor((root + quotient) / 2) = root - ceil((root - quotient) / 2)
+    bsub(&remainder, root, &quotient)
+    badd_small(&remainder, &remainder, 1)
+    bdivsmall(&remainder, 2)
+    bsub(root, root, &remainder)
+  end
+  return false
+end
+
 -- Find a proper factor, or return false for a probable prime.
 local function bfindfactor(n: *Big, d: *Big): boolean
+  if bsquarefactor(n, d) then return true end
   ## if ccinfo.has_int128 then
   if #n.l <= 4 then
     local v: uint128 = 0
