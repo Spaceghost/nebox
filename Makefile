@@ -27,9 +27,10 @@ CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-prot
   -ffreestanding -fno-builtin -fno-sanitize=all -Wl,-e,_start -Wl,--build-id=none \
   -I$(NELIBC)/include \
   -DNEBOX_NELIBC_STAMP=$(NELIBC_STAMP)
-LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive -Wl,--strip-all
+NELIBC_LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive
+LDFLAGS := $(NELIBC_LDFLAGS) -Wl,--strip-all
 
-.PHONY: all nebox test clean
+.PHONY: all nebox nebuild test test-nebuild clean
 
 all: nebox
 
@@ -39,6 +40,15 @@ $(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) | $(OUT)
 	$(NELUA) -r -L src $(THESEUS_FLAGS) --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(LDFLAGS)' -o $@ src/nebox.nelua
 	@test -z "$$($(NM) -u $@)" || { echo "undefined symbols:"; $(NM) -u $@; exit 1; }
 	@echo "built $@ ($$(stat -c %s $@) bytes, static, no host libc)"
+
+nebuild: $(OUT)/nebuild
+
+$(OUT)/nebuild: tools/nebuild.nelua src/nebox/sys.nelua Makefile $(NELIBC_LIB) | $(OUT)
+	$(NELUA) -r -L src --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(NELIBC_LDFLAGS)' -o $@ tools/nebuild.nelua
+	@undefined=$$($(NM) -u $@) && test -z "$$undefined" || { echo "$$undefined"; exit 1; }
+
+test-nebuild: $(OUT)/nebuild
+	python3 tests/nebuild.py $(abspath $(OUT)/nebuild)
 
 $(OUT):
 	mkdir -p $(OUT)

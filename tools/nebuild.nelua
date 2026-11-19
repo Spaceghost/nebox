@@ -1,0 +1,209 @@
+-- A file dependency runner for the standalone distribution bootstrap.
+## pragmas.nogc = true
+
+require 'arg'
+require 'hashmap'
+require 'io'
+require 'nebox.sys'
+require 'os'
+require 'sequence'
+require 'string'
+
+local SYS_flock: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
+local function syscall(number: clong, ...: cvarargs): clong <cimport, cinclude '<nelibc_syscall.h>'> end
+
+local stamp_suffix = '.nebuild-command'
+local Edge = @record{
+  output: string,
+  inputs: sequence(string),
+  command: string,
+  signature: string,
+  visiting: boolean,
+  planned: boolean,
+  rebuilt: boolean,
+}
+
+local edges: sequence(Edge)
+local producers: hashmap(string, usize)
+local defaults: sequence(string)
+local order: sequence(usize)
+
+local function fail(message: string): void <noreturn>
+  io.stderr:write('nebuild: ' .. message .. '\n')
+  os.exit(1)
+end
+
+local function lock_build_directory()
+  local fd = sys.open('.', sys.O_RDONLY | sys.O_DIRECTORY, 0)
+  if fd < 0 then fail('cannot open build directory: ' .. sys.errstr()) end
+  -- Linux LOCK_EX | LOCK_NB. Keep the descriptor open through each recipe.
+  if syscall(SYS_flock, (@clong)(fd), 6_clong, 0_clong, 0_clong, 0_clong, 0_clong) ~= 0 then
+    fail('cannot lock build directory: ' .. sys.errstr())
+  end
+end
+
+local function file_status(path: string, status: *sys.Stat): boolean
+  if sys.stat(path, status) == 0 then return true end
+  if sys.errno() == sys.ENOENT then return false end
+  fail(path .. ': ' .. sys.errstr())
+  return false
+end
+
+local function valid_path(path: string): boolean
+  if #path == 0 or path:sub(-1) == '/' or path:sub(-#stamp_suffix) == stamp_suffix then
+    return false
+  end
+  local absolute = path:sub(1, 1) == '/'
+  local components = '/' .. path:sub(absolute and 2 or 1) .. '/'
+  return components:find('//', 1, true) == 0 and
+    components:find('/./', 1, true) == 0 and components:find('/../', 1, true) == 0
+end
+
+local function read_manifest(path: string)
+  local input, reason = io.open(path, 'rb')
+  if not input then fail(path .. ': ' .. reason) end
+  local contents = input:read('a')
+  if not input:close() then fail('cannot close ' .. path) end
+  if contents:find(string.char(0), 1, true) ~= 0 then fail(path .. ': NUL byte') end
+
+  local pending: usize = 0
+  local line_number = 0
+  local offset: isize = 1
+  while offset <= (@isize)(#contents) do
+    local newline = contents:find('\n', offset, true)
+    if newline == 0 then newline = (@isize)(#contents) + 1 end
+    local line = contents:sub(offset, newline - 1)
+    offset = newline + 1
+    line_number = line_number + 1
+    local location = path .. ':' .. tostring(line_number) .. ': '
+
+    if pending ~= 0 then
+      if line:sub(1, 1) ~= '\t' or #line <= 1 then fail(location .. 'expected a tab-prefixed command') end
+      local edge = &edges[pending]
+      edge.command = line:sub(2)
+      edge.signature = edge.signature .. '\n' .. edge.command
+      pending = 0
+    elseif #line > 0 and line:sub(1, 1) ~= '#' then
+      local words: sequence(string)
+      local first: isize = 1
+      local length = (@isize)(#line)
+      while first <= length do
+        local last = first
+        while last <= length and line:byte(last) ~= 32 and line:byte(last) ~= 9 do
+          last = last + 1
+        end
+        if last > first then words:push(line:sub(first, last - 1)) end
+        first = last + 1
+      end
+
+      if #words == 0 then
+        -- Allow blank lines containing spaces.
+      elseif (words[1] == 'build' or words[1] == 'default') and #words >= 2 then
+        for index: usize = 2, #words do
+          if not valid_path(words[index]) then fail(location .. 'invalid path ' .. words[index]) end
+        end
+        if words[1] == 'build' then
+          local output = words[2]
+          if producers[output] ~= 0 then fail(location .. 'duplicate output ' .. output) end
+          if output == path then fail(location .. 'manifest is a build output') end
+          local edge: Edge = {output = output, signature = line}
+          for index: usize = 3, #words do edge.inputs:push(words[index]) end
+          edges:push(edge)
+          pending = #edges
+          producers[output] = pending
+        else
+          for index: usize = 2, #words do defaults:push(words[index]) end
+        end
+      else
+        fail(location .. 'expected build or default')
+      end
+      words:destroy()
+    end
+  end
+  if pending ~= 0 then fail(path .. ': missing command for ' .. edges[pending].output) end
+end
+
+local function visit(index: usize)
+  local edge = &edges[index]
+  if edge.visiting then fail('dependency cycle at ' .. edge.output) end
+  if edge.planned then return end
+  edge.visiting = true
+  for i: usize = 1, #edge.inputs do
+    local input = edge.inputs[i]
+    local producer = producers[input]
+    if producer ~= 0 then
+      visit(producer)
+    else
+      local info: sys.Stat
+      if not file_status(input, &info) then fail('missing input ' .. input .. ' for ' .. edge.output) end
+    end
+  end
+  edge.visiting = false
+  edge.planned = true
+  order:push(index)
+end
+
+local function plan(target: string)
+  local index = producers[target]
+  if index == 0 then fail('unknown target ' .. target) end
+  visit(index)
+end
+
+local function newer(left: sys.Timespec, right: sys.Timespec): boolean
+  return left.tv_sec > right.tv_sec or (left.tv_sec == right.tv_sec and left.tv_nsec > right.tv_nsec)
+end
+
+local function signature_matches(stamp: string, signature: string): boolean
+  local input = io.open(stamp, 'rb')
+  if not input then return false end
+  local previous = input:read('a')
+  local closed = input:close()
+  return closed and previous == signature
+end
+
+local function build(edge: *Edge)
+  local stamp = edge.output .. stamp_suffix
+  local info: sys.Stat
+  local exists = file_status(edge.output, &info)
+  if exists and (info.st_mode & sys.S_IFMT) ~= sys.S_IFREG then fail('expected file output ' .. edge.output) end
+  local dirty = not exists or not signature_matches(stamp, edge.signature)
+  for i: usize = 1, #edge.inputs do
+    local input = edge.inputs[i]
+    local dependency: sys.Stat
+    if not file_status(input, &dependency) then fail('missing input ' .. input .. ' for ' .. edge.output) end
+    local producer = producers[input]
+    dirty = dirty or (producer ~= 0 and edges[producer].rebuilt) or newer(dependency.st_mtim, info.st_mtim)
+  end
+  if not dirty then return end
+
+  -- Invalidate the previous completion record before starting the recipe.
+  if sys.unlink(stamp) ~= 0 and sys.errno() ~= sys.ENOENT then fail(stamp .. ': ' .. sys.errstr()) end
+  print(edge.command)
+  io.stdout:flush()
+  local ok = os.execute(edge.command)
+  if not ok then fail('command failed for ' .. edge.output) end
+  if not file_status(edge.output, &info) or (info.st_mode & sys.S_IFMT) ~= sys.S_IFREG then
+    fail('command did not produce file ' .. edge.output)
+  end
+
+  local output, reason = io.open(stamp, 'wb')
+  if not output then fail(stamp .. ': ' .. reason) end
+  local written = output:write(edge.signature)
+  local closed = output:close()
+  if not written or not closed then
+    sys.unlink(stamp)
+    fail('cannot record command for ' .. edge.output)
+  end
+  edge.rebuilt = true
+end
+
+if #arg < 1 then fail('usage: nebuild MANIFEST [TARGET ...]') end
+lock_build_directory()
+read_manifest(arg[1])
+if #arg > 1 then
+  for i: usize = 2, #arg do plan(arg[i]) end
+else
+  if #defaults == 0 then fail('no default target') end
+  for i: usize = 1, #defaults do plan(defaults[i]) end
+end
+for i: usize = 1, #order do build(&edges[order[i]]) end
