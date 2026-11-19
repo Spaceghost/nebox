@@ -62,6 +62,33 @@ just rebuilt, or its edge and command differ from the last successful run
 recorded in the adjacent `.nebuild-command` file. List headers, command
 tools and configuration files as inputs when they affect an output.
 
+For the x86-64 bootstrap image, stage the Nelua, Nelibc, Nebox and
+Theseus sources under `/work/src/{nelua,nelibc,nebox,theseus}` and Zig
+under `/tool/zig`. Start with a compatible `nelua-lua` seed beside
+`/work/src/nelua/nelua`. Copy the launcher to `/work/native-nelua/nelua`
+and link its `lib` and `lualib` paths to those in the source tree.
+Create `/work/out/lib`, `/work/cache` and the compiler cache and temporary
+directories before building.
+
+On the staging host, with `IMAGE_ROOT` pointing to the mounted image tree
+and `SCRATCH` pointing to a writable temporary directory:
+
+```sh
+make -C "$IMAGE_ROOT/work/src/nelibc" -n -B lib-standalone-zig \
+  OUT=/work/out/lib ZIG=/tool/zig/zig AR='/tool/zig/zig ar' \
+  ZIGFLAGS='-mcpu=x86_64 -target x86_64-linux-musl' \
+  NELUA='/work/src/nelua/nelua --cache-dir /work/cache/nelua' \
+  > "$SCRATCH/nelibc-recipes"
+python3 tools/bootstrap_manifest.py "$IMAGE_ROOT" "$SCRATCH/nelibc-recipes" \
+  > "$IMAGE_ROOT/work/bootstrap.ne"
+```
+
+Inside the image, run `/tool/nebuild bootstrap.ne` from `/work` with the
+Nebox applets on `PATH` and `/bin/sh` linked to Nebox. The graph rebuilds
+the standalone Nelibc archive, links Nelua's Lua runtime against it, and
+uses that runtime to compile Theseus-enabled Nebox. GNU Make and Python
+generate the manifest on the staging host.
+
 ## Applets
 
 ```
