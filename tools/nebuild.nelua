@@ -8,6 +8,7 @@ require 'nebox.sys'
 require 'os'
 require 'sequence'
 require 'string'
+require 'stringbuilder'
 
 local SYS_flock: clong <cimport, nodecl, cinclude '<sys/syscall.h>'>
 local function syscall(number: clong, ...: cvarargs): clong <cimport, cinclude '<nelibc_syscall.h>'> end
@@ -20,10 +21,9 @@ local Edge = @record{
   signature: string,
   visiting: boolean,
   planned: boolean,
-  rebuilt: boolean,
   waiting: usize,
   consumers: sequence(usize),
-  completed_at: sys.Timespec,
+  generation: string,
 }
 
 local edges: sequence(Edge)
@@ -154,40 +154,56 @@ local function plan(target: string)
   visit(index)
 end
 
-local function newer(left: sys.Timespec, right: sys.Timespec): boolean
-  return left.tv_sec > right.tv_sec or (left.tv_sec == right.tv_sec and left.tv_nsec > right.tv_nsec)
-end
+local record_prefix = 'nebuild 2 '
+local invocation: string
 
-local function signature_matches(stamp: string, signature: string): boolean
-  local input = io.open(stamp, 'rb')
-  if not input then return false end
-  local previous = input:read('a')
-  local closed = input:close()
-  return closed and previous == signature
+local function build_generation(): string
+  if #invocation == 0 then
+    local random: [2]uint64
+    if sys.getrandom(&random[0], 16, 1) == 16 then -- GRND_NONBLOCK
+      invocation = tostring(random[0]) .. '.' .. tostring(random[1])
+    else
+      -- Early boot and older kernels can run recipes before random bytes are ready.
+      local wall: sys.Timespec
+      local uptime: sys.Timespec
+      if sys.clock_gettime(0, &wall) ~= 0 or sys.clock_gettime(sys.CLOCK_MONOTONIC, &uptime) ~= 0 then
+        fail('cannot identify build invocation: ' .. sys.errstr())
+      end
+      invocation = tostring(wall.tv_sec) .. '.' .. tostring(wall.tv_nsec) .. '.' ..
+        tostring(uptime.tv_sec) .. '.' .. tostring(uptime.tv_nsec) .. '.' .. tostring(sys.getpid())
+    end
+  end
+  return invocation
 end
 
 local function needs_build(edge: *Edge): boolean
-  local stamp = edge.output .. stamp_suffix
   local info: sys.Stat
   local exists = file_status(edge.output, &info)
   if exists and (info.st_mode & sys.S_IFMT) ~= sys.S_IFREG then fail('expected file output ' .. edge.output) end
-  local saved: sys.Stat
-  local dirty = not exists or not file_status(stamp, &saved) or not signature_matches(stamp, edge.signature)
-  -- A cached recipe may succeed without changing the output's timestamp.
-  edge.completed_at = info.st_mtim
-  if newer(saved.st_mtim, edge.completed_at) then edge.completed_at = saved.st_mtim end
+
+  -- Capture the inputs before starting the recipe. A modification while the
+  -- command runs will still be visible to the next invocation.
+  local signature: stringbuilder
+  signature:write(edge.signature)
   for i: usize = 1, #edge.inputs do
-    local input = edge.inputs[i]
-    local dependency: sys.Stat
-    if not file_status(input, &dependency) then fail('missing input ' .. input .. ' for ' .. edge.output) end
-    local producer = producers[input]
-    local modified_at = dependency.st_mtim
-    if producer ~= 0 and newer(edges[producer].completed_at, modified_at) then
-      modified_at = edges[producer].completed_at
-    end
-    dirty = dirty or (producer ~= 0 and edges[producer].rebuilt) or newer(modified_at, edge.completed_at)
+    local path = edge.inputs[i]
+    if not file_status(path, &info) then fail('missing input ' .. path .. ' for ' .. edge.output) end
+    signature:write('\n', info.st_dev, ' ', info.st_ino, ' ', info.st_mode, ' ', info.st_size,
+      ' ', info.st_mtim.tv_sec, '.', info.st_mtim.tv_nsec, ' ', info.st_ctim.tv_sec, '.', info.st_ctim.tv_nsec)
+    local producer = producers[path]
+    if producer ~= 0 then signature:write(' ', edges[producer].generation) end
   end
-  return dirty
+  edge.signature = signature:promote()
+  if not exists then return true end
+  local input = io.open(edge.output .. stamp_suffix, 'rb')
+  if not input then return true end
+  local previous = input:read('a')
+  local closed = input:close()
+  local newline = previous:find('\n', 1, true)
+  if not closed or newline <= (@isize)(#record_prefix + 1) or
+      previous:sub(1, #record_prefix) ~= record_prefix or previous:sub(newline + 1) ~= edge.signature then return true end
+  edge.generation = previous:sub(#record_prefix + 1, newline - 1)
+  return false
 end
 
 local function launch(edge: *Edge): cint
@@ -213,16 +229,13 @@ local function record_completion(edge: *Edge)
   local stamp = edge.output .. stamp_suffix
   local output, reason = io.open(stamp, 'wb')
   if not output then fail(stamp .. ': ' .. reason) end
-  local written = output:write(edge.signature)
+  edge.generation = build_generation()
+  local written = output:write(record_prefix .. edge.generation .. '\n' .. edge.signature)
   local closed = output:close()
   if not written or not closed then
     sys.unlink(stamp)
     fail('cannot record command for ' .. edge.output)
   end
-  local completion: sys.Stat
-  if not file_status(stamp, &completion) then fail('missing completion record for ' .. edge.output) end
-  edge.completed_at = newer(completion.st_mtim, info.st_mtim) and completion.st_mtim or info.st_mtim
-  edge.rebuilt = true
 end
 
 local function release(edge: *Edge, ready: *sequence(usize))

@@ -116,9 +116,13 @@ def main(binary, root):
     )
     assert run(binary, root) == [cache_recipe, consumer_recipe]
     timestamp = (root / "reuse").stat().st_mtime_ns
-    source.touch()
+    # Imported and restored sources can be older than an existing completion.
+    os.utime(source, ns=(1, 1))
     assert run(binary, root, "reuse") == [cache_recipe]
     assert (root / "reuse").stat().st_mtime_ns == timestamp
+    # Match the stamps exactly, as can happen on coarse filesystems.
+    same_time = (root / "cached.nebuild-command").stat().st_mtime_ns
+    os.utime(root / "reuse.nebuild-command", ns=(same_time, same_time))
     assert run(binary, root, jobs=2) == [consumer_recipe]
     assert run(binary, root, jobs=2) == []
 

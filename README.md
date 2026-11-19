@@ -58,10 +58,11 @@ Paths are separated by spaces or tabs and must be spelled consistently.
 Recipes run through `/bin/sh`. Use `-j JOBS` before the manifest to run
 independent recipes concurrently. The runner locks the working
 directory, so invocations that share outputs must use the same working
-directory. An output rebuilds when it is missing, a dependency is newer or
-just rebuilt, or its edge and command differ from the last successful run
-recorded in the adjacent `.nebuild-command` file. The record's timestamp
-also tracks successful cache hits that preserve the output's timestamp.
+directory. The adjacent `.nebuild-command` record captures
+the recipe, declared inputs, their file metadata and the last successful
+build of each generated input. An output rebuilds if it is missing or any
+of those inputs change, including after a cache hit that keeps the same
+output timestamp.
 List headers, command
 tools and configuration files as inputs when they affect an output.
 
