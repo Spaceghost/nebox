@@ -436,5 +436,56 @@ def _():
     assert os.WIFEXITED(status), status
 
 
+@case('fc lists numbered history and recalls by prefix or relative number')
+def _():
+    sh = Shell()
+    try:
+        sh.run('echo first', '\x1b[?2004lfirst\r\n')
+        sh.prompt()
+        sh.run('echo second', '\x1b[?2004lsecond\r\n')
+        sh.prompt()
+        sh.run('fc -lr -2 -1', '2\techo second\r\n1\techo first\r\n')
+        sh.prompt()
+        sh.run('fc -s second=changed "echo second"', '\r\nchanged\r\n')
+        sh.prompt()
+        sh.run('fc -s -1', '\r\nchanged\r\n')
+    finally:
+        sh.close()
+
+
+@case('fc runs the selected editor and executes the edited command')
+def _():
+    sh = Shell()
+    try:
+        editor = os.path.join(sh.home, 'edit-history')
+        with open(editor, 'w') as file:
+            file.write("#!/bin/sh\nprintf 'echo edited\\n' > \"$1\"\n")
+        os.chmod(editor, 0o700)
+        sh.run('echo original', '\x1b[?2004loriginal\r\n')
+        sh.prompt()
+        sh.run('fc -e ./edit-history -1', '\r\nedited\r\n')
+    finally:
+        sh.close()
+
+
+@case('vi insertion, movement, delete, undo, and history')
+def _():
+    sh = Shell()
+    try:
+        sh.send('set -o vi\r')
+        sh.prompt()
+        sh.run('echo xa\x1b0wxa!', '\x1b[?2004la!\r\n')
+        sh.prompt()
+        sh.run('echo ax\x1bxu', '\x1b[?2004lax\r\n')
+        sh.prompt()
+        sh.run('\x1bk$', '\x1b[?2004lax\r\n')
+        sh.prompt()
+        sh.send('set -o emacs\r')
+        sh.prompt()
+        sh.run('echo x\x01\x06\x06\x06\x06\x06y', '\x1b[?2004lyx\r\n')
+    finally:
+        sh.close()
+
+
 print('%d failed' % len(failures))
 sys.exit(1 if failures else 0)

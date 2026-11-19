@@ -11,6 +11,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'allocators.default'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
@@ -141,6 +142,11 @@ local function keycmp(line1: *Line, line2: *Line, jf_1: uint64, jf_2: uint64): i
   end
   if len1 == 0 then return len2 == 0 and 0 or -1 end
   if len2 == 0 then return 1 end
+  if nlocale.collating and not ignore_case then
+    local left: string = {data = &line1.buf[beg1], size = (@usize)(len1)}
+    local right: string = {data = &line2.buf[beg2], size = (@usize)(len2)}
+    return nlocale.compare(left, right)
+  end
   local n = len1 < len2 and len1 or len2
   for i = 0, < n do
     local a, b = line1.buf[beg1 + i], line2.buf[beg2 + i]

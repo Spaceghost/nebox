@@ -12,6 +12,7 @@
 require 'string'
 require 'sequence'
 require 'stringbuilder'
+require 'nebox.locale'
 
 global regex = @record{}
 
@@ -31,7 +32,14 @@ local OP_WSTART: byte <comptime> = 13
 local OP_WEND: byte <comptime> = 14
 
 global regex.Inst = @record{ op: byte, c: byte, x: integer, y: integer }
-global regex.Set = @record{ bits: [32]byte }
+local WideRange = @record{lo: cuint, hi: cuint}
+global regex.Set = @record{
+  bits: [32]byte,
+  ranges: sequence(WideRange),
+  classes: sequence(culong),
+  inverse: boolean,
+  nocase: boolean,
+}
 global regex.Caps = @record{ at: [20]isize }
 
 -- One VM thread: program counter, progress inside a back-reference being
@@ -47,6 +55,7 @@ global regex.Prog = @record{
   sets: sequence(regex.Set),
   nsub: integer,
   icase: boolean,
+  wide: boolean,
   hasref: boolean,      -- program contains a back-reference
   nlanchor: boolean,    -- ^ and $ also match after/before a newline (sed M)
   toocomplex: boolean,  -- last execution exceeded the thread bound
@@ -82,6 +91,39 @@ function regex.Set:has(b: byte): boolean
   return (self.bits[b >> 3] & (1 << (b & 7))) ~= 0
 end
 
+local function invert(s: *regex.Set)
+  for i = 0, 31 do s.bits[i] = ~s.bits[i] end
+  s.inverse = true
+end
+
+local function set_wide_range(s: *regex.Set, lo: cuint, hi: cuint)
+  s.ranges:push({lo = lo, hi = hi})
+  if hi >= 128 then hi = 127 end
+  for b: cuint = lo, hi do
+    s:add((@byte)(b))
+    if s.nocase and b >= 65 and b <= 90 then s:add((@byte)(b + 32)) end
+    if s.nocase and b >= 97 and b <= 122 then s:add((@byte)(b - 32)) end
+  end
+end
+
+local function set_matches(s: *regex.Set, ch: cuint): boolean
+  if ch < 128 then return s:has((@byte)(ch)) end
+  if ch >= 0x110000 then return false end
+  local folded = s.nocase and nlocale.fold(ch) or ch
+  for i = 1, #s.ranges do
+    local r = s.ranges[i]
+    if ch >= r.lo and ch <= r.hi then return not s.inverse end
+    if s.nocase then
+      local lo, hi = nlocale.fold(r.lo), nlocale.fold(r.hi)
+      if folded >= lo and folded <= hi then return not s.inverse end
+    end
+  end
+  for i = 1, #s.classes do
+    if nlocale.in_class(ch, s.classes[i]) then return not s.inverse end
+  end
+  return s.inverse
+end
+
 local function set_addrange(s: *regex.Set, lo: integer, hi: integer, icase: boolean)
   for b = lo, hi do
     s:add((@byte)(b))
@@ -108,6 +150,7 @@ local function set_named(s: *regex.Set, name: string): boolean
   elseif name == 'cntrl' then set_addrange(s, 0, 31, false); s:add(127)
   elseif name == 'xdigit' then set_addrange(s, 48, 57, false); set_addrange(s, 65, 70, false); set_addrange(s, 97, 102, false)
   else return false end
+  if nlocale.multibyte then s.classes:push(nlocale.class(name)) end
   return true
 end
 
@@ -270,6 +313,7 @@ end
 function Parser:parse_bracket(): Frag
   -- self.pos is just past '['
   local s: regex.Set
+  s.nocase = nlocale.multibyte and self.icase
   local negate = false
   if self:peek() == 94 then negate = true; self.pos = self.pos + 1 end
   local first = true
@@ -285,27 +329,28 @@ function Parser:parse_bracket(): Frag
       local close = self.pat:find(':]', self.pos + 2, true)
       if close <= 0 then self.err = 'Unmatched [, [^, [:, [., or [='; return out end
       local name = self.pat:sub(self.pos + 2, close - 1)
+      if s.nocase and (name == 'upper' or name == 'lower') then name = 'alpha' end
       if not set_named(&s, name) then self.err = 'Invalid character class name'; return out end
       self.pos = (@usize)(close) + 2
       continue
     end
-    local lo: integer = c
-    self.pos = self.pos + 1
+    local lo, used = nlocale.decode(self.pat, self.pos - 1)
+    self.pos = self.pos + used
+    local hi = lo
     if self:peek() == 45 and self:peek2() ~= 93 and self:peek2() ~= 0 then
-      local hi: integer = self:peek2()
-      self.pos = self.pos + 2
-      if hi < lo then
-        if not self.empty_ranges then self.err = 'Invalid range end'; return out end
-      else
-        set_addrange(&s, lo, hi, self.icase)
-      end
+      hi, used = nlocale.decode(self.pat, self.pos)
+      self.pos = self.pos + 1 + used
+    end
+    if hi < lo then
+      if not self.empty_ranges then self.err = 'Invalid range end'; return out end
+    elseif nlocale.multibyte then
+      set_wide_range(&s, lo, hi)
     else
-      set_addrange(&s, lo, lo, self.icase)
+      set_addrange(&s, lo, hi, self.icase)
     end
   end
   if negate then
-    for i = 0, 31 do s.bits[i] = ~s.bits[i] end
-    -- with REG_NEWLINE (sed's M flag) a negated set does not match newline
+    invert(&s)
     if self.newline then s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7)) end
   end
   self.sets:push(s)
@@ -417,10 +462,12 @@ function Parser:parse_interval(): (integer, integer, boolean)
   return lo, hi, true
 end
 
-function Parser:single(c: byte): Frag
+function Parser:single(c: cuint): Frag
   local out: Frag
-  if self.icase then c = lower(c) end
-  out:push(inst(OP_CHAR, c, 0, 0))
+  if self.icase then
+    if nlocale.multibyte then c = nlocale.fold(c) else c = lower((@byte)(c)) end
+  end
+  out:push(inst(OP_CHAR, (@byte)(c), c, 0))
   return out
 end
 
@@ -454,13 +501,7 @@ function Parser:parse_atom(start: boolean): (Frag, boolean)
     return self:single(36), true
   elseif c == 46 then
     self.pos = self.pos + 1
-    if self.newline then
-      local s: regex.Set
-      for i = 0, 31 do s.bits[i] = 0xff end
-      s.bits[10 >> 3] = s.bits[10 >> 3] & ~(1 << (10 & 7))
-      return self:class_frag(s), true
-    end
-    out:push(inst(OP_ANY, 0, 0, 0))
+    out:push(inst(OP_ANY, 0, self.newline and 1 or 0, 0))
     return out, true
   elseif c == 91 then
     self.pos = self.pos + 1
@@ -498,16 +539,16 @@ function Parser:parse_atom(start: boolean): (Frag, boolean)
     local e = self:peek2()
     if e == 0 then self.err = 'Trailing backslash'; return out, false end
     self.pos = self.pos + 2
-    if e == 119 then local s: regex.Set; set_named(&s, 'alnum'); s:add(95); return self:class_frag(s), true end
+    if e == 119 then local s: regex.Set; set_named(&s, 'alnum'); s:add(95); if nlocale.multibyte then set_wide_range(&s, 95, 95) end; return self:class_frag(s), true end
     if e == 87 then
-      local s: regex.Set; set_named(&s, 'alnum'); s:add(95)
-      for i = 0, 31 do s.bits[i] = ~s.bits[i] end
+      local s: regex.Set; set_named(&s, 'alnum'); s:add(95); if nlocale.multibyte then set_wide_range(&s, 95, 95) end
+      invert(&s)
       return self:class_frag(s), true
     end
     if e == 115 then local s: regex.Set; set_named(&s, 'space'); return self:class_frag(s), true end
     if e == 83 then
       local s: regex.Set; set_named(&s, 'space')
-      for i = 0, 31 do s.bits[i] = ~s.bits[i] end
+      invert(&s)
       return self:class_frag(s), true
     end
     -- GNU \` and \' anchor at the ends of the whole buffer, even with M
@@ -524,10 +565,15 @@ function Parser:parse_atom(start: boolean): (Frag, boolean)
     end
     if e == 110 then return self:single(10), true end
     if e == 116 then return self:single(9), true end
-    return self:single(e), true
+    local wc, used = nlocale.decode(self.pat, self.pos - 2)
+    if wc == nlocale.INVALID then wc = 0x110000 + e end
+    self.pos = self.pos + used - 1
+    return self:single(wc), true
   end
-  self.pos = self.pos + 1
-  return self:single(c), true
+  local wc, used = nlocale.decode(self.pat, self.pos - 1)
+  if wc == nlocale.INVALID then wc = 0x110000 + c end
+  self.pos = self.pos + used
+  return self:single(wc), true
 end
 
 -- Compile a pattern. Returns the program and an error message ("" on success).
@@ -545,6 +591,7 @@ function regex.compile_opts(pat: string, ere: boolean, icase: boolean, newline: 
                      empty_ranges = (flags & regex.EMPTY_RANGES) ~= 0, glibc_errors = (flags & regex.GLIBC_ERRORS) ~= 0}
   local prog: regex.Prog
   prog.icase = icase
+  prog.wide = nlocale.multibyte
   prog.nlanchor = nlanchor
   local body = p:parse_alt()
   if p.err.size == 0 and p:more() then
@@ -1048,6 +1095,10 @@ end
 -- Returns the program, an error message ("" on success) and re_nsub.
 function regex.compile_posix(pat: string, ere: boolean, icase: boolean, newline: boolean, nlanchor: boolean,
                              flags: integer): (regex.Prog, string, integer)
+  if nlocale.multibyte then
+    local prog, err = regex.compile_opts(pat, ere, icase, newline, nlanchor, 0)
+    return prog, err, prog.nsub
+  end
   local p: GParser = {pat = pat, pos = 0, ere = ere, icase = icase, newline = newline,
                       rparen_ord = (flags & regex.RPAREN_ORD) ~= 0,
                       no_gnu_ops = (flags & regex.NO_GNU_OPS) ~= 0,
@@ -1597,6 +1648,12 @@ end
 -- re_compile_pattern with re_syntax_options = SYNTAX: the program and an
 -- error message ("" on success).
 function regex.compile_syntax(pat: string, syn: uint64): (regex.Prog, string)
+  if nlocale.multibyte then
+    local ere = (syn & regex.RE_NO_BK_PARENS) ~= 0
+    local icase = (syn & regex.RE_ICASE) ~= 0
+    local newline = (syn & regex.RE_DOT_NEWLINE) == 0
+    return regex.compile_opts(pat, ere, icase, newline, true, 0)
+  end
   local p: SParser = {pat = pat, pos = 0, icase = (syn & regex.RE_ICASE) ~= 0}
   local prog: regex.Prog
   prog.icase = p.icase
@@ -1754,6 +1811,18 @@ local function zw_ok(prog: *regex.Prog, ins: regex.Inst, text: string, pos: isiz
   end
   local before = pos > 0 and isword(text.data[pos - 1])
   local after = pos < n and isword(text.data[pos])
+  if prog.wide then
+    before = false
+    after = false
+    if pos > 0 then
+      local wc = nlocale.decode(text, nlocale.previous(text, (@usize)(pos)))
+      before = nlocale.word(wc)
+    end
+    if pos < n then
+      local wc = nlocale.decode(text, (@usize)(pos))
+      after = nlocale.word(wc)
+    end
+  end
   if op == OP_WORDB then return before ~= after end
   if op == OP_NWORDB then return before == after end
   if op == OP_WSTART then return (not before) and after end
@@ -1812,7 +1881,32 @@ end
 
 -- Follow epsilon transitions from pc at pos and add the resulting consuming
 -- (or MATCH) threads to `list` in priority order.
-local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer, pc: integer, pos: isize, text: string, caps: *regex.Caps, dirty: boolean, neednl: boolean)
+global regex.Refill = @function(pointer): string
+local RegexInput = @record{text: string, refill: regex.Refill, context: pointer}
+
+local function ensure_byte(input: *RegexInput, pos: isize): boolean <inline>
+  if pos < (@isize)(input.text.size) then return true end
+  if input.refill ~= nilptr then
+    local size = input.text.size
+    input.text = input.refill(input.context)
+    if input.text.size == size then input.refill = nilptr end
+  end
+  return pos < (@isize)(input.text.size)
+end
+
+local function read_unit(input: *RegexInput, pos: isize, wide: boolean): (cuint, isize)
+  if not wide then return input.text.data[pos], 1 end
+  while true do
+    local wc, len, partial = nlocale.decode(input.text, (@usize)(pos))
+    if not partial or not ensure_byte(input, (@isize)(input.text.size)) then
+      if wc == nlocale.INVALID then wc = 0x110000 + input.text.data[pos] end
+      return wc, (@isize)(len)
+    end
+  end
+  return 0, 1
+end
+
+local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer, pc: integer, pos: isize, input: *RegexInput, caps: *regex.Caps, dirty: boolean, neednl: boolean)
   if prog.toocomplex then return end
   local vi = pc + 1
   if dirty then vi = vi + #prog.code end
@@ -1839,27 +1933,30 @@ local function addthread(prog: *regex.Prog, list: *sequence(Thread), n: *integer
   local old: isize = 0
   if prog.hasref then old = prog.epsvis[vi]; prog.epsvis[vi] = pos end
   if op == OP_JMP then
-    addthread(prog, list, n, ins.x, pos, text, caps, dirty, neednl)
+    addthread(prog, list, n, ins.x, pos, input, caps, dirty, neednl)
   elseif op == OP_SPLIT then
-    addthread(prog, list, n, ins.x, pos, text, caps, dirty, neednl)
-    addthread(prog, list, n, ins.y, pos, text, caps, dirty, neednl)
+    addthread(prog, list, n, ins.x, pos, input, caps, dirty, neednl)
+    addthread(prog, list, n, ins.y, pos, input, caps, dirty, neednl)
   elseif op == OP_SAVE then
     local o = caps.at[ins.x]
     caps.at[ins.x] = pos
-    addthread(prog, list, n, pc + 1, pos, text, caps, dirty, neednl)
+    addthread(prog, list, n, pc + 1, pos, input, caps, dirty, neednl)
     caps.at[ins.x] = o
   elseif op == OP_BACKREF then
-    addthread(prog, list, n, pc + 1, pos, text, caps, dirty, neednl)
+    addthread(prog, list, n, pc + 1, pos, input, caps, dirty, neednl)
   else
+    if op ~= OP_BOL then ensure_byte(input, pos) end
+    if prog.wide and op >= OP_WORDB and pos < (@isize)(input.text.size) then read_unit(input, pos, true) end
+    local text = input.text
     if zw_ok(prog, ins, text, pos) then
-      addthread(prog, list, n, pc + 1, pos, text, caps, dirty or prog.glibc_halt, neednl)
+      addthread(prog, list, n, pc + 1, pos, input, caps, dirty or prog.glibc_halt, neednl)
     elseif prog.nlquirk and ins.c == 0 then
       -- glibc's matcher enters a newline context after consuming a
       -- newline, and lets `$` stand before one that the match consumes
       if op == OP_BOL and pos > 0 and caps.at[0] >= 0 and pos > caps.at[0] and text.data[pos - 1] == 10 then
-        addthread(prog, list, n, pc + 1, pos, text, caps, true, neednl)
+        addthread(prog, list, n, pc + 1, pos, input, caps, true, neednl)
       elseif op == OP_EOL and pos < (@isize)(text.size) and text.data[pos] == 10 then
-        addthread(prog, list, n, pc + 1, pos, text, caps, true, true)
+        addthread(prog, list, n, pc + 1, pos, input, caps, true, true)
       end
     end
   end
@@ -1869,10 +1966,9 @@ end
 -- Run the program over text from `start`. With `anchored` only matches that
 -- begin at `start` count; otherwise the leftmost start wins. Among matches
 -- from the winning start the longest wins, ties going to the earlier path.
-local function execute(prog: *regex.Prog, text: string, start: isize, anchored: boolean, caps: *regex.Caps): boolean
+local function execute(prog: *regex.Prog, input: *RegexInput, start: isize, anchored: boolean, nonempty: boolean, caps: *regex.Caps): boolean
   ensure_scratch(prog)
   prog.toocomplex = false
-  local n: isize = (@isize)(text.size)
   local cn: integer = 0
   local nn: integer = 0
   local found = false
@@ -1883,7 +1979,7 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
   local init: regex.Caps
   caps_clear(&init)
   prog.gen = prog.gen + 1
-  addthread(prog, &prog.clist, &cn, 0, pos, text, &init, false, false)
+  addthread(prog, &prog.clist, &cn, 0, pos, input, &init, false, false)
   while true do
     prog.gen = prog.gen + 1
     nn = 0
@@ -1892,8 +1988,9 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
       if found and t.caps.at[0] > best.at[0] then continue end
       local ins = prog.code[t.pc + 1]
       local op = ins.op
-      if t.neednl and (op == OP_MATCH or pos >= n or text.data[pos] ~= 10) then continue end
+      if t.neednl and (op == OP_MATCH or not ensure_byte(input, pos) or input.text.data[pos] ~= 10) then continue end
       if op == OP_MATCH then
+        if nonempty and t.caps.at[0] == pos then continue end
         if not found or t.caps.at[0] < best.at[0] or pos > bestend
            or (bestdirty and not t.dirty and pos == bestend and t.caps.at[0] == best.at[0]) then
           found = true
@@ -1901,37 +1998,49 @@ local function execute(prog: *regex.Prog, text: string, start: isize, anchored: 
           bestend = pos
           bestdirty = t.dirty
         end
-      elseif pos >= n then
+      elseif not ensure_byte(input, pos) then
         -- nothing left to consume
-      elseif op == OP_CHAR then
-        local b = text.data[pos]
-        if prog.icase then b = lower(b) end
-        if b == ins.c then addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false) end
-      elseif op == OP_ANY then
-        addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false)
-      elseif op == OP_CLASS then
-        if prog.sets[ins.x]:has(text.data[pos]) then
-          addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false)
-        end
-      elseif op == OP_BACKREF then
-        local s, e = t.caps.at[2 * ins.x], t.caps.at[2 * ins.x + 1]
-        local a, b = text.data[s + t.k], text.data[pos]
-        if prog.icase then a, b = lower(a), lower(b) end
-        if a == b then
-          if t.k + 1 == e - s then
-            addthread(prog, &prog.nlist, &nn, t.pc + 1, pos + 1, text, &t.caps, false, false)
+      else
+        local wc, used = read_unit(input, pos, prog.wide)
+        local nextpos = pos + used
+        local matched = false
+        if op == OP_CHAR then
+          if prog.wide then
+            if prog.icase then wc = nlocale.fold(wc) end
+            matched = wc == ins.x
           else
-            materialize(prog, &prog.nlist, &nn, t.pc, t.k + 1, &t.caps, false, false)
+            local b = (@byte)(wc)
+            if prog.icase then b = lower(b) end
+            matched = b == ins.c
+          end
+        elseif op == OP_ANY then
+          matched = (not prog.wide or wc < 0x110000) and (ins.x == 0 or wc ~= 10)
+        elseif op == OP_CLASS then
+          if prog.wide then matched = set_matches(&prog.sets[ins.x], wc)
+          else matched = prog.sets[ins.x]:has((@byte)(wc)) end
+        elseif op == OP_BACKREF then
+          local s, e = t.caps.at[2 * ins.x], t.caps.at[2 * ins.x + 1]
+          local ref, reflen = read_unit(input, s + t.k, prog.wide)
+          if prog.icase then
+            if prog.wide then ref, wc = nlocale.fold(ref), nlocale.fold(wc)
+            else ref, wc = lower((@byte)(ref)), lower((@byte)(wc)) end
+          end
+          if ref == wc then
+            if t.k + reflen == e - s then matched = true
+            else materialize(prog, &prog.nlist, &nn, t.pc, t.k + reflen, &t.caps, false, false) end
           end
         end
+        if matched then addthread(prog, &prog.nlist, &nn, t.pc + 1, nextpos, input, &t.caps, false, false) end
       end
     end
     if prog.toocomplex then return false end
-    if pos >= n then break end
-    pos = pos + 1
+    if nn == 0 and (found or anchored) then break end
+    if not ensure_byte(input, pos) then break end
+    local _, used = read_unit(input, pos, prog.wide)
+    pos = pos + used
     if not found and not anchored then
       caps_clear(&init)
-      addthread(prog, &prog.nlist, &nn, 0, pos, text, &init, false, false)
+      addthread(prog, &prog.nlist, &nn, 0, pos, input, &init, false, false)
     end
     local tmp = prog.clist
     prog.clist = prog.nlist
@@ -1949,17 +2058,32 @@ end
 -- Anchored match at `pos`. caps.at[0..1] receive the match bounds.
 function regex.Prog:matchat(text: string, pos: isize, caps: *regex.Caps): boolean
   caps_clear(caps)
-  return execute(self, text, pos, true, caps)
+  local input: RegexInput = {text = text}
+  return execute(self, &input, pos, true, false, caps)
+end
+
+local function anchored_start(self: *regex.Prog): boolean
+  return #self.code > 1 and self.code[2].op == OP_BOL and (self.code[2].c == 1 or not self.nlanchor)
 end
 
 -- Search from `start`; the leftmost match wins, then the longest.
 function regex.Prog:search(text: string, start: isize, caps: *regex.Caps): boolean
   caps_clear(caps)
-  if #self.code > 1 and self.code[2].op == OP_BOL and (self.code[2].c == 1 or not self.nlanchor) then
-    if start > 0 then return false end
-    return execute(self, text, 0, true, caps)
-  end
-  return execute(self, text, start, false, caps)
+  local anchored = anchored_start(self)
+  if anchored and start > 0 then return false end
+  local input: RegexInput = {text = text}
+  return execute(self, &input, start, anchored, false, caps)
+end
+
+-- The refill function may grow or relocate the backing buffer, but must
+-- preserve existing offsets. Returning a view of the same length marks EOF.
+function regex.Prog:stream_separator(text: string, start: isize, caps: *regex.Caps,
+                                     refill: regex.Refill, context: pointer): boolean
+  caps_clear(caps)
+  local anchored = anchored_start(self)
+  if anchored and start > 0 then return false end
+  local input: RegexInput = {text = text, refill = refill, context = context}
+  return execute(self, &input, start, anchored, true, caps)
 end
 
 -- Convenience: does the pattern match anywhere in text?

@@ -22,6 +22,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.clock'
 require 'nebox.quotearg'
 require 'nebox.human'
@@ -308,6 +309,16 @@ local function iscntrl(c: byte): boolean return c < 32 or c == 127 end
 -- gnulib mbswidth in the C locale: printable and non-control bytes count.
 local function mbswidth(s: string): integer
   local w: integer = 0
+  if nlocale.multibyte then
+    local i: usize = 0
+    while i < s.size do
+      local c, used = nlocale.decode(s, i)
+      local width = nlocale.width(c)
+      if width > 0 then w = w + width end
+      i = i + used
+    end
+    return w
+  end
   for i: usize = 0, < s.size do
     local c = s.data[i]
     if isprint(c) or not iscntrl(c) then w = w + 1 end
@@ -724,7 +735,29 @@ local function quote_name_buf(name: string, qs: integer, qtt: *[256]boolean, nee
     alloc = true
   end
   local width: integer = 0
-  if needs_further_quoting then
+  if nlocale.multibyte then
+    local i: usize = 0
+    local copy: stringbuilder
+    while i < buf.size do
+      local c, used = nlocale.decode(buf, i)
+      local cells = nlocale.width(c)
+      if needs_further_quoting and cells < 0 then
+        copy:writebyte(63)
+        width = width + 1
+      else
+        if needs_further_quoting then
+          for j: usize = 0, < used do copy:writebyte(buf.data[i + j]) end
+        end
+        if cells > 0 then width = width + cells end
+      end
+      i = i + used
+    end
+    if needs_further_quoting then
+      if alloc then buf:destroy() end
+      buf = copy:promote()
+      alloc = true
+    end
+  elseif needs_further_quoting then
     for i: usize = 0, < buf.size do
       if not isprint(buf.data[i]) then buf.data[i] = 63 end
     end
@@ -1371,6 +1404,7 @@ end
 -- Sorting
 
 local function strcmp(a: string, b: string): integer
+  if nlocale.collating then return nlocale.compare(a, b) end
   local n = #a < #b and #a or #b
   for i = 0, < n do
     local x, y = a.data[i], b.data[i]

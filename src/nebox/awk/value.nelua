@@ -5,6 +5,7 @@
 ## pragmas.nogc = true
 
 require 'string'
+require 'nebox.locale'
 require 'sequence'
 require 'stringbuilder'
 require 'hashmap'
@@ -265,7 +266,7 @@ end
 
 -- Pad `s` to `width` with spaces; left-justified when `left`.
 local function pad(sb: *stringbuilder, s: string, width: integer, left: boolean)
-  local n = (@integer)(s.size)
+  local n = (@integer)(nlocale.length(s))
   if not left then for _ = n + 1, width do sb:writebyte(32) end end
   sb:write(s)
   if left then for _ = n + 1, width do sb:writebyte(32) end end

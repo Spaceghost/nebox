@@ -7,6 +7,8 @@ require 'sequence'
 require 'allocators.default'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.regex'
+require 'nebox.locale'
 
 global awkio = @record{}
 
@@ -20,6 +22,7 @@ global awkio.Reader = @record{
   len: usize,
   pos: usize,
   eof: boolean,
+  separator: string,
 }
 
 local READCHUNK: usize <comptime> = 65536
@@ -34,17 +37,22 @@ function awkio.Reader:init(name: string, fd: cint, pid: cint, is_cmd: boolean)
   self.len = 0
   self.pos = 0
   self.eof = false
+  self.separator = ''
 end
 
--- Pull more bytes; returns false at end of input or on error.
-function awkio.Reader:fill(): boolean
-  if self.eof then return false end
+function awkio.Reader:compact()
   if self.pos > 0 then
     local n = self.len - self.pos
     for i: usize = 0, < n do self.buf[i] = self.buf[self.pos + i] end
     self.len = n
     self.pos = 0
   end
+end
+
+-- Pull more bytes; returns false at end of input or on error.
+function awkio.Reader:fill(): boolean
+  if self.eof then return false end
+  self:compact()
   if self.len == self.cap then
     local ncap = self.cap * 2
     self.buf = (@*[0]byte)(default_allocator:realloc(self.buf, ncap, self.cap))
@@ -77,6 +85,7 @@ function awkio.Reader:record_byte(sep: byte, out: *string): boolean
     while i < self.len and self.buf[i] ~= sep do i = i + 1 end
     if i < self.len then
       $out = self:view(self.pos, i)
+      self.separator = self:view(i, i + 1)
       self.pos = i + 1
       return true
     end
@@ -112,15 +121,25 @@ function awkio.Reader:record_paragraph(out: *string): boolean
       i = i + 1
     end
     if found then
-      $out = self:view(self.pos, i)
-      self.pos = i + 2
+      local split = i - self.pos
+      local after = split + 2
+      while true do
+        while self.pos + after < self.len and self.buf[self.pos + after] == 10 do after = after + 1 end
+        if self.pos + after < self.len or not self:fill() then break end
+      end
+      $out = self:view(self.pos, self.pos + split)
+      self.separator = self:view(self.pos + split, self.pos + after)
+      self.pos = self.pos + after
       return true
     end
     scan = (self.len - self.pos > 0) and (self.len - self.pos - 1) or 0
     if not self:fill() then
       if self.pos < self.len then
         local stop = self.len
-        if self.buf[stop - 1] == 10 then stop = stop - 1 end
+        if self.buf[stop - 1] == 10 then
+          stop = stop - 1
+          self.separator = self:view(stop, self.len)
+        end
         $out = self:view(self.pos, stop)
         self.pos = self.len
         return true
@@ -131,9 +150,38 @@ function awkio.Reader:record_paragraph(out: *string): boolean
   return false
 end
 
-function awkio.Reader:record(rs: string, out: *string): boolean
-  if rs.size == 0 then return self:record_paragraph(out) end
-  return self:record_byte(rs:byte(1), out)
+local function refill_regex(context: pointer): string
+  local self = (@*awkio.Reader)(context)
+  self:fill()
+  return self:view(0, self.len)
+end
+
+function awkio.Reader:record(rs: string, re: *regex.Prog, out: *string): boolean
+  self.separator = ''
+  if #rs == 0 then return self:record_paragraph(out) end
+  if #rs == 1 then return self:record_byte(rs:byte(1), out) end
+  -- Retain the preceding character for file-start and word assertions.
+  local start: usize = 0
+  if self.pos > 0 then
+    local previous = nlocale.previous(self:view(0, self.len), self.pos)
+    start = self.pos - previous
+    self.pos = previous
+    self:compact()
+  end
+  local caps: regex.Caps
+  if re:stream_separator(self:view(0, self.len), (@isize)(start), &caps, refill_regex, self) then
+    local first, past = (@usize)(caps.at[0]), (@usize)(caps.at[1])
+    $out = self:view(start, first)
+    self.separator = self:view(first, past)
+    self.pos = past
+    return true
+  end
+  -- An anchored expression may reject without consuming the rest.
+  while self:fill() do end
+  self.pos = self.len
+  if start == self.len then return false end
+  $out = self:view(start, self.len)
+  return true
 end
 
 function awkio.Reader:close()

@@ -31,6 +31,7 @@ require 'stringbuilder'
 require 'hashmap'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.regex'
 require 'nebox.fts'
 
@@ -1450,6 +1451,17 @@ end
 -- regex_compile: report a failure with the pattern's file and line
 local function regex_compile(dc: *DfaComp, p: string, lineno: integer, syntax_bits: integer, syntax_only: boolean): boolean
   local prog: regex.Prog
+  if nlocale.multibyte then
+    local message: string
+    local ere = (syntax_bits & RE_NO_BK_PARENS) ~= 0
+    prog, message = regex.compile_opts(p, ere, match_icase, false, false, regex.GLIBC_ERRORS)
+    if message.size ~= 0 then
+      gerror(message, 0)
+      return false
+    end
+    dc.patterns:push(prog)
+    return true
+  end
   local err = rx_compile(p, syntax_bits, &prog)
   if err == REG_NOERROR then
     if not syntax_only then dc.patterns:push(prog) end
@@ -1497,6 +1509,10 @@ local function GEAcompile(pattern: string, syntax_bits: integer, exact: boolean)
     if backref then prev = p end
   until p > size
   if compilation_failed then gexit(EXIT_TROUBLE) end
+  if nlocale.multibyte then
+    dc.unsupported = true
+    return dc
+  end
   local bufstr: string
   if prev <= size then
     if 0 < prev then
@@ -1544,12 +1560,18 @@ local function sv(buf: *[0]byte, from: isize, len: isize): string
 end
 
 local function wordchar_next(buf: *[0]byte, p: isize, e: isize): boolean
-  return p < e and wordchar(buf[p])
+  if p >= e then return false end
+  if not nlocale.multibyte then return wordchar(buf[p]) end
+  local wc = nlocale.decode(sv(buf, p, e - p), 0)
+  return nlocale.word(wc)
 end
 
 local function wordchar_prev(buf: *[0]byte, b: isize, cur: isize): boolean
   if b == cur then return false end
-  return wordchar(buf[cur - 1])
+  if not nlocale.multibyte then return wordchar(buf[cur - 1]) end
+  local text = sv(buf, b, cur - b)
+  local wc = nlocale.decode(text, nlocale.previous(text, text.size))
+  return nlocale.word(wc)
 end
 
 -- re_search over BEG[0, LEN) from START: the match start or -1
@@ -1627,7 +1649,7 @@ local function EGexecute(dc: *DfaComp, buf: *[0]byte, bstart: isize, size: isize
               break
             end
             if len > 0 then
-              len = len - 1
+              len = nlocale.multibyte and (@isize)(nlocale.previous(sv(buf, match, len), (@usize)(len))) or len - 1
               pat.noteol = true
               shorter_len = re_match(pat, buf, beg, match + len - ptr, match - beg, &dc.regs)
             end
@@ -1635,7 +1657,12 @@ local function EGexecute(dc: *DfaComp, buf: *[0]byte, bstart: isize, size: isize
               len = shorter_len
             else
               if match == end_ - 1 then break end
-              match = match + 1
+              if nlocale.multibyte then
+                local _, used = nlocale.decode(sv(buf, match, end_ - match - 1), 0)
+                match = match + (@isize)(used)
+              else
+                match = match + 1
+              end
               pat.noteol = false
               start = re_search(pat, buf, beg, linelen, match - beg, &dc.regs)
               if start < 0 then break end
@@ -2275,7 +2302,8 @@ local function print_line_middle(beg: isize, lim: isize, line_color: string, mat
     local b = beg + match_offset
     if b == lim then break end
     if match_size == 0 then
-      match_size = 1
+      local _, used = nlocale.decode(sv(buffer, b, lim - b), 0)
+      match_size = (@isize)(used)
       if mid < 0 then mid = cur end
     else
       if only_matching then
@@ -3248,11 +3276,11 @@ global function applet_grep(args: sequence(string)): integer
 
   if matcher < 0 then matcher = G_MATCHER_INDEX end
   if matcher == F_MATCHER_INDEX then
-    if n_patterns == 1 and match_words then
+    if (n_patterns == 1 and match_words) or (nlocale.multibyte and (match_icase or match_words)) then
       pattern = fgrep_to_grep_pattern(pattern)
       matcher = G_MATCHER_INDEX
     end
-  elseif (matcher == E_MATCHER_INDEX or matcher == G_MATCHER_INDEX) and 1 < n_patterns then
+  elseif (matcher == E_MATCHER_INDEX or matcher == G_MATCHER_INDEX) and 1 < n_patterns and not nlocale.multibyte then
     matcher = try_fgrep_pattern(matcher, &pattern)
   end
 

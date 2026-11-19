@@ -8,6 +8,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 local function c_getpagesize(): cint <cimport 'getpagesize', cinclude '<unistd.h>'> end
@@ -51,7 +52,7 @@ local function wc(fd: cint, name: string, has_name: boolean, fs: *FStatus, curre
   local file = has_name and name or 'standard input'
   local lines, words, chars, bytes, linelength: uint64 = 0, 0, 0, 0, 0
   local count_bytes = print_bytes or print_chars
-  local count_complicated = print_words or print_linelength
+  local count_complicated = print_words or print_linelength or (print_chars and nlocale.multibyte)
   local buf: [65536]byte
   if count_bytes and not print_lines and not count_complicated then
     local skip_read = false
@@ -82,6 +83,48 @@ local function wc(fd: cint, name: string, has_name: boolean, fs: *FStatus, curre
         bytes = bytes + (@uint64)(n)
       end
     end
+  elseif nlocale.multibyte and count_complicated then
+    local in_word = false
+    local linepos: uint64 = 0
+    local carried: usize = 0
+    local posix = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+    while true do
+      local n = sys.read(fd, &buf[carried], #buf - carried)
+      if n < 0 then
+        if sys.errno() == sys.EINTR then continue end
+        util.err(util.quotef(file) .. ': ' .. sys.errstr()); ok = false; break
+      end
+      if n == 0 then break end
+      bytes = bytes + (@uint64)(n)
+      local text: string = {data = &buf[0], size = carried + (@usize)(n)}
+      local offset: usize = 0
+      while offset < text.size do
+        local c, used, partial = nlocale.decode(text, offset)
+        if partial then break end
+        offset = offset + used
+        if c == nlocale.INVALID then continue end
+        chars = chars + 1
+        if c == 10 then lines = lines + 1 end
+        if c == 10 or c == 13 or c == 12 then
+          if linepos > linelength then linelength = linepos end
+          linepos = 0
+        elseif c == 9 then
+          linepos = linepos + 8 - linepos % 8
+        else
+          local width = nlocale.width(c)
+          if width > 0 then linepos = linepos + (@uint64)(width) end
+        end
+        if nlocale.space(c) or (not posix and (c == 0xa0 or c == 0x2007 or c == 0x202f or c == 0x2060)) then
+          if in_word then words = words + 1; in_word = false end
+        elseif nlocale.printable(c) then
+          in_word = true
+        end
+      end
+      carried = text.size - offset
+      for i: usize = 0, < carried do buf[i] = buf[offset + i] end
+    end
+    if linepos > linelength then linelength = linepos end
+    if in_word then words = words + 1 end
   else
     local in_word = false
     local linepos: uint64 = 0
@@ -121,7 +164,7 @@ local function wc(fd: cint, name: string, has_name: boolean, fs: *FStatus, curre
     if linepos > linelength then linelength = linepos end
     if in_word then words = words + 1 end
   end
-  chars = bytes
+  if not nlocale.multibyte then chars = bytes end
   write_counts(lines, words, chars, bytes, linelength, name, has_name)
   total_lines = total_lines + lines; total_words = total_words + words
   total_chars = total_chars + chars; total_bytes = total_bytes + bytes

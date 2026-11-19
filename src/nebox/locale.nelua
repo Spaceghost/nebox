@@ -1,0 +1,178 @@
+-- CTYPE and COLLATE are independent. Protocols and numeric syntax stay in C.
+require 'string'
+require 'stringbuilder'
+require 'nebox.sys'
+
+global nlocale = @record{}
+global nlocale.multibyte: boolean
+global nlocale.collating: boolean
+global nlocale.INVALID: cuint <comptime> = 0xffffffff
+
+local function c_setlocale(category: cint, name: cstring): cstring <cimport 'setlocale', cinclude '<locale.h>'> end
+local function c_mbmax(): csize <cimport '__ctype_get_mb_cur_max', cinclude '<stdlib.h>'> end
+local function c_strcoll(a: cstring, b: cstring): cint <cimport 'strcoll', cinclude '<string.h>'> end
+local function c_wcwidth(c: cwchar_t): cint <cimport 'wcwidth', cinclude '<wchar.h>', nodecl> end
+local function c_mbrtowc(w: *cwchar_t, text: cstring, n: csize, state: pointer): csize <cimport 'mbrtowc', cinclude '<wchar.h>', nodecl> end
+local function c_wcrtomb(text: cstring, w: cwchar_t, state: pointer): csize <cimport 'wcrtomb', cinclude '<wchar.h>', nodecl> end
+local function c_towlower(w: cuint): cuint <cimport 'towlower', cinclude '<wctype.h>'> end
+local function c_towupper(w: cuint): cuint <cimport 'towupper', cinclude '<wctype.h>'> end
+local function c_iswalnum(w: cuint): cint <cimport 'iswalnum', cinclude '<wctype.h>'> end
+local function c_wctype(name: cstring): culong <cimport 'wctype', cinclude '<wctype.h>', nodecl> end
+local function c_iswctype(w: cuint, class: culong): cint <cimport 'iswctype', cinclude '<wctype.h>', nodecl> end
+local function c_iswspace(w: cuint): cint <cimport 'iswspace', cinclude '<wctype.h>'> end
+local function c_iswprint(w: cuint): cint <cimport 'iswprint', cinclude '<wctype.h>'> end
+
+local function environment_locale(category: string): string
+  local variables: [3]string = {'LC_ALL', category, 'LANG'}
+  for i: usize = 0, < #variables do
+    local value = sys.getenv(variables[i])
+    if value ~= nilptr and ((@string)(value)).size ~= 0 then return (@string)(value) end
+  end
+  return 'C'
+end
+
+function nlocale.init()
+  local ctype = environment_locale('LC_CTYPE')
+  local collate = environment_locale('LC_COLLATE')
+  -- Standalone Nelibc exposes its Unicode CTYPE data as C.UTF-8.
+  if ctype == 'de_DE' or ctype:sub(-6) == '.UTF-8' or ctype:sub(-5) == '.utf8'
+      or ctype:sub(-5) == '.UTF8' then
+    ctype = 'C.UTF-8'
+  end
+  c_setlocale(0, (@cstring)(ctype))
+  nlocale.multibyte = c_mbmax() > 1
+  c_setlocale(3, 'C')
+  local chosen = c_setlocale(3, (@cstring)(collate))
+  nlocale.collating = chosen ~= nilptr and (@string)(chosen) ~= 'C'
+end
+
+-- Decode one character. An invalid byte occupies one position; an incomplete
+-- sequence is distinguished so buffered readers can carry it to the next read.
+function nlocale.decode(text: string, offset: usize): (cuint, usize, boolean)
+  local b = text.data[offset]
+  if b < 128 or not nlocale.multibyte then return b, 1, false end
+  local wc: cwchar_t
+  local state: [2]uint32
+  local n = c_mbrtowc(&wc, (@cstring)(&text.data[offset]), text.size - offset, &state)
+  if n == ~0_csize or n == ~1_csize then return nlocale.INVALID, 1, n == ~1_csize end
+  return (@cuint)(wc), n == 0 and 1 or n, false
+end
+
+function nlocale.previous(text: string, offset: usize): usize
+  local start = offset - 1
+  if not nlocale.multibyte or text.data[start] < 128 then return start end
+  while start > 0 and offset - start < 4 and (text.data[start] & 0xc0) == 0x80 do
+    start = start - 1
+  end
+  local _, used = nlocale.decode(text, start)
+  return start + used == offset and start or offset - 1
+end
+
+function nlocale.fold(c: cuint): cuint
+  return c_towlower(c)
+end
+
+function nlocale.word(c: cuint): boolean
+  return c == 95 or c_iswalnum(c) ~= 0
+end
+
+function nlocale.class(name: string): culong
+  return c_wctype((@cstring)(name))
+end
+
+function nlocale.in_class(c: cuint, class: culong): boolean
+  return c_iswctype(c, class) ~= 0
+end
+
+function nlocale.advance(text: string, offset: usize, count: usize): usize
+  if not nlocale.multibyte then
+    if count >= text.size - offset then return text.size end
+    return offset + count
+  end
+  while offset < text.size and count > 0 do
+    local _, used = nlocale.decode(text, offset)
+    offset = offset + used
+    count = count - 1
+  end
+  return offset
+end
+
+function nlocale.length(text: string): usize
+  if not nlocale.multibyte then return text.size end
+  local count, offset: usize = 0, 0
+  while offset < text.size do
+    local _, used = nlocale.decode(text, offset)
+    offset = offset + used
+    count = count + 1
+  end
+  return count
+end
+
+function nlocale.encode(buf: *[0]byte, wc: cuint): usize
+  local state: [2]uint32
+  local n = c_wcrtomb((@cstring)(buf), (@cwchar_t)(wc), &state)
+  return n == ~0_csize and 0 or n
+end
+
+function nlocale.casemap(text: string, upper: boolean): string
+  local out: stringbuilder
+  local offset: usize = 0
+  while offset < text.size do
+    local wc, used = nlocale.decode(text, offset)
+    local folded = upper and c_towupper(wc) or c_towlower(wc)
+    if wc ~= folded and wc ~= nlocale.INVALID then
+      local encoded: [16]byte
+      local n = nlocale.encode(&encoded[0], folded)
+      if n > 0 then
+        for i: usize = 0, < n do out:writebyte(encoded[i]) end
+        offset = offset + used
+        continue
+      end
+    end
+    for i: usize = 0, < used do out:writebyte(text.data[offset + i]) end
+    offset = offset + used
+  end
+  return out:promote()
+end
+
+function nlocale.width(c: cuint): integer
+  if c == nlocale.INVALID then return -1 end
+  return c_wcwidth((@cwchar_t)(c))
+end
+
+function nlocale.space(c: cuint): boolean
+  return c_iswspace(c) ~= 0
+end
+
+function nlocale.printable(c: cuint): boolean
+  return c_iswprint(c) ~= 0
+end
+
+-- Compare strings that may contain NULs, preserving those separators.
+function nlocale.compare(a: string, b: string): integer
+  if not nlocale.collating then
+    if a == b then return 0 end
+    return a < b and -1 or 1
+  end
+  if a == b then return 0 end
+  if a.size == 0 or b.size == 0 then
+    return (a.size > 0 and 1 or 0) - (b.size > 0 and 1 or 0)
+  end
+  local left, right = string.copy(a), string.copy(b)
+  local i, j: usize = 0, 0
+  local diff: integer = 0
+  while true do
+    diff = c_strcoll((@cstring)(&left.data[i]), (@cstring)(&right.data[j]))
+    if diff ~= 0 then break end
+    while i < left.size and left.data[i] ~= 0 do i = i + 1 end
+    while j < right.size and right.data[j] ~= 0 do j = j + 1 end
+    if i == left.size or j == right.size then
+      diff = (i < left.size and 1 or 0) - (j < right.size and 1 or 0)
+      break
+    end
+    i, j = i + 1, j + 1
+  end
+  left:destroy()
+  right:destroy()
+  return diff
+end

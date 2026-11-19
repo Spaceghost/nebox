@@ -17,6 +17,7 @@ require 'stringbuilder'
 require 'hashmap'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.regex'
 require 'nebox.fnmatch'
 require 'nebox.diff_format'
@@ -72,17 +73,26 @@ local function line_key(o: *Opt, s: string, incomplete: boolean): string
     sb:write(s)
     return sb:promote()
   end
+  local input = s
+  if o.icase and nlocale.multibyte then input = nlocale.casemap(s, false) end
   local pending_space = false
-  for i: usize = 0, < s.size do
-    local c = s.data[i]
-    if is_space(c) and (o.all_space or o.space_change) then
+  local i: usize = 0
+  while i < input.size do
+    local c, used = nlocale.decode(input, i)
+    local space = nlocale.multibyte and nlocale.space(c) or (not nlocale.multibyte and is_space(input.data[i]))
+    if space and (o.all_space or o.space_change) then
       if o.space_change and not o.all_space then pending_space = true end
     else
       if pending_space then sb:writebyte(32); pending_space = false end
-      if o.icase and c >= 65 and c <= 90 then c = c + 32 end
-      sb:writebyte(c)
+      if o.icase and not nlocale.multibyte and c >= 65 and c <= 90 then
+        sb:writebyte((@byte)(c + 32))
+      else
+        for j: usize = 0, < used do sb:writebyte(input.data[i + j]) end
+      end
     end
+    i = i + used
   end
+  if o.icase and nlocale.multibyte then input:destroy() end
   -- -b: trailing white space is dropped (pending_space is never written)
   return sb:promote()
 end
@@ -90,8 +100,13 @@ end
 local function is_blank(o: *Opt, s: string): boolean
   if s.size == 0 then return true end
   if not (o.space_change or o.all_space) then return false end
-  for i: usize = 0, < s.size do
-    if not is_space(s.data[i]) then return false end
+  local i: usize = 0
+  while i < s.size do
+    local c, used = nlocale.decode(s, i)
+    if nlocale.multibyte then
+      if not nlocale.space(c) then return false end
+    elseif not is_space((@byte)(c)) then return false end
+    i = i + used
   end
   return true
 end

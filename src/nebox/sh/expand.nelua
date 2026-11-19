@@ -10,6 +10,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.sh.ast'
 require 'nebox.sh.arith'
 
@@ -85,7 +86,11 @@ end
 -- Pattern matching
 ----------------------------------------------------------------------
 
-local function class_match(name: string, b: byte): (boolean, boolean)
+local function class_match(name: string, b: cuint): (boolean, boolean)
+  if nlocale.multibyte then
+    local class = nlocale.class(name)
+    return class ~= 0 and nlocale.in_class(b, class), class ~= 0
+  end
   local ok = false
   if name == 'alpha' then ok = (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
   elseif name == 'digit' then ok = b >= 48 and b <= 57
@@ -105,8 +110,9 @@ end
 
 -- Bracket expression starting at pat[pi] == '['. Returns (matched, end
 -- index after ']', valid). Quoted characters inside are literal.
-local function bracket(p: *shexp.Buf, pi: integer, b: byte): (boolean, integer, boolean)
+local function bracket(p: *shexp.Buf, pi: integer, b: cuint): (boolean, integer, boolean)
   local n = #p.bytes
+  local text: string = {data = &p.bytes[1], size = (@usize)(n)}
   local j = pi + 1
   local negate = false
   if j <= n and p.flags[j] & shexp.F_Q == 0 and p.bytes[j] == #[B'!']# then
@@ -133,20 +139,24 @@ local function bracket(p: *shexp.Buf, pi: integer, b: byte): (boolean, integer, 
         k = k + 1
       end
       if closed then
-        local ok, known = class_match(name:view(), b)
+        name:writebyte(0)
+        local view = name:view()
+        view.size = view.size - 1
+        local ok, known = class_match(view, b)
+        name:destroy()
         if ok then matched = true end
         j = k + 2
         continue
       end
     end
-    local lo = d
-    local hi = d
-    if j + 2 <= n and p.bytes[j + 1] == #[B'-']# and p.flags[j + 1] & shexp.F_Q == 0 and p.bytes[j + 2] ~= #[B']']# then
-      hi = p.bytes[j + 2]
-      j = j + 2
+    local lo, used = nlocale.decode(text, (@usize)(j - 1))
+    local hi = lo
+    j = j + (@integer)(used)
+    if j < n and p.bytes[j] == 45 and p.flags[j] & shexp.F_Q == 0 and p.bytes[j + 1] ~= 93 then
+      hi, used = nlocale.decode(text, (@usize)(j))
+      j = j + 1 + (@integer)(used)
     end
     if b >= lo and b <= hi then matched = true end
-    j = j + 1
   end
   return false, pi, false
 end
@@ -160,27 +170,33 @@ local function match_at(p: *shexp.Buf, pi: integer, s: string, si: usize): boole
     if not q and c == #[B'*']# then
       while pi <= n and p.bytes[pi] == #[B'*']# and p.flags[pi] & shexp.F_Q == 0 do pi = pi + 1 end
       if pi > n then return true end
-      for k = si, s.size + 1 do
+      local k = si
+      while true do
         if match_at(p, pi, s, k) then return true end
+        if k > s.size then break end
+        k = nlocale.advance(s, k - 1, 1) + 1
       end
       return false
     end
     if si > s.size then return false end
-    local b = s:byte(si)
+    local b, used = nlocale.decode(s, si - 1)
     if not q and c == #[B'?']# then
-      pi = pi + 1; si = si + 1
+      pi = pi + 1; si = si + used
     elseif not q and c == #[B'[']# then
       local ok, after, valid = bracket(p, pi, b)
       if valid then
         if not ok then return false end
-        pi = after; si = si + 1
+        pi = after; si = si + used
       else
         if b ~= #[B'[']# then return false end
         pi = pi + 1; si = si + 1
       end
     else
-      if b ~= c then return false end
-      pi = pi + 1; si = si + 1
+      if s:byte(si) ~= c then return false end
+      for k: usize = 1, < used do
+        if pi + (@integer)(k) > n or p.bytes[pi + (@integer)(k)] ~= s:byte(si + k) then return false end
+      end
+      pi = pi + (@integer)(used); si = si + used
     end
   end
   return si > s.size
@@ -227,25 +243,20 @@ end
 
 local function remove_pattern(value: string, pat: *shexp.Buf, prefix: boolean, longest: boolean): string
   local n = value.size
-  if prefix then
-    if longest then
-      for k = n, 0, -1 do
-        if shexp.match(pat, value:subview(1, k)) then return value:sub(k + 1) end
-      end
-    else
-      for k = 0, n do
-        if shexp.match(pat, value:subview(1, k)) then return value:sub(k + 1) end
-      end
+  local backward = prefix == longest
+  local k = backward and n or 0
+  while true do
+    if prefix then
+      if shexp.match(pat, value:subview(1, k)) then return value:sub(k + 1) end
+    elseif shexp.match(pat, value:subview(k + 1, n)) then
+      return value:sub(1, k)
     end
-  else
-    if longest then
-      for k = 1, n + 1 do
-        if shexp.match(pat, value:subview(k, n)) then return value:sub(1, k - 1) end
-      end
+    if backward then
+      if k == 0 then break end
+      k = nlocale.previous(value, k)
     else
-      for k = n + 1, 1, -1 do
-        if shexp.match(pat, value:subview(k, n)) then return value:sub(1, k - 1) end
-      end
+      if k == n then break end
+      k = nlocale.advance(value, k, 1)
     end
   end
   return value
@@ -327,7 +338,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
   if p.a == N.OP_BAD then shexp.fatal('Bad substitution') return end
   if p.c == 1 then
     local v, set = param_value(name)
-    local len: usize = v.size
+    local len: usize = nlocale.length(v)
     if is_at then len = (@usize)(#shexp.params()) end
     if not set and shexp.nounset and not is_at then shexp.fatal(name .. ': parameter not set') end
     out:addstr(string.format('%d', len), f)
@@ -543,7 +554,7 @@ local function split_fields(b: *shexp.Buf): sequence(shexp.Buf)
   return out
 end
 
-local function name_less(a: string, b: string): boolean return a < b end
+local function name_less(a: string, b: string): boolean return nlocale.compare(a, b) < 0 end
 
 local function is_dir(path: string): boolean
   local st: sys.Stat

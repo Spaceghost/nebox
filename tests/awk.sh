@@ -258,11 +258,6 @@ expect awk-posix-error-exit-2 '2 2 2
 exit=0' "awk 'BEGIN { print ( }' 2>/dev/null; a=\$?; awk 'BEGIN { z = 0; print 1 / z }' 2>/dev/null; b=\$?; awk 'BEGIN { \$(-1) }' 2>/dev/null; c=\$?; echo \$a \$b \$c"
 expect awk-posix-length-array '3
 exit=0' "awk 'BEGIN { a[1]; a[2]; a[\"x\"]; print length(a) }'"
-expect awk-posix-rs-first-char '1:a
-2:
-3:b
-4:c
-exit=0' "printf 'aXXbXc' | awk 'BEGIN { RS = \"XX\" } { print NR \":\" \$0 }'"
 expect awk-posix-fs-empty '3 b
 exit=0' "printf 'abc\\n' | awk 'BEGIN { FS = \"\" } { print NF, \$2 }'"
 expect awk-posix-hex-not-numeric '0 0 1
@@ -286,3 +281,13 @@ same awk-file-hooks-getline 'awk '"'"'BEGIN { getline line; print line,NR } BEGI
 same awk-file-hooks-only 'awk '"'"'BEGINFILE {print FILENAME,FNR,mode; nextfile} ENDFILE {print "done",FNR}'"'"' mode=one left.txt mode=two right.txt'
 same awk-file-hooks-exit 'awk '"'"'BEGINFILE {print FILENAME; exit 7} ENDFILE {print "unexpected"} END {print "end", NR}'"'"' left.txt; echo $?'
 same awk-file-hooks-exit-getline 'awk '"'"'BEGIN { getline line; print "unexpected" } BEGINFILE { exit 6 } END { print "end", NR }'"'"' left.txt; echo $?'
+
+same awk-regexp-records 'printf "::a:b:::c::tail" | awk '"'"'BEGIN { RS="::+" } { print NR, "[" $0 "]", "[" RT "]" }'"'"''
+expect awk-regexp-record-ignores-empty-matches '[ab] [X]
+[c] [XX]
+[d] []
+exit=0' 'printf "abXcXXd" | awk '"'"'BEGIN { RS="X*" } {print "[" $0 "]", "[" RT "]"}'"'"''
+same awk-regexp-record-anchors 'printf "ABAB\nZZ" | awk '"'"'BEGIN { RS="^AB|ZZ$" } { print "[" $0 "]", "[" RT "]" }'"'"''
+same awk-regexp-record-boundary 'awk '"'"'BEGIN { for(i=0;i<65534;i++) printf "q"; printf "XYYYYend" }'"'"' | awk '"'"'BEGIN {RS="XYY+"} {print length($0), "["RT"]"}'"'"''
+same awk-regexp-record-switch 'printf "a::b,c::d" | awk '"'"'BEGIN {RS="::"} {print $0,RT; RS=(NR%2 ? "," : "::")}'"'"''
+same awk-regexp-record-getline 'printf "a::b::c" > input; awk '"'"'BEGIN {RS="::"; while ((getline v < "input") > 0) print v, "["RT"]"; close("input")}'"'"''

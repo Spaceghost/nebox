@@ -15,6 +15,7 @@ require 'nebox.sh.lex'
 require 'nebox.sh.parse'
 require 'nebox.sh.expand'
 require 'nebox.sh.exec'
+require 'nebox.sh.lineedit'
 require 'nebox.applets.text'
 require 'nebox.applets.fs'
 
@@ -344,7 +345,7 @@ local OPTNAMES: []OptName = {
   {'allexport', #[B'a']#}, {'notify', #[B'b']#}, {'noclobber', #[B'C']#}, {'errexit', #[B'e']#},
   {'noglob', #[B'f']#}, {'hashall', #[B'h']#}, {'noexec', #[B'n']#}, {'nounset', #[B'u']#},
   {'verbose', #[B'v']#}, {'xtrace', #[B'x']#}, {'ignoreeof', 0}, {'nolog', 0},
-  {'monitor', #[B'm']#},
+  {'monitor', #[B'm']#}, {'vi', 0},
 }
 
 local function opt_get(letter: byte): boolean
@@ -382,9 +383,13 @@ end
 -- -o name / +o name; returns an error message or "".
 function shbi.set_option_name(name: string, on: boolean): string
   if name == 'vi' then
-    return name .. ': option not supported (no vi editing mode)'
+    shst.o_vi = on
+    return ''
   end
-  if name == 'emacs' then return '' end   -- the line editor's keys are emacs-style
+  if name == 'emacs' then
+    if on then shst.o_vi = false end
+    return ''
+  end
   for i: integer = 0, < #OPTNAMES do
     if OPTNAMES[i].name == name then
       if OPTNAMES[i].letter ~= 0 then shbi.set_option(OPTNAMES[i].letter, on) end
@@ -398,7 +403,7 @@ local function print_options(as_commands: boolean)
   if not as_commands then util.line('Current option settings') end
   for i: integer = 0, < #OPTNAMES do
     local o = OPTNAMES[i]
-    local on = o.letter ~= 0 and opt_get(o.letter) or false
+    local on = o.name == 'vi' and shst.o_vi or (o.letter ~= 0 and opt_get(o.letter))
     if as_commands then
       util.line('set ' .. (on and '-o ' or '+o ') .. o.name)
     else
@@ -1399,6 +1404,134 @@ local function bi_command(args: sequence(string)): integer
   return shexec.wait_pid(pid, false)
 end
 
+local function fc_index(history: *lineedit.Editor, selector: string): integer
+  local n = history.hist_end
+  local number, numeric = util.toint(selector)
+  if numeric then
+    if number < 0 then return n + 1 + number end
+    return number - history.hist_base
+  end
+  for i = n, 1, -1 do
+    if history.history[i]:subview(1, selector.size) == selector then return i end
+  end
+  return 0
+end
+
+local function fc_mkstemp(path: cstring): cint <cimport 'mkstemp', cinclude '<stdlib.h>'> end
+
+local function fc_edit(editor: string, text: string): (string, boolean)
+  local directory, _ = shexec.getvar('TMPDIR')
+  if directory.size == 0 then directory = '/tmp' end
+  local path = util.join(directory, 'sh-fc.XXXXXX')
+  local fd = fc_mkstemp((@cstring)(path.data))
+  if fd < 0 then return '', false end
+  local offset: usize = 0
+  while offset < text.size do
+    local wrote = sys.write(fd, &text.data[offset], text.size - offset)
+    if wrote < 0 and sys.errno() == sys.EINTR then continue end
+    if wrote <= 0 then break end
+    offset = offset + (@usize)(wrote)
+  end
+  local closed = sys.close(fd)
+  local result: string
+  local ok = false
+  if offset == text.size and closed == 0 and
+      shexec.run_string('(' .. editor .. ' ' .. quote(path) .. ')', shst.lineno) == 0 then
+    result, ok = util.readfile(path)
+  end
+  sys.unlink(path)
+  path:destroy()
+  return result, ok
+end
+
+local function bi_fc(args: sequence(string)): integer
+  local i = 2
+  local listing, unnumbered, reverse, substitute = false, false, false, false
+  local editor: string
+  while i <= #args do
+    local flag = args[i]
+    if flag == '--' then i = i + 1; break end
+    if flag.size < 2 or flag:byte(1) ~= 45 or (flag:byte(2) >= 48 and flag:byte(2) <= 57) then break end
+    for j: usize = 2, flag.size do
+      local c = flag:byte(j)
+      if c == #[B'l']# then listing = true
+      elseif c == #[B'n']# then unnumbered = true
+      elseif c == #[B'r']# then reverse = true
+      elseif c == #[B's']# then substitute = true
+      elseif c == #[B'e']# then
+        if j < flag.size then
+          editor = flag:sub(j + 1)
+        else
+          i = i + 1
+          if i > #args then return rberr('fc: -e requires an editor') end
+          editor = args[i]
+        end
+        break
+      else return rberr('fc: unknown option ' .. flag) end
+    end
+    i = i + 1
+  end
+  if substitute and listing then return rberr('fc: -l and -s are incompatible') end
+  if editor == '-' then substitute = true end
+  local old, replacement: string
+  if substitute and i <= #args then
+    local equals = args[i]:find('=', 1, true)
+    if equals > 0 then
+      old = args[i]:sub(1, equals - 1)
+      replacement = args[i]:sub(equals + 1)
+      i = i + 1
+    end
+  end
+  if #args - i >= (substitute and 1 or 2) then return rberr('fc: too many operands') end
+  local h = lineedit.active
+  if h == nilptr or h.hist_end <= 0 then return rberr('fc: no command history') end
+  local first, last = h.hist_end, h.hist_end
+  if i <= #args then first = fc_index(h, args[i])
+  elseif listing then first = h.hist_end > 15 and h.hist_end - 15 or 1 end
+  if i + 1 <= #args then last = fc_index(h, args[i + 1])
+  elseif not listing then last = first end
+  if first < 1 or last < 1 or first > h.hist_end or last > h.hist_end then
+    return rberr('fc: history entry not found')
+  end
+  if reverse then first, last = last, first end
+  local step = first <= last and 1 or -1
+  local text: stringbuilder
+  for entry = first, last, step do
+    local command = h.history[entry]
+    if listing then
+      if not unnumbered then util.write(tostring(h.hist_base + entry)) end
+      util.write('\t')
+      util.line(command)
+    else
+      if old.size > 0 then
+        local at = command:find(old, 1, true)
+        if at > 0 then command = command:sub(1, at - 1) .. replacement .. command:sub(at + old.size) end
+      end
+      text:write(command)
+      text:writebyte(10)
+    end
+  end
+  if listing then return 0 end
+  local script = text:promote()
+  if not substitute then
+    if editor.size == 0 then editor = shexec.getvar('FCEDIT') end
+    if editor.size == 0 then editor = 'ed' end
+    local edited, ok = fc_edit(editor, script)
+    script:destroy()
+    if not ok then return rberr('fc: could not edit history') end
+    script = edited
+  end
+  util.flush()
+  sys.write(2, script.data, script.size)
+  local saved_end = h.hist_end
+  h.hist_end = 0   -- A recalled fc must not recursively recall itself.
+  local status = shexec.run_string(script, shst.lineno)
+  h.hist_end = saved_end
+  h:add_history(script:sub(1, script.size > 0 and script.data[script.size - 1] == 10 and script.size - 1 or script.size))
+  script:destroy()
+  return status
+end
+
 ----------------------------------------------------------------------
 -- Table
 ----------------------------------------------------------------------
@@ -1411,7 +1544,7 @@ local BUILTINS: []Builtin = {
   {'readonly', bi_export, true}, {'return', bi_return, true}, {'set', bi_set, true}, {'shift', bi_shift, true},
   {'times', bi_times, true}, {'trap', bi_trap, true}, {'unset', bi_unset, true},
   {'alias', bi_alias, false}, {'cd', bi_cd, false}, {'command', bi_command, false}, {'echo', bi_echo, false},
-  {'false', bi_false, false}, {'getopts', bi_getopts, false}, {'hash', bi_hash, false}, {'kill', bi_kill, false},
+  {'false', bi_false, false}, {'fc', bi_fc, false}, {'getopts', bi_getopts, false}, {'hash', bi_hash, false}, {'kill', bi_kill, false},
   {'printf', bi_printf, false}, {'pwd', bi_pwd, false}, {'read', bi_read, false}, {'test', bi_test, false},
   {'[', bi_test, false}, {'true', bi_true, false}, {'type', bi_type, false}, {'umask', bi_umask, false},
   {'unalias', bi_unalias, false}, {'wait', bi_wait, false},

@@ -21,6 +21,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.digest'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
@@ -31,6 +32,7 @@ local function c_memcmp(a: pointer, b: pointer, n: csize): cint <cimport 'memcmp
 local function c_memcpy(d: pointer, s: pointer, n: csize): pointer <cimport 'memcpy', cinclude '<string.h>'> end
 local function c_memmove(d: pointer, s: pointer, n: csize): pointer <cimport 'memmove', cinclude '<string.h>'> end
 local function c_strtold(s: cstring, e: *cstring): clongdouble <cimport 'strtold', cinclude '<stdlib.h>'> end
+local function c_mkstemp(path: cstring): cint <cimport 'mkstemp', cinclude '<stdlib.h>'> end
 local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
 local function c_getrlimit(res: cint, r: pointer): cint <cimport 'getrlimit', cinclude '<sys/resource.h>'> end
 
@@ -95,6 +97,9 @@ local fold_toupper: [256]byte
 local random_md5_state: digest.Ctx
 local have_read_stdin = false
 local nthreads: uint64 = 0
+local sort_memory: uint64 = 0
+local temp_dirs: sequence(string)
+local next_temp: integer = 1
 
 local function isdig(c: integer): boolean return c >= 48 and c <= 57 end
 local function c_isspace(c: integer): boolean return c == 32 or (c >= 9 and c <= 13) end
@@ -160,6 +165,7 @@ local olen: usize = 0
 local ototal: uint64 = 0
 local ofail: cint = 0
 local oblksize: uint64 = 8192
+local output_fd: cint = 1
 local outname = 'standard output'
 
 local function die_write(what: string)
@@ -171,7 +177,7 @@ end
 local function write_fd(p: *[0]byte, n: usize)
   local done: usize = 0
   while done < n do
-    local r = sys.write(1, &p[done], n - done)
+    local r = sys.write(output_fd, &p[done], n - done)
     if r < 0 then
       if sys.errno() == sys.EINTR then continue end
       ofail = sys.errno()
@@ -218,7 +224,7 @@ end
 
 local function out_start()
   local st: sys.Stat
-  if sys.fstat(1, &st) == 0 and st.st_blksize > 0 then oblksize = (@uint64)(st.st_blksize) end
+  if sys.fstat(output_fd, &st) == 0 and st.st_blksize > 0 then oblksize = (@uint64)(st.st_blksize) end
 end
 
 ----------------------------------------------------------------------------
@@ -764,6 +770,10 @@ local function keycompare(a: *Line, b: *Line): integer
         ta[tlena] = enda
         tb[tlenb] = endb
       end
+    elseif nlocale.collating and ign == 0 and not tr then
+      local left: string = {data = &a.text[texta], size = lena}
+      local right: string = {data = &b.text[textb], size = lenb}
+      diff = nlocale.compare(left, right)
     elseif ign ~= 0 then
       local pa = texta
       local pb = textb
@@ -825,7 +835,11 @@ local function compare(a: *Line, b: *Line): integer
   end
   local alen = a.len
   local blen = b.len
-  if alen == 0 then diff = blen ~= 0 and -1 or 0
+  if nlocale.collating then
+    local left: string = {data = a.text, size = alen}
+    local right: string = {data = b.text, size = blen}
+    diff = nlocale.compare(left, right)
+  elseif alen == 0 then diff = blen ~= 0 and -1 or 0
   elseif blen == 0 then diff = 1
   else
     diff = c_memcmp(a.text, b.text, alen < blen and alen or blen)
@@ -965,41 +979,11 @@ local function read_some(fd: cint, p: *[0]byte, n: usize, name: string): usize
   return 0
 end
 
--- Read all of FD, then split it into lines (a final unterminated line gets
--- a delimiter, as fillbuf supplies one).
-local function read_lines(fd: cint, name: string, out: *sequence(Line))
-  local cap: usize = 0
-  local used: usize = 0
-  local buf: *[0]byte = nilptr
-  while true do
-    buf = grow(buf, &cap, used + 65536 + 1)
-    local r = read_some(fd, (@*[0]byte)(&buf[used]), cap - used - 1, name)
-    if r == 0 then break end
-    used = used + r
-  end
-  local start: usize = 0
-  for i: usize = 0, < used do
-    if buf[i] == eolchar then
-      buf[i] = 0
-      local l: Line = {text = (@*[0]byte)(&buf[start]), len = i - start}
-      setkeys(&l)
-      out:push(l)
-      start = i + 1
-    end
-  end
-  if start < used then
-    buf[used] = 0
-    local l: Line = {text = (@*[0]byte)(&buf[start]), len = used - start}
-    setkeys(&l)
-    out:push(l)
-  end
-end
-
--- An input of mergefps or check: a file read buffer by buffer, or the
--- in-memory result of an earlier merge (GNU's temporary file).
+-- A buffered input file, temporary run, or sorted in-memory run.
 local Source = @record{
   name: string,
   isfile: boolean,
+  temporary: boolean,
   fd: cint,
   buf: *[0]byte,
   cap: usize,
@@ -1021,11 +1005,13 @@ local function new_source(name: string, isfile: boolean): *Source
 end
 
 local function src_open(s: *Source)
-  if s.isfile then s.fd = xfopen(s.name) end
+  if s.isfile and s.fd < 0 then s.fd = xfopen(s.name) end
 end
 
 local function src_close(s: *Source)
-  if s.isfile then xfclose(s.fd) end
+  if not s.isfile then return end
+  if s.temporary then sys.close(s.fd) else xfclose(s.fd) end
+  s.fd = -1
 end
 
 -- fillbuf: the next batch of lines, false at the end.
@@ -1044,7 +1030,9 @@ local function src_fill(s: *Source): boolean
   s.lines:clear()
   while true do
     s.buf = grow(s.buf, &s.cap, s.used + 65536 + 1)
-    local r = read_some(s.fd, (@*[0]byte)(&s.buf[s.used]), s.cap - s.used - 1, s.name)
+    local avail = s.cap - s.used - 1
+    if avail > 65536 then avail = 65536 end
+    local r = read_some(s.fd, (@*[0]byte)(&s.buf[s.used]), avail, s.name)
     if r == 0 then
       s.eof = true
       if s.used > s.start then
@@ -1073,8 +1061,7 @@ local function src_fill(s: *Source): boolean
   return false
 end
 
--- Merge output that is not standard output: collected like a temporary
--- file, then turned into an in-memory Source.
+-- Store input bytes and line offsets until the run is ready to sort.
 local Arena = @record{buf: *[0]byte, cap: usize, used: usize, offs: sequence(usize), lens: sequence(usize)}
 
 local function arena_add(ar: *Arena, l: *Line)
@@ -1114,14 +1101,14 @@ local function save_line(sv: *SavedLine, l: *Line)
 end
 
 ----------------------------------------------------------------------------
--- mergefps: merge FILES (already open) to standard output, or into AR.
+-- Merge already-open inputs to the current output.
 
 local function curline(files: *sequence(*Source), cur: *sequence(integer), p: integer): *Line
   local s: *Source = ($files)[p]
   return &s.lines[($cur)[p]]
 end
 
-local function mergefps(fs: sequence(*Source), ar: *Arena)
+local function mergefps(fs: sequence(*Source))
   local files: sequence(*Source)
   local cur: sequence(integer)
   for i = 1, #fs do files:push(fs[i]) end
@@ -1154,14 +1141,14 @@ local function mergefps(fs: sequence(*Source), ar: *Arena)
     if unique then
       if have_saved and compare(&saved.line, smallest) ~= 0 then
         have_saved = false
-        if ar ~= nilptr then arena_add(ar, &saved.line) else write_line(&saved.line) end
+        write_line(&saved.line)
       end
       if not have_saved then
         have_saved = true
         save_line(&saved, smallest)
       end
     else
-      if ar ~= nilptr then arena_add(ar, smallest) else write_line(smallest) end
+      write_line(smallest)
     end
     local exhausted = false
     if cur[f] < #files[f].lines then
@@ -1197,16 +1184,69 @@ local function mergefps(fs: sequence(*Source), ar: *Arena)
     end
   end
   if unique and have_saved then
-    if ar ~= nilptr then arena_add(ar, &saved.line) else write_line(&saved.line) end
+    write_line(&saved.line)
   end
+  c_free(saved.line.text)
+  files:destroy()
+  cur:destroy()
+  ord:destroy()
 end
 
--- mergefiles into a "temporary file".
+local function free_source(src: *Source)
+  c_free(src.buf)
+  src.lines:destroy()
+  c_free(src)
+end
+
+local function temp_run(): cint
+  local dir: string
+  if #temp_dirs == 0 then
+    local env = sys.getenv('TMPDIR')
+    dir = env ~= nilptr and (@string)(env) or ''
+    if dir.size == 0 then dir = '/tmp' end
+  else
+    dir = temp_dirs[next_temp]
+    next_temp = next_temp % #temp_dirs + 1
+  end
+  local name = util.join(dir, 'sort.XXXXXX')
+  local fd = c_mkstemp((@cstring)(name.data))
+  if fd < 0 then sort_die('cannot create temporary file in', dir) end
+  if sys.unlink(name) ~= 0 then
+    local e = sys.errno()
+    sys.close(fd)
+    die_errno(e, 'cannot unlink temporary file ' .. util.quotef(name))
+  end
+  name:destroy()
+  return fd
+end
+
+local function run_source(fd: cint): *Source
+  local src = new_source('temporary run', true)
+  src.fd = fd
+  src.temporary = true
+  if sys.lseek(fd, 0, sys.SEEK_SET) < 0 then sort_die('cannot rewind', src.name) end
+  return src
+end
+
+local function begin_temp_output(fd: cint)
+  output_fd = fd
+  outname = 'temporary run'
+  ototal = 0
+  out_start()
+end
+
+-- Merge one batch into a temporary run.
 local function mergefiles(group: sequence(*Source)): *Source
   for i = 1, #group do src_open(group[i]) end
-  local ar: Arena
-  mergefps(group, &ar)
-  return arena_source(&ar)
+  local fd = temp_run()
+  local was_debug = debug
+  debug = false
+  begin_temp_output(fd)
+  mergefps(group)
+  out_finish()
+  debug = was_debug
+  for i = 1, #group do free_source(group[i]) end
+  return run_source(fd)
 end
 
 ----------------------------------------------------------------------------
@@ -1245,10 +1285,9 @@ end
 
 -- avoid_trashing_input: inputs that are the output are first copied.
 local function avoid_trashing_input(files: sequence(*Source))
-  local tempcopy: *Source = nilptr
   for i = 1, #files do
     local f = files[i]
-    if not f.isfile then continue end
+    if f.temporary then continue end
     local is_stdin = f.name == '-'
     local same = false
     if have_outfile and outfile == f.name and not is_stdin then
@@ -1262,14 +1301,10 @@ local function avoid_trashing_input(files: sequence(*Source))
       same = r == 0 and same_inode(&inst, &outst)
     end
     if same then
-      if tempcopy == nilptr then
-        local g: sequence(*Source)
-        g:push(f)
-        tempcopy = mergefiles(g)
-      end
-      local c = new_source('', false)
-      c.lines = tempcopy.lines
-      files[i] = c
+      local g: sequence(*Source)
+      g:push(f)
+      files[i] = mergefiles(g)
+      g:destroy()
     end
   end
 end
@@ -1284,6 +1319,7 @@ local function merge(files: sequence(*Source))
       local g: sequence(*Source)
       for j = 1, nm do g:push(files[in_ + j]) end
       files[out + 1] = mergefiles(g)
+      g:destroy()
       out = out + 1
       in_ = in_ + nm
     end
@@ -1294,6 +1330,7 @@ local function merge(files: sequence(*Source))
       local g: sequence(*Source)
       for j = 1, nshortmerge do g:push(files[in_ + j]) end
       files[out + 1] = mergefiles(g)
+      g:destroy()
       out = out + 1
       in_ = in_ + nshortmerge
     end
@@ -1303,9 +1340,13 @@ local function merge(files: sequence(*Source))
   end
   avoid_trashing_input(files)
   for i = 1, #files do src_open(files[i]) end
+  output_fd = 1
+  outname = have_outfile and outfile or 'standard output'
+  ototal = 0
   open_output()
-  mergefps(files, nilptr)
+  mergefps(files)
   out_finish()
+  for i = 1, #files do free_source(files[i]) end
 end
 
 -- sort: read every input, sort stably, write with -u's first-of-a-run.
@@ -1330,41 +1371,142 @@ local function msort(a: *[0]Line, tmp: *[0]Line, n: usize)
   while i < nlo do a[k] = tmp[i]; i = i + 1; k = k + 1 end
 end
 
-local function sort_files(files: sequence(string))
-  local lines: sequence(Line)
-  for i = 1, #files do
-    local fd = xfopen(files[i])
-    read_lines(fd, files[i], &lines)
-    xfclose(fd)
-  end
-  local n = (@usize)(#lines)
+local function free_arena(ar: *Arena)
+  c_free(ar.buf)
+  ar.offs:destroy()
+  ar.lens:destroy()
+  local empty: Arena
+  $ar = empty
+end
+
+local function sort_run(ar: *Arena): *Source
+  local src = arena_source(ar)
+  local n = (@usize)(#src.lines)
   if n > 1 then
     local tmp = (@*[0]Line)(c_malloc((n // 2 + 1) * #@Line))
-    msort((@*[0]Line)(&lines[1]), tmp, n)
+    if tmp == nilptr then die('memory exhausted') end
+    msort((@*[0]Line)(&src.lines[1]), tmp, n)
+    c_free(tmp)
   end
-  open_output()
-  if n > 1 and nthreads > 1 then
-    -- queue_init and merge_tree_init allocate 2 * 8 and 2 * 128 bytes per
-    -- thread (nthreads is capped at SIZE_MAX / 256); a huge --parallel
-    -- runs out of memory there
-    local nt = nthreads
-    if nt > SIZE_MAX // 256 then nt = SIZE_MAX // 256 end
-    local q = c_malloc(16 * nt)
-    local t: pointer = nilptr
-    if q ~= nilptr then t = c_malloc(256 * nt) end
-    if q == nilptr or t == nilptr then die('memory exhausted') end
-    c_free(t); c_free(q)
-  end
-  local saved: *Line = nilptr
-  for i = 1, #lines do
-    local l = &lines[i]
-    if unique then
-      if saved ~= nilptr and compare(l, saved) == 0 then continue end
-      saved = l
-    end
-    write_line(l)
-  end
+  return src
+end
+
+local function write_run(ar: *Arena, fd: cint)
+  local src = sort_run(ar)
+  local was_debug = debug
+  debug = false
+  begin_temp_output(fd)
+  local group: sequence(*Source)
+  group:push(src)
+  mergefps(group)
   out_finish()
+  group:destroy()
+  free_source(src)
+  debug = was_debug
+end
+
+-- A binary-carry merge tree keeps live unlinked files logarithmic in
+-- the number of runs. Old runs always precede new ones on equal keys.
+local function retain_run(levels: *sequence(cint), fd: cint)
+  local level = 1
+  while level <= #levels and levels[level] >= 0 do
+    local left, right = run_source(levels[level]), run_source(fd)
+    local group: sequence(*Source)
+    group:push(left); group:push(right)
+    levels[level] = -1
+    fd = temp_run()
+    local was_debug = debug
+    debug = false
+    begin_temp_output(fd)
+    mergefps(group)
+    out_finish()
+    debug = was_debug
+    group:destroy()
+    free_source(left); free_source(right)
+    level = level + 1
+  end
+  if level > #levels then levels:push(fd) else levels[level] = fd end
+end
+
+local Worker = @record{pid: cint, fd: cint}
+
+local function collect_worker(workers: *sequence(Worker), levels: *sequence(cint))
+  local job = workers:remove(1)
+  if job.pid > 0 then
+    local status: cint
+    local pid: cint
+    repeat pid = sys.waitpid(job.pid, &status, 0) until pid >= 0 or sys.errno() ~= sys.EINTR
+    if pid < 0 or status ~= 0 then die('sort worker failed') end
+  end
+  retain_run(levels, job.fd)
+end
+
+local function start_run(ar: *Arena, workers: *sequence(Worker), parallel: boolean)
+  local fd = temp_run()
+  local pid: cint = -1
+  if parallel then pid = sys.fork() end
+  if pid == 0 then
+    write_run(ar, fd)
+    sys._exit(0)
+  end
+  if pid < 0 then write_run(ar, fd) end
+  workers:push({pid = pid, fd = fd})
+  free_arena(ar)
+end
+
+local function sort_files(files: sequence(string))
+  local workers: sequence(Worker)
+  local levels: sequence(cint)
+  local ar: Arena
+  local count = nthreads == 0 and 8 or nthreads
+  -- Preserve the GNU failure on impossible thread counts before reading.
+  if count > SIZE_MAX // 256 then die('memory exhausted') end
+  local available = sys.sysconf(84) -- _SC_NPROCESSORS_ONLN on Linux.
+  if available < 1 then available = 1 end
+  if count > (@uint64)(available) then count = (@uint64)(available) end
+  -- Keep descriptor use bounded even when a machine has many CPUs.
+  if count > 16 then count = 16 end
+  local budget = (sort_memory == 0 and 64 * 1024 * 1024 or sort_memory) // count
+  if budget < 4096 then budget = 4096 end
+  for i = 1, #files do
+    local src = new_source(files[i], true)
+    src_open(src)
+    while src_fill(src) do
+      for j = 1, #src.lines do
+        local l = &src.lines[j]
+        local used = ar.used + (@usize)(#ar.offs) * (#@Line * 2 + 16)
+        if #ar.offs > 0 and (used >= budget or l.len >= budget - used) then
+          start_run(&ar, &workers, count > 1)
+          if (@uint64)(#workers) >= count then collect_worker(&workers, &levels) end
+        end
+        arena_add(&ar, l)
+      end
+    end
+    src_close(src)
+    free_source(src)
+  end
+
+  local group: sequence(*Source)
+  if #workers == 0 and #levels == 0 then
+    group:push(sort_run(&ar))
+  else
+    if #ar.offs > 0 then start_run(&ar, &workers, count > 1) end
+    while #workers > 0 do collect_worker(&workers, &levels) end
+    for i = #levels, 1, -1 do
+      if levels[i] >= 0 then group:push(run_source(levels[i])) end
+    end
+  end
+  output_fd = 1
+  outname = have_outfile and outfile or 'standard output'
+  ototal = 0
+  open_output()
+  mergefps(group)
+  out_finish()
+  for i = 1, #group do free_source(group[i]) end
+  group:destroy()
+  levels:destroy()
+  workers:destroy()
+  free_arena(&ar)
 end
 
 -- check: are the lines of NAME in order? With CHECKONLY 'c', report the
@@ -1429,10 +1571,12 @@ local function specify_sort_size(optname: string, s: string)
         if pages > 0 then total = (@float64)((@uint64)(total) // (@uint64)(pages) * (@uint64)(pages)) end
       end
       local mem = total * (@float64)(n) / 100
-      if mem < 18446744073709551615.0 then e = LONGINT_OK else e = LONGINT_OVERFLOW end
+      if mem < 18446744073709551615.0 then e = LONGINT_OK; n = (@uint64)(mem) else e = LONGINT_OVERFLOW end
     end
   end
   if e ~= LONGINT_OK then xstrtol_fatal(e, optname, s) end
+  if n == 0 then n = 1 end
+  if n > sort_memory then sort_memory = n end
 end
 
 local function specify_nmerge(s: string)
@@ -1664,6 +1808,9 @@ global function applet_sort(args: sequence(string)): integer
   reverse = false; stable = false; unique = false; debug = false
   nmerge = NMERGE_DEFAULT
   nthreads = 0
+  sort_memory = 0
+  temp_dirs:clear(); next_temp = 1
+  output_fd = 1
   have_outfile = false; outfile = ''
   local gkey = key_init()
   gkey.sword = SIZE_MAX
@@ -1846,7 +1993,7 @@ global function applet_sort(args: sequence(string)): integer
       if tab >= 0 and tab ~= newtab then die('incompatible tabs') end
       tab = newtab
     elseif c == 84 then
-      -- -T DIR: temporary files are never created
+      temp_dirs:push(optarg)
     elseif c == PARALLEL_OPTION then
       specify_nthreads(optarg)
     elseif c == 117 then

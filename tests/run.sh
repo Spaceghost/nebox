@@ -145,6 +145,27 @@ same sort-hr 'printf "1K\n2000\n1M\n" | sort -hr; printf "1K\n2000\n1M\n" | sort
 same sort-u-key 'printf "01 x\n1 y\n2 z\n" | sort -nu; printf "01 x\n1 y\n" | sort -n -k1,1 -u; printf "a 1\nb 1\nc 2\n" | sort -u -k2,2; printf "a 1\nb 1\n" | sort -u -s -k2,2'
 same sort-fu 'sort -fu case.txt; printf "_\na\nA\n[\n" | sort -f; printf "x _\ny a\n" | sort -k2f'
 same sort-n-edge 'printf "+5\n3\nabc\n-2\n0\n 7\n-0\n.5\n1e3\n-.5\n0.50\n00\n-\n" | sort -n; printf "12345678901234567890\n2345678901234567890\n12345678901234567891\n" | sort -n'
+# GNU references also have C.UTF-8 installed in the test container.
+same locale-utf8-wc 'printf "é 世é\n" | LC_ALL=C.UTF-8 wc -cmwL'
+same locale-utf8-grep 'printf "élan\n日本語\nfoo\n" | LC_ALL=C.UTF-8 grep -Eio "ÉL[[:alpha:]]+|^...$"'
+same locale-utf8-grep-fixed 'printf "élan\npréélan\n" | LC_ALL=C.UTF-8 grep -Fiwo ÉLAN'
+same locale-utf8-sed 'printf "élan\n" | LC_ALL=C.UTF-8 sed "s/^./X/; s/[éÉ]/Y/g"'
+same locale-utf8-diff 'printf "Été\n" > upper; printf "été\n" > lower; LC_ALL=C.UTF-8 diff -i upper lower'
+same locale-utf8-awk 'printf "aéébé" | LC_ALL=C.UTF-8 gawk '"'"'BEGIN {RS="é+"} { print length($0), toupper($0), RT }'"'"' > reference; printf "aéébé" | LC_ALL=C.UTF-8 awk '"'"'BEGIN {RS="é+"} { print length($0), toupper($0), RT }'"'"' > actual; diff reference actual'
+expect locale-utf8-shell '2
+z
+class
+exit=0' 'LC_ALL=C.UTF-8 sh -c '"'"'x=éz; echo "${#x}"; echo "${x#?}"; case é in [[:alpha:]]) echo class;; esac'"'"''
+same locale-utf8-regex-empty 'printf "é世\n" | LC_ALL=C.UTF-8 sed "s/x*/_/g"; LC_ALL=C.UTF-8 awk '"'"'BEGIN { s="é世"; gsub(/x*/, "_", s); print s }'"'"''
+same locale-utf8-rev 'printf "é世\ná\n" | LC_ALL=C.UTF-8 rev'
+same locale-utf8-ls 'mkdir unicode; touch unicode/é unicode/日本語 unicode/apple unicode/abcdef; LC_ALL=C.UTF-8 ls -C -w 20 unicode'
+expect locale-german-sort 'a
+ä
+z
+exit=0' 'printf "z\nä\na\n" | LC_ALL=de_DE.UTF-8 sort'
+same sort-external-stable 'mkdir scratch; seq 12000 | awk "{ print \$1 % 11, \$1 }" > numbers; sort --parallel=3 -S 16K -T scratch -s -k1,1n -o numbers numbers; cksum numbers'
+same sort-external-unique-zero 'mkdir scratch; seq 12000 | awk "{ printf \"%d %s%c\", \$1 % 173, \$1, 0 }" | sort -z -S 16K --parallel=2 -T scratch -u -k1,1n | cksum'
+same sort-external-merge-output 'mkdir scratch; printf "a\nc\n" > a; printf "b\nd\n" > b; printf "c\ne\n" > c; sort -m --batch-size=2 -T scratch -o c a b c; cat c'
 same sort-o-input 'sort -o words.txt words.txt; cat words.txt; sort -n -o nums.txt nums.txt; cat nums.txt'
 same sort-empty ': > e; sort e | wc -c; sort < e | wc -c; sort -u e | wc -c'
 same sort-nonl 'sort nonl.txt | od -c; printf "b\na" | sort | od -c; printf "b\na" | sort -o out; od -c out'

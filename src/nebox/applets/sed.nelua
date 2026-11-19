@@ -15,6 +15,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.regex'
 
 local function c_realloc(p: pointer, n: csize): pointer <cimport 'realloc', cinclude '<stdlib.h>'> end
@@ -2297,7 +2298,12 @@ local function do_subst(sub: *Subst)
         again = sub.isglobal
       else
         if matched == 0 then
-          if start < line.length then matched = 1 else stop = true end
+          if start < line.length then
+            local _, used = nlocale.decode(view(lp(&line), line.length), offset)
+            matched = used
+          else
+            stop = true
+          end
         end
         if not stop then str_append(&s_accum, &line.text[line.active + (@usize)(offset)], matched) end
       end

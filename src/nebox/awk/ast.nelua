@@ -105,7 +105,8 @@ global awkast.V_ENVIRON: integer <comptime> = 14
 global awkast.V_ARGC: integer <comptime> = 15
 global awkast.V_ARGV: integer <comptime> = 16
 global awkast.V_ERRNO: integer <comptime> = 17
-global awkast.V_COUNT: integer <comptime> = 17
+global awkast.V_RT: integer <comptime> = 18
+global awkast.V_COUNT: integer <comptime> = 18
 
 global awkast.Program = @record{
   nodes: sequence(awkast.Node),
@@ -129,7 +130,7 @@ end
 
 function awkast.Program:init()
   local specials: []string = {'NF', 'NR', 'FNR', 'FS', 'OFS', 'ORS', 'RS', 'SUBSEP', 'CONVFMT',
-    'OFMT', 'FILENAME', 'RSTART', 'RLENGTH', 'ENVIRON', 'ARGC', 'ARGV', 'ERRNO'}
+    'OFMT', 'FILENAME', 'RSTART', 'RLENGTH', 'ENVIRON', 'ARGC', 'ARGV', 'ERRNO', 'RT'}
   for i: integer = 0, < #specials do self:global_id(specials[i]) end
 end
 

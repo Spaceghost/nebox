@@ -8,6 +8,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.clock'
 require 'nebox.applets.text'
 require 'nebox.applets.fs'
@@ -197,6 +198,7 @@ local function main(): integer
     util.err(name .. ': applet not found')
     return 127
   end
+  nlocale.init()
   util.applet = name
   local args: sequence(string)
   for i: integer = first, #arg do args:push(arg[i]) end

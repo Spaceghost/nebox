@@ -10,6 +10,7 @@ require 'span'
 require 'allocators.default'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.clock'
 require 'nebox.regex'
 require 'nebox.awk.lex'
@@ -238,6 +239,15 @@ local function push_field(out: *sequence(Cell), s: string)
   out:push(awkval.strnum(s, true))
 end
 
+local function read_record(reader: *awkio.Reader, out: *string): boolean
+  local rs = global_str(awkast.V_RS)
+  local re: *regex.Prog = nilptr
+  if #rs > 1 then re = dyn_regex(rs) end
+  local ok = reader:record(rs, re, out)
+  if ok then set_global_str(awkast.V_RT, reader.separator) end
+  return ok
+end
+
 -- Split on runs of blanks (FS == " "), ignoring leading and trailing ones.
 local function split_blank(text: string, out: *sequence(Cell))
   local i: usize = 0
@@ -288,10 +298,13 @@ local function split_text(text: string, fs: string, re: *regex.Prog, paragraph: 
     if fs == ' ' then split_blank(text, out); return end
     if fs.size == 1 then split_byte(text, fs:byte(1), paragraph, out); return end
     if fs.size == 0 then
-      for i: usize = 0, < text.size do
+      local i: usize = 0
+      while i < text.size do
+        local _, used = nlocale.decode(text, i)
         if not (paragraph and text.data[i] == 10) then
-          push_field(out, (@string){data = &text.data[i], size = 1})
+          push_field(out, (@string){data = &text.data[i], size = used})
         end
+        i = i + used
       end
       return
     end
@@ -698,7 +711,7 @@ end
 local function next_record(out: *string): boolean
   while not st.exiting do
     if not st.main_open and not open_next_file() then return false end
-    if st.main:record(global_str(awkast.V_RS), out) then return true end
+    if read_record(&st.main, out) then return true end
     finish_main()
   end
   return false
@@ -777,8 +790,12 @@ local function substitute(re: *regex.Prog, repl: string, text: string, occurrenc
     if not re:search(text, pos, &caps) then break end
     local ms, me = caps.at[0], caps.at[1]
     if me == ms and ms == last_end then
-      if ms < len then sb:writebyte(text.data[ms]) end
-      pos = ms + 1
+      if ms < len then
+        pos = (@isize)(nlocale.advance(text, (@usize)(ms), 1))
+        sb:write(text:subview(ms + 1, pos))
+      else
+        pos = ms + 1
+      end
       continue
     end
     seen = seen + 1
@@ -794,8 +811,12 @@ local function substitute(re: *regex.Prog, repl: string, text: string, occurrenc
       pos = me
       last_end = me
     else
-      if ms < len then sb:writebyte(text.data[ms]) end
-      pos = ms + 1
+      if ms < len then
+        pos = (@isize)(nlocale.advance(text, (@usize)(ms), 1))
+        sb:write(text:subview(ms + 1, pos))
+      else
+        pos = ms + 1
+      end
     end
     if occurrence ~= 0 and seen == occurrence then break end
   end
@@ -841,7 +862,7 @@ end
 -- without shortening n (gawk --posix and the One True AWK agree; mawk
 -- shortens).
 local function bi_substr(s: string, m: float64, n: float64, has_n: boolean): string
-  local len = (@float64)(s.size)
+  local len = (@float64)(nlocale.length(s))
   m = trunc(m)
   if m <= 0 then m = 1 end
   if m > len then return '' end
@@ -854,8 +875,9 @@ local function bi_substr(s: string, m: float64, n: float64, has_n: boolean): str
     cnt = len + 1 - m
   end
   if cnt <= 0 then return '' end
-  local a = (@isize)(m)
-  return s:subview(a, a + (@isize)(cnt) - 1)
+  local a = nlocale.advance(s, 0, (@usize)(m - 1))
+  local b = nlocale.advance(s, a, (@usize)(cnt))
+  return s:subview(a + 1, b)
 end
 
 local function bi_index(s: string, t: string): integer
@@ -866,12 +888,13 @@ local function bi_index(s: string, t: string): integer
     for j: usize = 0, < t.size do
       if s.data[i + j] ~= t.data[j] then ok = false; break end
     end
-    if ok then return (@integer)(i) + 1 end
+    if ok then return (@integer)(nlocale.length(s:subview(1, i))) + 1 end
   end
   return 0
 end
 
 local function case_map(s: string, upper: boolean): string
+  if nlocale.multibyte then return nlocale.casemap(s, upper) end
   local out = string.copy(s)
   for i: usize = 0, < out.size do
     local c = out.data[i]
@@ -988,8 +1011,8 @@ local function bi_match(n: *Node): Cell
   local caps: regex.Caps
   local rstart: float64, rlength: float64 = 0, -1
   if re:search(s, 0, &caps) then
-    rstart = (@float64)(caps.at[0]) + 1
-    rlength = (@float64)(caps.at[1] - caps.at[0])
+    rstart = (@float64)(nlocale.length(s:subview(1, caps.at[0]))) + 1
+    rlength = (@float64)(nlocale.length(s:subview(caps.at[0] + 1, caps.at[1])))
   end
   set_global_num(awkast.V_RSTART, rstart)
   set_global_num(awkast.V_RLENGTH, rlength)
@@ -999,11 +1022,11 @@ end
 local function bi_length(n: *Node): Cell
   if n.c == 0 then
     ensure_rec()
-    return awkval.num(st.rec.size)
+    return awkval.num(nlocale.length(st.rec))
   end
   local a = L(n.b)
   if node_is_array_var(a) then return awkval.num(array_of(a):count()) end
-  return awkval.num(str_of(eval(a)).size)
+  return awkval.num(nlocale.length(str_of(eval(a))))
 end
 
 local function bi_system(cmd: string): Cell
@@ -1085,7 +1108,7 @@ local function eval_getline(n: *Node): Cell
   local src = str_of(eval(n.c))
   local idx = open_in(src, n.a == 2)
   if idx < 0 then return awkval.num(-1) end
-  if not st.ins[idx]:record(global_str(awkast.V_RS), &view) then return awkval.num(0) end
+  if not read_record(&st.ins[idx], &view) then return awkval.num(0) end
   if n.b < 0 then set_record(view) else assign(n.b, awkval.strnum(view, true)) end
   if n.a == 2 then set_global_num(awkast.V_NR, global_num(awkast.V_NR) + 1) end
   return awkval.num(1)
@@ -1507,6 +1530,7 @@ local function setup(prog: *awkast.Program, argv: sequence(string), fs: string, 
   set_global_str(awkast.V_OFS, ' ')
   set_global_str(awkast.V_ORS, '\n')
   set_global_str(awkast.V_RS, '\n')
+  set_global_str(awkast.V_RT, '')
   set_global_str(awkast.V_SUBSEP, '\x1c')
   set_global_str(awkast.V_CONVFMT, '%.6g')
   set_global_str(awkast.V_OFMT, '%.6g')

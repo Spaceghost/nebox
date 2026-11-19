@@ -32,6 +32,9 @@ global lineedit.Completer = @function(line: string, cursor: integer): (sequence(
 global lineedit.Editor = @record{
   history: sequence(string),
   hist_max: integer,
+  hist_base: integer,
+  hist_end: integer,
+  vi: boolean,
   hist_file: string,
   completer: lineedit.Completer,
   -- editing state
@@ -51,6 +54,8 @@ global lineedit.Editor = @record{
   have_saved: boolean,
   raw: boolean,
 }
+
+global lineedit.active: *lineedit.Editor
 
 local function out(s: string)
   local off: usize = 0
@@ -331,12 +336,13 @@ end
 -- History
 ----------------------------------------------------------------------
 
-function lineedit.Editor:add_history(line: string)
-  if line.size == 0 or line:byte(1) == 32 then return end
+function lineedit.Editor:add_history(line: string): boolean
+  if line.size == 0 or line:byte(1) == 32 then return false end
   -- one entry per line; a multi-line command is kept as typed
-  if #self.history > 0 and self.history[#self.history] == line then return end
+  if #self.history > 0 and self.history[#self.history] == line then return false end
   self.history:push(string.copy(line))
   while #self.history > self.hist_max and #self.history > 0 do
+    self.hist_base = self.hist_base + 1
     local old = self.history:remove(1)
     old:destroy()
   end
@@ -355,6 +361,7 @@ function lineedit.Editor:add_history(line: string)
       sys.close(fd)
     end
   end
+  return true
 end
 
 function lineedit.Editor:load_history(path: string)
@@ -382,6 +389,7 @@ function lineedit.Editor:load_history(path: string)
   local e = sb:promote()
   if e.size > 0 then self.history:push(e) end
   while #self.history > self.hist_max do
+    self.hist_base = self.hist_base + 1
     local old = self.history:remove(1)
     old:destroy()
   end
@@ -423,7 +431,14 @@ end
 
 -- Read the rest of an escape sequence after ESC; returns its final form, e.g.
 -- "[A", "[3~", "[1;5C", "OH", "b" (Alt-b).
-local function read_escape(): string
+local PollFd = @record{fd: cint, events: cshort, revents: cshort}
+local function poll_fds(fds: pointer, n: culong, timeout: cint): cint <cimport 'poll', nodecl> end
+
+local function read_escape(vi: boolean): string
+  if vi then
+    local p: PollFd = {fd = 0, events = 1}
+    if poll_fds(&p, 1, 40) <= 0 then return '' end
+  end
   local c = read_byte_retry()
   if c < 0 then return '' end
   local sb: stringbuilder
@@ -597,6 +612,151 @@ local function reverse_search(self: *lineedit.Editor): (boolean, integer)
   return result == 1, result == 3 and 1 or 0
 end
 
+local Vi = @record{
+  command: boolean,
+  action: integer,
+  count: integer,
+  undo: string,
+  undo_cursor: integer,
+}
+
+local function vi_save(self: *lineedit.Editor, state: *Vi)
+  state.undo:destroy()
+  state.undo = self:text()
+  state.undo_cursor = self.cursor
+end
+
+local function vi_step(self: *lineedit.Editor, key: integer): integer
+  local at = self.cursor
+  if key == 104 then return cursor_prev(self) end     -- h
+  if key == 108 then return cursor_next(self) end     -- l
+  if key == 48 then return 0 end                      -- 0
+  if key == 36 then return #self.buf end              -- $
+  if key == 94 then                                  -- ^
+    at = 0
+    while at < #self.buf and (self.buf[at + 1] == 32 or self.buf[at + 1] == 9) do at = at + 1 end
+    return at
+  end
+  if key == 98 or key == 66 then                     -- b B
+    at = cursor_prev(self)
+    while at > 0 and self.buf[at + 1] == 32 do at = at - 1 end
+    while at > 0 and (key == 66 and self.buf[at] ~= 32 or key == 98 and
+        is_word(self.buf[at]) == is_word(self.buf[at + 1]) and self.buf[at] ~= 32) do at = at - 1 end
+    return at
+  end
+  if key == 119 or key == 87 or key == 101 or key == 69 then  -- w W e E
+    local big = key == 87 or key == 69
+    local ending = key == 101 or key == 69
+    if ending then
+      at = cursor_next(self)
+      while at < #self.buf and self.buf[at + 1] == 32 do at = at + 1 end
+    end
+    if at < #self.buf and self.buf[at + 1] ~= 32 then
+      local word = is_word(self.buf[at + 1])
+      while at < #self.buf and self.buf[at + 1] ~= 32 and
+          (big or is_word(self.buf[at + 1]) == word) do at = at + 1 end
+    end
+    if not ending then
+      while at < #self.buf and self.buf[at + 1] == 32 do at = at + 1 end
+    elseif at > 0 then
+      self.cursor = at
+      at = cursor_prev(self)
+    end
+    return at
+  end
+  return -1
+end
+
+local function vi_command(self: *lineedit.Editor, state: *Vi, c: integer)
+  if c >= 49 and c <= 57 or c == 48 and state.count > 0 then
+    if state.count < 1000 then state.count = state.count * 10 + c - 48 end
+    return
+  end
+  local count = state.count > 0 and state.count or 1
+  state.count = 0
+  local action = state.action
+  state.action = 0
+  local origin = self.cursor
+  if action ~= 0 or c == 120 or c == 88 or c == 68 or c == 67 or c == 115 or c == 83 or c == 89 then
+    local motion = c
+    if action == 0 then
+      action = 100
+      if c == 120 or c == 115 then motion = 108
+      elseif c == 88 then motion = 104
+      elseif c == 83 or c == 89 then motion = c == 83 and 99 or 121
+      else motion = 36 end
+      if c == 67 or c == 115 or c == 83 then action = 99 end
+      if c == 89 then action = 121 end
+    end
+    local limit = origin
+    if motion == action then
+      origin, limit = 0, #self.buf
+    else
+      for _ = 1, count do
+        limit = vi_step(self, motion)
+        if limit < 0 then self.cursor = origin; return end
+        self.cursor = limit
+      end
+      if motion == 101 or motion == 69 then limit = cursor_next(self) end
+      if limit < origin then limit, origin = origin, limit end
+    end
+    self.cursor = origin
+    if action == 121 then
+      local saved: stringbuilder
+      for i = origin + 1, limit do saved:writebyte(self.buf[i]) end
+      self.kill:destroy()
+      self.kill = saved:promote()
+    else
+      vi_save(self, state)
+      self.kill:destroy()
+      self.kill = cut(self, origin, limit)
+      state.command = action ~= 99
+    end
+  elseif c == 100 or c == 99 or c == 121 then
+    state.action = c
+    state.count = count
+  elseif c == 105 or c == 73 or c == 97 or c == 65 then
+    vi_save(self, state)
+    if c == 73 then self.cursor = vi_step(self, 94)
+    elseif c == 97 then self.cursor = cursor_next(self)
+    elseif c == 65 then self.cursor = #self.buf end
+    state.command = false
+  elseif c == 112 or c == 80 then
+    vi_save(self, state)
+    if c == 112 then self.cursor = cursor_next(self) end
+    for _ = 1, count do self:insert(self.kill) end
+    self.cursor = cursor_prev(self)
+  elseif c == 117 then
+    local previous, cursor = state.undo, state.undo_cursor
+    state.undo, state.undo_cursor = self:text(), self.cursor
+    self:set_text(previous)
+    self.cursor = cursor
+    previous:destroy()
+  elseif c == 107 or c == 106 or c == 45 or c == 43 then
+    history_move(self, (c == 107 or c == 45) and -count or count)
+    self.cursor = 0
+  elseif c == 114 then
+    local replacement = read_byte_retry()
+    if replacement >= 32 and replacement < 127 and self.cursor < #self.buf then
+      vi_save(self, state)
+      for _ = 1, count do
+        if self.cursor >= #self.buf then break end
+        local removed = cut(self, self.cursor, cursor_next(self))
+        removed:destroy()
+        self:insert(string.char((@byte)(replacement)))
+      end
+      self.cursor = cursor_prev(self)
+    end
+  else
+    for _ = 1, count do
+      local target = vi_step(self, c)
+      if target < 0 then break end
+      self.cursor = target
+    end
+  end
+  if state.command and self.cursor == #self.buf then self.cursor = cursor_prev(self) end
+end
+
 -- Read one line with `prompt`. Without a terminal on fd 0, prints the prompt
 -- and reads up to a newline. Returns the line (without the newline) and a
 -- READ_* status.
@@ -634,6 +794,7 @@ function lineedit.Editor:read(prompt: string): (string, integer)
   self.hist_saved = ''
   self:refresh()
   local status = lineedit.READ_OK
+  local vi: Vi
   while true do
     local c = read_byte()
     if c == -2 then                          -- a signal (SIGWINCH): re-measure and redraw
@@ -652,6 +813,8 @@ function lineedit.Editor:read(prompt: string): (string, integer)
       out('^C')
       status = lineedit.READ_INTR
       break
+    elseif self.vi and vi.command and c >= 32 then
+      vi_command(self, &vi, c)
     elseif c == 4 then                       -- Ctrl-D
       if #self.buf == 0 then status = lineedit.READ_EOF; break end
       cut(self, self.cursor, cursor_next(self))
@@ -691,8 +854,13 @@ function lineedit.Editor:read(prompt: string): (string, integer)
       if accept then break end
     elseif c == 9 then complete(self)
     elseif c == 27 then
-      local seq = read_escape()
-      if seq == '[A' or seq == 'OA' then history_move(self, -1)
+      local seq = read_escape(self.vi)
+      if self.vi and seq.size < 2 then
+        if not vi.command then self.cursor = cursor_prev(self) end
+        vi.command = true
+        vi.action, vi.count = 0, 0
+        if seq.size == 1 then vi_command(self, &vi, seq.data[0]) end
+      elseif seq == '[A' or seq == 'OA' then history_move(self, -1)
       elseif seq == '[B' or seq == 'OB' then history_move(self, 1)
       elseif seq == '[C' or seq == 'OC' then self.cursor = cursor_next(self)
       elseif seq == '[D' or seq == 'OD' then self.cursor = cursor_prev(self)
@@ -721,6 +889,7 @@ function lineedit.Editor:read(prompt: string): (string, integer)
     end
     self:refresh()
   end
+  vi.undo:destroy()
   if status ~= lineedit.READ_INTR then
     self.cursor = #self.buf
     self:refresh()

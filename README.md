@@ -56,7 +56,15 @@ per applet in `DIR`.
 
 ## Known limits
 
-Stated here rather than worked around:
+The text applets use byte semantics under `LC_ALL=C`. In UTF-8 locales,
+`wc` counts characters and display columns, `rev` reverses code points,
+and the shell matches and trims
+patterns by character, and `awk`, `grep`, `sed`, `expr` and `find -regex`
+use a multibyte regex matcher. `grep -i`, `sed`'s case-insensitive regexes
+and `diff -i` fold Unicode case. `sort`, `comm`, `join` and `ls` use
+Nelibc's available collation for ordinary string comparisons. The standalone
+locale catalog supplies C, UTF-8 character data and German collation.
+Individual applets below list the operations that still use byte semantics.
 
 - Option parsing follows glibc `getopt_long` (`util.getopt`) for the applets
   listed in `src/nebox/longopts.nelua` and for grep, fold and the coreutils
@@ -336,9 +344,8 @@ Stated here rather than worked around:
   source gives GNU's order), the last-resort comparison unless -s or -u,
   the same stable merge sort, -u keeping the first line of an equal run,
   -c/-C/`--check=` with GNU's disorder report, -m through mergefps
-  (streamed, ties to the earlier file, `--batch-size` intermediate merges
-  done in memory with GNU's grouping, an output that is also an input
-  copied first), -o created before and truncated after the input is read,
+  (streamed, ties to the earlier file, `--batch-size` controls disk-backed
+  intermediate merges, an output that is also an input copied first), -o created before and truncated after the input is read,
   -t (`\0`, multi-character and incompatible tabs), -z, obsolete `+POS1
   -POS2` keys under GNU's `_POSIX2_VERSION`/POSIXLY_CORRECT rules,
   `--files0-from`, every key-parse and ordering-incompatibility message,
@@ -349,16 +356,13 @@ Stated here rather than worked around:
   messages and statuses. `tests/sort_compare.py`: 340 fixed and 500 random
   cases, 0 mismatches (5 more runs of 3000 random cases with other seeds
   also gave 0). Differences:
-  - nebox sorts in memory in one thread and never makes temporary files.
-    -S (size suffixes and `%` of physical memory), -T, `--parallel`,
-    `--batch-size` and `--compress-program` are validated with GNU's
-    messages and limits but change nothing else, except that
-    `--batch-size` shapes -m as in GNU and a huge `--parallel` runs out of
-    memory where GNU does (allocating GNU's per-thread merge structures).
-    GNU spills inputs larger than its buffer to temporary files and merges
-    them; that gives the same output whenever the ordering is consistent,
-    but a compress program is never run, so a missing one is not reported.
-  - Only the C locale: `--debug` always reports simple byte comparison.
+  - Inputs exceeding the run budget spill to unlinked temporary files
+    selected by `-T` or `TMPDIR`. Independent runs sort in child processes
+    and merge stably in input order. `-S` sets the run budget and
+    `--parallel` sets the maximum worker count, subject to available CPUs
+    and a cap of 16. A run can hold one record larger than the budget.
+  - `--compress-program` is parsed but temporary files are uncompressed.
+    `--debug` prints the C-locale comparison message in all locales.
   - Two NaNs under -g: GNU memcmps the whole 16-byte long double, whose six
     padding bytes its compiler leaves uninitialized (sort.c's memset is a
     dead store), so their order and whether -u merges them depend on the
@@ -706,7 +710,7 @@ Stated here rather than worked around:
   trailing "/", "/." and "/.." checks and symlink-loop detection.
   `tests/realpath_compare.py`: 2042 random cases over a symlink fixture, 0
   mismatches.
-- `wc` ports wc.c (C locale): -c and -m as separate columns in GNU's order,
+- `wc` ports wc.c: -c and -m as separate columns in GNU's order,
   compute_number_width, `--files0-from`, the bytes-only path that honours
   the file offset, counts printed after read errors. `id` ports id.c and
   group-list.c over nelibc's passwd/group functions: USER operands, -u -g
@@ -739,9 +743,11 @@ Stated here rather than worked around:
   empty files. In `BEGINFILE`, `ERRNO` and `nextfile` can skip an unreadable
   file. GNU extension cases use gawk without `--posix`.
   Remaining gaps include `**`, `IGNORECASE`, `-e`, long
-  options, the `PROCINFO["strftime"]` override and a regex `RS` (only the
-  first byte is used). Strings, collation and character classes use the C
-  locale. Hexadecimal/`inf`/`nan` spellings in numeric strings are
+  options, the `PROCINFO["strftime"]` override and locale-specific string
+  collation. A multi-character `RS` is a streaming regular expression.
+  `RT` contains the actual separator, including blank-line separators.
+  Empty matches are skipped. In UTF-8 locales, string lengths, positions
+  and case conversion use characters. Hexadecimal/`inf`/`nan` spellings in numeric strings are
   strings (gawk treats "0x1A" as 26). Choices where references disagree:
   every error exits 2 (gawk exits 1 for syntax errors and division by
   zero); `cmd | getline` increments NR as the POSIX table says (gawk and
@@ -780,7 +786,7 @@ Stated here rather than worked around:
   continue eval exec exit export readonly return set shift times trap
   unset`) and the regular ones a shell must provide (`alias cd command
   echo false getopts hash kill pwd read test [ true type umask unalias
-  wait`, plus `printf` through the `printf` applet); traps, `set -e`
+  wait fc`, plus `printf` through the `printf` applet); traps, `set -e`
   exceptions, `$!`/`wait` for asynchronous lists, `LINENO`, and
   diagnostics as `sh: line N: ...`. Interactive use (`-i`, or no command
   operand with a terminal on stdin and stderr; `src/nebox/sh/interactive.nelua`
@@ -813,9 +819,11 @@ Stated here rather than worked around:
   resource options and soft/hard selection. Children inherit the limit.
   Changes in a subshell stay in that subshell. Overflowing decimal values
   are rejected before they reach the kernel.
-  Unimplemented: `fc`, vi mode, locales and multibyte characters
-  (bytes only, C-locale classes and byte
-  order for globbing). Not POSIX and refused: `local`, `;&` in `case`,
+  `fc` lists, edits and re-executes command history with numeric, relative
+  and prefix selectors. `set -o vi` enables vi insert and command modes
+  with history navigation, motions, delete/change/yank, put, replace and
+  undo. `set -o emacs` restores Emacs keys. Field splitting still treats
+  `IFS` as bytes. Not POSIX and refused: `local`, `;&` in `case`,
   `${!name}` and other bash expansions (an invalid `${...}` is reported
   when it is expanded, as dash does). Choices where dash differs:
   `"${@#p}"`/`"${@%p}"` apply to every positional parameter (dash: only the
@@ -845,11 +853,9 @@ Stated here rather than worked around:
   bounded to 65536 simultaneous states and stop with "pattern too complex"
   (grep exit 2, sed exit 4, expr exit 2) where GNU keeps searching
   (`re-too-complex*`; `re-pathological-backref` stays within the bound).
-  Not implemented: multibyte locales (bytes only; `-i` folds ASCII; the test
-  harness runs in the C locale, so this has no case), and outside grep and
-  sed equivalence classes `[=a=]` and collating symbols `[.a.]` (grep's
-  parsers take single-character ones as glibc does, `grep-equiv`; sed's
-  through `regex.compile_posix`). sed compiles through
+  The UTF-8 path uses code points for ranges and Nelibc's character classes.
+  Equivalence classes `[=a=]` and collating symbols `[.a.]` are supported
+  for single characters by grep and sed's C-locale parsers. sed compiles through
   `regex.compile_posix`, a port of glibc's regcomp.c parser (peek_token,
   parse_reg_exp, parse_branch, parse_expression, parse_dup_op,
   parse_bracket_exp) for RE_SYNTAX_POSIX_BASIC and _EXTENDED with sed's
@@ -999,8 +1005,8 @@ Stated here rather than worked around:
     supported in a --disable-perl-regexp build", status 2).
   - `--help` omits GNU's bug-report paragraph; `--version` prints nebox's
     line.
-  - Only the C locale: no multibyte characters or encoding errors, so a
-    byte above 127 never makes a file binary (as in GNU's C locale).
+  - NUL bytes drive binary-file detection. Invalid UTF-8 by itself does
+    not classify a file as binary.
   - A pattern with back-references that needs more than 65536 simultaneous
     states stops with "pattern too complex" (status 2) where GNU keeps
     searching (`re-too-complex`). Back-references are matched exactly
@@ -1203,13 +1209,15 @@ Stated here rather than worked around:
   - SELinux contexts are the raw `security.selinux` attribute (no
     libselinux translation, no SMACK); without one, -Z shows `?` and -l no
     `.` marker, as GNU does on a system without SELinux.
-  - Only the C locale: no multibyte widths, `locale` and `posix-` styles
-    give the C formats, names compare bytewise.
+  - `locale` and `posix-` time styles use C date formats. UTF-8 file
+    names use terminal-cell widths.
   - Files are examined with stat/lstat; statx (with AT_NO_AUTOMOUNT) is
     used only for birth times, so listing an automount point may trigger it.
   - The color restore on SIGINT/SIGTSTP is ported but untested: the test
     pseudo-terminal is not a controlling terminal.
-  - User and group names come from nelibc's getpwuid/getgrgid.
+  - User and group names come from Nelibc's `getpwuid` and `getgrgid`.
+    Nelibc with nscd support can resolve names supplied by its system
+    account service, with local file fallback.
 - `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `printf` (the applet and the `sh` builtin) ports printf.c: escapes
   including \u/\U (gnulib's \uXXXX fallback in the C locale), `%b`, `%q`,

@@ -58,7 +58,7 @@ local function expand_prompt(ps: string, bang: boolean): string
       if i + 1 < s.size and s.data[i + 1] == 33 then
         sb:writebyte(33); i = i + 2
       else
-        sb:write(#editor.history + 1); i = i + 1
+        sb:write(editor.hist_base + #editor.history + 1); i = i + 1
       end
     else
       sb:writebyte(c); i = i + 1
@@ -73,6 +73,7 @@ local function read_line(first: boolean): (string, boolean)
   local prompt: string
   if first then prompt = expand_prompt(getvar_or('PS1', '$ '), true)
   else prompt = expand_prompt(getvar_or('PS2', '> '), false) end
+  editor.vi = shst.o_vi
   local line, st = editor:read(prompt)
   prompt:destroy()
   if st == lineedit.READ_EOF then return '', false end
@@ -344,6 +345,7 @@ function shint.run(lx: *shlex.Lexer)
   shexec.set_handler(28, 2)  -- SIGWINCH: interrupts the editor's read so it redraws
   for fd: cint = 0, 2 do std_saved[fd] = sys.fcntl(fd, sys.F_DUPFD_CLOEXEC, 100) end
   editor:init()
+  lineedit.active = &editor
   local hs, hset = shexec.getvar('HISTSIZE')
   if hset then
     local n, ok = util.toint(hs)
@@ -382,6 +384,7 @@ function shint.run(lx: *shlex.Lexer)
       end
       break
     end
+    editor.hist_end = #editor.history
     -- the text of the command, for the history
     if #lx.srcs > 0 then
       local src = &lx.srcs[1]
@@ -392,7 +395,7 @@ function shint.run(lx: *shlex.Lexer)
         for k: usize = s0, < e do sb:writebyte(src.data[k]) end
         local t = sb:promote()
         while t.size > 0 and (t.data[t.size - 1] == 10 or t.data[t.size - 1] == 32) do t.size = t.size - 1 end
-        editor:add_history(t)
+        if editor:add_history(t) then editor.hist_end = #editor.history - 1 end
         shst.cmd_text = t
       end
     end

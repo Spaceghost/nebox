@@ -16,6 +16,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 
 local SIGTERM: cint <comptime> = 15
 local SA_RESTART: cint <comptime> = 0x10000000
@@ -57,30 +58,43 @@ local err = false
 local err_errno: cint = 0
 local EILSEQ: cint <comptime> = 84
 
--- next character, -1 at end of file, -2 on an error
+-- Fetch input while keeping any incomplete character at the buffer edge.
+local function refill(): boolean
+  if eof or err then return false end
+  local remaining = rlen - rpos
+  for i = 0, < remaining do rbuf[i] = rbuf[rpos + i] end
+  rlen, rpos = remaining, 0
+  local received: isize
+  repeat
+    received = sys.read(fd, &rbuf[remaining], #rbuf - remaining)
+  until received >= 0 or sys.errno() ~= sys.EINTR
+  if received < 0 then
+    err = true
+    err_errno = sys.errno()
+    return false
+  end
+  if received == 0 then eof = true; return false end
+  rlen = rlen + received
+  return true
+end
+
+-- Next character, -1 at end of file, -2 on an encoding or I/O error.
 local function getwc(): integer
   if err then return -2 end
-  if rpos >= rlen then
-    if eof then return -1 end
-    while true do
-      local r = sys.read(fd, &rbuf[0], #rbuf)
-      if r < 0 then
-        if sys.errno() == sys.EINTR then continue end
-        err = true; err_errno = sys.errno()
+  if rpos >= rlen and not refill() then return err and -2 or -1 end
+  while true do
+    local text: string = {data = &rbuf[0], size = (@usize)(rlen)}
+    local wc, used, partial = nlocale.decode(text, (@usize)(rpos))
+    if not partial or not refill() then
+      if wc == nlocale.INVALID or (not nlocale.multibyte and wc >= 128) then
+        if not err then err = true; err_errno = EILSEQ end
         return -2
       end
-      if r == 0 then eof = true; return -1 end
-      rlen = r; rpos = 0
-      break
+      rpos = rpos + (@integer)(used)
+      return wc
     end
   end
-  local c = rbuf[rpos]
-  if c >= 128 then
-    err = true; err_errno = EILSEQ
-    return -2
-  end
-  rpos = rpos + 1
-  return c
+  return -1
 end
 
 local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
@@ -89,7 +103,7 @@ local function c_free(p: pointer) <cimport 'free', cinclude '<stdlib.h>'> end
 -- buf holds what was read; bufsiz is the size rev.c believes it has (in
 -- wide characters), each doubling tried as an untouched allocation of
 -- that many wchar_t, so an impossible one fails as xrealloc does
-local buf: sequence(byte)
+local buf: sequence(cuint)
 local bufsiz: uint64 = 8192
 
 local function ensure(n: integer)
@@ -112,7 +126,7 @@ local function fgetws(off: integer, nz: uint64): boolean
     if c == -1 then break end
     if c == -2 then failed = true; break end
     ensure(off + count + 2)
-    buf[off + count + 1] = (@byte)(c)
+    buf[off + count + 1] = (@cuint)(c)
     count = count + 1
     if c == 10 then break end
   end
@@ -238,7 +252,17 @@ For more details see rev(1).
           lo = lo + 1; hi = hi - 1
         end
         local k = 1
-        while k <= #buf and buf[k] ~= 0 do obyte(buf[k]); k = k + 1 end
+        while k <= #buf and buf[k] ~= 0 do
+          local wc = buf[k]
+          if wc < 128 then
+            obyte((@byte)(wc))
+          else
+            local encoded: [16]byte
+            local size = nlocale.encode(&encoded[0], wc)
+            for i: usize = 0, < size do obyte(encoded[i]) end
+          end
+          k = k + 1
+        end
         line = line + 1
       end
       if err then

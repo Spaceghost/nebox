@@ -87,6 +87,7 @@ global shexec.State = @record{
   o_noexec: boolean, o_nounset: boolean, o_verbose: boolean, o_xtrace: boolean,
   o_notify: boolean, o_hashall: boolean,
   o_monitor: boolean,
+  o_vi: boolean,
   -- job control: the controlling terminal, the shell's own group and modes
   tty: cint,
   shell_pgid: cint,

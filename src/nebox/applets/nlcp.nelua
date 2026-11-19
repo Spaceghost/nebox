@@ -7,6 +7,7 @@ require 'sequence'
 require 'stringbuilder'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.regex'
 require 'allocators.default'
 
@@ -261,6 +262,11 @@ end
 -- comm ---------------------------------------------------------------------
 local function memcmp2(a: *sequence(byte), alen: integer, b: *sequence(byte), blen: integer): integer
   local x, y = $a, $b
+  if nlocale.collating then
+    local left: string = {data = &x[1], size = (@usize)(alen)}
+    local right: string = {data = &y[1], size = (@usize)(blen)}
+    return nlocale.compare(left, right)
+  end
   local n = alen < blen and alen or blen
   for k = 1, n do
     if x[k] ~= y[k] then return (@integer)(x[k]) - (@integer)(y[k]) end
