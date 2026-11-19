@@ -1458,20 +1458,24 @@ local function sort_files(files: sequence(string))
   local workers: sequence(Worker)
   local levels: sequence(cint)
   local ar: Arena
-  local count = nthreads == 0 and 8 or nthreads
-  -- Preserve the GNU failure on impossible thread counts before reading.
-  if count > SIZE_MAX // 256 then die('memory exhausted') end
+  local count: uint64 = nthreads
+  if count == 0 then count = 8 end
+  -- GNU allocates the merge workers only when there is input to sort.
+  local oversized = count > SIZE_MAX // 256
   local available = sys.sysconf(84) -- _SC_NPROCESSORS_ONLN on Linux.
   if available < 1 then available = 1 end
   if count > (@uint64)(available) then count = (@uint64)(available) end
   -- Keep descriptor use bounded even when a machine has many CPUs.
   if count > 16 then count = 16 end
-  local budget = (sort_memory == 0 and 64 * 1024 * 1024 or sort_memory) // count
+  local budget: uint64 = sort_memory
+  if budget == 0 then budget = 64 * 1024 * 1024 end
+  budget = budget // count
   if budget < 4096 then budget = 4096 end
   for i = 1, #files do
     local src = new_source(files[i], true)
     src_open(src)
     while src_fill(src) do
+      if oversized then die('memory exhausted') end
       for j = 1, #src.lines do
         local l = &src.lines[j]
         local used = ar.used + (@usize)(#ar.offs) * (#@Line * 2 + 16)
