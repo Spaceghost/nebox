@@ -5,7 +5,6 @@
 -- backward as glibc re_search does with re_syntax_options 0 (Emacs syntax:
 -- \( \) \| groups and alternation, + and ? operators, no intervals, ^ and $
 -- anchors only in context, newline anchors), translated for nebox's engine.
--- One difference: in that syntax [^...] matches a newline; here it does not.
 ## pragmas.nogc = true
 
 require 'string'
@@ -328,7 +327,7 @@ global function applet_tac(args: sequence(string)): integer
     -- glibc reports a pattern that ends right after "[" or "[^" as REG_BADPAT
     local tr, early_end = translate(separator)
     if early_end then die('Invalid regular expression') end
-    prog, e = regex.compile_nl(tr, true, false, true, true)
+    prog, e = regex.compile_opts(tr, true, false, true, true, regex.NEGATED_NEWLINE)
     if #e > 0 then die(e) end
   else
     sentinel_length = #separator > 0 and #separator or 1

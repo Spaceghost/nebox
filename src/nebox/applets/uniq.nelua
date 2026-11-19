@@ -7,6 +7,7 @@ require 'string'
 require 'sequence'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 
@@ -85,9 +86,8 @@ local function find_field(line: *sequence(byte)): integer
     while i < size and not field_sep(t[i + 1]) do i = i + 1 end
     count = count + 1
   end
-  local rest = (@uint64)(size - i)
-  i = i + (@integer)(skip_chars < rest and skip_chars or rest)
-  return i
+  local text: string = {data = &t[1], size = (@usize)(size)}
+  return (@integer)(nlocale.advance(text, (@usize)(i), (@usize)(skip_chars)))
 end
 
 local function upper(c: byte): byte
@@ -96,6 +96,18 @@ local function upper(c: byte): byte
 end
 
 local function different(a: *sequence(byte), aoff: integer, alen: integer, b: *sequence(byte), boff: integer, blen: integer): boolean
+  if nlocale.multibyte then
+    local left: string = {data = &($a)[aoff + 1], size = (@usize)(alen)}
+    local right: string = {data = &($b)[boff + 1], size = (@usize)(blen)}
+    left.size = nlocale.advance(left, 0, (@usize)(check_chars))
+    right.size = nlocale.advance(right, 0, (@usize)(check_chars))
+    if not ignore_case then return left ~= right end
+    local folded_left, folded_right = nlocale.casemap(left, false), nlocale.casemap(right, false)
+    local unequal = folded_left ~= folded_right
+    folded_left:destroy()
+    folded_right:destroy()
+    return unequal
+  end
   if check_chars < (@uint64)(alen) then alen = (@integer)(check_chars) end
   if check_chars < (@uint64)(blen) then blen = (@integer)(check_chars) end
   if alen ~= blen then return true end

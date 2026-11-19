@@ -271,6 +271,7 @@ same awk-bracket-slash 'awk '"'"'BEGIN { print ("/"~/[/]/), ("]"~/[]/]/), ("/"~/
 
 # GNU extensions use gawk without the compatibility flag.
 printf '#!/bin/sh\nexec gawk "$@"\n' > "$W/refbin/awk"
+REFPATH="$W/refbin:"
 same awk-gensub 'awk '"'"'BEGIN { t="abc 12 ab 34"; print gensub(/([a-z]+) ([0-9]+)/,"<\\2:\\1:&: \\0>","g",t); print gensub(/[a-z]+/,"X",2,t),t; print gensub(/(a)?b/,"<\\1,\\7>","G","b ab"); print gensub(//,"X","g","abc"); print gensub(/a/,"X",10,"abc") }'"'"''
 same awk-gensub-record 'printf "a b a\nc\n" | awk '"'"'{ print gensub(/a/,"z",2),$0; print gensub(/a/,"<\\q\\&\\>","g") }'"'"''
 same awk-strftime 'TZ=EST5 awk '"'"'BEGIN { print strftime("%F %T %Z %z",0); print strftime("%F %T %Z %z",-1,1); print "[" strftime("",0) "]"; print systime()>0; print length(strftime())>10 }'"'"''
@@ -291,3 +292,10 @@ same awk-regexp-record-anchors 'printf "ABAB\nZZ" | awk '"'"'BEGIN { RS="^AB|ZZ$
 same awk-regexp-record-boundary 'awk '"'"'BEGIN { for(i=0;i<65534;i++) printf "q"; printf "XYYYYend" }'"'"' | awk '"'"'BEGIN {RS="XYY+"} {print length($0), "["RT"]"}'"'"''
 same awk-regexp-record-switch 'printf "a::b,c::d" | awk '"'"'BEGIN {RS="::"} {print $0,RT; RS=(NR%2 ? "," : "::")}'"'"''
 same awk-regexp-record-getline 'printf "a::b::c" > input; awk '"'"'BEGIN {RS="::"; while ((getline v < "input") > 0) print v, "["RT"]"; close("input")}'"'"''
+
+same awk-power-operator 'awk '"'"'BEGIN { x=2; x**=3; print 2**3**2, x, -2**2, 2**-1 }'"'"''
+same awk-program-fragment-order 'printf "BEGIN { print 2 }\n" > fragment; awk --source '"'"'BEGIN {print 1}'"'"' --file fragment -e '"'"'BEGIN {print 3}'"'"''
+same awk-ignorecase-dynamic 'printf "xAayBBz" | awk '"'"'BEGIN { IGNORECASE=1; RS="A+|B+" } {print $0,RT} END { print ("a"=="A"), ("a"~/A/), ("a"~"A"), index("ba", "A"); IGNORECASE=0; print ("a"=="A"), ("a"~/A/), ("a"~"A") }'"'"''
+same awk-ignorecase-utf8 'printf "firstÉÉsecond\n" | LC_ALL=C.UTF-8 awk '"'"'BEGIN { IGNORECASE=1; FS="é+" } {print NF,$1,$2,("É"=="é"),("é"~/É/),index("xé", "É")}'"'"''
+expect awk-locale-relational '1 0
+exit=0' 'LC_ALL=de_DE.UTF-8 awk '"'"'BEGIN { print ("ä" < "z"), ("ä" == "a") }'"'"''

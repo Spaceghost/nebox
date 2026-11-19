@@ -101,7 +101,9 @@ function Parser:regex_node(text: string): integer
   local prog, err = regex.compile(text, true, false)
   if err.size > 0 then self:fail('bad regular expression /' .. text .. '/: ' .. err) end
   self.prog.regexes:push(prog)
-  return self:mk(awkast.REGEX, #self.prog.regexes, 0, 0, 0)
+  local node = self:mk(awkast.REGEX, #self.prog.regexes, 0, 0, 0)
+  self.prog.nodes[node].s = text
+  return node
 end
 
 function Parser:parse_expr(): integer <forwarddecl> end

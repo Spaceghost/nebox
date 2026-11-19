@@ -592,7 +592,7 @@ global function applet_seq(args: sequence(string)): integer
       local eq = body:find('=', 1, true)
       local has_value = eq > 0
       if has_value then name = body:sub(1, eq - 1); value = body:sub(eq + 1) end
-      local longs: [3]string = {'equal-width', 'format', 'separator'}
+      local longs: [5]string = {'equal-width', 'format', 'separator', 'help', 'version'}
       local match: string = ''
       local count = 0
       for _, l in ipairs(longs) do
@@ -603,7 +603,23 @@ global function applet_seq(args: sequence(string)): integer
         return seq_usage_fail((count == 0 and "unrecognized option '" or "option '") .. a ..
           (count == 0 and "'" or "' is ambiguous"))
       end
-      if match == 'equal-width' then
+      if match == 'help' or match == 'version' then
+        if has_value then return seq_usage_fail("option '--" .. match .. "' doesn't allow an argument") end
+        if match == 'version' then
+          util.line('seq (nebox) after GNU coreutils 9.1')
+        else
+          util.line([[Usage: seq [OPTION]... LAST
+  or:  seq [OPTION]... FIRST LAST
+  or:  seq [OPTION]... FIRST INCREMENT LAST
+Print numbers between FIRST and LAST, stepping by INCREMENT.
+  -f, --format=FORMAT       use a floating-point printf format
+  -s, --separator=STRING    separate numbers with STRING
+  -w, --equal-width        pad numbers with leading zeros
+      --help               display this help
+      --version            display version information]])
+        end
+        return util.flush() and 0 or 1
+      elseif match == 'equal-width' then
         if has_value then return seq_usage_fail("option '--equal-width' doesn't allow an argument") end
         equal = true
       else

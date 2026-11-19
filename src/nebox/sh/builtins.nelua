@@ -10,6 +10,7 @@ require 'stringbuilder'
 require 'hashmap'
 require 'nebox.sys'
 require 'nebox.util'
+require 'nebox.locale'
 require 'nebox.sh.ast'
 require 'nebox.sh.lex'
 require 'nebox.sh.parse'
@@ -596,12 +597,6 @@ local function bi_pwd(args: sequence(string)): integer
   return 0
 end
 
-local function read_ws(sep: string, c: byte): boolean
-  return (c == 32 or c == 9 or c == 10) and shexp.has_byte(sep, c)
-end
-local function read_sep(sep: string, c: byte): boolean
-  return shexp.has_byte(sep, c)
-end
 local function index_of(s: string, c: byte): isize
   for i: usize = 0, < s.size do
     if s.data[i] == c then return (@isize)(i) + 1 end
@@ -658,41 +653,57 @@ local function bi_read(args: sequence(string)): integer
   if not set then sep = ' \t\n' end
   local n = (@integer)(text.size)
   local pos: integer = 0
-  -- skip leading IFS whitespace
-  while pos < n and not escaped[pos + 1] and read_ws(sep, text.data[pos]) do pos = pos + 1 end
-  for vi = 1, #names do
-    local last = vi == #names
-    local sb: stringbuilder
-    if last then
-      -- the rest of the line, trailing IFS whitespace removed
-      local stop = n
-      while stop > pos and not escaped[stop] and read_ws(sep, text.data[stop - 1]) do stop = stop - 1 end
-      -- if the rest is one field ended by a non-whitespace IFS delimiter,
-      -- that delimiter (and IFS whitespace before it) is not part of it
-      if stop > pos and not escaped[stop] and read_sep(sep, text.data[stop - 1]) then
-        local e = stop - 1
-        while e > pos and not escaped[e] and read_ws(sep, text.data[e - 1]) do e = e - 1 end
-        local inner = false
-        for k = pos, < e do
-          if not escaped[k + 1] and read_sep(sep, text.data[k]) then inner = true; break end
-        end
-        if not inner then stop = e end
+  local separators: sequence(integer)
+  separators:resize(text.size)
+  local at: usize = 0
+  while at < text.size do
+    local width = shexp.ifs_separator(text, at, sep)
+    if width > 0 then
+      local unquoted = true
+      for j: usize = 0, < width do
+        if escaped[at + j + 1] then unquoted = false; break end
       end
-      for k = pos, < stop do sb:writebyte(text.data[k]) end
+      if unquoted then
+        if shexp.ifs_whitespace(text.data[at]) then separators[at + 1] = -1
+        else separators[at + 1] = (@integer)(width) end
+      end
+    end
+    at = nlocale.advance(text, at, 1)
+  end
+  while pos < n and separators[pos + 1] == -1 do pos = pos + 1 end
+  for vi = 1, #names do
+    local sb: stringbuilder
+    if vi == #names then
+      -- Remove trailing IFS whitespace and a single final delimiter.
+      local stop = n
+      while stop > pos and separators[stop] == -1 do stop = stop - 1 end
+      if stop > pos then
+        local sep_start = (@integer)(nlocale.previous(text, (@usize)(stop)))
+        if separators[sep_start + 1] > 0 then
+          local e = sep_start
+          while e > pos and separators[e] == -1 do e = e - 1 end
+          local inner = false
+          for k = pos, < e do
+            if separators[k + 1] ~= 0 then inner = true; break end
+          end
+          if not inner then stop = e end
+        end
+      end
+      sb:write(text:subview(pos + 1, stop))
       pos = n
     else
-      while pos < n and (escaped[pos + 1] or not read_sep(sep, text.data[pos])) do
-        sb:writebyte(text.data[pos]); pos = pos + 1
-      end
-      -- delimiter: IFS whitespace run, optionally one non-whitespace separator, more whitespace
-      while pos < n and not escaped[pos + 1] and read_ws(sep, text.data[pos]) do pos = pos + 1 end
-      if pos < n and not escaped[pos + 1] and read_sep(sep, text.data[pos]) and not read_ws(sep, text.data[pos]) then
-        pos = pos + 1
-        while pos < n and not escaped[pos + 1] and read_ws(sep, text.data[pos]) do pos = pos + 1 end
+      local start = pos
+      while pos < n and separators[pos + 1] == 0 do pos = pos + 1 end
+      sb:write(text:subview(start + 1, pos))
+      while pos < n and separators[pos + 1] == -1 do pos = pos + 1 end
+      if pos < n and separators[pos + 1] > 0 then
+        pos = pos + separators[pos + 1]
+        while pos < n and separators[pos + 1] == -1 do pos = pos + 1 end
       end
     end
     shexec.setvar(names[vi], sb:promote())
   end
+  separators:destroy()
   if eof then return 1 end
   return 0
 end

@@ -24,7 +24,7 @@ require 'nebox.diff_format'
 
 local Opt = @record{
   fmt: byte,          -- normal, context, unified, ed, ifdef, or side by side
-  context: integer,
+  context: integer, horizon: integer, minimal: boolean, initial_tab: boolean,
   icase: boolean, space_change: boolean, all_space: boolean, blank_lines: boolean,
   text: boolean, new_file: boolean, brief: boolean, same: boolean, recursive: boolean,
   labels: sequence(string), excludes: sequence(string),
@@ -278,7 +278,7 @@ local function compareseq(c: *Ctx, xoff: integer, xlim: integer, yoff: integer, 
 end
 
 -- discard_confusing_lines: equivs over the middle regions, counts per class.
-local function discard_confusing(c: *Ctx, eq: *[2]IArr, len: *[2]integer, nclass: integer)
+local function discard_confusing(c: *Ctx, eq: *[2]IArr, len: *[2]integer, nclass: integer, minimal: boolean)
   local counts: [2]IArr = {iarr(0, nclass), iarr(0, nclass)}
   for f = 0, 1 do
     for i = 0, < len[f] do
@@ -375,7 +375,7 @@ local function discard_confusing(c: *Ctx, eq: *[2]IArr, len: *[2]integer, nclass
     local j = 0
     local changed = f == 0 and &c.changed0 or &c.changed1
     for i = 0, < len[f] do
-      if discards[f]:get(i) == 0 then
+      if minimal or discards[f]:get(i) == 0 then
         und[f]:set(j, eq[f]:get(i))
         real[f]:set(j, i)
         j = j + 1
@@ -396,7 +396,7 @@ local function discard_confusing(c: *Ctx, eq: *[2]IArr, len: *[2]integer, nclass
   c.too_expensive = 1
   while diags ~= 0 do c.too_expensive = c.too_expensive << 1; diags = diags >> 2 end
   if c.too_expensive < 4096 then c.too_expensive = 4096 end
-  compareseq(c, 0, nx, 0, ny, false)
+  compareseq(c, 0, nx, 0, ny, minimal)
 end
 
 local function shift_boundaries(changed: *[2]*IArr, eq: *[2]IArr, len: *[2]integer)
@@ -541,7 +541,7 @@ local function analyze(o: *Opt, a: *DFile, b: *DFile, horizon: integer): sequenc
   local c: Ctx
   c.changed0 = iarr(-1, len[0] + 1)
   c.changed1 = iarr(-1, len[1] + 1)
-  discard_confusing(&c, &eq, &len, nclass)
+  discard_confusing(&c, &eq, &len, nclass, o.minimal)
   local changed: [2]*IArr = {&c.changed0, &c.changed1}
   shift_boundaries(&changed, &eq, &len)
   local out: sequence(Change)
@@ -585,9 +585,38 @@ end
 
 local ed_mode = false   -- ed scripts have no "\ No newline" marker
 
-local function put_line(prefix: string, f: *DFile, i: integer)
-  util.write(prefix)
-  util.write(f.lines[i + 1])
+local function put_text(o: *Opt, text: string)
+  if not o.expand_tabs then util.write(text); return end
+  local column: integer = 0
+  local i: usize = 0
+  while i < text.size do
+    local wc, used = nlocale.decode(text, i)
+    if wc == 9 then
+      local spaces = o.tabsize - column % o.tabsize
+      for _ = 1, spaces do util.writebyte(32) end
+      column = column + spaces
+    else
+      util.writebytes(&text.data[i], used)
+      if wc == 13 then column = 0
+      elseif wc == 8 then
+        if column > 0 then column = column - 1 end
+      else
+        local width = nlocale.width(wc)
+        if width > 0 then column = column + width end
+      end
+    end
+    i = i + used
+  end
+end
+
+local function put_line(o: *Opt, prefix: string, f: *DFile, i: integer)
+  if o.initial_tab and prefix.size > 0 then
+    if prefix ~= ' ' then util.writebyte(prefix.data[0]) end
+    util.writebyte(9)
+  else
+    util.write(prefix)
+  end
+  put_text(o, f.lines[i + 1])
   util.writebyte(10)
   if f.incomplete and i == #f.lines - 1 and not ed_mode then util.write('\\ No newline at end of file\n') end
 end
@@ -676,7 +705,7 @@ local function hunks(ch: *sequence(Change), context: integer): sequence(integer)
   return starts
 end
 
-local function print_normal(a: *DFile, b: *DFile, ch: *sequence(Change))
+local function print_normal(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
   for k = 1, #ch do
     local f0, l0, f1, l1, changes = hunk_range(ch, k, k)
     if changes == 0 then continue end
@@ -684,13 +713,13 @@ local function print_normal(a: *DFile, b: *DFile, ch: *sequence(Change))
     util.writebyte(changes == OLD and 100 or (changes == NEW and 97 or 99))
     num_range(f1, l1)
     util.writebyte(10)
-    if changes & OLD ~= 0 then for i = f0, l0 do put_line('< ', a, i) end end
+    if changes & OLD ~= 0 then for i = f0, l0 do put_line(o, '< ', a, i) end end
     if changes == OLD | NEW then util.write('---\n') end
-    if changes & NEW ~= 0 then for i = f1, l1 do put_line('> ', b, i) end end
+    if changes & NEW ~= 0 then for i = f1, l1 do put_line(o, '> ', b, i) end end
   end
 end
 
-local function print_ed(a: *DFile, b: *DFile, ch: *sequence(Change))
+local function print_ed(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
   for k = #ch, 1, -1 do
     local f0, l0, f1, l1, changes = hunk_range(ch, k, k)
     if changes == 0 then continue end
@@ -706,7 +735,7 @@ local function print_ed(a: *DFile, b: *DFile, ch: *sequence(Change))
           util.write('..\n.\ns/.//\n')
           insert_mode = false
         else
-          put_line('', b, i)
+          put_line(o, '', b, i)
         end
       end
       if insert_mode then util.write('.\n') end
@@ -761,11 +790,11 @@ local function print_unified(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change
     local i, j = f0, f1
     while i <= l0 or j <= l1 do
       if nx > h1 or i < ch[nx].line0 then
-        put_line(' ', a, i)
+        put_line(o, ' ', a, i)
         i = i + 1; j = j + 1
       else
-        for _ = 1, ch[nx].deleted do put_line('-', a, i); i = i + 1 end
-        for _ = 1, ch[nx].inserted do put_line('+', b, j); j = j + 1 end
+        for _ = 1, ch[nx].deleted do put_line(o, '-', a, i); i = i + 1 end
+        for _ = 1, ch[nx].inserted do put_line(o, '+', b, j); j = j + 1 end
         nx = nx + 1
       end
     end
@@ -788,7 +817,7 @@ local function print_context(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change
         while nx <= h1 and ch[nx].line0 + ch[nx].deleted <= i do nx = nx + 1 end
         local prefix: string = '  '
         if nx <= h1 and ch[nx].line0 <= i then prefix = ch[nx].inserted > 0 and '! ' or '- ' end
-        put_line(prefix, a, i)
+        put_line(o, prefix, a, i)
       end
     end
     util.write('--- '); ctx_range(f1, l1); util.write(' ----\n')
@@ -798,13 +827,13 @@ local function print_context(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change
         while nx <= h1 and ch[nx].line1 + ch[nx].inserted <= j do nx = nx + 1 end
         local prefix: string = '  '
         if nx <= h1 and ch[nx].line1 <= j then prefix = ch[nx].deleted > 0 and '! ' or '+ ' end
-        put_line(prefix, b, j)
+        put_line(o, prefix, b, j)
       end
     end
   end
 end
 
-local function print_rcs(b: *DFile, ch: *sequence(Change))
+local function print_rcs(o: *Opt, b: *DFile, ch: *sequence(Change))
   for i = 1, #ch do
     local change = &ch[i]
     if change.ignore then continue end
@@ -812,7 +841,7 @@ local function print_rcs(b: *DFile, ch: *sequence(Change))
     if change.inserted > 0 then
       util.writef('a%d %d\n', change.line0 + change.deleted, change.inserted)
       for j = change.line1 + 1, change.line1 + change.inserted do
-        util.write(b.lines[j])
+        put_text(o, b.lines[j])
         if j < #b.lines or not b.missing_nl then util.writebyte(10) end
       end
     end
@@ -1011,6 +1040,7 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
     return 1
   end
   local horizon = (o.fmt == 99 or o.fmt == 117) and o.context or 0
+  if o.horizon > horizon then horizon = o.horizon end
   local ch = analyze(o, &a, &b, horizon)
   local any = false
   for k = 1, #ch do if not ch[k].ignore then any = true; break end end
@@ -1041,7 +1071,7 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
   elseif o.fmt == 'D'_b then
     print_merged(o, &a, &b, &ch)
   elseif o.fmt == 'R'_b then
-    print_rcs(&b, &ch)
+    print_rcs(o, &b, &ch)
   elseif o.fmt == 'y'_b then
     print_side(o, &a, &b, &ch)
   elseif o.fmt == 99 then
@@ -1050,13 +1080,13 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
     print_context(o, &a, &b, &ch)
   elseif o.fmt == 101 then
     ed_mode = true
-    print_ed(&a, &b, &ch)
+    print_ed(o, &a, &b, &ch)
     ed_mode = false
     if a.missing_nl then util.err(a.name .. ': No newline at end of file\n') end
     if b.missing_nl then util.err(b.name .. ': No newline at end of file\n') end
     if ed_trouble then return 2 end
   else
-    print_normal(&a, &b, &ch)
+    print_normal(o, &a, &b, &ch)
   end
   return 1
 end
@@ -1138,11 +1168,11 @@ local LONGOPTS: []util.LongOpt = {
   {'to-file', 1, util.UNSUPPORTED}, {'starting-file', 1, util.UNSUPPORTED},
   {'side-by-side', 0, 'y'_b}, {'width', 1, 'W'_b},
   {'left-column', 0, 129}, {'suppress-common-lines', 0, 130},
-  {'expand-tabs', 0, 't'_b}, {'initial-tab', 0, util.UNSUPPORTED},
+  {'expand-tabs', 0, 't'_b}, {'initial-tab', 0, 'T'_b},
   {'tabsize', 1, 131}, {'suppress-blank-empty', 0, util.UNSUPPORTED},
   {'paginate', 0, util.UNSUPPORTED}, {'no-dereference', 0, util.UNSUPPORTED},
   {'unidirectional-new-file', 0, util.UNSUPPORTED}, {'ifdef', 1, 'D'_b},
-  {'minimal', 0, util.UNSUPPORTED}, {'horizon-lines', 1, util.UNSUPPORTED},
+  {'minimal', 0, 'd'_b}, {'horizon-lines', 1, 140},
   {'speed-large-files', 0, util.UNSUPPORTED}, {'rcs', 0, 'n'_b},
   {'old-line-format', 1, 132}, {'new-line-format', 1, 133},
   {'unchanged-line-format', 1, 134}, {'line-format', 1, 135},
@@ -1210,7 +1240,7 @@ local function write_switch(sb: *stringbuilder, word: string)
 end
 
 global function applet_diff(args: sequence(string)): integer
-  local g = util.getopt(args, 'abBcC:D:eiI:F:L:nNpqrstuU:W:wx:X:y', &LONGOPTS[0], #LONGOPTS)
+  local g = util.getopt(args, 'abBcC:dD:eiI:F:L:nNpqrstTuU:W:wx:X:y', &LONGOPTS[0], #LONGOPTS)
   local opt: Opt = {context = 3, width = 130, tabsize = 8}
   local sw: stringbuilder
   local last_switch = 0
@@ -1253,6 +1283,16 @@ global function applet_diff(args: sequence(string)): integer
     elseif c == 129 then opt.left_column = true
     elseif c == 130 then opt.suppress_common = true
     elseif c == 't'_b then opt.expand_tabs = true
+    elseif c == 'T'_b then opt.initial_tab = true
+    elseif c == 'd'_b then opt.minimal = true
+    elseif c == 140 then
+      local value, ok = util.toint(g.optarg)
+      if not ok or value < 0 then
+        util.err('invalid horizon length ' .. util.quote(g.optarg))
+        util.err("Try 'diff --help' for more information.")
+        return 2
+      end
+      opt.horizon = value
     elseif c == 'W'_b or c == 131 then
       local positive, ok = util.toint(g.optarg)
       local label = c == 'W'_b and 'width' or 'tab size'
@@ -1298,9 +1338,6 @@ global function applet_diff(args: sequence(string)): integer
   opt.switches = sw:promote()
   if opt.fmt == 0 then opt.fmt = c_function and 'c'_b or 'n'_b end
   if opt.fmt == 'D'_b then default_templates(&opt) end
-  if opt.fmt ~= 'y'_b and opt.expand_tabs then
-    util.err('tab expansion is only supported for side-by-side output'); return 2
-  end
   local operands = g:operands()
   if #operands ~= 2 then
     if #operands < 2 then

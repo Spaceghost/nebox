@@ -73,13 +73,25 @@ function shexp.has_byte(s: string, c: byte): boolean
   return false
 end
 
-local function is_ifs_ws(c: byte, s: string): boolean
-  if c ~= 32 and c ~= 9 and c ~= 10 then return false end
-  return shexp.has_byte(s, c)
+-- Return the byte width of an IFS character at the current position.
+function shexp.ifs_separator(text: string, offset: usize, sep: string): usize
+  if sep.size == 0 then return 0 end
+  if not nlocale.multibyte then
+    return shexp.has_byte(sep, text.data[offset]) and 1 or 0
+  end
+  local _, used = nlocale.decode(text, offset)
+  local candidate = text:subview(offset + 1, offset + used)
+  local at: usize = 0
+  while at < sep.size do
+    local past = nlocale.advance(sep, at, 1)
+    if candidate == sep:subview(at + 1, past) then return used end
+    at = past
+  end
+  return 0
 end
 
-local function in_ifs(c: byte, s: string): boolean
-  return shexp.has_byte(s, c)
+function shexp.ifs_whitespace(c: byte): boolean
+  return c == 32 or c == 9 or c == 10
 end
 
 ----------------------------------------------------------------------
@@ -305,7 +317,7 @@ local function expand_at(star: boolean, quoted: boolean, out: *shexp.Buf, split:
     for i = 1, #ps do
       if i > 1 then
         if not set then out:add(32, shexp.F_Q)
-        elseif sepstr.size > 0 then out:add(sepstr:byte(1), shexp.F_Q) end
+        elseif sepstr.size > 0 then out:addstr(sepstr:subview(1, nlocale.advance(sepstr, 0, 1)), shexp.F_Q) end
       end
       out:addstr(ps[i], shexp.F_Q)
     end
@@ -427,7 +439,7 @@ local function expand_param(p: *N.Part, out: *shexp.Buf, split: boolean)
       if i > 1 then
         if not star_q then out:add(32, shexp.F_SEP)
         elseif not ifs_set then out:add(32, shexp.F_Q)
-        elseif sepstr.size > 0 then out:add(sepstr:byte(1), shexp.F_Q) end
+        elseif sepstr.size > 0 then out:addstr(sepstr:subview(1, nlocale.advance(sepstr, 0, 1)), shexp.F_Q) end
       end
       local r = remove_pattern(ps[i], &pat, prefix, longest)
       if r.size == 0 then
@@ -519,9 +531,19 @@ local function split_fields(b: *shexp.Buf): sequence(shexp.Buf)
   local cur: shexp.Buf
   local has = false
   local after_ws = false
-  for i = 1, #b.bytes do
+  if #b.bytes == 0 then return out end
+  local text: string = {data = &b.bytes[1], size = (@usize)(#b.bytes)}
+  local i: integer = 1
+  while i <= #b.bytes do
     local c = b.bytes[i]
     local f = b.flags[i]
+    local width: usize = 0
+    if f & shexp.F_S ~= 0 and f & shexp.F_Q == 0 then
+      width = shexp.ifs_separator(text, (@usize)(i - 1), sep)
+      for j: integer = 1, < (@integer)(width) do
+        if b.flags[i + j] ~= f then width = 0; break end
+      end
+    end
     if f & shexp.F_SEP ~= 0 then
       if has then out:push(cur); cur = (@shexp.Buf)() end
       has = false
@@ -529,8 +551,8 @@ local function split_fields(b: *shexp.Buf): sequence(shexp.Buf)
     elseif f & shexp.F_EMPTY ~= 0 then
       has = true
       after_ws = false
-    elseif f & shexp.F_S ~= 0 and sep.size > 0 and in_ifs(c, sep) then
-      if is_ifs_ws(c, sep) then
+    elseif width > 0 then
+      if shexp.ifs_whitespace(c) then
         if has then
           out:push(cur); cur = (@shexp.Buf)()
           has = false
@@ -549,6 +571,7 @@ local function split_fields(b: *shexp.Buf): sequence(shexp.Buf)
       has = true
       after_ws = false
     end
+    i = i + (width > 0 and (@integer)(width) or 1)
   end
   if has then out:push(cur) end
   return out

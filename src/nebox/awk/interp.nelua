@@ -51,7 +51,9 @@ local State = @record{
   nf: integer,
   split_valid: boolean,   -- fields reflect rec
   rec_valid: boolean,     -- rec reflects fields
-  rec_fs: string,         -- FS in force when the record was set
+  rec_fs: string,         -- splitting settings in force when the record was set
+  rec_paragraph: boolean,
+  rec_icase: boolean,
   -- control flow
   jump: integer,          -- next/nextfile/exit escaping from a function body
   exiting: boolean,
@@ -75,6 +77,7 @@ local State = @record{
   rng: uint64,
   -- dynamic regex cache
   recache: hashmap(string, integer),
+  recache_folded: hashmap(string, integer),
   reprogs: sequence(regex.Prog),
 }
 
@@ -209,6 +212,10 @@ local function buf_put(b: *RecBuf, s: string)
   b.len = s.size
 end
 
+local function ignore_case(): boolean
+  return global_num(awkast.V_IGNORECASE) ~= 0
+end
+
 -- Set $0 from a string (copied into the inactive buffer); fields are split
 -- lazily with the FS in force now.
 local function set_record(s: string)
@@ -219,19 +226,22 @@ local function set_record(s: string)
   st.split_valid = false
   st.rec_valid = true
   st.rec_fs = global_str(awkast.V_FS)
+  st.rec_paragraph = global_str(awkast.V_RS).size == 0
+  st.rec_icase = ignore_case()
 end
 
 local function isblank(c: byte): boolean return c == 32 or c == 9 or c == 10 end
 
 -- Compile (with caching) a dynamic regular expression.
-local function dyn_regex(pat: string): *regex.Prog
-  local idx = st.recache:peek(pat)
+local function dyn_regex(pat: string, icase: boolean): *regex.Prog
+  local cache = icase and &st.recache_folded or &st.recache
+  local idx = cache:peek(pat)
   if idx ~= nilptr then return &st.reprogs[$idx] end
-  local prog, err = regex.compile(pat, true, false)
+  local prog, err = regex.compile(pat, true, icase)
   if err.size > 0 then fatal('bad regular expression "' .. pat .. '": ' .. err) end
   st.reprogs:push(prog)
   local key = string.copy(pat)
-  st.recache[key] = #st.reprogs
+  cache[key] = #st.reprogs
   return &st.reprogs[#st.reprogs]
 end
 
@@ -242,7 +252,7 @@ end
 local function read_record(reader: *awkio.Reader, out: *string): boolean
   local rs = global_str(awkast.V_RS)
   local re: *regex.Prog = nilptr
-  if #rs > 1 then re = dyn_regex(rs) end
+  if #rs > 1 then re = dyn_regex(rs, ignore_case() and nlocale.length(rs) > 1) end
   local ok = reader:record(rs, re, out)
   if ok then set_global_str(awkast.V_RT, reader.separator) end
   return ok
@@ -292,7 +302,7 @@ end
 -- the separator came from a regex literal. In paragraph mode (RS == "")
 -- newline separates fields as well. An empty separator splits into
 -- characters (undefined in POSIX; gawk and mawk do this for split()).
-local function split_text(text: string, fs: string, re: *regex.Prog, paragraph: boolean, out: *sequence(Cell))
+local function split_text(text: string, fs: string, re: *regex.Prog, paragraph: boolean, icase: boolean, out: *sequence(Cell))
   out:clear()
   if re == nilptr then
     if fs == ' ' then split_blank(text, out); return end
@@ -308,7 +318,7 @@ local function split_text(text: string, fs: string, re: *regex.Prog, paragraph: 
       end
       return
     end
-    re = dyn_regex(fs)
+    re = dyn_regex(fs, icase and nlocale.length(fs) > 1)
   end
   split_regex(text, re, out)
   if paragraph then
@@ -322,8 +332,7 @@ end
 
 local function ensure_split()
   if st.split_valid then return end
-  local paragraph = global_str(awkast.V_RS).size == 0
-  split_text(st.rec, st.rec_fs, nilptr, paragraph, &st.fields)
+  split_text(st.rec, st.rec_fs, nilptr, st.rec_paragraph, st.rec_icase, &st.fields)
   st.nf = #st.fields
   st.split_valid = true
 end
@@ -729,8 +738,12 @@ end
 -- Regex for a pattern operand: a literal /ere/ node, or a dynamic string.
 local function regex_of(node: integer): *regex.Prog
   local n = P(node)
-  if n.kind == awkast.REGEX then return &st.prog.regexes[n.a] end
-  return dyn_regex(str_of(eval(node)))
+  if n.kind == awkast.REGEX then
+    if ignore_case() then return dyn_regex(n.s, true) end
+    return &st.prog.regexes[n.a]
+  end
+  local pat = str_of(eval(node))
+  return dyn_regex(pat, ignore_case())
 end
 
 local function matches(re: *regex.Prog, s: string): boolean
@@ -922,12 +935,12 @@ local function bi_split(n: *Node): Cell
   if n.c == 3 then
     local fsnode = L(n.b + 2)
     if P(fsnode).kind == awkast.REGEX then
-      split_text(text, '', &st.prog.regexes[P(fsnode).a], false, &parts)
+      split_text(text, '', regex_of(fsnode), false, false, &parts)
     else
-      split_text(text, str_of(eval(fsnode)), nilptr, false, &parts)
+      split_text(text, str_of(eval(fsnode)), nilptr, false, ignore_case(), &parts)
     end
   else
-    split_text(text, global_str(awkast.V_FS), nilptr, paragraph, &parts)
+    split_text(text, global_str(awkast.V_FS), nilptr, paragraph, ignore_case(), &parts)
   end
   arr:clear()
   for i = 1, #parts do
@@ -1046,7 +1059,13 @@ local function eval_builtin(n: *Node): Cell
     if n.c == 3 then len = num_of(arg(n.b, 2)) end
     return awkval.str(bi_substr(s, m, len, n.c == 3), true)
   elseif name == 'index' then
-    return awkval.num(bi_index(str_of(arg(n.b, 0)), str_of(arg(n.b, 1))))
+    local text, needle = str_of(arg(n.b, 0)), str_of(arg(n.b, 1))
+    if not ignore_case() then return awkval.num(bi_index(text, needle)) end
+    local left, right = nlocale.casemap(text, false), nlocale.casemap(needle, false)
+    local position = bi_index(left, right)
+    left:destroy()
+    right:destroy()
+    return awkval.num(position)
   elseif name == 'split' then return bi_split(n)
   elseif name == 'sub' then return bi_sub(n, false)
   elseif name == 'gsub' then return bi_sub(n, true)
@@ -1179,7 +1198,7 @@ end
 local function eval_cmp(n: *Node): Cell
   local a = eval(n.a)
   local b = eval(n.b)
-  local c = awkval.compare(a, b, convfmt())
+  local c = awkval.compare(a, b, convfmt(), ignore_case(), n.c ~= T.EQ and n.c ~= T.NE)
   local r = false
   if n.c == T.LT then r = c < 0
   elseif n.c == T.LE then r = c <= 0
@@ -1203,7 +1222,7 @@ function eval(node: integer): Cell
     return read_lvalue(node)
   elseif k == awkast.REGEX then
     ensure_rec()
-    return awkval.num(matches(&st.prog.regexes[n.a], st.rec) and 1 or 0)
+    return awkval.num(matches(regex_of(node), st.rec) and 1 or 0)
   elseif k == awkast.ASSIGN then
     local v = eval(n.b)
     local r = ref_of(n.a, true)
@@ -1531,6 +1550,7 @@ local function setup(prog: *awkast.Program, argv: sequence(string), fs: string, 
   set_global_str(awkast.V_ORS, '\n')
   set_global_str(awkast.V_RS, '\n')
   set_global_str(awkast.V_RT, '')
+  set_global_num(awkast.V_IGNORECASE, 0)
   set_global_str(awkast.V_SUBSEP, '\x1c')
   set_global_str(awkast.V_CONVFMT, '%.6g')
   set_global_str(awkast.V_OFMT, '%.6g')

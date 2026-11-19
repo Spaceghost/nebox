@@ -137,11 +137,12 @@ per applet in `DIR`.
 
 The text applets use byte semantics under `LC_ALL=C`. In UTF-8 locales,
 `wc` counts characters and display columns, `rev` reverses code points,
-and the shell matches and trims
-patterns by character, and `awk`, `grep`, `sed`, `expr` and `find -regex`
-use a multibyte regex matcher. `grep -i`, `sed`'s case-insensitive regexes
-and `diff -i` fold Unicode case. `sort`, `comm`, `join` and `ls` use
-Nelibc's available collation for ordinary string comparisons. The standalone
+`cut -c` selects characters, `uniq -s/-w` measure characters, and the
+shell matches patterns and splits fields by character. `awk`, `grep`, `sed`,
+`expr` and `find -regex` use a multibyte regex matcher. `grep -i`, `sed`'s
+case-insensitive regexes, `diff -i`, `join -i` and `uniq -i` fold Unicode
+case. `sort`, `comm`, `join` and `ls` use Nelibc's available collation for
+ordinary string comparisons. The standalone
 locale catalog supplies C, UTF-8 character data and German collation.
 Individual applets below list the operations that still use byte semantics.
 
@@ -151,9 +152,9 @@ Individual applets below list the operations that still use byte semantics.
   GNU stops at the first operand (basename, tr, timeout, xargs, awk, which),
   long options accept unique abbreviations with glibc's ambiguity rules, and
   a GNU long option nebox does not implement is refused by name ("option
-  '--x' is not supported") rather than misparsed. No applet has `--help` or
-  `--version` except the coreutils ports. `tests/opts_compare.py` checks 233
-  invocations against GNU (output, status, first diagnostic line).
+  '--x' is not supported") rather than misparsed. Help and version output vary by applet.
+  `tests/opts_compare.py` checks 233 invocations against GNU (output, status,
+  first diagnostic line).
 - `chmod` follows GNU chmod.c over a port of gnulib's `modechange.c`
   (`src/nebox/modechange.nelua`): octal and symbolic modes with the umask
   applied when no "who" is given, `u=g`-style copies, `X`, `s`, `t`,
@@ -361,7 +362,7 @@ Individual applets below list the operations that still use byte semantics.
   re_search does with re_syntax_options 0 (Emacs syntax, translated for
   nebox's engine: \( \) \| groups, + and ? operators, no intervals or
   character classes, context-dependent anchors, glibc's wording for a
-  pattern ending in "[" ); one difference remains: [^...] does not match a
+  pattern ending in "[" ). A negated bracket expression can match a
   newline. `tests/tac_compare.py`: 55 fixed cases plus 300 random inputs
   from files and pipes, 0 mismatches.
 - `tsort` ports tsort.c: Knuth's algorithm over the items in strcmp order
@@ -440,7 +441,9 @@ Individual applets below list the operations that still use byte semantics.
     and merge stably in input order. `-S` sets the run budget and
     `--parallel` sets the maximum worker count, subject to available CPUs
     and a cap of 16. A run can hold one record larger than the budget.
-  - `--compress-program` is parsed but temporary files are uncompressed.
+  - `--compress-program` compresses spilled runs and intermediate merges.
+    The filter is executed directly and called with `-d` to decode. Plain
+    data is staged in an unlinked temporary file during each conversion.
     `--debug` prints the C-locale comparison message in all locales.
   - Two NaNs under -g: GNU memcmps the whole 16-byte long double, whose six
     padding bytes its compiler leaves uninitialized (sort.c's memset is a
@@ -821,9 +824,10 @@ Individual applets below list the operations that still use byte semantics.
   literal slash. `BEGINFILE` and `ENDFILE` bracket each input file, including
   empty files. In `BEGINFILE`, `ERRNO` and `nextfile` can skip an unreadable
   file. GNU extension cases use gawk without `--posix`.
-  Remaining gaps include `**`, `IGNORECASE`, `-e`, long
-  options, the `PROCINFO["strftime"]` override and locale-specific string
-  collation. A multi-character `RS` is a streaming regular expression.
+  Supports `**`, `**=`, `IGNORECASE`, `-e`/`--source`, `--file`,
+  `--field-separator` and `--assign`. Relational string comparisons use
+  the available locale collation. Remaining gaps include other GNU long
+  options and the `PROCINFO["strftime"]` override. A multi-character `RS` is a streaming regular expression.
   `RT` contains the actual separator, including blank-line separators.
   Empty matches are skipped. In UTF-8 locales, string lengths, positions
   and case conversion use characters. Hexadecimal/`inf`/`nan` spellings in numeric strings are
@@ -901,8 +905,8 @@ Individual applets below list the operations that still use byte semantics.
   `fc` lists, edits and re-executes command history with numeric, relative
   and prefix selectors. `set -o vi` enables vi insert and command modes
   with history navigation, motions, delete/change/yank, put, replace and
-  undo. `set -o emacs` restores Emacs keys. Field splitting still treats
-  `IFS` as bytes. Not POSIX and refused: `local`, `;&` in `case`,
+  undo. `set -o emacs` restores Emacs keys. Field splitting, `read` and
+  quoted `"$*"` recognize multibyte `IFS` characters in UTF-8 locales. Not POSIX and refused: `local`, `;&` in `case`,
   `${!name}` and other bash expansions (an invalid `${...}` is reported
   when it is expanded, as dash does). Choices where dash differs:
   `"${@#p}"`/`"${@%p}"` apply to every positional parameter (dash: only the
@@ -987,7 +991,8 @@ Individual applets below list the operations that still use byte semantics.
   progress output were compared by hand. `--help` is shorter than GNU's;
   the rate uses double rather than long double arithmetic.
 - `join` is a port of GNU coreutils 9.1 `src/join.c` in the C locale: byte
-  comparison (`-i` folds ASCII), blank-run or single-character (`-t`, `-t ''`,
+  comparison (Unicode case folding with `-i` in UTF-8 locales),
+  blank-run or single-character (`-t`, `-t ''`,
   `-t '\0'`) fields with GNU's empty trailing field, `-a -v -e -o` (with
   `-o auto` and the obsolete `-j1 ARG` and `-o` list continuation operand
   rules), `-1 -2 -j`, `--header`, `-z`, the order checks and GNU's
@@ -1036,8 +1041,12 @@ Individual applets below list the operations that still use byte semantics.
   `--suppress-common-lines`. `-n` emits an RCS script, and `-x` / `-X` exclude
   basenames at every level of directory comparison. Line and group
   templates support line numbers, character literals, and nested numeric
-  conditionals. Remaining gaps include tab expansion outside side by side,
-  `-T`, `-l`, `--minimal` and `--speed-large-files`.
+  conditionals. `-d`/`--minimal` searches for the smallest edit script,
+  and `--horizon-lines` preserves extra common lines during the search.
+  `-t` expands tabs in standard, context, unified, ed and RCS output.
+  `-T` aligns the output prefixes in normal, context and unified formats.
+  Remaining gaps include `-l`, `--speed-large-files` and tab expansion
+  in custom templates.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
   patches are kept (the `stray \` warnings appear only when
@@ -1180,9 +1189,6 @@ Individual applets below list the operations that still use byte semantics.
     buffer anchors out of `M` addresses for these reasons.
   - A program with back-references can exceed nebox's thread bound and
     stops with "pattern too complex" (exit 4), as in the regex entry.
-- `df` reads mounts from /proc/self/mounts and statfs through nelibc's
-  backend table.
-- `whoami` knows only the current process.
 - Local time (`date`, `stat`, `ls -l`, `diff -u` headers, `touch -d`/`-t`)
   comes from nelibc's `localtime_r` (and `mktime`, except in `date` and
   `touch`, which use a port of glibc's mktime over localtime_r): TZif zone files, POSIX TZ
@@ -1280,7 +1286,7 @@ Individual applets below list the operations that still use byte semantics.
   and vdir, 0 mismatches as an ordinary user; run as root (other owners,
   unknown ids, a file capability) 2878 cases, 0 mismatches; a run of 2500
   random cases with another seed also gave 0. Differences:
-  - `--help` and `--version` are refused as unsupported options (status 2).
+  - `--help` is shorter than GNU's. `--version` prints nebox's line.
   - `ca`: nebox colors files that have a `security.capability` attribute,
     as an ls built with libcap does; the GNU ls in the test container is
     built without libcap and never does. The root run checks that this is
@@ -1297,7 +1303,6 @@ Individual applets below list the operations that still use byte semantics.
   - User and group names come from Nelibc's `getpwuid` and `getgrgid`.
     Nelibc with nscd support can resolve names supplied by its system
     account service, with local file fallback.
-- `nproc` counts the CPUs in the process affinity mask, like GNU nproc.
 - `printf` (the applet and the `sh` builtin) ports printf.c: escapes
   including \u/\U (gnulib's \uXXXX fallback in the C locale), `%b`, `%q`,
   every flag, `*` widths and precisions, length modifiers dropped and
@@ -1316,9 +1321,7 @@ Individual applets below list the operations that still use byte semantics.
   to 200 (`seq 18446744073709551614 18446744073709551617`, `seq 1 inf`)
   (`seq-*`). One difference, from nelibc's printf: `-f %a` prints the
   normalized `0x1p+0` where glibc prints `0x8p-3` (`seq-f-hexfloat`); both
-  are valid C. No `--help`/`--version`.
-- `test` has no parentheses; `-a`/`-o` bind loosest, in that order.
-- `mv` across filesystems copies then removes; `cp -a` is `-rp`.
+  are valid C. `--help` is shorter than GNU's. `--version` prints nebox's line.
 
 Everything in the applet list has at least one passing case in
 `tests/run.sh`; see the test names for the exact flags covered. The result
