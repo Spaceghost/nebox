@@ -38,6 +38,30 @@ one shell command twice from identical fixture trees, once with the
 container's coreutils and once with nebox first on `PATH`, and compares
 stdout, exit status, and the resulting directory tree.
 
+## Build runner for the distro bootstrap
+
+`make nebuild` builds a static Linux x86-64 dependency runner written in
+Nelua and linked against standalone Nelibc. `make test-nebuild` verifies
+incremental builds, target selection, failure recovery and directory locking.
+
+```text
+build out/hello hello.c
+	cc -o out/hello hello.c
+default out/hello
+```
+
+Run `build/nebuild build.ne` from the build directory, with the manifest at
+`build.ne` and any output directories already created. Pass output paths
+after the manifest to select targets. Each `build` line lists one output
+followed by its inputs and is followed by a tab-prefixed shell command.
+Paths are separated by spaces or tabs and must be spelled consistently.
+Recipes run serially through `/bin/sh`. The runner locks the working
+directory, so invocations that share outputs must use the same working
+directory. An output rebuilds when it is missing, a dependency is newer or
+just rebuilt, or its edge and command differ from the last successful run
+recorded in the adjacent `.nebuild-command` file. List headers, command
+tools and configuration files as inputs when they affect an output.
+
 ## Applets
 
 ```
