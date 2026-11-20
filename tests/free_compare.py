@@ -88,7 +88,8 @@ CASES.append(('live', None, '@ -t -l -v -w'))
 CASES.append(('live', None, '@ -b -t'))
 CASES.append(('live', None, '@ -h'))
 CASES.append(('live', None, '@ -s 0.05 | head -n 4'))
-CASES.append(('ns', 'basic', 'timeout 0.25 @ -s 0.1 | head -n 8'))
+# Compare the same eight lines even when the two processes get different CPU time.
+CASES.append(('ns', 'basic', '@ -s 0.1 | head -n 8'))
 NOVERSION = {'@ -V', '@ --version', '@ -V x'}
 
 for k in range(NRAND):
