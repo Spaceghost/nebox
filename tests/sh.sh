@@ -432,9 +432,10 @@ trap "exec 9>&-; check_closed second" EXIT
 exit 0'
 shx sh-redir-exec-explicit-high-fd 'high descriptor remained open
 exit=0' 'set -e
+exec 3>&1
 exec 1>out 10>high
 test /proc/$$/fd/10 -ef high
-printf "high descriptor remained open\n" >&2'
+printf "high descriptor remained open\n" >&3'
 shf sh-redir-exec-rolls-back-on-error 'if [ "$1" = inner ]; then
     trap "test ! -e /proc/$$/fd/9 && echo rolled-back" EXIT
     exec 9>opened 8<missing
