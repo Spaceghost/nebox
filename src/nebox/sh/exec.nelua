@@ -1240,6 +1240,14 @@ local function exec_simple(n: *N.Node): integer
       shexec.restore_redirs(&save)
       shexec.error_exit(2)
     end
+    if name == 'exec' then
+      -- The redirections persist. Release their rollback copies before running
+      -- the builtin so that a closed descriptor no longer holds the file open.
+      for i = 1, #save do
+        if save[i].saved >= 0 then sys.close(save[i].saved) end
+      end
+      save:clear()
+    end
     local st = shexec.builtin_call(bidx, args)
     if n.r1 > 0 and name ~= 'exec' then shexec.restore_redirs(&save) end
     util.flush()

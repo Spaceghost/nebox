@@ -416,6 +416,20 @@ shf sh-redir-word-expansion 'n=f; echo a > $n; cat f; echo b > "${n}2"; cat f2; 
 shf sh-redir-tilde 'HOME=$PWD; echo home > ~/hf; cat hf'
 shf sh-redir-dev-null 'echo x > /dev/null; set -C; echo y > /dev/null; echo st=$?'
 shf sh-redir-exec-persists-children 'exec 3>f3; sh -c "echo child >&3"; exec 3>&-; cat f3'
+# Inspect the running shell: close-on-exec rollback copies disappear in children
+# but prolong file locks and mounts while the shell itself stays alive.
+shf sh-redir-exec-releases-fds 'check_closed() {
+    for fd in /proc/$$/fd/*; do
+        if [ "$fd" -ef "$1" ]; then echo "file still open: $1"; return 1; fi
+    done
+    echo "closed: $1"
+}
+set -e
+exec 9>first
+exec 9>second
+check_closed first
+trap "exec 9>&-; check_closed second" EXIT
+exit 0'
 shf sh-redir-nonexistent-dir-fd 'echo a 3>nonexist/x 2>/dev/null; echo st=$?'
 shf sh-redir-append-create 'rm -f ap; echo a >> ap; echo b >> ap; cat ap'
 shf sh-redir-here-and-redirect-order 'cat <<EOF >hf 2>&1
