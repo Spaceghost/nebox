@@ -182,6 +182,7 @@ end
 
 local function main(): integer
   local name = util.basename(arg[0])
+  if name == '-sh' or name == '-nsh' then name = name:sub(2) end
   local first: integer = 1
   if name == 'nebox' or find(name) < 0 then
     if #arg < 1 then return usage() end

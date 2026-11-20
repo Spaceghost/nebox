@@ -4,6 +4,7 @@
 --   sh [options] command_file [argument...]
 ## pragmas.nogc = true
 
+require 'arg'
 require 'string'
 require 'sequence'
 require 'nebox.sys'
@@ -54,8 +55,19 @@ local function nsh_defaults()
   end
 end
 
+local function read_profile(path: string)
+  if sys.access(path, sys.R_OK) ~= 0 then return end
+  local idx = shexec.builtin_lookup('.')
+  local operands: sequence(string)
+  operands:push('.')
+  operands:push(path)
+  shexec.builtin_call(idx, operands)
+end
+
 local function run_sh(args: sequence(string), nsh: boolean): integer
-  shexec.init(nsh and 'nsh' or 'sh')
+  local invoked = util.basename(arg[0])
+  local login = invoked == '-sh' or invoked == '-nsh'
+  shexec.init(login and invoked or (nsh and 'nsh' or 'sh'))
   shbi.init()
   if nsh then nsh_defaults() end
   local cmode = false
@@ -73,6 +85,7 @@ local function run_sh(args: sequence(string), nsh: boolean): integer
       local c = a:byte(j)
       if c == 99 then cmode = true            -- c
       elseif c == 115 then smode = true       -- s
+      elseif c == 108 then login = on              -- l
       elseif c == 105 then imode = on              -- i
       elseif c == 109 then shbi.set_option(c, on)   -- m: job control (needs a terminal)
       elseif c == 111 then                    -- o
@@ -87,6 +100,11 @@ local function run_sh(args: sequence(string), nsh: boolean): integer
     end
     i = i + 1
     if consumed_next then i = i + 1 end
+  end
+  if login and sys.getuid() == sys.geteuid() and sys.getgid() == sys.getegid() then
+    read_profile('/etc/profile')
+    local home, set = shexec.getvar('HOME')
+    if set and home.size > 0 then read_profile(util.join(home, '.profile')) end
   end
   local lx: shlex.Lexer
   shst.main_lexer = &lx

@@ -10,7 +10,7 @@ failures = []
 
 
 class Shell:
-    def __init__(self, env_extra=None, cols=80, argv=('sh', '-i'), home=None):
+    def __init__(self, env_extra=None, cols=80, argv=('sh', '-i'), home=None, argv0=NEBOX):
         self.home = home or tempfile.mkdtemp(prefix='nebox-sh-i-')
         env = {'HOME': self.home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
                'PS1': '$ ', 'TERM': 'xterm'}
@@ -19,7 +19,7 @@ class Shell:
         pid, fd = pty.fork()
         if pid == 0:
             os.chdir(self.home)
-            os.execve(NEBOX, [NEBOX] + list(argv), env)
+            os.execve(NEBOX, [argv0] + list(argv), env)
         self.pid, self.fd = pid, fd
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, cols, 0, 0))
         self.out = ''
@@ -346,6 +346,18 @@ def _():
     sh.send('exit\r')
     sh.expect('bye')
     sh.close()
+
+
+@case('login shell reads the user profile and keeps its arguments')
+def _():
+    with tempfile.TemporaryDirectory(prefix='nebox-login-') as home:
+        with open(os.path.join(home, '.profile'), 'w') as f:
+            f.write("export LOGIN_MARKER=from-profile\n")
+        sh = Shell(argv=(), home=home, argv0='-sh')
+        try:
+            sh.run('printf "%s:%s\\n" "$0" "$LOGIN_MARKER"', '-sh:from-profile\r\n')
+        finally:
+            sh.close()
 
 
 @case('nsh: prompt with the directory, XDG history and rc')
