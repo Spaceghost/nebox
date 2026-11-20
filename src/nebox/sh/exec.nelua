@@ -991,6 +991,25 @@ local function open_redir(r: *N.Redir): cint
   return fd
 end
 
+-- Reserve a rollback copy outside the descriptors this command can change.
+local function save_redir_fd(target: cint, r0: integer, r1: integer): cint
+  local minimum: cint = 10
+  while true do
+    local saved = sys.fcntl(target, sys.F_DUPFD_CLOEXEC, minimum)
+    if saved < 0 then return saved end
+    local reserved = false
+    for i = 0, < r1 do
+      if shprog.redirs[N.L(r0 + i)].fd == saved then
+        reserved = true
+        break
+      end
+    end
+    if not reserved then return saved end
+    sys.close(saved)
+    minimum = saved + 1
+  end
+end
+
 -- Apply the redirections of a node. With `save`, the previous state of each
 -- descriptor is recorded for restore_redirs. Returns false on error.
 function shexec.apply_redirs(r0: integer, r1: integer, save: *sequence(shexec.Saved)): boolean
@@ -1003,8 +1022,16 @@ function shexec.apply_redirs(r0: integer, r1: integer, save: *sequence(shexec.Sa
     if save ~= nilptr then
       local s: shexec.Saved
       s.fd = target
-      s.saved = sys.fcntl(target, sys.F_DUPFD_CLOEXEC, 10)
-      if s.saved < 0 then s.saved = -1 end
+      s.saved = -1
+      -- If open returned the target itself, it was previously closed.
+      if fd ~= target then
+        s.saved = save_redir_fd(target, r0, r1)
+        if s.saved < 0 and sys.errno() ~= sys.EBADF then
+          shexec.errmsg(string.format('%d', r.fd) .. ': ' .. sys.errstr())
+          if fd >= 0 then sys.close(fd) end
+          return false
+        end
+      end
       save:push(s)
     end
     if fd == -2 then
