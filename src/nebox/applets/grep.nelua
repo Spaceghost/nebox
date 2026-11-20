@@ -1974,6 +1974,7 @@ local LISTFILES_NONMATCHING <comptime> = 2
 local G_MATCHER_INDEX <comptime> = 0
 local E_MATCHER_INDEX <comptime> = 1
 local F_MATCHER_INDEX <comptime> = 2
+local P_MATCHER_INDEX <comptime> = 6
 
 local basic_fts_options: integer <comptime> = fts.CWDFD | fts.NOSTAT | fts.TIGHT_CYCLE_CHECK
 
@@ -2028,7 +2029,84 @@ local matcher_f = false
 local compiled_dfa: *DfaComp = nilptr
 local compiled_kw: *KwSearch = nilptr
 
+## if NEBOX_PCRE2 then
+local function c_pcre_compile(p: pointer, n: csize, flags: cuint, err: *cint, off: *csize, ctx: pointer): pointer <cimport 'pcre2_compile_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_context(gctx: pointer): pointer <cimport 'pcre2_compile_context_create_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_extra(ctx: pointer, flags: cuint): cint <cimport 'pcre2_set_compile_extra_options_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_context_free(ctx: pointer) <cimport 'pcre2_compile_context_free_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_data(code: pointer, gctx: pointer): pointer <cimport 'pcre2_match_data_create_from_pattern_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_match(code: pointer, text: pointer, n: csize, start: csize, flags: cuint, data: pointer, ctx: pointer): cint <cimport 'pcre2_match_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_positions(data: pointer): *[0]csize <cimport 'pcre2_get_ovector_pointer_8', cinclude '<pcre2.h>', nodecl> end
+local function c_pcre_error(err: cint, buf: pointer, size: csize): cint <cimport 'pcre2_get_error_message_8', cinclude '<pcre2.h>', nodecl> end
+
+local compiled_perl: pointer
+local perl_matches: pointer
+
+local function compile_perl(pattern: string)
+  if pattern:find('\n', 1, true) > 0 then die(EXIT_TROUBLE, 0, 'the -P option only supports a single pattern') end
+  local flags: cuint = 0x10 -- PCRE2_DOLLAR_ENDONLY
+  if match_icase then flags = flags | 8 end
+  if nlocale.multibyte then flags = flags | 0x00080000 | 0x04000000 end -- UTF | MATCH_INVALID_UTF
+  local ctx = c_pcre_context(nilptr)
+  if ctx == nilptr then die(EXIT_TROUBLE, 0, 'memory exhausted') end
+  if match_lines then
+    c_pcre_extra(ctx, 8) -- PCRE2_EXTRA_MATCH_LINE
+  elseif match_words then
+    pattern = '(?<!\\w)(?:' .. pattern .. ')(?!\\w)'
+  end
+  local err: cint
+  local offset: csize
+  compiled_perl = c_pcre_compile(pattern.data, pattern.size, flags, &err, &offset, ctx)
+  c_pcre_context_free(ctx)
+  if compiled_perl == nilptr then
+    local msg: [256]cchar
+    c_pcre_error(err, &msg[0], #msg)
+    die(EXIT_TROUBLE, 0, sys.cstr(&msg[0]))
+  end
+  perl_matches = c_pcre_data(compiled_perl, nilptr)
+  if perl_matches == nilptr then die(EXIT_TROUBLE, 0, 'memory exhausted') end
+end
+
+-- Search one grep record at a time, also when the record delimiter is NUL.
+-- The offset search still passes the preceding bytes for lookbehind.
+local function execute_perl(buf: *[0]byte, bstart: isize, size: isize, match_size: *isize, start_ptr: isize): isize
+  local finish = bstart + size
+  local first = bstart
+  while first < finish do
+    local last = first
+    while last < finish and buf[last] ~= eolbyte do last = last + 1 end
+    local start = start_ptr > first and start_ptr - first or 0
+    if start <= last - first then
+      local found = c_pcre_match(compiled_perl, &buf[first], (@csize)(last - first),
+          (@csize)(start), start > 0 and 1 or 0, perl_matches, nilptr)
+      if found >= 0 then
+        local spans = c_pcre_positions(perl_matches)
+        if start_ptr >= 0 then
+          $match_size = (@isize)(spans[1]) - (@isize)(spans[0])
+          return first - bstart + (@isize)(spans[0])
+        end
+        $match_size = last - first + (last < finish and 1 or 0)
+        return first - bstart
+      end
+      if found ~= -1 then
+        local reason = 'internal PCRE error: ' .. tostring(found)
+        if found == -47 then reason = "exceeded PCRE's backtracking limit"
+        elseif found == -48 then reason = 'memory exhausted'
+        elseif found == -53 then reason = "exceeded PCRE's nested backtracking limit"
+        elseif found == -63 then reason = "exceeded PCRE's heap limit" end
+        die(EXIT_TROUBLE, 0, (has_filename and filename or '(standard input)') .. ': ' .. reason)
+      end
+    end
+    first = last + 1
+  end
+  return -1
+end
+## end
+
 local function execute(buf: *[0]byte, bstart: isize, size: isize, match_size: *isize, start_ptr: isize): isize
+  ## if NEBOX_PCRE2 then
+  if compiled_perl ~= nilptr then return execute_perl(buf, bstart, size, match_size, start_ptr) end
+  ## end
   if matcher_f then return Fexecute(compiled_kw, buf, bstart, size, match_size, start_ptr) end
   return EGexecute(compiled_dfa, buf, bstart, size, match_size, start_ptr)
 end
@@ -2873,7 +2951,14 @@ local function setmatcher(m: string, matcher: integer): integer
       return i
     end
   end
-  if m == 'perl' then die(EXIT_TROUBLE, 0, 'Perl matching not supported in a --disable-perl-regexp build') end
+  if m == 'perl' then
+    ## if NEBOX_PCRE2 then
+    if matcher >= 0 and matcher ~= P_MATCHER_INDEX then die(EXIT_TROUBLE, 0, 'conflicting matchers specified') end
+    return P_MATCHER_INDEX
+    ## else
+    die(EXIT_TROUBLE, 0, 'Perl matching not supported in a --disable-perl-regexp build')
+    ## end
+  end
   die(EXIT_TROUBLE, 0, 'invalid matcher ' .. m)
   return -1
 end
@@ -3288,6 +3373,10 @@ global function applet_grep(args: sequence(string)): integer
   if matcher == F_MATCHER_INDEX then
     matcher_f = true
     compiled_kw = Fcompile(pattern)
+  elseif matcher == P_MATCHER_INDEX then
+    ## if NEBOX_PCRE2 then
+    compile_perl(pattern)
+    ## end
   else
     local syntaxes: []integer = {RE_SYNTAX_GREP, RE_SYNTAX_EGREP, 0, RE_SYNTAX_AWK, RE_SYNTAX_GNU_AWK, RE_SYNTAX_POSIX_AWK}
     compiled_dfa = GEAcompile(pattern, syntaxes[matcher], exact)

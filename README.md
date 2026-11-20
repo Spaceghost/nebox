@@ -1098,8 +1098,12 @@ Individual applets below list the operations that still use byte semantics.
   `tests/grep_compare.py`: 604 fixed cases and 3000 random patterns,
   options and inputs, 0 mismatches (3 more runs of 3000 random cases with
   other seeds also gave 0). Differences:
-  - -P is refused as by a GNU grep built without PCRE ("Perl matching not
-    supported in a --disable-perl-regexp build", status 2).
+  - `-P` uses the optional PCRE2 8-bit interpreter. Set
+    `PCRE2_LIB=/path/to/libpcre2-8.a` and
+    `PCRE2_INCLUDE=/path/to/include` when invoking make. Use an archive
+    compiled against Nelibc headers with stack protection and JIT disabled,
+    or another archive that links with standalone Nelibc. The default build
+    omits this dependency and prints GNU's disabled-Perl diagnostic.
   - `--help` omits GNU's bug-report paragraph; `--version` prints nebox's
     line.
   - NUL bytes drive binary-file detection. Invalid UTF-8 by itself does

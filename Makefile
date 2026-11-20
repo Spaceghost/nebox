@@ -11,7 +11,7 @@ NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-zig.a
 # the archive given in --ldflags: the archive's checksum goes into the C
 # flags so that a rebuilt nelibc is linked instead of a cached binary.
 NELIBC_STAMP = $(shell sha256sum $(NELIBC_LIB) 2>/dev/null | cut -c1-16)
-OUT ?= $(if $(THESEUS_FLAGS),build-theseus,build)
+OUT ?= $(if $(THESEUS_FLAGS),build-theseus,build)$(if $(strip $(PCRE2_LIB)),-pcre2)
 NM ?= nm
 
 # Opt in to Theseus early boot with a checkout and the Spaceghost Nelua fork.
@@ -30,14 +30,23 @@ CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-prot
 NELIBC_LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive
 LDFLAGS := $(NELIBC_LDFLAGS) -Wl,--strip-all
 
+# Optional 8-bit PCRE2 archive built for the standalone libc environment.
+ifneq ($(strip $(PCRE2_LIB)),)
+PCRE2_STAMP := $(shell sha256sum $(PCRE2_LIB) 2>/dev/null | cut -c1-16)
+PCRE2_FLAGS := -D NEBOX_PCRE2=true
+PCRE2_CFLAGS := -DPCRE2_CODE_UNIT_WIDTH=8 -DNEBOX_PCRE2_STAMP=$(PCRE2_STAMP) $(if $(PCRE2_INCLUDE),-I$(PCRE2_INCLUDE))
+PCRE2_LDFLAGS := $(PCRE2_LIB)
+endif
+
+
 .PHONY: all nebox nebuild test test-nebuild clean
 
 all: nebox
 
 nebox: $(OUT)/nebox
 
-$(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) | $(OUT)
-	$(NELUA) -r -L src $(THESEUS_FLAGS) --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(LDFLAGS)' -o $@ src/nebox.nelua
+$(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) $(PCRE2_LIB) | $(OUT)
+	$(NELUA) -r -L src $(THESEUS_FLAGS) $(PCRE2_FLAGS) --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS) $(PCRE2_CFLAGS)' --ldflags='$(PCRE2_LDFLAGS) $(LDFLAGS)' -o $@ src/nebox.nelua
 	@test -z "$$($(NM) -u $@)" || { echo "undefined symbols:"; $(NM) -u $@; exit 1; }
 	@echo "built $@ ($$(stat -c %s $@) bytes, static, no host libc)"
 

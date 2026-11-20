@@ -369,6 +369,12 @@ same uname-s 'uname -s'
 same uname-m 'uname -m'
 same uname-r 'uname -r'
 same uname-n 'uname -n'
+if printf 'ab\n' | "$BIN" grep -Pq '(?<=a)b'; then
+  same grep-perl-lookarounds 'printf "a:123 x:4\na:56z\n" | grep -Pon "(?<=a:)\d+(?![0-9z])"; printf "abcb abc abc_\n" | grep -Pow "abc"; printf "x12\n12\n" | grep -Px "[0-9]+"'
+  same grep-perl-captures 'printf "cat cat\ncat dog\nfoo=42 bar=7\n" | grep -P "(\w+) \1"; printf "foo=42 bar=7\n" | grep -Po "\w+=\K\d+"'
+  same grep-perl-utf8 'printf "Élan élan\n123٤５\n" | LC_ALL=C.UTF-8 grep -Poi "élan|\p{Mn}|\d+"'
+  same grep-perl-nul-records 'printf "a\n2\000a\n4\000no\000" | grep -Pzo "(?s)a.\d" | od -An -tx1'
+fi
 same hostname 'hostname'
 if python3 "$(dirname -- "$0")/hostname_compare.py" "$BIN" --transport; then
   pass=$((pass+1))

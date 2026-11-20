@@ -27,6 +27,8 @@ env = dict(os.environ, LC_ALL='C')
 for k in ('GREP_COLOR', 'GREP_COLORS', 'TERM', 'POSIXLY_CORRECT', 'DEB_GREP_ENABLE_STRAY_BACKSLASH_WARN'):
     env.pop(k, None)
 GNU = 'grep'
+PERL = subprocess.run([NEBOX, 'grep', '-Pq', '(?<=a)b'], input=b'ab\n',
+                      capture_output=True, env=env).returncode == 0
 
 
 def sh(c):
@@ -313,7 +315,7 @@ for c in CASES:
     n = run(c, 'nebox')
     if '--help' in c or '--color=bogus' in c:
         g = (g[0], strip_help(g[1]), g[2])
-    if '-P' in c.split() or '--perl-regexp' in c:
+    if not PERL and ('-P' in c.split() or '--perl-regexp' in c):
         want = b'grep: Perl matching not supported in a --disable-perl-regexp build\n'
         if n[0] != 2 or n[1] != b'' or n[2] != want:
             bad += 1
