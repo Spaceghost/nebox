@@ -638,7 +638,9 @@ exit=0' 'trap "echo bad" NOPE 2>/dev/null; echo st=$?; trap "echo k" KILL 2>/dev
 shf sh-trap-numbers 'trap "echo ten" 10; kill -10 $$; trap "echo zero" 0; trap | grep EXIT'
 shf sh-trap-inherited-ignore 'trap "" USR1; sh -c "trap \"echo got\" USR1; kill -USR1 \$\$; echo after \$?"'
 shf sh-trap-subshell-reset 'trap "echo parent-trap" USR1; (kill -USR1 $$); echo main; (trap "echo sub" USR1; kill -USR1 $$); (trap; echo sub-traps-cleared) | sed "s/.*//"'
-shf sh-trap-wait 'trap "echo trapped" USR1; (sleep 0.3; kill -USR1 $$) & wait; echo "wait st=$?"; wait; echo done'
+# Keep the sender alive until wait has returned. Repeated signals also cover a
+# parent that receives its first USR1 before entering wait on a loaded host.
+shf sh-trap-wait 'seen=0; trap "seen=1" USR1; release=wait-release.$$; (i=0; while [ ! -f "$release" ] && [ "$i" -lt 200 ]; do kill -USR1 $$ || exit; sleep 0.02; i=$((i+1)); done) & wait; st=$?; trap "" USR1; : > "$release"; wait; rm -f "$release"; [ "$seen" = 1 ] && echo trapped; echo "wait st=$st"; echo done'
 shf sh-trap-during-foreground 'trap "echo trapped" USR1; (sleep 0.3; kill -USR1 $$) & sleep 1; echo "sleep st=$?"'
 shf sh-trap-status-preserved 'trap "true" USR1; (exit 5); kill -USR1 $$; echo $?; trap "false" USR2; (exit 6); kill -USR2 $$; echo $?'
 shf sh-trap-exit-in-function 'f() { trap "echo from-trap" EXIT; }; f; echo body'

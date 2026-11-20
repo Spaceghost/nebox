@@ -1,6 +1,8 @@
 """Boot a Theseus-enabled nebox with a supplied Linux bzImage in QEMU."""
 
 import argparse
+from contextlib import nullcontext
+import math
 import os
 from pathlib import Path
 import selectors
@@ -10,7 +12,76 @@ import tempfile
 import time
 
 
-def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None):
+def sdk_files(sdk, compiler_source, runtime_source):
+    def directory(name, mode=0o755):
+        return (name, stat.S_IFDIR | mode, b"", 0, 0)
+
+    def regular(name, data, mode=0o644):
+        return (name, stat.S_IFREG | mode, data, 0, 0)
+
+    yield directory("tmp", 0o1777)
+    yield directory("usr")
+    yield directory("usr/lib")
+    yield directory("usr/lib/necc")
+    yield directory("usr/src")
+    yield directory("usr/src/demo")
+    yield ("dev/null", stat.S_IFCHR | 0o666, b"", 1, 3)
+    yield ("dev/urandom", stat.S_IFCHR | 0o666, b"", 1, 9)
+    for applet in ("basename", "cat", "cmp", "dirname", "env", "mkdir", "pwd",
+                   "readlink", "realpath", "rm", "uname", "which"):
+        yield ("bin/" + applet, stat.S_IFLNK | 0o777, b"nebox", 0, 0)
+    for path in sorted(sdk.rglob("*")):
+        name = "usr/lib/necc/" + path.relative_to(sdk).as_posix()
+        if path.is_symlink():
+            yield (name, stat.S_IFLNK | 0o777, os.fsencode(os.readlink(path)), 0, 0)
+        elif path.is_dir():
+            yield directory(name)
+        elif path.is_file():
+            yield regular(name, path.read_bytes(), 0o755 if path.stat().st_mode & 0o111 else 0o644)
+    yield regular("usr/src/demo/hello.c", b"""#include <stdint.h>
+#include <stdio.h>
+int main(void) { int64_t n = INT64_C(3000000000); printf("native %ld\\n", n + 42); return 23; }
+""")
+    yield regular("usr/src/demo/arrays.nelua", b"""local t: [3]integer = {10, 12, 20}
+print(t[0] + t[1] + t[2])
+""")
+    yield regular("usr/src/demo/direct.nelua", b"do return 42 end\n")
+    yield regular("usr/src/demo/args.lua", b"""assert(arg[1] == 'two words')
+assert(require('lfs').attributes('/mnt', 'mode') == 'directory')
+print(_VERSION)
+""")
+    graph = []
+    for output, filename, flags in (("native", "hello.c", ""), ("arrays", "arrays.nelua", ""),
+                                    ("direct", "direct.nelua", "--direct ")):
+        src = "/usr/src/demo/" + filename
+        deps = [src, "/bin/necc", "/usr/lib/necc/tcc/tcc", "/usr/lib/necc/libnelibc.a"]
+        if output == "arrays":
+            deps.append("/usr/lib/necc/nelua-lua")
+        elif output == "direct":
+            deps.append("/usr/lib/necc/nlc")
+        graph.extend(["build " + " ".join([output, *deps]), f"\t/bin/necc {flags}{src} -o {output}"])
+    graph.append("default native arrays direct")
+    yield regular("usr/src/demo/build.ne", ("\n".join(graph) + "\n").encode())
+    if compiler_source:
+        yield directory("usr/src/necc")
+        for path in sorted(compiler_source.glob("*.nelua")):
+            yield regular("usr/src/necc/" + path.name, path.read_bytes())
+
+    if runtime_source:
+        yield regular("usr/src/necc/render-lua.lua", (compiler_source / "render-lua.lua").read_bytes())
+        yield directory("usr/src/nelua")
+        yield directory("usr/src/nelua/src")
+        root = runtime_source / "src"
+        for path in sorted(root.rglob("*")):
+            name = "usr/src/nelua/src/" + path.relative_to(root).as_posix()
+            if path.is_dir():
+                yield directory(name)
+            elif path.suffix in {".c", ".h", ".lua"}:
+                yield regular(name, path.read_bytes())
+
+
+def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None,
+                    sdk=None, compiler_source=None, runtime_source=None):
     entries = [
         ("bin", stat.S_IFDIR | 0o755, b"", 0, 0),
         ("dev", stat.S_IFDIR | 0o755, b"", 0, 0),
@@ -41,6 +112,8 @@ def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None):
             ("bin/nlc", stat.S_IFREG | 0o755, nlc.read_bytes(), 0, 0),
             ("answer.nelua", stat.S_IFREG | 0o644, b"do return 42 end\n", 0, 0),
         ])
+    if sdk:
+        entries.extend(sdk_files(sdk, compiler_source, runtime_source))
     entries.append(("TRAILER!!!", 0, b"", 0, 0))
     with path.open("wb") as archive:
         for inode, (name, mode, data, major, minor) in enumerate(entries, 1):
@@ -54,28 +127,34 @@ def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None):
             archive.write(b"\0" * (-archive.tell() % 4))
 
 
-def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False):
+def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
+          sdk=False, compiler_source=False, runtime_source=False, serial_log=None, distro=False, timeout_scale=1):
     vm = subprocess.Popen(
         ["qemu-system-x86_64", "-nodefaults", "-display", "none",
-         "-serial", "stdio", "-m", "256M", "-no-reboot",
+         "-serial", "stdio", "-m", "512M" if sdk or distro else "256M", "-no-reboot",
          "-kernel", str(kernel), "-initrd", str(initramfs),
          "-append", "console=ttyS0 rdinit=/init quiet"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     output = bytearray()
     try:
-        with selectors.DefaultSelector() as selector:
+        with selectors.DefaultSelector() as selector, (serial_log.open("wb") if serial_log else nullcontext()) as transcript:
             selector.register(vm.stdout, selectors.EVENT_READ)
 
-            def expect(marker, timeout):
-                deadline = time.monotonic() + timeout
+            def expect(marker, timeout, failure=None):
+                deadline = time.monotonic() + timeout * timeout_scale
                 while marker not in output:
+                    if failure and failure in output:
+                        raise RuntimeError(f"Guest command reported {failure!r}")
                     if not selector.select(max(0, deadline - time.monotonic())):
                         raise RuntimeError(f"Timed out waiting for {marker!r}")
                     chunk = os.read(vm.stdout.fileno(), 4096)
                     if not chunk:
                         raise RuntimeError(f"QEMU exited before {marker!r}")
                     output.extend(chunk)
+                    if transcript:
+                        transcript.write(chunk)
+                        transcript.flush()
 
             expect(b"theseus: starting console shell", 45)
             vm.stdin.write(
@@ -87,6 +166,22 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False):
             )
             vm.stdin.flush()
             expect(b"THESEUS_BOOT_OK", 15)
+            if distro:
+                vm.stdin.write(
+                    b"(cd /mnt && for applet in $(/bin/nebox --list); do "
+                    b"test -x /bin/\"$applet\" || exit 1; done && "
+                    b"test -x /usr/bin/ls && test -c /dev/null && test -d /root && "
+                    b"test \"$(id -un)\" = root && test \"$(lua -e 'print(_VERSION)')\" = 'Lua 5.4' && "
+                    b"printf 'int main(void) {return 42;}\\n' > check.c && "
+                    b"printf 'build check check.c\\n\\tcc check.c -o check\\ndefault check\\n' > build.ne && "
+                    b"nebuild build.ne && { rc=0; ./check || rc=$?; test \"$rc\" = 42; } && "
+                    b"nebuild build.ne > noop && test ! -s noop && "
+                    b"printf 'local t: [2]integer = {20,22}\\nprint(t[0]+t[1])\\n' > demo.nelua && "
+                    b"necc demo.nelua -o demo && test \"$(./demo)\" = 42) && "
+                    b"printf 'THESEUS_%s\\n' DISTRO_OK || printf 'THESEUS_%s\\n' DISTRO_FAILED\n"
+                )
+                vm.stdin.flush()
+                expect(b"THESEUS_DISTRO_OK", 120, b"THESEUS_DISTRO_FAILED")
             if lua:
                 vm.stdin.write(
                     b"/bin/nelua-lua -e 'assert(require(\"lfs\").attributes(\"/mnt\", \"mode\") == \"directory\"); "
@@ -120,6 +215,46 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False):
                 )
                 vm.stdin.flush()
                 expect(b"THESEUS_NLC_OK", 15)
+            if sdk:
+                vm.stdin.write(
+                    b"export PATH=/bin HOME=/tmp TMPDIR=/tmp; "
+                    b"(cd /mnt && /bin/nebuild -j 2 /usr/src/demo/build.ne && "
+                    b"{ rc=0; ./native > c.out || rc=$?; test \"$rc\" = 23; } && "
+                    b"test \"$(cat c.out)\" = 'native 3000000042' && test \"$(./arrays)\" = 42 && "
+                    b"{ rc=0; ./direct || rc=$?; test \"$rc\" = 42; } && "
+                    b"test \"$(/bin/necc /usr/src/demo/args.lua 'two words')\" = 'Lua 5.4' && "
+                    b"/bin/nebuild -j 2 /usr/src/demo/build.ne > sdk-noop && test ! -s sdk-noop) && "
+                    b"printf 'THESEUS_%s\\n' SDK_OK || printf 'THESEUS_%s\\n' SDK_FAILED\n"
+                )
+                vm.stdin.flush()
+                expect(b"THESEUS_SDK_OK", 120, b"THESEUS_SDK_FAILED")
+                if compiler_source:
+                    vm.stdin.write(
+                        b"(cd /usr/src/necc && /bin/necc necc.nelua -o /mnt/necc2 && "
+                        b"/mnt/necc2 necc.nelua -o /mnt/necc3 && cmp /mnt/necc2 /mnt/necc3 && "
+                        b"/mnt/necc3 /usr/src/demo/hello.c -o /mnt/rebuilt-hello && "
+                        b"{ rc=0; /mnt/rebuilt-hello > /mnt/rebuilt.out || rc=$?; test \"$rc\" = 23; } && "
+                        b"test \"$(cat /mnt/rebuilt.out)\" = 'native 3000000042') && "
+                        b"printf 'THESEUS_%s\\n' SDK_REBUILD_OK || printf 'THESEUS_%s\\n' SDK_REBUILD_FAILED\n"
+                    )
+                    vm.stdin.flush()
+                    expect(b"THESEUS_SDK_REBUILD_OK", 360, b"THESEUS_SDK_REBUILD_FAILED")
+                if runtime_source:
+                    vm.stdin.write(
+                        b"(mkdir /mnt/runtime && cd /mnt/runtime && "
+                        b"/bin/necc --lua /usr/src/necc/render-lua.lua /mnt/necc3 /usr/lib/necc /usr/src/nelua > build.ne && "
+                        b"/bin/nebuild -j 4 build.ne > build.log && "
+                        b"/bin/nebox ln -s /usr/lib/necc/lualib lualib && /bin/nebox ln -s /usr/lib/necc/lib lib && "
+                        b"./nelua-lua -e 'assert(load(\"local _aF09=0x2a; return _aF09\")() == 42); "
+                        b"assert(require(\"lfs\").currentdir() == \"/mnt/runtime\")' && "
+                        b"./nelua-lua -lnelua nelua.lua --cc /usr/lib/necc/tcc/tcc --cache-dir /tmp "
+                        b"-c -o /mnt/runtime/full.c /usr/src/demo/arrays.nelua && "
+                        b"/bin/nebox grep -q 'Generated by Nelua' full.c && "
+                        b"/bin/nebuild -j 4 build.ne > noop.log && test ! -s noop.log) && "
+                        b"printf 'THESEUS_%s\\n' RUNTIME_REBUILD_OK || printf 'THESEUS_%s\\n' RUNTIME_REBUILD_FAILED\n"
+                    )
+                    vm.stdin.flush()
+                    expect(b"THESEUS_RUNTIME_REBUILD_OK", 360, b"THESEUS_RUNTIME_REBUILD_FAILED")
             vm.stdin.write(
                 b"/bin/nebox sh -c '/bin/nebox sleep 3 & echo $! > /mnt/orphan'; "
                 b"read pid < /mnt/orphan; "
@@ -143,6 +278,8 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False):
             vm.kill()
             vm.wait()
     print("Theseus boot, tmpfs mount, child execution, orphan reaping, and shell respawn passed")
+    if distro:
+        print("The packaged distro booted with applet links, root account lookup, Lua, a native C build and a full Nelua executable")
     if lua:
         print("Lua arithmetic, filesystem access, and Nebox shell execution passed")
     if necc:
@@ -151,19 +288,48 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False):
         print("nebuild built a target and skipped a no-op rebuild inside the guest")
     if nlc:
         print("The necc-built frontend compiled Nelua to C inside the guest")
+    if sdk:
+        print("The guest built and ran native C and both Nelua frontends, ran Lua, and skipped a parallel no-op")
+    if compiler_source:
+        print("Two guest rebuilds of necc matched byte for byte and the rebuilt compiler compiled a working C program")
+    if runtime_source:
+        print("The guest rebuilt the complete Lua runtime with nebuild and used the new runtime to compile Nelua")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kernel", type=Path)
-    parser.add_argument("nebox", type=Path)
+    parser.add_argument("nebox", type=Path, nargs="?")
+    parser.add_argument("--boot-image", type=Path, help="boot and test a development initramfs from tools/distro_image.lua")
     parser.add_argument("--lua", type=Path, help="standalone Nelua Lua interpreter")
     parser.add_argument("--necc", type=Path, help="standalone necc compiler")
     parser.add_argument("--nebuild", type=Path, help="standalone nebuild runner")
     parser.add_argument("--nlc", type=Path, help="standalone Nelua subset frontend built by necc")
+    parser.add_argument("--sdk", type=Path, help="staged necc SDK directory")
+    parser.add_argument("--necc-source", type=Path, help="rebuild necc from these Nelua sources inside the guest")
+    parser.add_argument("--runtime-source", type=Path, help="rebuild the bundled Lua interpreter from this Nelua checkout in the guest")
+    parser.add_argument("--serial-log", type=Path, help="save the guest serial console as it runs")
     parser.add_argument("--initramfs-out", type=Path, help="retain the initramfs at this path")
+    parser.add_argument("--timeout-scale", type=float, default=1,
+                        help="multiply guest deadlines for slow QEMU hosts")
     args = parser.parse_args()
+    if not math.isfinite(args.timeout_scale) or args.timeout_scale <= 0:
+        parser.error("--timeout-scale must be finite and positive")
+    if args.boot_image:
+        if any((args.nebox, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source, args.initramfs_out)):
+            parser.error("--boot-image accepts a kernel and an optional --serial-log")
+        smoke(args.kernel, args.boot_image, serial_log=args.serial_log, distro=True, timeout_scale=args.timeout_scale)
+        parser.exit()
+    if not args.nebox:
+        parser.error("supply a Nebox executable or --boot-image")
+    if args.sdk and not (args.necc and args.nebuild):
+        parser.error("--sdk requires --necc and --nebuild")
+    if args.necc_source and not args.sdk:
+        parser.error("--necc-source requires --sdk")
+    if args.runtime_source and not args.necc_source:
+        parser.error("--runtime-source requires --necc-source")
     with tempfile.TemporaryDirectory(prefix="theseus-boot-") as tmp:
         image = args.initramfs_out or Path(tmp) / "initramfs.cpio"
-        write_initramfs(image, args.nebox, args.lua, args.necc, args.nebuild, args.nlc)
-        smoke(args.kernel, image, bool(args.lua), bool(args.necc), bool(args.nebuild), bool(args.nlc))
+        write_initramfs(image, args.nebox, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source)
+        smoke(args.kernel, image, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source, args.serial_log,
+              timeout_scale=args.timeout_scale)

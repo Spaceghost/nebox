@@ -147,6 +147,7 @@ end
 -- 2^128 built from 64x64->128 multiplies, so no 128-bit division (which
 -- would need compiler-rt) is used.
 
+## if ccinfo.has_int128 then
 local M64: uint128 <comptime> = 0xffffffffffffffff
 
 -- the 256-bit product hi:lo of a and b
@@ -312,6 +313,8 @@ local function rho128(n: uint128): uint128
   end
   return n
 end
+
+## end
 
 ----------------------------------------------------------------------------
 -- bignum path: little-endian base-2^32 limbs, no high zero limbs. The
@@ -673,6 +676,69 @@ local function brho(g: *Big, n: *Big)
   end
 end
 
+-- Integer Newton iteration from an upper bound on sqrt(n). When the quotient
+-- reaches the root, the quotient and remainder tell us whether n is a square.
+local function bisqrt(n: *Big, root: *Big): boolean
+  local bit = (bbits(n) + 1) // 2
+  root.l:resize(bit // 32 + 1)
+  for i = 1, #root.l do root.l[i] = 0 end
+  root.l[#root.l] = (@uint32)(1) << (bit % 32)
+  local quotient: Big
+  local remainder: Big
+  defer quotient.l:destroy(); remainder.l:destroy() end
+  while true do
+    bdivmod(&quotient, &remainder, n, root)
+    local order = bcmp(&quotient, root)
+    if order >= 0 then return order == 0 and #remainder.l == 0 end
+    -- floor((root + quotient) / 2) = root - ceil((root - quotient) / 2)
+    bsub(&remainder, root, &quotient)
+    badd_small(&remainder, &remainder, 1)
+    bdivsmall(&remainder, 2)
+    bsub(root, root, &remainder)
+  end
+  return false
+end
+
+local function bsquarefactor(n: *Big, root: *Big): boolean
+  local residue = n.l[1] & 15
+  if residue ~= 0 and residue ~= 1 and residue ~= 4 and residue ~= 9 then return false end
+  return bisqrt(n, root)
+end
+
+-- One Fermat step finds nearby factors of an odd n: for a = ceil(sqrt(n)),
+-- a square gap a*a - n = b*b gives the factors a-b and a+b.
+local function bfermatfactor(n: *Big, d: *Big): boolean
+  if bisqrt(n, d) then return true end
+  badd_small(d, d, 1)
+  local gap: Big
+  local offset: Big
+  defer gap.l:destroy(); offset.l:destroy() end
+  bmul(&gap, d, d)
+  bsub(&gap, &gap, n)
+  if not bsquarefactor(&gap, &offset) then return false end
+  bsub(d, d, &offset)
+  return not bisone(d)
+end
+
+-- Find a proper factor, or return false for a probable prime.
+local function bfindfactor(n: *Big, d: *Big): boolean
+  if bsquarefactor(n, d) then return true end
+  ## if ccinfo.has_int128 then
+  if #n.l <= 4 then
+    local v: uint128 = 0
+    for k = #n.l, 1, -1 do v = (v << 32) | n.l[k] end
+    if isprime128(v) then return false end
+    local g = rho128(v)
+    d.l:clear()
+    while g > 0 do d.l:push((@uint32)(g & 0xffffffff)); g = g >> 32 end
+    return true
+  end
+  ## end
+  if bisprime(n) then return false end
+  brho(d, n)
+  return true
+end
+
 -- The factors of n go to out as decimal strings (n is consumed).
 local function bfactor_rec(n: *Big, out: *sequence(string))
   if bfits64(n) then
@@ -686,23 +752,26 @@ local function bfactor_rec(n: *Big, out: *sequence(string))
   local qt: Big
   local rm: Big
   defer d.l:destroy(); qt.l:destroy(); rm.l:destroy() end
-  if #n.l <= 4 then
-    local v: uint128 = 0
-    for k = #n.l, 1, -1 do v = (v << 32) | n.l[k] end
-    if isprime128(v) then out:push(btodec(n)); return end
-    local g = rho128(v)
-    d.l:clear()
-    while g > 0 do d.l:push((@uint32)(g & 0xffffffff)); g = g >> 32 end
-  else
-    if bisprime(n) then out:push(btodec(n)); return end
-    brho(&d, n)
-  end
+  if not bfindfactor(n, &d) then out:push(btodec(n)); return end
   bdivmod(&qt, &rm, n, &d)
   bfactor_rec(&d, out)
   bfactor_rec(&qt, out)
 end
 
 local function bfactor(n: *Big, out: *sequence(string), small: *sequence(uint64))
+  -- Removing small primes first can hide two nearby factors of the input.
+  if not bfits64(n) and n.l[1] & 1 ~= 0 then
+    local d: Big
+    local quotient: Big
+    local remainder: Big
+    defer d.l:destroy(); quotient.l:destroy(); remainder.l:destroy() end
+    if bfermatfactor(n, &d) then
+      bdivmod(&quotient, &remainder, n, &d)
+      bfactor(&d, out, small)
+      bfactor(&quotient, out, small)
+      return
+    end
+  end
   local p: uint32 = 2
   while p < 65536 and not bfits64(n) do
     if bmodsmall(n, p) == 0 then bdivsmall(n, p); small:push(p)
