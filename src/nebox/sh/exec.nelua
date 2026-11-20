@@ -57,6 +57,7 @@ global shexec.Job = @record{
   pgid: cint,         -- 0 when the job is not in its own group
   pids: sequence(cint),
   sts: sequence(integer),
+  pipefail: boolean,
   live: integer,      -- members not yet finished
   stopped: boolean,
   stopsig: integer,
@@ -90,7 +91,7 @@ global shexec.State = @record{
   o_allexport: boolean, o_errexit: boolean, o_noclobber: boolean, o_noglob: boolean,
   o_noexec: boolean, o_nounset: boolean, o_verbose: boolean, o_xtrace: boolean,
   o_notify: boolean, o_hashall: boolean,
-  o_monitor: boolean,
+  o_monitor: boolean, o_pipefail: boolean,
   o_vi: boolean,
   -- job control: the controlling terminal, the shell's own group and modes
   tty: cint,
@@ -528,6 +529,7 @@ function shexec.job_new(pgid: cint, bg: boolean): integer
   j.pgid = pgid
   j.num = num
   j.bg = bg
+  j.pipefail = shst.o_pipefail
   j.text = job_text(bg)
   shst.jobs:push(j)
   return #shst.jobs
@@ -539,6 +541,14 @@ function shexec.job_add_pid(ji: integer, pid: cint)
   j.sts:push(0)
   j.live = j.live + 1
   j.pid = pid
+end
+
+local function job_exit_status(j: *shexec.Job): integer
+  if not j.pipefail then return j.sts[#j.sts] end
+  for i = #j.sts, 1, -1 do
+    if j.sts[i] ~= 0 then return j.sts[i] end
+  end
+  return 0
 end
 
 -- Record a wait status for one of the jobs' processes; false if unknown.
@@ -559,7 +569,7 @@ local function job_note(pid: cint, status: cint): boolean
           if j.live <= 0 then
             j.done = true
             j.stopped = false
-            j.status = j.sts[#j.sts]
+            j.status = job_exit_status(j)
             j.notified = false
           end
         end
@@ -655,7 +665,7 @@ function shexec.wait_fg(ji: integer): integer
       if sys.errno() == sys.EINTR then continue end
       -- no such children any more: count every member as gone
       j.done = true; j.live = 0
-      if #j.sts > 0 then j.status = j.sts[#j.sts] end
+      if #j.sts > 0 then j.status = job_exit_status(j) end
       break
     end
     job_note(r, st)
@@ -676,10 +686,11 @@ function shexec.wait_fg(ji: integer): integer
     return 128 + j.stopsig
   end
   local status = j.status
+  local last_status = #j.sts > 0 and j.sts[#j.sts] or status
   job_remove(ji)
   -- a foreground job killed by SIGINT ends the rest of the command too, as
   -- if the shell had been interrupted (bash)
-  if status == 130 and shst.interactive then
+  if last_status == 130 and shst.interactive then
     shst.pending[2] = true
     shst.got_signal = true
   end
@@ -1323,7 +1334,7 @@ local function exec_pipeline(n: *N.Node): integer
   else
     for i = 1, #pids do
       local st = shexec.wait_pid(pids[i], false)
-      if i == #pids then status = st end
+      if st ~= 0 or (i == #pids and not shst.o_pipefail) then status = st end
     end
   end
   if n.c == 1 then status = status == 0 and 1 or 0 end

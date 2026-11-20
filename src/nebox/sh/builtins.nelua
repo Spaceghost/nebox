@@ -346,7 +346,7 @@ local OPTNAMES: []OptName = {
   {'allexport', #[B'a']#}, {'notify', #[B'b']#}, {'noclobber', #[B'C']#}, {'errexit', #[B'e']#},
   {'noglob', #[B'f']#}, {'hashall', #[B'h']#}, {'noexec', #[B'n']#}, {'nounset', #[B'u']#},
   {'verbose', #[B'v']#}, {'xtrace', #[B'x']#}, {'ignoreeof', 0}, {'nolog', 0},
-  {'monitor', #[B'm']#}, {'vi', 0},
+  {'monitor', #[B'm']#}, {'pipefail', 0}, {'vi', 0},
 }
 
 local function opt_get(letter: byte): boolean
@@ -383,6 +383,10 @@ end
 
 -- -o name / +o name; returns an error message or "".
 function shbi.set_option_name(name: string, on: boolean): string
+  if name == 'pipefail' then
+    shst.o_pipefail = on
+    return ''
+  end
   if name == 'vi' then
     shst.o_vi = on
     return ''
@@ -404,7 +408,9 @@ local function print_options(as_commands: boolean)
   if not as_commands then util.line('Current option settings') end
   for i: integer = 0, < #OPTNAMES do
     local o = OPTNAMES[i]
-    local on = o.name == 'vi' and shst.o_vi or (o.letter ~= 0 and opt_get(o.letter))
+    local on = (o.name == 'vi' and shst.o_vi) or
+               (o.name == 'pipefail' and shst.o_pipefail) or
+               (o.letter ~= 0 and opt_get(o.letter))
     if as_commands then
       util.line('set ' .. (on and '-o ' or '+o ') .. o.name)
     else
