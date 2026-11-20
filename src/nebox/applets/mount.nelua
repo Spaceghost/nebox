@@ -1,0 +1,364 @@
+-- Linux mount and umount over Nelibc. Kernel permissions govern both calls.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.mountlist'
+require 'nebox.canonicalize'
+
+local function c_mount(source: cstring, target: cstring, kind: cstring, flags: culong, data: pointer): cint
+  <cimport 'mount', cinclude '<sys/mount.h>'> end
+local function c_umount(target: cstring, flags: cint): cint <cimport 'umount2', cinclude '<sys/mount.h>'> end
+local function c_pread(fd: cint, data: pointer, size: csize, offset: clong): clong
+  <cimport 'pread', cinclude '<unistd.h>'> end
+
+local MS_RDONLY: culong <comptime> = 1
+local MS_REMOUNT: culong <comptime> = 32
+local MS_BIND: culong <comptime> = 4096
+local MS_MOVE: culong <comptime> = 8192
+local MS_REC: culong <comptime> = 16384
+local REMOUNTABLE: culong <comptime> = 1 | 2 | 4 | 8 | 256 | 1024 | 2048 | 2097152 | 16777216
+local O_NONBLOCK: cint <comptime> = 2048
+local EINVAL: cint <comptime> = 22
+
+local mount_options: []util.LongOpt = {
+  {'all', 0, 'a'_b}, {'fstab', 1, 'T'_b}, {'types', 1, 't'_b}, {'options', 1, 'o'_b},
+  {'read-only', 0, 'r'_b}, {'ro', 0, 'r'_b}, {'read-write', 0, 'w'_b}, {'rw', 0, 'w'_b},
+  {'bind', 0, 'B'_b}, {'rbind', 0, 'R'_b}, {'move', 0, 'M'_b},
+  {'internal-only', 0, 'i'_b}, {'no-mtab', 0, 'n'_b}, {'verbose', 0, 'v'_b},
+  {'help', 0, 128}, {'version', 0, 129},
+}
+local umount_options: []util.LongOpt = {
+  {'force', 0, 'f'_b}, {'lazy', 0, 'l'_b}, {'no-mtab', 0, 'n'_b},
+  {'internal-only', 0, 'i'_b}, {'verbose', 0, 'v'_b}, {'help', 0, 128}, {'version', 0, 129},
+}
+
+local Flag = @record{name: string, set: culong, clear: culong}
+local flags: []Flag = {
+  {'ro', MS_RDONLY, 0}, {'rw', 0, MS_RDONLY},
+  {'nosuid', 2, 0}, {'suid', 0, 2}, {'nodev', 4, 0}, {'dev', 0, 4}, {'noexec', 8, 0}, {'exec', 0, 8},
+  {'sync', 16, 0}, {'async', 0, 16}, {'dirsync', 128, 0}, {'mand', 64, 0}, {'nomand', 0, 64},
+  {'remount', MS_REMOUNT, 0}, {'bind', MS_BIND, 0}, {'rbind', MS_BIND | MS_REC, 0}, {'move', MS_MOVE, 0},
+  {'noatime', 1024, 2097152 | 16777216}, {'atime', 0, 1024},
+  {'nodiratime', 2048, 0}, {'diratime', 0, 2048},
+  {'relatime', 2097152, 1024 | 16777216}, {'norelatime', 0, 2097152},
+  {'strictatime', 16777216, 1024 | 2097152}, {'nostrictatime', 0, 16777216},
+  {'lazytime', 33554432, 0}, {'nolazytime', 0, 33554432}, {'nosymfollow', 256, 0}, {'symfollow', 0, 256},
+}
+
+local Fstab = @record{source: string, target: string, kind: string, opts: string}
+local Config = @record{flags: culong, changed: culong, data: stringbuilder, skip: boolean, nofail: boolean, loop: boolean}
+
+local function field(line: string, pos: integer): (string, integer)
+  while pos <= #line and (line:byte(pos) == 32 or line:byte(pos) == 9) do pos = pos + 1 end
+  if pos > #line or line:byte(pos) == '#'_b then return '', #line + 1 end
+  local start = pos
+  while pos <= #line and line:byte(pos) ~= 32 and line:byte(pos) ~= 9 do pos = pos + 1 end
+  return mountlist.unescape(line:subview(start, pos - 1)), pos
+end
+
+local function load_fstab(path: string): (sequence(Fstab), boolean)
+  local list: sequence(Fstab)
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then util.perror(path); return list, false end
+  local data, ok = util.readfd(fd)
+  if not ok then util.perror(path) end
+  sys.close(fd)
+  for _, line in ipairs(util.lines(data)) do
+    local item: Fstab
+    local pos = 1
+    item.source, pos = field(line, pos)
+    if item.source.size == 0 then continue end
+    item.target, pos = field(line, pos)
+    item.kind, pos = field(line, pos)
+    item.opts = field(line, pos)
+    if item.target.size == 0 or item.kind.size == 0 or item.opts.size == 0 then continue end
+    if item.source:find('\0', 1, true) > 0 or item.target:find('\0', 1, true) > 0 or
+       item.kind:find('\0', 1, true) > 0 or item.opts:find('\0', 1, true) > 0 then continue end
+    list:push(item)
+  end
+  return list, ok
+end
+
+local function apply_option(cfg: *Config, opt: string): boolean
+  for i = 0, < #flags do
+    local flag = flags[i]
+    if opt == flag.name then
+      cfg.flags = (cfg.flags & ~flag.clear) | flag.set
+      cfg.changed = cfg.changed | flag.set | flag.clear
+      return true
+    end
+  end
+  if opt == 'noauto' then cfg.skip = true
+  elseif opt == 'auto' then cfg.skip = false
+  elseif opt == 'nofail' then cfg.nofail = true
+  elseif opt == 'fail' then cfg.nofail = false
+  elseif opt == 'loop' or opt:subview(1, 5) == 'loop=' or opt:subview(1, 7) == 'offset=' or
+         opt:subview(1, 10) == 'sizelimit=' then
+    cfg.loop = true
+  elseif opt == 'user' or opt == 'users' then
+    cfg.flags = cfg.flags | 2 | 4 | 8
+    cfg.changed = cfg.changed | 2 | 4 | 8
+  elseif opt == 'owner' or opt == 'group' then
+    cfg.flags = cfg.flags | 2 | 4
+    cfg.changed = cfg.changed | 2 | 4
+  elseif opt ~= '' and opt ~= 'defaults' and opt ~= 'nouser' and
+         opt ~= '_netdev' and opt:subview(1, 2):lower() ~= 'x-' then
+    if cfg.data:view().size > 0 then cfg.data:writebyte(','_b) end
+    cfg.data:write(opt)
+  end
+  return true
+end
+
+local function apply_options(cfg: *Config, opts: string): boolean
+  local start = 1
+  local quoted = false
+  for i = 1, #opts do
+    local c = opts:byte(i)
+    if c == 34 then quoted = not quoted end
+    if c == ','_b and not quoted then
+      if not apply_option(cfg, opts:subview(start, i - 1)) then return false end
+      start = i + 1
+    end
+  end
+  if quoted then util.err('unterminated quote in mount options'); return false end
+  return apply_option(cfg, opts:subview(start))
+end
+
+local function resolve_source(source: string): string
+  local eq = source:find('=', 1, true)
+  if eq == 0 then return source end
+  local tag = source:subview(1, eq - 1)
+  local dirname: string
+  if tag == 'UUID' then dirname = 'by-uuid'
+  elseif tag == 'LABEL' then dirname = 'by-label'
+  elseif tag == 'PARTUUID' then dirname = 'by-partuuid'
+  elseif tag == 'PARTLABEL' then dirname = 'by-partlabel'
+  else return source end
+  local label = source:subview(eq + 1)
+  if label.size >= 2 and label:byte(1) == 34 and label:byte(label.size) == 34 then
+    label = label:subview(2, label.size - 1)
+  end
+  if label.size == 0 or label == '.' or label == '..' then return '' end
+  local escaped: stringbuilder
+  for i = 1, #label do
+    local c = label:byte(i)
+    if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or
+       c == 45 or c == 46 or c == 95 or c == 43 or c >= 128 then
+      escaped:writebyte(c)
+    else
+      escaped:write(string.format('\\x%02x', c))
+    end
+  end
+  return '/dev/disk/' .. dirname .. '/' .. escaped:promote()
+end
+
+local function starts_at(data: *[4096]byte, n: integer, offset: integer, magic: string): boolean
+  if n < offset + #magic then return false end
+  for i = 0, < #magic do if data[offset + i] ~= magic.data[i] then return false end end
+  return true
+end
+
+local function detect_type(source: string): string
+  local virtual: []string = {'tmpfs', 'ramfs', 'proc', 'sysfs', 'devtmpfs', 'devpts', 'overlay', 'cgroup2', 'mqueue'}
+  for i = 0, < #virtual do if source == virtual[i] then return source end end
+  local fd = sys.open(source, sys.O_RDONLY | sys.O_CLOEXEC | O_NONBLOCK, 0)
+  if fd < 0 then return '' end
+  defer sys.close(fd) end
+  local st: sys.Stat
+  if sys.fstat(fd, &st) ~= 0 or (st.st_mode & sys.S_IFMT) ~= sys.S_IFBLK then return '' end
+  local b: [4096]byte
+  local n = c_pread(fd, &b[0], #b, 0)
+  if starts_at(&b, n, 0, 'XFSB') then return 'xfs' end
+  if starts_at(&b, n, 0, 'hsqs') then return 'squashfs' end
+  if starts_at(&b, n, 3, 'EXFAT   ') then return 'exfat' end
+  if starts_at(&b, n, 3, 'NTFS    ') then return 'ntfs3' end
+  if starts_at(&b, n, 510, '\x55\xaa') and
+     (starts_at(&b, n, 82, 'FAT32   ') or starts_at(&b, n, 54, 'FAT16   ') or starts_at(&b, n, 54, 'FAT12   ')) then return 'vfat' end
+  if starts_at(&b, n, 1024, '\x10\x20\xf5\xf2') then return 'f2fs' end
+  if n >= 1128 and starts_at(&b, n, 1080, '\x53\xef') then
+    local compat = b[1116]
+    local incompat = ((@uint32)(b[1121]) << 8) | b[1120]
+    local ro_compat = ((@uint32)(b[1125]) << 8) | b[1124]
+    if incompat & ~0x1e ~= 0 or ro_compat & ~0x7 ~= 0 then return 'ext4' end
+    return compat & 4 ~= 0 and 'ext3' or 'ext2'
+  end
+  n = c_pread(fd, &b[0], #b, 65536)
+  if starts_at(&b, n, 64, '_BHRfS_M') then return 'btrfs' end
+  return ''
+end
+
+local function type_allowed(kind: string, filter: string): boolean
+  if filter.size == 0 then return true end
+  local exclude = filter:subview(1, 2) == 'no'
+  local start = exclude and 3 or 1
+  while start <= #filter do
+    local stop = filter:find(',', start, true)
+    if stop == 0 then stop = #filter + 1 end
+    if kind == filter:subview(start, stop - 1) then return not exclude end
+    start = stop + 1
+  end
+  return exclude
+end
+
+local function print_mounts(filter: string): integer
+  local entries, ok = mountlist.read()
+  if not ok then util.perror('/proc/self/mountinfo'); return 1 end
+  for _, entry in ipairs(entries) do
+    if not type_allowed(entry.fstype, filter) then continue end
+    local opts = entry.vfs_options
+    local start = 1
+    while start <= #entry.fs_options do
+      local stop = entry.fs_options:find(',', start, true)
+      if stop == 0 then stop = #entry.fs_options + 1 end
+      local opt = entry.fs_options:subview(start, stop - 1)
+      if opt ~= 'ro' and opt ~= 'rw' and (',' .. opts .. ','):find(',' .. opt .. ',', 1, true) == 0 then
+        opts = opts .. ',' .. opt
+      end
+      start = stop + 1
+    end
+    util.line(entry.devname .. ' on ' .. entry.mountdir .. ' type ' .. entry.fstype .. ' (' .. opts .. ')')
+  end
+  return 0
+end
+
+local function mount_one(item: Fstab, o: *util.Opts, all: boolean): integer
+  if all and (item.kind == 'swap' or not type_allowed(item.kind, o:get('t'))) then return 0 end
+  local cfg: Config
+  if not apply_options(&cfg, item.opts) then return 1 end
+  if all and cfg.skip then return 0 end
+  local next = 1
+  for _, op in ipairs(o.order) do
+    if op == 'o'_b then
+      while o.keys[next] ~= 'o'_b do next = next + 1 end
+      if not apply_options(&cfg, o.vals[next]) then return 1 end
+      next = next + 1
+    elseif op == 'r'_b then apply_option(&cfg, 'ro')
+    elseif op == 'w'_b then apply_option(&cfg, 'rw')
+    elseif op == 'B'_b then apply_option(&cfg, 'bind')
+    elseif op == 'R'_b then apply_option(&cfg, 'rbind')
+    elseif op == 'M'_b then apply_option(&cfg, 'move') end
+  end
+  if cfg.loop then util.err('loop device allocation is unsupported'); return 1 end
+  local source = resolve_source(item.source)
+  local target = item.target
+  local device_missing = cfg.nofail and source.size > 0 and source:byte(1) == '/'_b and not util.exists(source)
+  local kind = item.kind
+  local special = cfg.flags & (MS_BIND | MS_MOVE | MS_REMOUNT) ~= 0
+  if all or cfg.flags & MS_REMOUNT ~= 0 then
+    local canon_target, _ = canon.canonicalize(target, canon.CAN_EXISTING)
+    local entries, ok = mountlist.read()
+    if not ok then util.perror('/proc/self/mountinfo'); return 1 end
+    for i = #entries, 1, -1 do
+      local entry = entries[i]
+      if entry.mountdir ~= target and (canon_target.size == 0 or entry.mountdir ~= canon_target) then continue end
+      if all then return 0 end
+      local previous: Config
+      apply_options(&previous, entry.vfs_options)
+      cfg.flags = cfg.flags | (previous.flags & REMOUNTABLE & ~cfg.changed)
+      break
+    end
+  end
+  if not special and (kind.size == 0 or kind == 'auto') then
+    kind = detect_type(source)
+    if kind.size == 0 then
+      if device_missing then return 0 end
+      util.err('cannot determine filesystem type for ' .. util.quote(item.source) .. '. Use -t TYPE.')
+      return 1
+    end
+  end
+  if kind == 'none' or kind == 'auto' then kind = '' end
+  local kind_arg: cstring = kind.size == 0 and nilptr or (@cstring)(kind)
+  local data_arg: pointer = nilptr
+  if cfg.data:view().size > 0 then
+    cfg.data:writebyte(0)
+    data_arg = cfg.data:view().data
+  end
+  local source_arg: cstring = source.size == 0 and nilptr or (@cstring)(source)
+  if source.size == 0 and item.source.size > 0 then sys.seterrno(EINVAL); util.perror(target); return 1 end
+  if c_mount(source_arg, target, kind_arg, cfg.flags, data_arg) ~= 0 then
+    if device_missing and sys.errno() == sys.ENOENT then return 0 end
+    util.perror(target)
+    return 1
+  end
+  if cfg.flags & MS_BIND ~= 0 and cfg.flags & MS_REMOUNT == 0 and cfg.changed & REMOUNTABLE ~= 0 then
+    local entries, ok = mountlist.read()
+    local canonical, _ = canon.canonicalize(target, canon.CAN_EXISTING)
+    local old_flags: culong = 0
+    local have_flags = false
+    if ok then
+      for i = #entries, 1, -1 do
+        if entries[i].mountdir ~= canonical and entries[i].mountdir ~= target then continue end
+        local inherited: Config
+        apply_options(&inherited, entries[i].vfs_options)
+        old_flags = inherited.flags
+        have_flags = true
+        break
+      end
+    end
+    local wanted = (cfg.flags & REMOUNTABLE) | (old_flags & REMOUNTABLE & ~cfg.changed)
+    if not have_flags or c_mount(nilptr, target, nilptr, MS_BIND | MS_REMOUNT | wanted, nilptr) ~= 0 then
+      local error = have_flags and sys.errno() or EINVAL
+      c_umount(target, 0)
+      sys.seterrno(error)
+      util.perror(target)
+      return 1
+    end
+  end
+  if o:has('v') then util.line(item.source .. ' mounted on ' .. target .. '.') end
+  return 0
+end
+
+global function applet_mount(args: sequence(string)): integer
+  local o = util.parsel(args, 'aT:t:o:rwBRMinv', &mount_options[0], #mount_options)
+  if not o:ok() then util.optfail(o); return 2 end
+  if o:has(string.char(128)) then
+    util.line('Usage: mount [-r|-w] [-t TYPE] [-o OPTIONS] [-T FSTAB] [SOURCE] [TARGET]')
+    util.line('       mount -a [-T FSTAB] [-t TYPES]')
+    return 0
+  end
+  if o:has(string.char(129)) then util.line('mount (nebox)'); return 0 end
+  local n = #o.operands
+  local all = o:has('a')
+  if n > 2 or (all and n ~= 0) then util.err('invalid number of operands'); return 2 end
+  if n == 0 and not all then return print_mounts(o:get('t')) end
+  if n == 2 then
+    return mount_one({source=o.operands[1], target=o.operands[2], kind=o:get('t')}, &o, false) * 32
+  end
+  local path = o:has('T') and o:get('T') or '/etc/fstab'
+  local entries, ok = load_fstab(path)
+  if not ok then return 1 end
+  if all then
+    local failed = false
+    for _, item in ipairs(entries) do if mount_one(item, &o, true) ~= 0 then failed = true end end
+    return failed and 32 or 0
+  end
+  local operand = o.operands[1]
+  local canonical, _ = canon.canonicalize(operand, canon.CAN_EXISTING)
+  local found: Fstab
+  for _, item in ipairs(entries) do
+    if item.target == operand or (canonical.size > 0 and item.target == canonical) then found = item; break end
+    if found.target.size == 0 and (item.source == operand or (canonical.size > 0 and item.source == canonical)) then found = item end
+  end
+  if found.target.size == 0 then util.err(operand .. ': not found in ' .. path); return 1 end
+  if o:has('t') then found.kind = o:get('t') end
+  return mount_one(found, &o, false) * 32
+end
+
+global function applet_umount(args: sequence(string)): integer
+  local o = util.parsel(args, 'flniv', &umount_options[0], #umount_options)
+  if not o:ok() then util.optfail(o); return 2 end
+  if o:has(string.char(128)) then util.line('Usage: umount [-f] [-l] TARGET...'); return 0 end
+  if o:has(string.char(129)) then util.line('umount (nebox)'); return 0 end
+  if #o.operands == 0 then util.err('missing operand'); return 2 end
+  local flags = (o:has('f') and 1 or 0) | (o:has('l') and 2 or 0)
+  local failed = 0
+  for _, target in ipairs(o.operands) do
+    if c_umount(target, flags) ~= 0 then util.perror(target); failed = failed + 1
+    elseif o:has('v') then util.line(target .. ' unmounted.') end
+  end
+  if failed == 0 then return 0 end
+  return failed == #o.operands and 32 or 64
+end

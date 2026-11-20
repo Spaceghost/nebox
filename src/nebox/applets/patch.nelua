@@ -1012,45 +1012,37 @@ local function apply_ed(data: string, o: *Opt, name: string): integer
   return write_file(target, &t.lines, o.outfile.size > 0 and 0x180 or 0x1a4) and 0 or 2
 end
 
+local patch_options: []util.LongOpt = {
+  {'backup', 0, 'b'_b}, {'context', 0, 'c'_b}, {'directory', 1, 'd'_b}, {'ifdef', 1, 'D'_b},
+  {'ed', 0, 'e'_b}, {'remove-empty-files', 0, 'E'_b}, {'force', 0, 'f'_b}, {'fuzz', 1, 'F'_b},
+  {'input', 1, 'i'_b}, {'ignore-whitespace', 0, 'l'_b}, {'normal', 0, 'n'_b}, {'forward', 0, 'N'_b},
+  {'output', 1, 'o'_b}, {'strip', 1, 'p'_b}, {'reject-file', 1, 'r'_b}, {'reverse', 0, 'R'_b},
+  {'silent', 0, 's'_b}, {'quiet', 0, 's'_b}, {'batch', 0, 't'_b}, {'unified', 0, 'u'_b},
+  {'version', 0, 'v'_b}, {'help', 0, 128}, {'dry-run', 0, 129}, {'posix', 0, 130},
+  {'backup-if-mismatch', 0, 131}, {'no-backup-if-mismatch', 0, 132},
+}
+
 global function applet_patch(args: sequence(string)): integer
-  -- long options GNU patch users write, mapped to the short ones
-  local rest: sequence(string)
-  local dry = false
+  local o = util.parsel(args, 'bcd:D:eEfF:i:lno:p:Rr:stuvN', &patch_options[0], #patch_options)
+  if not o:ok() then return util.optfail(o) + 1 end
   local posix = sys.getenv('POSIXLY_CORRECT') ~= nilptr
   local backup_mismatch = not posix
-  for i = 1, #args do
-    local a = args[i]
-    if a == '--' then
-      for j = i, #args do rest:push(args[j]) end
-      break
-    elseif a == '--dry-run' then dry = true
-    elseif a == '--posix' then posix = true
-    elseif a == '--backup-if-mismatch' then backup_mismatch = true
-    elseif a == '--no-backup-if-mismatch' then backup_mismatch = false
-    elseif a == '--forward' then rest:push('-N')
-    elseif a == '--reverse' then rest:push('-R')
-    elseif a == '--batch' then rest:push('-t')
-    elseif a == '--force' then rest:push('-f')
-    elseif a == '--ignore-whitespace' then rest:push('-l')
-    elseif a == '--silent' or a == '--quiet' then rest:push('-s')
-    elseif a == '--backup' then rest:push('-b')
-    elseif a == '--remove-empty-files' then rest:push('-E')
-    elseif starts(a, '--strip=') then rest:push('-p'); rest:push(a:sub(9))
-    elseif starts(a, '--input=') then rest:push('-i'); rest:push(a:sub(9))
-    elseif starts(a, '--output=') then rest:push('-o'); rest:push(a:sub(10))
-    elseif starts(a, '--reject-file=') then rest:push('-r'); rest:push(a:sub(15))
-    elseif starts(a, '--directory=') then rest:push('-d'); rest:push(a:sub(13))
-    elseif a == '--ifdef' then rest:push('-D')
-    elseif starts(a, '--ifdef=') then rest:push('-D'); rest:push(a:sub(9))
-    elseif starts(a, '--fuzz=') then rest:push('-F'); rest:push(a:sub(8))
-    elseif a == '--unified' then rest:push('-u')
-    elseif a == '--context' then rest:push('-c')
-    elseif a == '--normal' then rest:push('-n')
-    elseif a == '--ed' then rest:push('-e')
-    else rest:push(a) end
+  local dry = false
+  for _, op in ipairs(o.order) do
+    if op == 128 then
+      util.line('Usage: patch [OPTION]... [ORIGFILE [PATCHFILE]]')
+      util.line('Apply a context, unified, normal or ed patch.')
+      util.line('-p N strips path components. -i FILE selects the patch. -o FILE writes a separate result.')
+      util.line('--dry-run checks what would apply. --posix uses POSIX file selection.')
+      return 0
+    elseif op == 'v'_b then
+      util.line('patch (nebox) after GNU patch 2.7.6')
+      return 0
+    elseif op == 129 then dry = true
+    elseif op == 130 then posix = true
+    elseif op == 131 then backup_mismatch = true
+    elseif op == 132 then backup_mismatch = false end
   end
-  local o = util.parse(rest, 'bcd:D:eEfF:i:lno:p:Rr:stuN')
-  if not o:ok() then return util.optfail(o) + 1 end
   local opt: Opt = {strip = -1, fuzz = 2, reverse = o:has('R'), forward = o:has('N'),
     batch = o:has('t'), force = o:has('f'), silent = o:has('s'), backup = o:has('b'),
     posix = posix, backup_mismatch = backup_mismatch,

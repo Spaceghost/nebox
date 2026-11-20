@@ -560,7 +560,7 @@ end
 
 local tr_longs: []util.LongOpt = {
   {'complement', 0, 99}, {'delete', 0, 100}, {'squeeze-repeats', 0, 115}, {'truncate-set1', 0, 116},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  {'help', 0, 128}, {'version', 0, 129},
 }
 
 global function applet_tr(args: sequence(string)): integer
@@ -568,6 +568,7 @@ global function applet_tr(args: sequence(string)): integer
   for k = 0, 255 do in_squeeze_set[k] = false; in_delete_set[k] = false end
   local o = util.parsel(args, '+AcCdst', &tr_longs, #tr_longs)
   if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'tr [OPTION]... STRING1 [STRING2]') then return 0 end
   if o:has('c') or o:has('C') then complement = true end
   delete = o:has('d'); squeeze_repeats = o:has('s'); truncate_set1 = o:has('t')
   local n = #o.operands

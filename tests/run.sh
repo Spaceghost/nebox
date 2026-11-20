@@ -176,6 +176,14 @@ EOF
 printf "%s:%s\n" "$x" "$y"'"'"''
 same diff-minimal-horizon 'printf "z\na\nb\nb\nc\nz\n" > a; printf "z\nb\nb\na\nc\nz\n" > b; diff --minimal --horizon-lines=2 a b; diff -d -u --label a --label b a b'
 same diff-speed-large 'awk "BEGIN { for(i=1;i<=24000;i++) print i }" > a; awk "BEGIN { for(i=1;i<=24000;i++) print (i%35==1 && i<24000 ? i+1 : i%35==2 ? i-1 : i) }" > b; diff --speed-large-files -u --label a --label b a b | cksum'
+expect tool-information 'Usage: diff [OPTION]... FILES
+patch (nebox) after GNU patch 2.7.6
+Usage: tr [OPTION]... STRING1 [STRING2]
+exit=0' 'diff --help | head -n1; patch --version; tr --help'
+same diff-tab-equivalence 'printf "a\tz\nabc\b\tz\nx\ry\tz\n" > a; printf "a       z\nabc\b      z\nx\ry       z\n" > b; diff -E a b; diff -EZ a b; printf "a\tz\n" > a; printf "a   z\n" > b; diff --tabsize=4 --ignore-tab-expansion a b'
+same diff-comparison-list 'cp words.txt a; cp words.txt b; cp spaces.txt c; diff -q --from-file=a b c; diff -q --to-file=a b c; diff --from-file=a; diff --from-file=a --to-file=b c; diff -qs --from-file=- b c < a'
+same diff-suppress-empty 'printf "\nchange\n\n" > a; printf "insert\n\n" > b; diff --suppress-blank-empty --label old --label new -u a b; diff --suppress-blank-empty --label old --label new -c a b; diff --suppress-blank-empty -T a b'
+same diff-starting-file 'mkdir -p a/part b/part; printf "old\n" > a/aa; printf "new\n" > b/aa; cp a/aa a/part/aa; cp b/aa b/part/aa; diff -qr -S part a b'
 same diff-color 'diff --color=always words.txt spaces.txt; diff --color=always -u --label left --label right words.txt nonl.txt; diff --color=always -c --label left --label right words.txt spaces.txt; diff --color=always -y words.txt spaces.txt'
 same diff-palette 'diff --color=always --palette=hd=31:ad=34:de=35:ln=33 -u --label a --label b words.txt spaces.txt; diff --color=always --palette=bad words.txt spaces.txt; diff --color words.txt spaces.txt; diff --color=invalid words.txt spaces.txt'
 same diff-strip-cr 'printf "same\r\nold\r\n" > a; printf "same\nnew\n" > b; diff --strip-trailing-cr -u --label a --label b a b'
@@ -512,6 +520,7 @@ same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -
 same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
 same touch-d-fraction "touch -d '2026-01-02 03:04:05.123456789' f; TZ=UTC stat -c '%y' f; touch -d '2026-01-02 03:04:05,5' g; TZ=UTC stat -c '%y' g"
 # patch (GNU patch 2.7.6); tests/patch_fuzz.py compares hunk placement, fuzz, rejects and backups on random inputs
+same patch-long-options 'printf "old\\n" > a; printf "new\\n" > b; diff -u --label a --label a a b > changes; patch --strip 0 --inp changes; cat a'
 same patch-posix-name 'printf '"'"'old\n'"'"' > longest; cp longest x; printf '"'"'%s\n'"'"' '"'"'--- longest'"'"' '"'"'+++ x'"'"' '"'"'@@ -1 +1 @@'"'"' '"'"'-old'"'"' '"'"'+new'"'"' > change; patch --posix -p0 -i change; cat longest x'
 same patch-posix-delete 'printf '"'"'old\n'"'"' > old; printf '"'"'%s\n'"'"' '"'"'--- old'"'"' '"'"'+++ /dev/null'"'"' '"'"'@@ -1 +0,0 @@'"'"' '"'"'-old'"'"' > change; patch --posix -p0 -i change; test -f old && wc -c < old'
 same patch-posix-backup 'printf '"'"'first\nkeep\nold\nlast\n'"'"' > target; printf '"'"'%s\n'"'"' '"'"'--- target'"'"' '"'"'+++ target'"'"' '"'"'@@ -1,3 +1,3 @@'"'"' '"'"' keep'"'"' '"'"'-old'"'"' '"'"'+new'"'"' '"'"' last'"'"' > change; POSIXLY_CORRECT=1 patch -p0 -i change; cat target; test ! -e target.orig'
@@ -1095,13 +1104,41 @@ same seq-f-hexfloat 'seq -f %a 1 1; seq -f %A 2 2; seq -f "%%%#018.3La%%" -0.75 
 # sh
 . "$(dirname -- "$0")/sh.sh"
 # dispatch
+expect mount-rejects-unknown-option 'exit=2' 'mount -t tmpfs -x /mnt'
+expect mount-list 'exit=0' 'mount -t proc | grep -q " on /proc type proc "'
+if unshare -rm true >/dev/null 2>&1; then
+  expect mount-options-private 'exit=0' 'unshare -rm sh -c '"'"'
+    set -e
+    mkdir volume mirror
+    mount -o size=1m,mode=0751,nosuid,nodev,noexec tmpfs volume
+    [ "$(stat -c %a volume)" = 751 ]
+    mount -t tmpfs | grep -q " on $PWD/volume type tmpfs (rw,nosuid,nodev,noexec,"
+    mount --bind -r volume mirror
+    mount -t tmpfs | grep -q " on $PWD/mirror type tmpfs (ro,nosuid,nodev,noexec,"
+    umount -l mirror
+    umount volume
+    [ "$(stat -c %a volume)" != 751 ]
+  '"'"''
+  expect mount-fstab-private 'exit=0' 'unshare -rm sh -c '"'"'
+    set -e
+    mkdir "with space" later bulk skipped
+    escaped="$PWD/with\\040space"
+    printf "%s\\n" "tmpfs $escaped auto mode=0701,size=1m 0 0" "tmpfs $PWD/bulk tmpfs mode=0702 0 0" "tmpfs $PWD/skipped tmpfs noauto,mode=0703 0 0" > table
+    mount -T table "with space"
+    [ "$(stat -c %a "with space")" = 701 ]
+    mount -a -T table
+    [ "$(stat -c %a bulk)" = 702 ]
+    [ "$(stat -c %a skipped)" != 703 ]
+    mount -a -T table
+    umount "with space" bulk
+  '"'"''
+fi
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '122
+  expect list-count-theseus '123
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
-  expect mount-rejects-unknown-option 'exit=2' 'mount -t tmpfs -x /mnt'
 else
-  expect list-count '120
+  expect list-count '122
 exit=0' "$BIN --list | wc -l"
 fi
 

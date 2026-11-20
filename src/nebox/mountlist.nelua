@@ -14,12 +14,14 @@ global mountlist.Entry = @record{
   mountdir: string,
   mntroot: string,
   fstype: string,
+  vfs_options: string,
+  fs_options: string,
   dev: uint64,
   dummy: boolean,
   remote: boolean,
 }
 
-local function unescape_tab(s: string): string
+function mountlist.unescape(s: string): string
   local sb: stringbuilder
   local i = 1
   local n = #s
@@ -96,16 +98,20 @@ local function parse_line(line: string, e: *mountlist.Entry): boolean
   if not f1 then return false end
   local target, p3, f2 = field(line, p2)
   if not f2 then return false end
+  local vfs_options, _, have_vfs = field(line, p3)
+  if not have_vfs then return false end
   local dash = line:find(' - ', p3 - 1, true)
   if dash == 0 then return false end
   local fstype, p4, f3 = field(line, dash + 3)
   if not f3 then return false end
-  local source, _, f4 = field(line, p4)
+  local source, p5, f4 = field(line, p4)
   if not f4 then return false end
-  e.devname = unescape_tab(source)
-  e.mountdir = unescape_tab(target)
-  e.mntroot = unescape_tab(mntroot)
-  e.fstype = unescape_tab(fstype)
+  e.devname = mountlist.unescape(source)
+  e.mountdir = mountlist.unescape(target)
+  e.mntroot = mountlist.unescape(mntroot)
+  e.fstype = mountlist.unescape(fstype)
+  e.vfs_options = vfs_options
+  e.fs_options = line:sub(p5, #line - 1)
   e.dev = ((maj & 0xfffff000) << 32) | ((maj & 0xfff) << 8) | ((min & 0xffffff00) << 12) | (min & 0xff)
   e.dummy = is_dummy(e.fstype)
   e.remote = is_remote(e.devname, e.fstype)

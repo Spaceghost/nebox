@@ -127,10 +127,10 @@ and include files are prerequisites of the generated targets.
 [ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum cmp comm
 cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo env expand expr
 factor false find fmt fold free grep groups hd head hexdump hostid hostname id install
-join kill link ln logname ls md5sum mkdir mkfifo mknod mktemp mv nice nisdomainname nl nohup nproc nsh od paste
+join kill link ln logname ls md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
 patch pathchk pinky printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
-sync tac tail tee test timeout touch tr true truncate tsort tty uname unexpand
+sync tac tail tee test timeout touch tr true truncate tsort tty umount uname unexpand
 uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname
 ```
 
@@ -299,6 +299,18 @@ Individual applets below list the operations that still use byte semantics.
   gnulib backupfile.c (numbered names found by scanning the directory, with
   its string arithmetic) for cp, mv and install to share.
   `tests/ln_compare.py`: 149 cases, 0 mismatches.
+- `mount` lists live mounts from Linux mountinfo. Give it a source and
+  target, or let it look up one source or target in `/etc/fstab`. `-T FILE`
+  selects another fstab file. `-a` mounts entries in file order and skips
+  noauto, swap and already occupied mount points. Use `-o` to set VFS
+  flags or send filesystem-specific options to the kernel. The command
+  can infer the type for named virtual filesystems and recognizes common
+  filesystem signatures on block devices. `umount` accepts mount points
+  and supports lazy and forced unmounts. Namespace tests cover tmpfs type
+  inference, fstab path escapes, option propagation, read-only bind mounts
+  and lazy unmounts. The block signature paths and forced unmount need
+  additional fixtures. Loop allocation, external filesystem helpers, the
+  setuid permission model and mount propagation operations remain open.
 - `df` ports df.c over the mountinfo reader, gnulib fsusage (statfs) and
   `src/nebox/human.nelua`, a port of gnulib human.c (integer arithmetic
   when block sizes divide, long double otherwise, ceiling/floor/nearest
@@ -1090,7 +1102,11 @@ Individual applets below list the operations that still use byte semantics.
   does. `--strip-trailing-cr` strips CRLF line endings, `-Z` ignores
   trailing white space, and `--no-dereference` compares symbolic link targets.
   `--color` and `--palette` color normal, unified, context and side-by-side output.
-  Tab expansion in custom templates remains unsupported.
+  `--ignore-tab-expansion` equates tabs with the spaces they represent.
+  `--suppress-blank-empty` omits padding on empty lines. `--from-file`
+  and `--to-file` compare a fixed file or directory against each operand.
+  `--starting-file` skips earlier names at the top level of a directory
+  comparison. Tab expansion in custom templates remains unsupported.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
   patches are kept (the `stray \` warnings appear only when
@@ -1390,10 +1406,8 @@ make THESEUS="$THESEUS" NELUA="$NELUA" NELIBC="$NELIBC" ZIG="$ZIG"
 
 The opt-in build produces `build-theseus/nebox`. For an initramfs, install
 it as `/bin/nebox`, link `/init` to it, and include `/proc`, `/sys` and the
-`/dev/console` character device. The `mount` applet accepts
-`mount [-r] -t TYPE [--] SOURCE TARGET`. It needs an explicit type, source
-and existing target. fstab, automatic filesystem detection and filesystem
-options are outside this applet's current scope.
+`/dev/console` character device. The standalone and Theseus-enabled builds both provide
+`mount` and `umount`.
 
 On the QEMU host, pass a Linux x86-64 bzImage with initramfs, serial console,
 procfs, sysfs and tmpfs support built in:

@@ -25,6 +25,7 @@ require 'nebox.diff_format'
 local Opt = @record{
   paginate: boolean, messages: sequence(string),
   strip_cr: boolean, trailing_space: boolean, no_dereference: boolean,
+  ignore_tab_expansion: boolean, suppress_blank_empty: boolean, starting_file: string,
   color: boolean, colors: [7]string,
   fmt: byte,          -- normal, context, unified, ed, ifdef, or side by side
   context: integer, horizon: integer, minimal: boolean, initial_tab: boolean, speed_large: boolean,
@@ -66,6 +67,31 @@ local function is_space(c: byte): boolean
   return c == 32 or c == 9 or c == 11 or c == 12 or c == 13
 end
 
+-- Encode a run of spaces by length, so comparison stays bounded for large
+-- tab stops. Byte zero is the marker and is doubled for literal input NULs.
+local function compare_tabs(key: *stringbuilder, line: string, tabsize: uint64, icase: boolean, control_columns: boolean)
+  local column: uint64 = 0
+  local spaces: uint64 = 0
+  for i: usize = 0, < line.size do
+    local c = line.data[i]
+    if c == 32 or c == 9 then
+      local count = c == 32 and (@uint64)(1) or tabsize - column % tabsize
+      column = column + count
+      spaces = spaces + count
+      continue
+    end
+    if spaces > 0 then key:write('\0s', tostring(spaces), ';'); spaces = 0 end
+    if icase and c >= 65 and c <= 90 then c = c + 32 end
+    key:writebyte(c)
+    if c == 0 then key:writebyte(0) end
+    if control_columns and c == 8 then
+      if column > 0 then column = column - 1 end
+    elseif control_columns and c == 13 then column = 0
+    else column = column + 1 end
+  end
+  if spaces > 0 then key:write('\0s', tostring(spaces), ';') end
+end
+
 -- The key two lines must share to be equal under -i/-b/-w. An incomplete
 -- last line equals a complete one only under -b or -w, where the missing
 -- newline is white space, and in ed scripts, which cannot express it (GNU).
@@ -82,6 +108,20 @@ local function line_key(o: *Opt, s: string, incomplete: boolean): string
   end
   local sb: stringbuilder
   sb:writebyte((incomplete and not o.space_change and not o.all_space and not o.trailing_space and o.fmt ~= 101) and 73 or 67)
+  -- GNU's combined -E -Z comparison rejects in-line tab/space changes.
+  if o.ignore_tab_expansion and not o.trailing_space and not o.space_change and not o.all_space then
+    local input = o.icase and nlocale.multibyte and nlocale.casemap(s, false) or s
+    local icase = o.icase and not nlocale.multibyte
+    compare_tabs(&sb, input, (@uint64)(o.tabsize), icase, true)
+    -- GNU's hash tracks backspace and CR, while its equality check counts
+    -- them as bytes. Both comparisons must agree on the resulting spacing.
+    if input:find('\b', 1, true) > 0 or input:find('\r', 1, true) > 0 then
+      sb:write('\0x')
+      compare_tabs(&sb, input, (@uint64)(o.tabsize), icase, false)
+    end
+    if o.icase and nlocale.multibyte then input:destroy() end
+    return sb:promote()
+  end
   if not o.icase and not o.space_change and not o.all_space then
     sb:write(s)
     return sb:promote()
@@ -154,8 +194,9 @@ local function load(path: string, label: string, f: *DFile, strip_cr: boolean): 
     f.mtime = ts.tv_sec; f.mnsec = ts.tv_nsec
   end
   local data, ok = util.readfd(fd)
-  if fd > 0 then sys.close(fd) end
-  if not ok then util.perror(path); return false end
+  local read_error = sys.errno()
+  if path ~= '-' then sys.close(fd) end
+  if not ok then sys.seterrno(read_error); util.perror(path); return false end
   if strip_cr then
     local out: stringbuilder
     for i: usize = 0, < data.size do
@@ -695,13 +736,16 @@ end
 
 local function put_line(o: *Opt, prefix: string, f: *DFile, i: integer, color: integer)
   begin_color(o, color)
-  if o.initial_tab and prefix.size > 0 then
+  local text = f.lines[i + 1]
+  if o.suppress_blank_empty and text.size == 0 and prefix.size > 0 then
+    if prefix.data[0] ~= 32 then util.writebyte(prefix.data[0]) end
+  elseif o.initial_tab and prefix.size > 0 then
     if prefix ~= ' ' then util.writebyte(prefix.data[0]) end
     util.writebyte(9)
   else
     util.write(prefix)
   end
-  put_text(o, f.lines[i + 1])
+  put_text(o, text)
   end_color(o, color)
   if f.incomplete and i == #f.lines - 1 and not ed_mode then util.write('\\ No newline at end of file\n') end
 end
@@ -1324,7 +1368,7 @@ local function read_excludes(o: *Opt, path: string): boolean
   return true
 end
 
-local function diff_dirs(o: *Opt, d0: string, d1: string): integer
+local function diff_dirs(o: *Opt, d0: string, d1: string, top: boolean): integer
   local n0, ok0 = util.readnames(d0, true)
   local n1, ok1 = util.readnames(d1, true)
   if not ok0 then util.perror(d0); return 2 end
@@ -1341,7 +1385,7 @@ local function diff_dirs(o: *Opt, d0: string, d1: string): integer
   util.sort(names, util.name_less)
   local rc = 0
   for _, n in ipairs(names) do
-    if excluded(o, n) then continue end
+    if excluded(o, n) or (top and o.starting_file.size > 0 and util.name_less(n, o.starting_file)) then continue end
     local where = seen[n]
     local p0, p1 = util.join(d0, n), util.join(d1, n)
     local st0: sys.Stat
@@ -1356,7 +1400,7 @@ local function diff_dirs(o: *Opt, d0: string, d1: string): integer
       diff_message(o, string.format('Only in %s: %s', where == 1 and d0 or d1, n))
       r = 1
     elseif k0 == Kind.DIR and k1 == Kind.DIR then
-      if o.recursive then r = diff_dirs(o, p0, p1)
+      if o.recursive then r = diff_dirs(o, p0, p1, false)
       else diff_message(o, string.format('Common subdirectories: %s and %s', p0, p1)) end
     elseif (k0 == Kind.DIR) ~= (k1 == Kind.DIR) then
       diff_message(o, string.format('File %s is a %s while file %s is a %s', p0, type_name(k0, &st0), p1, type_name(k1, &st1)))
@@ -1376,15 +1420,15 @@ local LONGOPTS: []util.LongOpt = {
   {'new-file', 0, 'N'_b}, {'normal', 0, 128}, {'show-c-function', 0, 'p'_b},
   {'brief', 0, 'q'_b}, {'recursive', 0, 'r'_b}, {'report-identical-files', 0, 's'_b},
   {'unified', 2, 'U'_b}, {'ignore-all-space', 0, 'w'_b},
-  {'strip-trailing-cr', 0, 142}, {'ignore-tab-expansion', 0, util.UNSUPPORTED},
+  {'strip-trailing-cr', 0, 142}, {'ignore-tab-expansion', 0, 'E'_b},
   {'ignore-trailing-space', 0, 'Z'_b}, {'ignore-file-name-case', 0, util.UNSUPPORTED},
   {'no-ignore-file-name-case', 0, util.UNSUPPORTED}, {'exclude', 1, 'x'_b},
-  {'exclude-from', 1, 'X'_b}, {'from-file', 1, util.UNSUPPORTED},
-  {'to-file', 1, util.UNSUPPORTED}, {'starting-file', 1, util.UNSUPPORTED},
+  {'exclude-from', 1, 'X'_b}, {'from-file', 1, 146},
+  {'to-file', 1, 147}, {'starting-file', 1, 'S'_b},
   {'side-by-side', 0, 'y'_b}, {'width', 1, 'W'_b},
   {'left-column', 0, 129}, {'suppress-common-lines', 0, 130},
   {'expand-tabs', 0, 't'_b}, {'initial-tab', 0, 'T'_b},
-  {'tabsize', 1, 131}, {'suppress-blank-empty', 0, util.UNSUPPORTED},
+  {'tabsize', 1, 131}, {'suppress-blank-empty', 0, 148},
   {'paginate', 0, 'l'_b}, {'no-dereference', 0, 143},
   {'unidirectional-new-file', 0, util.UNSUPPORTED}, {'ifdef', 1, 'D'_b},
   {'minimal', 0, 'd'_b}, {'horizon-lines', 1, 140},
@@ -1394,7 +1438,7 @@ local LONGOPTS: []util.LongOpt = {
   {'old-group-format', 1, 136}, {'new-group-format', 1, 137},
   {'unchanged-group-format', 1, 138}, {'changed-group-format', 1, 139},
   {'color', 2, 144}, {'palette', 1, 145},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  {'help', 0, 149}, {'version', 0, 'v'_b},
 }
 
 local function add_rule(rules: *sequence(regex.Prog), pat: string): boolean
@@ -1490,11 +1534,24 @@ local function parse_palette(o: *Opt, palette: string): boolean
   return true
 end
 
+local function compare_operands(o: *Opt, p0: string, p1: string): integer
+  local st0: sys.Stat
+  local st1: sys.Stat
+  local k0 = p0 == '-' and Kind.FILE or kind_of(p0, &st0, o.no_dereference)
+  local k1 = p1 == '-' and Kind.FILE or kind_of(p1, &st1, o.no_dereference)
+  if k0 == Kind.DIR and k1 == Kind.DIR then return diff_dirs(o, p0, p1, true) end
+  if k0 == Kind.DIR then p0 = util.join(p0, util.basename(p1)) end
+  if k1 == Kind.DIR then p1 = util.join(p1, util.basename(p0)) end
+  return diff_files(o, p0, p1, false)
+end
+
 global function applet_diff(args: sequence(string)): integer
-  local g = util.getopt(args, 'abBcC:dD:eiI:F:lL:nNpqrstTuU:W:wx:X:yZ', &LONGOPTS[0], #LONGOPTS)
+  local g = util.getopt(args, 'abBcC:dD:eEiI:F:lL:nNpqrS:stTuU:vW:wx:X:yZ', &LONGOPTS[0], #LONGOPTS)
   local opt: Opt = {context = 3, width = 130, tabsize = 8, colors = {'1', '36', '31', '32', '\x1b[', 'm', '0'}}
   local color_mode = 'never'
   local palette = ''
+  local from_file, to_file = '', ''
+  local have_from, have_to = false, false
   local sw: stringbuilder
   local last_switch = 0
   local c_function = false
@@ -1545,6 +1602,26 @@ global function applet_diff(args: sequence(string)): integer
         return 2
       end
     elseif c == 145 then palette = g.optarg
+    elseif c == 146 then
+      if have_from and from_file ~= g.optarg then util.err('conflicting --from-file option value ' .. util.quote(g.optarg)); return 2 end
+      from_file, have_from = g.optarg, true
+    elseif c == 147 then
+      if have_to and to_file ~= g.optarg then util.err('conflicting --to-file option value ' .. util.quote(g.optarg)); return 2 end
+      to_file, have_to = g.optarg, true
+    elseif c == 148 then opt.suppress_blank_empty = true
+    elseif c == 149 then
+      util.line('Usage: diff [OPTION]... FILES')
+      util.line('Compare two files or directories, or use --from-file or --to-file.')
+      util.line('Formats include normal, -u, -c, -e, -n, -y and -D NAME.')
+      util.line('-r recurses into directories. -q reports differences without printing edits.')
+      return 0
+    elseif c == 'v'_b then util.line('diff (nebox) after GNU diffutils 3.8'); return 0
+    elseif c == 'E'_b then opt.ignore_tab_expansion = true
+    elseif c == 'S'_b then
+      if opt.starting_file.size > 0 and opt.starting_file ~= g.optarg then
+        util.err('conflicting -S option value ' .. util.quote(g.optarg)); return 2
+      end
+      opt.starting_file = g.optarg
     elseif c == 'Z'_b then opt.trailing_space = true
     elseif c == 'l'_b then opt.paginate = true
     elseif c == 't'_b then opt.expand_tabs = true
@@ -1612,7 +1689,8 @@ global function applet_diff(args: sequence(string)): integer
   if opt.fmt == 0 then opt.fmt = c_function and 'c'_b or 'n'_b end
   if opt.fmt == 'D'_b then default_templates(&opt) end
   local operands = g:operands()
-  if #operands ~= 2 then
+  if have_from and have_to then util.err('--from-file and --to-file both specified'); return 2 end
+  if not have_from and not have_to and #operands ~= 2 then
     if #operands < 2 then
       util.err(#operands == 0 and 'missing operand' or ('missing operand after ' .. util.quote(operands[1])))
     else
@@ -1620,19 +1698,16 @@ global function applet_diff(args: sequence(string)): integer
     end
     return 2
   end
-  local p0, p1 = operands[1], operands[2]
-  local st0: sys.Stat
-  local st1: sys.Stat
-  local k0 = p0 == '-' and Kind.FILE or kind_of(p0, &st0, opt.no_dereference)
-  local k1 = p1 == '-' and Kind.FILE or kind_of(p1, &st1, opt.no_dereference)
-  local rc: integer
-  if k0 == Kind.DIR and k1 == Kind.DIR then
-    rc = diff_dirs(&opt, p0, p1)
+  local rc = 0
+  if have_from or have_to then
+    local fixed = have_from and from_file or to_file
+    for _, operand in ipairs(operands) do
+      local status = have_from and compare_operands(&opt, fixed, operand) or compare_operands(&opt, operand, fixed)
+      if fixed == '-' or operand == '-' then sys.close(0) end
+      if status > rc then rc = status end
+    end
   else
-    -- a directory and a file: compare with the file of the same name in it
-    if k0 == Kind.DIR then p0 = util.join(p0, util.basename(p1)) end
-    if k1 == Kind.DIR then p1 = util.join(p1, util.basename(p0)) end
-    rc = diff_files(&opt, p0, p1, false)
+    rc = compare_operands(&opt, operands[1], operands[2])
   end
   for _, message in ipairs(opt.messages) do util.line(message) end
   return rc
