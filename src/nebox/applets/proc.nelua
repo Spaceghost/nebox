@@ -53,6 +53,7 @@ end
 global function applet_uname(args: sequence(string)): integer
   local o = util.parsel(args, 'asnrvmpio', &longopts.uname, #longopts.uname)
   if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'uname [OPTION]...') then return 0 end
   if #o.operands > 0 then return util.die("extra operand '" .. o.operands[1] .. "'") end
   local u: sys.Utsname
   if sys.uname(&u) ~= 0 then return util.die('uname: ' .. sys.errstr()) end

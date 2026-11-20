@@ -120,6 +120,17 @@ if recs.get('truncate') or recs.get('tcp_only'):
     listener.bind(('127.0.0.1', 53))
     listener.listen()
     threading.Thread(target=serve_tcp, args=(listener,), daemon=True).start()
+def reject_queries(sock, code):
+    while True:
+        query, peer = sock.recvfrom(4096)
+        if len(query) >= 12:
+            reply = query[:2] + struct.pack('>HHHHH', 0x8180 | code, 0, 0, 0, 0)
+            sock.sendto(reply, peer)
+
+if code := recs.get('reject_on_first'):
+    rejector = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rejector.bind(('127.0.0.9', 53))
+    threading.Thread(target=reject_queries, args=(rejector, code), daemon=True).start()
 open(sys.argv[2], 'w').write('ready\n')
 
 while True:
@@ -228,6 +239,11 @@ fixture('notld', hosts='127.0.0.1 localhost\n', resolv='nameserver 127.0.0.1\nse
 fixture('multisearch', hosts='127.0.0.1 localhost\n',
         resolv='# comment\n; other comment\nnameserver 127.0.0.1\nsearch nope.test example.com example.org\n')
 fixture('twons', hosts='127.0.0.1 localhost\n', resolv='nameserver 127.0.0.9\nnameserver 127.0.0.1\nsearch example.com\n')
+for error, code in [('servfail', 2), ('notimp', 4), ('refused', 5), ('rotate', 5)]:
+    options = 'options timeout:1 attempts:1' + (' rotate' if error == 'rotate' else '')
+    fixture('retry-' + error,
+            resolv='nameserver 127.0.0.9\nnameserver 127.0.0.1\nsearch example.com\n' + options + '\n',
+            records=dict(DNSREC, reject_on_first=code))
 fixture('slow', hosts='127.0.0.1 localhost\n',
         resolv='nameserver 127.0.0.1\nsearch example.com\noptions timeout:1 attempts:1\n')
 fixture('edns-required',
@@ -320,7 +336,8 @@ for prog in ['dnsdomainname', 'domainname', 'ypdomainname', 'nisdomainname']:
 
 TRANSPORT_CASES = [
     ('net', fx, host, '@ ' + args)
-    for fx in ['tcp-truncated', 'tcp-required', 'tcp-second-server', 'edns-required']
+    for fx in ['tcp-truncated', 'tcp-required', 'tcp-second-server', 'edns-required',
+               'retry-servfail', 'retry-notimp', 'retry-refused', 'retry-rotate']
     for host, args in [('dnshost', '-i'), ('www', '-f'), ('www', '-a'),
                        ('myhost', '-A'), ('unknownname', '-f')]
 ]

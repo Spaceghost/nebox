@@ -1,0 +1,464 @@
+-- Standalone device, process and portability utilities for Linux x86-64.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.modechange'
+require 'nebox.canonicalize'
+require 'nebox.applets.chown'
+require 'nebox.applets.hostname'
+
+local function c_mkfifo(path: cstring, mode: cuint): cint <cimport 'mkfifo', cinclude '<sys/stat.h>'> end
+local function c_mknod(path: cstring, mode: cuint, device: culong): cint <cimport 'mknod', cinclude '<sys/stat.h>'> end
+local function c_getpriority(which: cint, who: cuint): cint <cimport 'getpriority', cinclude '<sys/resource.h>'> end
+local function c_setpriority(which: cint, who: cuint, value: cint): cint <cimport 'setpriority', cinclude '<sys/resource.h>'> end
+
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @record{
+  gr_name: cstring, gr_passwd: cstring, gr_gid: cuint, gr_mem: *cstring,
+}
+local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
+local function c_getgrnam(name: cstring): *Group <cimport 'getgrnam', cinclude '<grp.h>'> end
+local function c_getgrouplist(user: cstring, gid: cuint, list: *[0]cuint, count: *cint): cint <cimport 'getgrouplist', cinclude '<grp.h>'> end
+local function c_setgroups(count: csize, list: *[0]cuint): cint <cimport 'setgroups', cinclude '<grp.h>'> end
+local function c_setgid(gid: cuint): cint <cimport 'setgid', cinclude '<unistd.h>'> end
+local function c_setuid(uid: cuint): cint <cimport 'setuid', cinclude '<unistd.h>'> end
+local function c_syscall(n: clong, ...: cvarargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
+local SYS_CHROOT: clong <comptime> = 161
+local NO_ID: cuint <comptime> = 0xffffffff
+local SYS_FCHMODAT2: clong <comptime> = 452
+local O_PATH: cint <comptime> = 0x200000
+local AT_EMPTY_PATH: cint <comptime> = 0x1000
+local ENOSYS: cint <comptime> = 38
+local EINVAL: cint <comptime> = 22
+
+local basic: []util.LongOpt = {{'help', 0, 128}, {'version', 0, 129}}
+local create_options: []util.LongOpt = {
+  {'mode', 1, 'm'_b}, {'context', 2, util.UNSUPPORTED}, {'help', 0, 128}, {'version', 0, 129},
+}
+local nice_options: []util.LongOpt = {{'adjustment', 1, 'n'_b}, {'help', 0, 128}, {'version', 0, 129}}
+local path_options: []util.LongOpt = {{'portability', 0, 130}, {'help', 0, 128}, {'version', 0, 129}}
+
+local chroot_options: []util.LongOpt = {
+  {'groups', 1, 130}, {'userspec', 1, 131}, {'skip-chdir', 0, 132}, {'help', 0, 128}, {'version', 0, 129},
+}
+
+local function create_mode(o: *util.Opts): (cuint, boolean)
+  local mode: cuint = 0x1b6
+  if not o:has('m') then return mode, true end
+  local changes, ok = modechange.compile(o:get('m'))
+  if not ok then util.err('invalid mode'); return 0, false end
+  local mask = sys.umask(0)
+  sys.umask(mask)
+  mode = modechange.adjust(mode, false, mask, changes)
+  if mode & ~0x1ff ~= 0 then
+    util.err('mode must specify only file permission bits')
+    return 0, false
+  end
+  return mode, true
+end
+
+local function set_created_mode(path: string, mode: cuint, kind: cuint): boolean
+  local fd = sys.open(path, O_PATH | sys.O_NOFOLLOW | sys.O_CLOEXEC, 0)
+  if fd < 0 then return false end
+  defer
+    local err = sys.errno()
+    sys.close(fd)
+    sys.seterrno(err)
+  end
+  local st: sys.Stat
+  if sys.fstat(fd, &st) ~= 0 then return false end
+  if (st.st_mode & sys.S_IFMT) ~= kind then sys.seterrno(EINVAL); return false end
+  if c_syscall(SYS_FCHMODAT2, fd, (@cstring)(''), mode, AT_EMPTY_PATH) == 0 then return true end
+  if sys.errno() ~= ENOSYS then return false end
+  return sys.chmod('/proc/self/fd/' .. tostring(fd), mode) == 0
+end
+
+global function applet_mkfifo(args: sequence(string)): integer
+  local o = util.parsel(args, 'm:', &create_options[0], #create_options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'mkfifo [OPTION]... NAME...') then return 0 end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local mode, ok = create_mode(&o)
+  if not ok then return 1 end
+  local result = 0
+  for _, path in ipairs(o.operands) do
+    if c_mkfifo(path, mode) ~= 0 then
+      util.perror('cannot create fifo ' .. util.quote(path)); result = 1
+    elseif o:has('m') and not set_created_mode(path, mode, sys.S_IFIFO) then
+      util.perror('cannot set permissions of ' .. util.quote(path)); result = 1
+    end
+  end
+  return result
+end
+
+global function applet_mknod(args: sequence(string)): integer
+  local o = util.parsel(args, 'm:', &create_options[0], #create_options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'mknod [OPTION]... NAME TYPE [MAJOR MINOR]') then return 0 end
+  local mode, ok = create_mode(&o)
+  if not ok then return 1 end
+  local n = #o.operands
+  if n < 2 then
+    return util.die(n == 0 and 'missing operand' or ('missing operand after ' .. util.quote(o.operands[1])))
+  end
+  local path, kind = o.operands[1], o.operands[2]
+  local ch = kind.size == 0 and 0 or kind:byte(1)
+  local count = ch == 'p'_b and 2 or 4
+  if n > count then return util.die('extra operand ' .. util.quote(o.operands[count + 1])) end
+  if n < count then return util.die('missing operand after ' .. util.quote(o.operands[n])) end
+  local result: cint
+  local device_kind = sys.S_IFIFO
+  if ch == 'p'_b then
+    result = c_mkfifo(path, mode)
+  elseif ch == 'b'_b or ch == 'c'_b or ch == 'u'_b then
+    local err1, major = util.xstrtoumax_base(o.operands[3], 0, '')
+    local err2, minor = util.xstrtoumax_base(o.operands[4], 0, '')
+    if err1 ~= 0 or major > 0xffffffff then return util.die('invalid major device number ' .. util.quote(o.operands[3])) end
+    if err2 ~= 0 or minor > 0xffffffff then return util.die('invalid minor device number ' .. util.quote(o.operands[4])) end
+    local dev = (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & ~0xff) << 12) | ((major & ~0xfff) << 32)
+    device_kind = ch == 'b'_b and sys.S_IFBLK or sys.S_IFCHR
+    result = c_mknod(path, mode | device_kind, dev)
+  else
+    return util.die('invalid device type ' .. util.quote(kind))
+  end
+  if result ~= 0 then util.perror(util.quotef(path)); return 1 end
+  if o:has('m') and not set_created_mode(path, mode, device_kind) then
+    util.perror('cannot set permissions of ' .. util.quote(path)); return 1
+  end
+  return 0
+end
+
+global function applet_arch(args: sequence(string)): integer
+  local o = util.parsel(args, '', &basic[0], #basic)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'arch [OPTION]...') then return 0 end
+  if #o.operands > 0 then return util.die('extra operand ' .. util.quote(o.operands[1])) end
+  local u: sys.Utsname
+  if sys.uname(&u) ~= 0 then return util.die('cannot get system name: ' .. sys.errstr()) end
+  util.line(sys.cstr(&u.machine))
+  return 0
+end
+
+global function applet_hostid(args: sequence(string)): integer
+  local o = util.parsel(args, '', &basic[0], #basic)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'hostid [OPTION]...') then return 0 end
+  if #o.operands > 0 then return util.die('extra operand ' .. util.quote(o.operands[1])) end
+  local fd = sys.open('/etc/hostid', sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd >= 0 then
+    local value: uint32
+    local count = sys.read(fd, &value, 4)
+    sys.close(fd)
+    if count == 4 then util.writef('%08x\n', value); return 0 end
+  end
+  util.writef('%08x\n', nebox_hostid_fallback())
+  return 0
+end
+
+global function applet_logname(args: sequence(string)): integer
+  local o = util.parsel(args, '', &basic[0], #basic)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'logname [OPTION]...') then return 0 end
+  if #o.operands > 0 then return util.die('extra operand ' .. util.quote(o.operands[1])) end
+  local fd = sys.open('/proc/self/loginuid', sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd >= 0 then
+    local buf: [32]byte
+    local n = sys.read(fd, &buf[0], #buf)
+    sys.close(fd)
+    if n > 0 then
+      local text: string = {data = &buf[0], size = (@usize)(n)}
+      local first, last = text:find('^%d+')
+      local uid, ok = util.toint(first == 1 and text:subview(1, last) or '')
+      if ok and uid >= 0 and uid < 0xffffffff then
+        local name = util.username(uid)
+        if name.size > 0 then util.line(name); return 0 end
+      end
+    end
+  end
+  return util.die('no login name')
+end
+
+local function exec_command(args: sequence(string))
+  local argv: sequence(cstring)
+  for _, arg in ipairs(args) do argv:push(arg) end
+  argv:push(nilptr)
+  util.flush()
+  sys.execvp(argv[1], &argv[1])
+end
+
+local function exec_failure(command: string): integer
+  local err = sys.errno()
+  util.perror('failed to run command ' .. util.quote(command))
+  return err == sys.ENOENT and 127 or 126
+end
+
+local function parse_groups(spec: string, diagnose: boolean): (sequence(cuint), boolean)
+  local groups: sequence(cuint)
+  local valid = true
+  local start = 1
+  for i = 1, #spec + 1 do
+    if i <= #spec and spec:byte(i) ~= ','_b then continue end
+    local item = spec:sub(start, i - 1)
+    start = i + 1
+    if item.size == 0 then continue end
+    local status, number = util.xstrtoumax(item, '')
+    local numeric = status == 0 and number < NO_ID
+    local offset = numeric and item:find('%S') or 1
+    local name = item:sub(offset)
+    local group: *Group = nilptr
+    if not numeric or name:byte(1) ~= '+'_b then group = c_getgrnam(name) end
+    if group ~= nilptr then
+      groups:push(group.gr_gid)
+    elseif numeric then
+      groups:push((@cuint)(number))
+    else
+      valid = false
+      if not diagnose then break end
+      util.perror('invalid group ' .. util.quote(item))
+    end
+  end
+  if valid and #groups == 0 then
+    if diagnose then util.err('invalid group list ' .. util.quote(spec)) end
+    valid = false
+  end
+  if not valid then groups:clear() end
+  return groups, valid
+end
+
+local function user_groups(user: cstring, gid: cuint): (sequence(cuint), boolean)
+  local groups: sequence(cuint)
+  local capacity: cint = 8
+  while capacity <= 65536 do
+    groups:resize((@usize)(capacity))
+    local count = capacity
+    if c_getgrouplist(user, gid, (@*[0]cuint)(&groups[1]), &count) >= 0 then
+      groups:resize((@usize)(count))
+      return groups, true
+    end
+    if count <= capacity then break end
+    capacity = count
+  end
+  groups:clear()
+  return groups, false
+end
+
+global function applet_chroot(args: sequence(string)): integer
+  local o = util.parsel(args, '+', &chroot_options[0], #chroot_options)
+  if not o:ok() then util.optfail(o); return 125 end
+  if util.core_info(&o, 'chroot [OPTION] NEWROOT [COMMAND [ARG]...]') then return 0 end
+  if #o.operands == 0 then util.err('missing operand'); return 125 end
+  local root = o.operands[1]
+  local resolved, _ = canon.canonicalize(root, canon.CAN_EXISTING)
+  local skip_chdir = o:has(string.char(132))
+  if skip_chdir and resolved ~= '/' then
+    util.err("option --skip-chdir only permitted if NEWROOT is old '/'")
+    return 125
+  end
+  local spec = o:get(string.char(131))
+  if spec.size > 0 and spec:byte(spec.size) == ':'_b then spec = spec:sub(1, -2) end
+  local group_spec = o:get(string.char(130))
+  local explicit_groups = o:has(string.char(130))
+  local uid: cuint = NO_ID
+  local gid: cuint = NO_ID
+  local groups: sequence(cuint)
+  if resolved ~= '/' then
+    if spec.size > 0 then nebox_parse_user_spec(spec, &uid, &gid) end
+    if explicit_groups and group_spec.size > 0 then
+      groups = parse_groups(group_spec, false)
+    elseif not explicit_groups and uid ~= NO_ID then
+      local user = c_getpwuid(uid)
+      if user ~= nilptr then
+        if gid == NO_ID then gid = user.pw_gid end
+        groups = user_groups(user.pw_name, gid)
+      end
+    end
+  end
+  if c_syscall(SYS_CHROOT, (@cstring)(root)) ~= 0 then
+    util.perror('cannot change root directory to ' .. util.quotef(root)); return 125
+  end
+  if not skip_chdir and sys.chdir('/') ~= 0 then
+    util.perror('cannot chdir to root directory'); return 125
+  end
+  if spec.size > 0 then
+    local msg, warning = nebox_parse_user_spec(spec, &uid, &gid)
+    if msg.size > 0 then
+      util.err(msg)
+      if not warning then return 125 end
+    end
+  end
+  local user: *Passwd = nilptr
+  if uid ~= NO_ID and (not explicit_groups or gid == NO_ID) then
+    user = c_getpwuid(uid)
+    if gid == NO_ID then
+      if user == nilptr then
+        util.err('no group specified for unknown uid: ' .. tostring((@cint)(uid)))
+        return 125
+      end
+      gid = user.pw_gid
+    end
+  end
+  if explicit_groups and group_spec.size > 0 then
+    local inside, ok = parse_groups(group_spec, #groups == 0)
+    if ok then groups:destroy(); groups = inside
+    elseif #groups == 0 then return 125 end
+  elseif not explicit_groups and user ~= nilptr and gid ~= NO_ID then
+    local inside, ok = user_groups(user.pw_name, gid)
+    if ok then groups:destroy(); groups = inside
+    elseif #groups == 0 then util.perror('failed to get supplemental groups'); return 125 end
+  end
+  if uid ~= NO_ID or explicit_groups then
+    local list = #groups > 0 and (@*[0]cuint)(&groups[1]) or nilptr
+    if c_setgroups((@csize)(#groups), list) ~= 0 then
+      util.perror('failed to set supplemental groups'); return 125
+    end
+  end
+  if gid ~= NO_ID and c_setgid(gid) ~= 0 then util.perror('failed to set group-ID'); return 125 end
+  if uid ~= NO_ID and c_setuid(uid) ~= 0 then util.perror('failed to set user-ID'); return 125 end
+  local command: sequence(string)
+  for i = 2, #o.operands do command:push(o.operands[i]) end
+  if #command == 0 then
+    local shell = sys.getenv('SHELL')
+    command:push(shell ~= nilptr and (@string)(shell) or '/bin/sh')
+    command:push('-i')
+  end
+  exec_command(command)
+  return exec_failure(command[1])
+end
+
+global function applet_nice(args: sequence(string)): integer
+  local parsed: sequence(string)
+  local i = 1
+  while i <= #args do
+    local a = args[i]
+    if a == '--' or a.size < 2 or a:byte(1) ~= 45 then break end
+    if a:find('^%-[+%-]?%d') > 0 then
+      parsed:push('-n'); parsed:push(a:sub(2))
+    else
+      parsed:push(a)
+      if (a == '-n' or a == '--adjustment') and i < #args then i = i + 1; parsed:push(args[i]) end
+    end
+    i = i + 1
+  end
+  for j = i, #args do parsed:push(args[j]) end
+  local o = util.parsel(parsed, '+n:', &nice_options[0], #nice_options)
+  if not o:ok() then util.optfail(o); return 125 end
+  if util.core_info(&o, 'nice [OPTION] [COMMAND [ARG]...]') then return 0 end
+  sys.seterrno(0)
+  local old = c_getpriority(0, 0)
+  if old == -1 and sys.errno() ~= 0 then util.perror('cannot get niceness'); return 125 end
+  if #o.operands == 0 then
+    if o:has('n') then util.err('a command must be given with an adjustment'); return 125 end
+    util.writef('%d\n', old)
+    return 0
+  end
+  local amount = 10
+  if o:has('n') then
+    local status, adj = util.xstrtoimax_base(o:get('n'), 10, '')
+    if status > 1 then util.err('invalid adjustment ' .. util.quote(o:get('n'))); return 125 end
+    amount = adj
+  end
+  if amount < -39 then amount = -39 elseif amount > 39 then amount = 39 end
+  local priority = old + amount
+  if c_setpriority(0, 0, (@cint)(priority)) ~= 0 then
+    local err = sys.errno()
+    util.perror('cannot set niceness')
+    if err ~= 1 and err ~= sys.EACCES then return 125 end
+  end
+  exec_command(o.operands)
+  return exec_failure(o.operands[1])
+end
+
+global function applet_nohup(args: sequence(string)): integer
+  local failure = sys.getenv('POSIXLY_CORRECT') ~= nilptr and 127 or 125
+  local o = util.parsel(args, '+', &basic[0], #basic)
+  if not o:ok() then util.optfail(o); return failure end
+  if util.core_info(&o, 'nohup COMMAND [ARG]...') then return 0 end
+  if #o.operands == 0 then util.err('missing operand'); return failure end
+  local input_tty, output_tty, error_tty = sys.isatty(0) ~= 0, sys.isatty(1) ~= 0, sys.isatty(2) ~= 0
+  local output_closed = sys.fcntl(1, sys.F_GETFD, 0) < 0
+  if input_tty then
+    local fd = sys.open('/dev/null', sys.O_WRONLY, 0)
+    if fd < 0 or sys.dup2(fd, 0) < 0 then util.perror('failed to render standard input unusable'); return failure end
+    if fd ~= 0 then sys.close(fd) end
+  end
+  local path = 'nohup.out'
+  local fd = -1
+  if output_tty or (output_closed and error_tty) then
+    local mask = sys.umask(0x3f)
+    fd = sys.open(path, sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND, 0x180)
+    if fd < 0 then
+      local home = sys.getenv('HOME')
+      if home ~= nilptr then
+        path = util.join((@string)(home), path)
+        fd = sys.open(path, sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND, 0x180)
+      end
+    end
+    sys.umask(mask)
+    if fd < 0 then util.perror('failed to open ' .. util.quote(path)); return failure end
+    if output_tty and sys.dup2(fd, 1) < 0 then util.perror('failed to redirect standard output'); return failure end
+    util.err((input_tty and 'ignoring input and appending output to ' or 'appending output to ') .. util.quote(path))
+  elseif input_tty then
+    util.err(error_tty and 'ignoring input and redirecting stderr to stdout' or 'ignoring input')
+  elseif error_tty then util.err('redirecting stderr to stdout') end
+  if error_tty and sys.dup2(output_closed and fd or 1, 2) < 0 then
+    util.perror('failed to redirect standard error'); return failure
+  end
+  if fd > 2 then sys.close(fd) end
+  local action: sys.Sigaction
+  action.sa_handler = (@function(cint): void)((@pointer)(sys.SIG_IGN))
+  if sys.sigaction(sys.SIGHUP, &action, nilptr) < 0 then util.perror('cannot ignore hangup'); return failure end
+  exec_command(o.operands)
+  return exec_failure(o.operands[1])
+end
+
+local function path_ok(path: string, portable: boolean, extra: boolean): boolean
+  if extra then
+    for i: usize = 0, < path.size do
+      if path.data[i] == 45 and (i == 0 or path.data[i - 1] == 47) then
+        util.err("leading '-' in a component of file name " .. util.quote(path)); return false
+      end
+    end
+  end
+  if (portable or extra) and path.size == 0 then util.err('empty file name'); return false end
+  if not portable then
+    local st: sys.Stat
+    if sys.lstat(path, &st) == 0 then return true end
+    if sys.errno() ~= sys.ENOENT or path.size == 0 then util.perror(util.quotef(path)); return false end
+  elseif path:find('[^A-Za-z0-9._/-]') > 0 then
+    util.err('nonportable character in file name ' .. util.quote(path)); return false
+  end
+  local limit = portable and 255 or 4095
+  if path.size > limit then
+    util.errf('limit %d exceeded by length %d of file name %s', limit, path.size, util.quote(path)); return false
+  end
+  limit = portable and 14 or 255
+  local first: usize = 0
+  for i: usize = 0, path.size do
+    if i == path.size or path.data[i] == 47 then
+      if i - first > limit then
+        util.errf('limit %d exceeded by length %d of file name component %s', limit, i - first,
+            util.quote(path:subview(first + 1, i)))
+        return false
+      end
+      first = i + 1
+    end
+  end
+  return true
+end
+
+global function applet_pathchk(args: sequence(string)): integer
+  local o = util.parsel(args, '+pP', &path_options[0], #path_options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'pathchk [OPTION]... NAME...') then return 0 end
+  if #o.operands == 0 then return util.die('missing operand') end
+  local all = o:has(string.char(130))
+  local result = 0
+  for _, path in ipairs(o.operands) do
+    if not path_ok(path, all or o:has('p'), all or o:has('P')) then result = 1 end
+  end
+  return result
+end

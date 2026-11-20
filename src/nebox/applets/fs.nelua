@@ -321,6 +321,7 @@ end
 global function applet_pwd(args: sequence(string)): integer
   local o = util.parsel(args, 'LP', &longopts.pwd, #longopts.pwd)
   if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'pwd [OPTION]...') then return 0 end
   if o:has('L') then
     local env = sys.getenv('PWD')
     if env ~= nilptr then

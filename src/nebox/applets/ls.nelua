@@ -545,70 +545,6 @@ local function at(s: string, i: integer): byte
   return s.data[i]
 end
 
-local ST_GND <comptime> = 0
-local ST_BACKSLASH <comptime> = 1
-local ST_OCTAL <comptime> = 2
-local ST_HEX <comptime> = 3
-local ST_CARET <comptime> = 4
-local ST_END <comptime> = 5
-local ST_ERROR <comptime> = 6
-
--- get_funky_string: decode one LS_COLORS value starting at *PP.
-local function get_funky_string(s: string, pp: *integer, equals_end: boolean): (string, boolean)
-  local p = $pp
-  local sb: stringbuilder
-  local num: integer = 0
-  local state = ST_GND
-  while state < ST_END do
-    local c = at(s, p)
-    if state == ST_GND then
-      if c == 58 or c == 0 then state = ST_END
-      elseif c == 92 then state = ST_BACKSLASH; p = p + 1
-      elseif c == 94 then state = ST_CARET; p = p + 1
-      elseif c == 61 and equals_end then state = ST_END
-      else sb:writebyte(c); p = p + 1 end
-    elseif state == ST_BACKSLASH then
-      if c >= 48 and c <= 55 then state = ST_OCTAL; num = c - 48
-      elseif c == 120 or c == 88 then state = ST_HEX; num = 0
-      elseif c == 97 then num = 7
-      elseif c == 98 then num = 8
-      elseif c == 101 then num = 27
-      elseif c == 102 then num = 12
-      elseif c == 110 then num = 10
-      elseif c == 114 then num = 13
-      elseif c == 116 then num = 9
-      elseif c == 118 then num = 11
-      elseif c == 63 then num = 127
-      elseif c == 95 then num = 32
-      elseif c == 0 then state = ST_ERROR
-      else num = c end
-      if state == ST_BACKSLASH then
-        sb:writebyte((@byte)(num & 0xff))
-        state = ST_GND
-      end
-      p = p + 1
-    elseif state == ST_OCTAL then
-      if c < 48 or c > 55 then
-        sb:writebyte((@byte)(num & 0xff)); state = ST_GND
-      else
-        num = ((num << 3) + (c - 48)) & 0xff; p = p + 1
-      end
-    elseif state == ST_HEX then
-      if c >= 48 and c <= 57 then num = ((num << 4) + (c - 48)) & 0xff; p = p + 1
-      elseif c >= 97 and c <= 102 then num = ((num << 4) + (c - 97) + 10) & 0xff; p = p + 1
-      elseif c >= 65 and c <= 70 then num = ((num << 4) + (c - 65) + 10) & 0xff; p = p + 1
-      else sb:writebyte((@byte)(num & 0xff)); state = ST_GND end
-    elseif state == ST_CARET then
-      state = ST_GND
-      if c >= 64 and c <= 126 then sb:writebyte(c & 31); p = p + 1
-      elseif c == 63 then sb:writebyte(127) -- the '?' is not consumed, as in ls.c
-      else state = ST_ERROR end
-    end
-  end
-  $pp = p
-  return sb:promote(), state ~= ST_ERROR
-end
-
 local term_patterns: [25]string = {
   'Eterm', 'ansi', '*color*', 'con[0-9]*x[0-9]*', 'cons25', 'console', 'cygwin', '*direct*',
   'dtterm', 'gnome', 'hurd', 'jfbterm', 'konsole', 'kterm', 'linux', 'linux-c', 'mlterm',
@@ -652,7 +588,7 @@ local function parse_ls_color()
         p = p + 1
       elseif c == 42 then
         p = p + 1
-        local e, ok = get_funky_string(s, &p, true)
+        local e, ok = util.color_escape(s, &p, true)
         color_ext_list:push({ext = e})
         state = ok and PS_4 or PS_FAIL
       elseif c == 0 then
@@ -673,7 +609,7 @@ local function parse_ls_color()
         local lab: string = (@string){data = &label[0], size = 2}
         for ind_no = 0, < N_INDICATORS do
           if lab == indicator_name[ind_no] then
-            local v, ok = get_funky_string(s, &p, false)
+            local v, ok = util.color_escape(s, &p, false)
             color_indicator[ind_no] = {s = v, set = true}
             state = ok and PS_START or PS_FAIL
             break
@@ -684,7 +620,7 @@ local function parse_ls_color()
     elseif state == PS_4 then
       local c = at(s, p); p = p + 1
       if c == 61 then
-        local v, ok = get_funky_string(s, &p, false)
+        local v, ok = util.color_escape(s, &p, false)
         color_ext_list[#color_ext_list].seq = {s = v, set = true}
         state = ok and PS_START or PS_FAIL
       else

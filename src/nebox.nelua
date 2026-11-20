@@ -78,6 +78,11 @@ require 'nebox.applets.sync'
 require 'nebox.applets.free'
 require 'nebox.applets.kill'
 require 'nebox.applets.hostname'
+require 'nebox.applets.catalog'
+require 'nebox.applets.dircolors'
+require 'nebox.applets.csplit'
+require 'nebox.applets.fmt'
+require 'nebox.applets.users'
 
 ## if THESEUS_BOOT then
 require 'theseus.earlyboot'
@@ -86,22 +91,22 @@ require 'theseus.earlyboot'
 local Applet = @record{name: string, run: function(sequence(string)): integer}
 
 local applets: []Applet = {
-  {'[', applet_test}, {'awk', applet_awk}, {'b2sum', applet_b2sum}, {'base32', applet_base32}, {'base64', applet_base64},
+  {'[', applet_test}, {'arch', applet_arch}, {'awk', applet_awk}, {'b2sum', applet_b2sum}, {'base32', applet_base32}, {'base64', applet_base64},
   {'basenc', applet_basenc}, {'basename', applet_basename},
   {'cat', applet_cat}, {'chgrp', applet_chgrp}, {'chmod', applet_chmod},
-  {'chown', applet_chown}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
-  {'cp', applet_cp}, {'cut', applet_cut}, {'date', applet_date}, {'dd', applet_dd},
-  {'df', applet_df}, {'diff', applet_diff}, {'dir', applet_dir}, {'dirname', applet_dirname}, {'dnsdomainname', applet_hostname},
+  {'chown', applet_chown}, {'chroot', applet_chroot}, {'cksum', applet_cksum}, {'cmp', applet_cmp}, {'comm', applet_comm},
+  {'cp', applet_cp}, {'csplit', applet_csplit}, {'cut', applet_cut}, {'date', applet_date}, {'dd', applet_dd},
+  {'df', applet_df}, {'diff', applet_diff}, {'dir', applet_dir}, {'dircolors', applet_dircolors}, {'dirname', applet_dirname}, {'dnsdomainname', applet_hostname},
   {'domainname', applet_hostname}, {'du', applet_du},
   {'echo', applet_echo}, {'env', applet_env}, {'expand', applet_expand}, {'expr', applet_expr},
-  {'factor', applet_factor}, {'false', applet_false}, {'find', applet_find},
+  {'factor', applet_factor}, {'false', applet_false}, {'find', applet_find}, {'fmt', applet_fmt},
   {'fold', applet_fold}, {'free', applet_free}, {'grep', applet_grep},
   {'groups', applet_groups}, {'hd', applet_hd}, {'head', applet_head}, {'hexdump', applet_hexdump},
-  {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install}, {'join', applet_join},
-  {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'ls', applet_ls},
-  {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mktemp', applet_mktemp},
-  {'mv', applet_mv}, {'nisdomainname', applet_hostname}, {'nl', applet_nl}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
-  {'paste', applet_paste}, {'patch', applet_patch}, {'printenv', applet_printenv}, {'printf', applet_printf},
+  {'hostid', applet_hostid}, {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install}, {'join', applet_join},
+  {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'logname', applet_logname}, {'ls', applet_ls},
+  {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mkfifo', applet_mkfifo}, {'mknod', applet_mknod}, {'mktemp', applet_mktemp},
+  {'mv', applet_mv}, {'nice', applet_nice}, {'nisdomainname', applet_hostname}, {'nl', applet_nl}, {'nohup', applet_nohup}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
+  {'paste', applet_paste}, {'patch', applet_patch}, {'pathchk', applet_pathchk}, {'pinky', applet_pinky}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
   {'seq', applet_seq}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha224sum', applet_sha224sum}, {'sha256sum', applet_sha256sum},
@@ -112,8 +117,8 @@ local applets: []Applet = {
   {'test', applet_test}, {'timeout', applet_timeout}, {'touch', applet_touch},
   {'tr', applet_tr}, {'true', applet_true}, {'truncate', applet_truncate},
   {'tsort', applet_tsort}, {'tty', applet_tty}, {'unexpand', applet_unexpand},
-  {'uname', applet_uname}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'vdir', applet_vdir}, {'wc', applet_wc},
-  {'which', applet_which}, {'whoami', applet_whoami}, {'xargs', applet_xargs},
+  {'uname', applet_uname}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'uptime', applet_uptime}, {'users', applet_users}, {'vdir', applet_vdir}, {'wc', applet_wc},
+  {'which', applet_which}, {'who', applet_who}, {'whoami', applet_whoami}, {'xargs', applet_xargs},
   {'yes', applet_yes}, {'ypdomainname', applet_hostname},
 }
 

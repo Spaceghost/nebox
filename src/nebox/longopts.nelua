@@ -11,7 +11,7 @@ global longopts = @record{}
 global longopts.cat: []util.LongOpt = {
   {'number-nonblank', 0, 98}, {'number', 0, 110}, {'squeeze-blank', 0, 115},
   {'show-nonprinting', 0, 118}, {'show-ends', 0, 69}, {'show-tabs', 0, 84}, {'show-all', 0, 65},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  {'help', 0, 128}, {'version', 0, 129},
 }
 global longopts.mkdir: []util.LongOpt = {
   {'mode', 1, 109}, {'parents', 0, 112}, {'verbose', 0, 118}, {'help', 0, util.UNSUPPORTED},
@@ -32,7 +32,7 @@ global longopts.uname: []util.LongOpt = {
   {'all', 0, 97}, {'kernel-name', 0, 115}, {'sysname', 0, 115}, {'nodename', 0, 110},
   {'kernel-release', 0, 114}, {'release', 0, 114}, {'kernel-version', 0, 118}, {'machine', 0, 109},
   {'processor', 0, 112}, {'hardware-platform', 0, 105}, {'operating-system', 0, 111},
-  {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
+  {'help', 0, 128}, {'version', 0, 129},
 }
 global longopts.rmdir: []util.LongOpt = {
   {'ignore-fail-on-non-empty', 0, 201}, {'path', 0, 112}, {'parents', 0, 112}, {'verbose', 0, 118},
@@ -43,6 +43,6 @@ global longopts.tty: []util.LongOpt = {
   {'version', 0, util.UNSUPPORTED},
 }
 global longopts.pwd: []util.LongOpt = {
-  {'logical', 0, 76}, {'physical', 0, 80}, {'help', 0, util.UNSUPPORTED},
-  {'version', 0, util.UNSUPPORTED},
+  {'logical', 0, 76}, {'physical', 0, 80}, {'help', 0, 128},
+  {'version', 0, 129},
 }

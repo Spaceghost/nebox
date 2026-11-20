@@ -1,0 +1,290 @@
+-- Paragraph reflow using the GNU Coreutils 9.1 line-break cost model.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local options: []util.LongOpt = {
+  {'crown-margin', 0, 'c'_b}, {'prefix', 1, 'p'_b}, {'split-only', 0, 's'_b},
+  {'tagged-paragraph', 0, 't'_b}, {'uniform-spacing', 0, 'u'_b},
+  {'width', 1, 'w'_b}, {'goal', 1, 'g'_b}, {'help', 0, 128}, {'version', 0, 129},
+}
+
+local Format = @record{
+  crown: boolean, tagged: boolean, split: boolean, uniform: boolean,
+  tabs: boolean, limit: integer, goal: integer,
+  prefix: string, prefix_width: integer, lead: integer,
+  prefix_indent: integer, first_indent: integer, other_indent: integer,
+}
+
+local Word = @record{
+  text: string, space: integer, punctuation: boolean, paren: boolean,
+  period: boolean, final: boolean, cost: integer, width: integer, next: integer,
+}
+
+local Line = @record{
+  text: string, start: integer, column: integer, prefix_indent: integer, newline: boolean,
+}
+
+local function spaces(f: *Format, text: string, pos: integer, col: integer): (integer, integer)
+  while pos <= #text do
+    local c = text:byte(pos)
+    if c == 32 then col = col + 1
+    elseif c == 9 then col = (col // 8 + 1) * 8; f.tabs = true
+    else break end
+    pos = pos + 1
+  end
+  return pos, col
+end
+
+local function prefix(f: *Format, text: string, newline: boolean): Line
+  local i, column = spaces(f, text, 1, 0)
+  local indentation = column
+  if f.prefix.size == 0 then
+    if f.lead < indentation then indentation = f.lead end
+  else
+    for j = 1, #f.prefix do
+      if i > #text or text:byte(i) ~= f.prefix:byte(j) then
+        return {text, i, column, indentation, newline}
+      end
+      i = i + 1
+      column = column + 1
+    end
+    i, column = spaces(f, text, i, column)
+  end
+  return {text, i, column, indentation, newline}
+end
+
+local function content(f: *Format, line: *Line): boolean
+  return line.start <= #line.text and line.column >= line.prefix_indent + f.prefix_width
+end
+
+local function indent(f: *Format, col: integer, target: integer): integer
+  local tab_target = target // 8 * 8
+  if f.tabs and col + 1 < tab_target then
+    local tabs = tab_target // 8 - col // 8
+    util.write(string.rep('\t', tabs))
+    col = tab_target
+  end
+  if col < target then util.write(string.rep(' ', target - col)); return target end
+  return col
+end
+
+local function copy_line(f: *Format, l: *Line)
+  local remaining = l.start <= #l.text
+  if l.column > l.prefix_indent or remaining then
+    local col = indent(f, 0, l.prefix_indent)
+    local consumed = l.column - col
+    if consumed > #f.prefix then consumed = #f.prefix end
+    if consumed > 0 then util.write(f.prefix:subview(1, consumed)); col = col + consumed end
+    if remaining then indent(f, col, l.column)
+    elseif not l.newline and l.column >= l.prefix_indent + #f.prefix then util.writebyte(10) end
+  end
+  if remaining then util.write(l.text:subview(l.start)) end
+  if l.newline then util.writebyte(10) end
+end
+
+local function ascii_space(c: byte): boolean
+  return c == 32 or (c >= 9 and c <= 13)
+end
+
+local function punctuation(c: byte): boolean
+  return (c >= 33 and c <= 47) or (c >= 58 and c <= 64) or
+         (c >= 91 and c <= 96) or (c >= 123 and c <= 126)
+end
+
+local function add_words(f: *Format, l: *Line, words: *sequence(Word))
+  local pos = l.start
+  local col = l.column
+  while pos <= #l.text do
+    local start = pos
+    repeat pos = pos + 1 until pos > #l.text or ascii_space(l.text:byte(pos))
+    local text = l.text:subview(start, pos - 1)
+    local n = #text
+    local last = text:byte(n)
+    while n > 1 and (last == 41 or last == 93 or last == 39 or last == 34) do
+      n = n - 1
+      last = text:byte(n)
+    end
+    local period = last == 46 or last == 63 or last == 33
+    local first = text:byte(1)
+    local paren = first == 40 or first == 91 or first == 39 or first == 96 or first == 34
+    col = col + #text
+    local gap_start = col
+    pos, col = spaces(f, l.text, pos, col)
+    local gap = col - gap_start
+    local at_end = pos > #l.text
+    local final = (at_end and not l.newline) or (period and (at_end or gap > 1))
+    if at_end or f.uniform then gap = final and 2 or 1 end
+    words:push({text = text, space = gap, punctuation = punctuation(text:byte(text.size)),
+                paren = paren, period = period, final = final})
+  end
+end
+
+local function base_cost(words: *sequence(Word), i: integer): integer
+  local cost = 4900
+  if i > 1 then
+    local prev = &words[i - 1]
+    if prev.period then cost = cost + (prev.final and -2500 or 360000)
+    elseif prev.punctuation then cost = cost - 1600
+    elseif i > 2 and words[i - 2].final then cost = cost + 40000 // (prev.text.size + 2) end
+  end
+  local word = &words[i]
+  if word.paren then cost = cost - 1600
+  elseif word.final then cost = cost + 22500 // (word.text.size + 2) end
+  return cost
+end
+
+local function short_cost(delta: integer): integer
+  -- Bound arithmetic for multi-megabyte words and indentations.
+  if delta > 1000000 then delta = 1000000
+  elseif delta < -1000000 then delta = -1000000 end
+  return delta * delta * 100
+end
+
+local function reflow(f: *Format, words: *sequence(Word))
+  local n = #words
+  words[n].period = true
+  words[n].final = true
+  words:push({})
+  for i = n, 1, -1 do
+    local w = &words[i]
+    local width = (i == 1 and f.first_indent or f.other_indent) + #w.text
+    local best = 0x7fffffffffffffff
+    local next_break = i + 1
+    while true do
+      local next = &words[next_break]
+      local cost = next.cost
+      if next_break <= n then
+        cost = cost + short_cost(f.goal - width)
+        if next.next <= n then cost = cost + short_cost(width - next.width) // 2 end
+      end
+      if cost < best then best = cost; w.next = next_break; w.width = width end
+      if next_break > n then break end
+      width = width + words[next_break - 1].space + #next.text
+      if width >= f.limit then break end
+      next_break = next_break + 1
+    end
+    w.cost = best + base_cost(words, i)
+  end
+  local start = 1
+  while start <= n do
+    local next_break = words[start].next
+    local col = indent(f, 0, f.prefix_indent)
+    util.write(f.prefix)
+    col = indent(f, col + #f.prefix, start == 1 and f.first_indent or f.other_indent)
+    for i = start, next_break - 1 do
+      local word = &words[i]
+      util.write(word.text)
+      col = col + #word.text
+      if i + 1 < next_break then col = indent(f, col, col + word.space) end
+    end
+    util.writebyte(10)
+    start = next_break
+  end
+end
+
+local function format_file(f: *Format, data: string)
+  f.tabs = false
+  f.other_indent = 0
+  local input = util.lines(data)
+  if #input == 0 then return end
+  local final_nl = data:byte(data.size) == 10
+  local i = 1
+  local line = prefix(f, input[i], i < #input or final_nl)
+  local words: sequence(Word)
+  while i <= #input do
+    if not content(f, &line) or line.prefix_indent < f.lead then
+      copy_line(f, &line)
+      i = i + 1
+      if i <= #input then line = prefix(f, input[i], i < #input or final_nl) end
+      continue
+    end
+    f.first_indent = line.column
+    f.prefix_indent = line.prefix_indent
+    words:clear()
+    add_words(f, &line, &words)
+    i = i + 1
+    if i <= #input then line = prefix(f, input[i], i < #input or final_nl) end
+    local same = i <= #input and content(f, &line) and line.prefix_indent == f.prefix_indent
+    if f.split then f.other_indent = f.first_indent
+    elseif f.crown then f.other_indent = same and line.column or f.first_indent
+    elseif f.tagged then
+      if same and line.column ~= f.first_indent then f.other_indent = line.column
+      elseif f.other_indent == f.first_indent then f.other_indent = f.first_indent == 0 and 3 or 0 end
+      same = same and line.column ~= f.first_indent
+    else f.other_indent = f.first_indent end
+    while not f.split and same and line.column == f.other_indent do
+      add_words(f, &line, &words)
+      i = i + 1
+      if i > #input then break end
+      line = prefix(f, input[i], i < #input or final_nl)
+      same = content(f, &line) and line.prefix_indent == f.prefix_indent
+    end
+    reflow(f, &words)
+  end
+  words:destroy()
+  input:destroy()
+end
+
+local function format_operand(f: *Format, path: string): boolean
+  local fd = path == '-' and 0 or sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then util.perror('cannot open ' .. util.quotef(path) .. ' for reading'); return false end
+  local data, ok = util.readfd(fd)
+  if fd ~= 0 then sys.close(fd) end
+  format_file(f, data)
+  data:destroy()
+  if not ok then util.err('read error') end
+  return ok
+end
+
+global function applet_fmt(args: sequence(string)): integer
+  local legacy, legacy_width = false, ''
+  if #args > 0 and args[1]:find('^%-%d') > 0 then
+    legacy = true
+    legacy_width = args[1]:sub(2)
+    local rest: sequence(string)
+    for i = 2, #args do rest:push(args[i]) end
+    args = rest
+  end
+  local o = util.parsel(args, '0123456789cstuw:p:g:', &options[0], #options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'fmt [OPTION]... [FILE]...') then return 0 end
+  for _, c in ipairs(o.order) do
+    if c >= 48 and c <= 57 then
+      return util.die('invalid option -- ' .. string.char(c) ..
+                      '; -WIDTH is recognized only when it is the first\noption; use -w N instead')
+    end
+  end
+  local config: Format = {
+    crown = o:has('c'), tagged = o:has('t'), split = o:has('s'), uniform = o:has('u'),
+    limit = 75,
+  }
+  local width_set = o:has('w') or legacy
+  if width_set then
+    local raw = o:has('w') and o:get('w') or legacy_width
+    local ok, width, error = util.xdectoumax(raw, 0, 2500, '', 'invalid width')
+    if not ok then return util.die(error) end
+    config.limit = (@integer)(width)
+  end
+  if o:has('g') then
+    local ok, goal, error = util.xdectoumax(o:get('g'), 0, config.limit, '', 'invalid width')
+    if not ok then return util.die(error) end
+    config.goal = (@integer)(goal)
+    if not width_set then config.limit = config.goal + 10 end
+  else config.goal = config.limit * 187 // 200 end
+  local raw = o:get('p')
+  local start, stop = 1, #raw
+  while start <= stop and raw:byte(start) == 32 do start = start + 1 end
+  config.lead = start - 1
+  config.prefix_width = stop - config.lead
+  while stop >= start and raw:byte(stop) == 32 do stop = stop - 1 end
+  config.prefix = raw:subview(start, stop)
+  if #o.operands == 0 then return format_operand(&config, '-') and 0 or 1 end
+  local success = true
+  for _, path in ipairs(o.operands) do
+    if not format_operand(&config, path) then success = false end
+  end
+  return success and 0 or 1
+end

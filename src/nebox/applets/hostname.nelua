@@ -372,7 +372,8 @@ local multi = false
 local Resconf = @record{
   ns: sequence(Addr), search: sequence(string),
   ndots: integer, attempts: integer, timeout: integer,
-  noaaaa: boolean, notld: boolean, usevc: boolean, edns: boolean,
+  noaaaa: boolean, notld: boolean, usevc: boolean, edns: boolean, rotate: boolean,
+  rotation: integer,
 }
 local res: Resconf
 local res_loaded = false
@@ -489,6 +490,8 @@ local function setoptions(s: string)
       res.attempts = n <= 5 and n or 5
     elseif w == 'use-vc' then
       res.usevc = true
+    elseif w == 'rotate' then
+      res.rotate = true
     elseif w == 'edns0' then
       res.edns = true
     elseif w:sub(1, 7) == 'no-aaaa' then
@@ -864,11 +867,18 @@ local function sockaddr(a: Addr, port: integer, buf: *[28]byte): cuint
   return 28
 end
 
--- whether a response answers a query: id and the question section
-local function answers(q: string, r: string): boolean
+local function retry_response(r: string): boolean
+  if #r < 12 then return false end
+  local code = r:byte(4) & 0xf
+  return code == 2 or code == 4 or code == 5 -- SERVFAIL, NOTIMP, REFUSED
+end
+
+-- Whether a response answers a query: id and the question section.
+local function answers(q: string, r: string, udp: boolean): boolean
   if #r < 12 or #q < 12 then return false end
   if r:byte(1) ~= q:byte(1) or r:byte(2) ~= q:byte(2) then return false end
   if r:byte(3) & 0x80 == 0 then return false end
+  if udp and #r == 12 and u16(r, 5) == 0 and retry_response(r) then return true end
   if u16(r, 5) ~= 1 then return false end
   local ok1, n1, l1 = expand(q, 13)
   local ok2, n2, l2 = expand(r, 13)
@@ -958,8 +968,8 @@ local function res_tcp(a: Addr, q1: string, q2: string, two: boolean,
     if size < 12 then res_errno = EINVAL; return false, '', '' end
     if not tcp_transfer(fd, &buf[0], size, false, deadline) then return false, '', '' end
     local r: string = {data = &buf[0], size = size}
-    if not have1 and answers(q1, r) then r1 = string.copy(r); have1 = true
-    elseif two and not have2 and answers(q2, r) then r2 = string.copy(r); have2 = true end
+    if not have1 and answers(q1, r, false) then r1 = string.copy(r); have1 = true
+    elseif two and not have2 and answers(q2, r, false) then r2 = string.copy(r); have2 = true end
   end
   res_errno = 0
   complete = true
@@ -972,9 +982,16 @@ local function res_send(q1: string, q2: string, two: boolean): (boolean, string,
   local gotsomewhere = false
   local use_tcp = res.usevc
   local nscount = #res.ns
+  local rotation = 0
+  if res.rotate and nscount > 1 then
+    if res.rotation == 0 then res.rotation = fresh_id() % nscount + 1 end
+    rotation = res.rotation - 1
+    res.rotation = res.rotation % nscount + 1
+  end
   for try = 0, < res.attempts do
     if use_tcp and try > 0 then break end
-    for nsi = 1, nscount do
+    for offset = 0, < nscount do
+      local nsi = (rotation + offset) % nscount + 1
       local a = res.ns[nsi]
       local seconds = res.timeout << try
       if nsi > 1 then seconds = seconds // nscount end
@@ -1010,18 +1027,25 @@ local function res_send(q1: string, q2: string, two: boolean): (boolean, string,
             break
           end
           local r: string = {data = &buf[0], size = (@usize)(n)}
-          local first = not have1 and answers(q1, r)
-          local second = not first and two and not have2 and answers(q2, r)
+          local first = not have1 and answers(q1, r, true)
+          local second = not first and two and not have2 and answers(q2, r, true)
           if not (first or second) then continue end
-          if r:byte(3) & 2 ~= 0 then use_tcp = true; break end
-          if first then r1 = string.copy(r); have1 = true
-          else r2 = string.copy(r); have2 = true end
+          gotsomewhere = true
+          local retry = retry_response(r)
+          if not retry and r:byte(3) & 2 ~= 0 then use_tcp = true; break end
+          if first then
+            have1 = true
+            if not retry then r1 = string.copy(r) end
+          else
+            have2 = true
+            if not retry then r2 = string.copy(r) end
+          end
         end
         sys.close(fd)
         if use_tcp then
           local ok, ans1, ans2 = res_tcp(a, q1, q2, two, seconds)
           if ok then return true, ans1, ans2 end
-        elseif have1 and have2 then res_errno = 0; return true, r1, r2 end
+        elseif have1 and have2 and (#r1 > 0 or #r2 > 0) then res_errno = 0; return true, r1, r2 end
         r1:destroy()
         r2:destroy()
       end
@@ -1754,6 +1778,14 @@ local function getaddrinfo(name: string, addrs: *sequence(Addr), canon: *string)
   return EAI_NONAME
 end
 
+global function nebox_canonical_host(name: string): string
+  local addresses: sequence(Addr)
+  local canonical: string
+  local result = getaddrinfo(name, &addresses, &canonical)
+  addresses:destroy()
+  return result == 0 and canonical.size > 0 and canonical or name
+end
+
 -- gethostbyname: true and the entry, or false with herrno_g
 local function gethostbyname(name: string, he: *Hostent): boolean
   if #name > 0 and (isdigit(name:byte(1)) or isxdigit(name:byte(1)) or name:byte(1) == 58) then
@@ -1795,6 +1827,16 @@ local function gethostbyname(name: string, he: *Hostent): boolean
   if status == NSS_SUCCESS then return true end
   herrno_g = herr
   return false
+end
+
+global function nebox_hostid_fallback(): uint32
+  local name = localhost_name()
+  if name.size == 0 then return 0 end
+  local he: Hostent
+  if not gethostbyname(name, &he) or #he.addrs == 0 then return 0 end
+  local b = &he.addrs[1].b
+  return ((@uint32)(b[1]) << 24) | ((@uint32)(b[0]) << 16)
+      | ((@uint32)(b[3]) << 8) | (@uint32)(b[2])
 end
 
 -- getnameinfo(NI_NAMEREQD): the host name or false

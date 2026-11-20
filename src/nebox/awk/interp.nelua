@@ -1005,8 +1005,17 @@ local function bi_fflush(n: *Node): Cell
   return awkval.num(ok and 0 or -1)
 end
 
+local default_time_format <comptime> = '%a %b %e %H:%M:%S %Z %Y'
+
 local function bi_strftime(n: *Node): Cell
-  local fmt = n.c > 0 and str_of(arg(n.b, 0)) or '%a %b %e %H:%M:%S %Z %Y'
+  local fmt: string
+  if n.c > 0 then
+    fmt = str_of(arg(n.b, 0))
+  else
+    local info = (@*awkval.Array)(st.globals[awkast.V_PROCINFO].arr)
+    local format = info:peek('strftime')
+    fmt = format ~= nilptr and str_of($format) or default_time_format
+  end
   local ts = n.c > 1 and num_of(arg(n.b, 1)) or (@float64)(sys.time(nilptr))
   local utc = n.c > 2 and num_of(arg(n.b, 2)) ~= 0
   if ts ~= ts or ts < -0x1p63 or ts >= 0x1p63 then return awkval.str('', false) end
@@ -1574,6 +1583,9 @@ local function setup(prog: *awkast.Program, argv: sequence(string), fs: string, 
     i = i + 1
   end
   st.globals[awkast.V_ENVIRON] = (@Cell){kind = awkval.ARRAY, arr = env}
+  local procinfo = awkval.new_array()
+  store(procinfo:get('strftime'), awkval.str(default_time_format, false))
+  st.globals[awkast.V_PROCINFO] = (@Cell){kind = awkval.ARRAY, arr = procinfo}
   -- ARGV / ARGC
   local av = awkval.new_array()
   store(av:get('0'), awkval.str('awk', false))

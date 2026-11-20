@@ -1,0 +1,172 @@
+-- Convert a dircolors database to LS_COLORS, shell code, or a color listing.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.fnmatch'
+require 'nebox.dircolors_db'
+
+local options: []util.LongOpt = {
+  {'bourne-shell', 0, 'b'_b}, {'sh', 0, 'b'_b}, {'csh', 0, 'c'_b}, {'c-shell', 0, 'c'_b},
+  {'print-database', 0, 'p'_b}, {'print-ls-colors', 0, 130}, {'help', 0, 128}, {'version', 0, 129},
+}
+
+local ColorCode = @record{keyword: string, code: string}
+local codes: []ColorCode = {
+  {'normal', 'no'}, {'norm', 'no'}, {'file', 'fi'}, {'reset', 'rs'}, {'dir', 'di'},
+  {'lnk', 'ln'}, {'link', 'ln'}, {'symlink', 'ln'}, {'orphan', 'or'}, {'missing', 'mi'},
+  {'fifo', 'pi'}, {'pipe', 'pi'}, {'sock', 'so'}, {'blk', 'bd'}, {'block', 'bd'},
+  {'chr', 'cd'}, {'char', 'cd'}, {'door', 'do'}, {'exec', 'ex'}, {'left', 'lc'},
+  {'leftcode', 'lc'}, {'right', 'rc'}, {'rightcode', 'rc'}, {'end', 'ec'}, {'endcode', 'ec'},
+  {'suid', 'su'}, {'setuid', 'su'}, {'sgid', 'sg'}, {'setgid', 'sg'}, {'sticky', 'st'},
+  {'other_writable', 'ow'}, {'owr', 'ow'}, {'sticky_other_writable', 'tw'}, {'owt', 'tw'},
+  {'capability', 'ca'}, {'multihardlink', 'mh'}, {'clrtoeol', 'cl'},
+}
+
+local function env(name: string): string
+  local value = sys.getenv(name)
+  return value == nilptr and '' or (@string)(value)
+end
+
+local function escape(sb: *stringbuilder, text: string)
+  local unescaped = true
+  for i: usize = 1, text.size do
+    local c = text:byte(i)
+    if c == 39 then
+      sb:write("'\\'")
+      unescaped = true
+    elseif c == 92 or c == 94 then
+      unescaped = not unescaped
+    else
+      if unescaped and (c == 58 or c == 61) then sb:writebyte(92) end
+      unescaped = true
+    end
+    sb:writebyte(c)
+  end
+end
+
+local function emit(sb: *stringbuilder, key: string, value: string, display: boolean)
+  if display then
+    sb:write('\x1b[', value, 'm', key, '\t', value, '\x1b[0m\n')
+  else
+    escape(sb, key)
+    sb:writebyte(61)
+    escape(sb, value)
+    sb:writebyte(58)
+  end
+end
+
+local GLOBAL <comptime> = 0
+local UNMATCHED <comptime> = 1
+local MATCHED <comptime> = 2
+local MATCHED_GROUP <comptime> = 3
+
+local function parse(db: string, file: string, display: boolean): (string, boolean)
+  local term = env('TERM')
+  if term.size == 0 then term = 'none' end
+  local colorterm = env('COLORTERM')
+  local line_no = 0
+  local start = 1
+  local state = GLOBAL
+  local output: stringbuilder
+  local success = true
+  while start <= #db do
+    local stop = db:find('\n', start, true)
+    if stop == 0 then stop = #db + 1 end
+    local line = db:subview(start, stop - 1)
+    start = stop + 1
+    line_no = line_no + 1
+    local i, last = line:find('^%s*')
+    local key_start = last + 1
+    if i == 0 then key_start = 1 end
+    if key_start > #line or line:byte(key_start) == '#'_b or line:byte(key_start) == 0 then continue end
+    local key_end = line:find('[%s%z]', key_start)
+    if key_end == 0 then key_end = #line + 1 end
+    local keyword = line:subview(key_start, key_end - 1)
+    local arg_end = line:find('[#%z]', key_end)
+    if arg_end == 0 then arg_end = #line + 1 end
+    local arg_start = key_end
+    while arg_start < arg_end and line:subview(arg_start, arg_start):find('%s') > 0 do arg_start = arg_start + 1 end
+    while arg_end > arg_start and line:subview(arg_end - 1, arg_end - 1):find('%s') > 0 do arg_end = arg_end - 1 end
+    if arg_end == arg_start or (key_end <= #line and line:byte(key_end) == 0) then
+      util.err(file .. ':' .. tostring(line_no) .. ': invalid line;  missing second token')
+      success = false
+      continue
+    end
+    local arg = line:subview(arg_start, arg_end - 1)
+    local key = keyword:lower()
+    if key == 'term' or key == 'colorterm' then
+      if state ~= MATCHED_GROUP then
+        local value = key == 'term' and term or colorterm
+        state = fnmatch.match(arg, value, 0) == 0 and MATCHED_GROUP or UNMATCHED
+      end
+      continue
+    end
+    if state == UNMATCHED then continue end
+    if state == MATCHED_GROUP then state = MATCHED end
+    local first = key:byte(1)
+    if first == '.'_b or first == '*'_b then
+      emit(&output, first == '.'_b and ('*' .. keyword) or keyword, arg, display)
+    elseif key ~= 'options' and key ~= 'color' and key ~= 'eightbit' then
+      local code = ''
+      for j = 0, < #codes do
+        if key == codes[j].keyword then code = codes[j].code; break end
+      end
+      if code.size > 0 then
+        emit(&output, code, arg, display)
+      elseif state == MATCHED then
+        util.err(file .. ':' .. tostring(line_no) .. ': unrecognized keyword ' .. keyword)
+        success = false
+      end
+    end
+  end
+  return output:promote(), success
+end
+
+global function applet_dircolors(args: sequence(string)): integer
+  local o = util.parsel(args, 'bcp', &options[0], #options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'dircolors [OPTION]... [FILE]') then return 0 end
+  local syntax: byte = 0
+  for _, c in ipairs(o.order) do if c == 'b'_b or c == 'c'_b then syntax = c end end
+  local database = o:has('p')
+  local display = o:has(string.char(130))
+  if (database or display) and syntax ~= 0 then
+    return util.die('the options to output non shell syntax,\nand to select a shell syntax are mutually exclusive')
+  end
+  if database and display then return util.die('options --print-database and --print-ls-colors are mutually exclusive') end
+  local max_operands = database and 0 or 1
+  if #o.operands > max_operands then return util.die('extra operand ' .. util.quote(o.operands[max_operands + 1])) end
+  if database then util.write(dircolors_db); return 0 end
+  if syntax == 0 and not display then
+    local shell = env('SHELL')
+    if shell.size == 0 then return util.die('no SHELL environment variable, and no shell type option given') end
+    local name = util.basename(shell)
+    syntax = (name == 'csh' or name == 'tcsh') and 'c'_b or 'b'_b
+  end
+  local data: string = dircolors_db
+  local label = '<internal>'
+  if #o.operands > 0 then
+    local path = o.operands[1]
+    label = util.quotef(path)
+    local fd = path == '-' and 0 or sys.open(path, sys.O_RDONLY, 0)
+    if fd < 0 then util.perror(label); return 1 end
+    local content, ok = util.readfd(fd)
+    local closed = sys.close(fd) == 0
+    if not ok then content = '' end
+    if not closed then util.perror(label); return 1 end
+    data = content
+  end
+  local output, ok = parse(data, label, display)
+  if not ok then return 1 end
+  if display then
+    util.write(output)
+  elseif syntax == 'c'_b then
+    util.write("setenv LS_COLORS '" .. output .. "'\n")
+  else
+    util.write("LS_COLORS='" .. output .. "';\nexport LS_COLORS\n")
+  end
+  return 0
+end

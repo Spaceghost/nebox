@@ -10,8 +10,8 @@
 -- on /dev/tty (answered with their defaults without one). Hunks that do not
 -- apply are saved to FILE.rej in the patch's format. File names come from the
 -- headers with -p N leading components removed (the base name without -p),
--- choosing as GNU does among the old, new and Index: names. Not supported: ed
--- scripts (-e), -D/--ifdef, -l, --posix, version control lookups.
+-- choosing as GNU does among the old, new and Index: names. Remaining gaps:
+-- version control lookups, merge conflicts, and Git metadata and binary patches.
 ## pragmas.nogc = true
 
 require 'string'
@@ -49,7 +49,8 @@ local FilePatch = @record{
 local Opt = @record{
   strip: integer, fuzz: integer,
   reverse: boolean, forward: boolean, batch: boolean, force: boolean, silent: boolean,
-  backup: boolean, remove_empty: boolean, dry_run: boolean, loose: boolean,
+  backup: boolean, backup_mismatch: boolean, posix: boolean,
+  remove_empty: boolean, dry_run: boolean, loose: boolean,
   outfile: string, rejfile: string,
   conditional: boolean, symbol: string,
 }
@@ -371,17 +372,18 @@ end
 
 local function choose_name(fp: *FilePatch, o: *Opt): string
   local cands: [3]string = {strip_name(fp.old_name, o.strip), strip_name(fp.new_name, o.strip), ''}
-  if (fp.old_name.size == 0 and fp.new_name.size == 0) and fp.index_name.size > 0 then
+  if (o.posix or (fp.old_name.size == 0 and fp.new_name.size == 0)) and fp.index_name.size > 0 then
     cands[2] = strip_name(fp.index_name, o.strip)
   end
   local best: string = ''
   for i = 0, 2 do
     local c = cands[i]
     if c.size > 0 and util.exists(c) then
+      if o.posix then return c end
       if best.size == 0 or better(c, best) then best = c end
     end
   end
-  if best.size > 0 then return best end
+  if best.size > 0 or o.posix then return best end
   -- creating: the best of the names given
   for i = 0, 2 do
     local c = cands[i]
@@ -706,7 +708,7 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
   local new_absent = fp.new_name == '/dev/null'
   local function_ignored = false
   if name.size == 0 or (not util.exists(name) and not (reverse and new_absent or old_absent)) then
-    if not (not util.exists(name) and (reverse and old_absent or new_absent)) then
+    if (o.posix and name.size == 0) or not (not util.exists(name) and (reverse and old_absent or new_absent)) then
       -- GNU asks for a file name; without one the patch is skipped
       if o.batch or o.force then
         say('No file to patch.  Skipping patch.\n')
@@ -883,15 +885,15 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
   -- that deletes the file removes it
   local target = o.outfile.size > 0 and o.outfile or name
   local deletes = reverse and old_absent or new_absent
-  if o.outfile.size == 0 and (o.backup or mismatch or failed > 0) and util.exists(name) then
+  if o.outfile.size == 0 and (o.backup or (o.backup_mismatch and (mismatch or failed > 0))) and util.exists(name) then
     local data, ok = util.readfile(name)
     if ok then save_file(name .. '.orig', data) end
   end
-  if o.outfile.size == 0 and #out == 0 and (o.remove_empty or deletes) then
+  if o.outfile.size == 0 and #out == 0 and (o.remove_empty or (deletes and not o.posix)) then
     if util.exists(name) and sys.unlink(name) ~= 0 then util.perror(name); return 2 end
     return rc
   end
-  if o.outfile.size == 0 and #out > 0 and deletes and not o.conditional then
+  if o.outfile.size == 0 and #out > 0 and deletes and (o.remove_empty or not o.posix) and not o.conditional then
     if not o.silent then say('Not deleting file ' .. name .. ' as content differs from patch\n') end
     rc = 1
   end
@@ -1014,9 +1016,17 @@ global function applet_patch(args: sequence(string)): integer
   -- long options GNU patch users write, mapped to the short ones
   local rest: sequence(string)
   local dry = false
+  local posix = sys.getenv('POSIXLY_CORRECT') ~= nilptr
+  local backup_mismatch = not posix
   for i = 1, #args do
     local a = args[i]
-    if a == '--dry-run' then dry = true
+    if a == '--' then
+      for j = i, #args do rest:push(args[j]) end
+      break
+    elseif a == '--dry-run' then dry = true
+    elseif a == '--posix' then posix = true
+    elseif a == '--backup-if-mismatch' then backup_mismatch = true
+    elseif a == '--no-backup-if-mismatch' then backup_mismatch = false
     elseif a == '--forward' then rest:push('-N')
     elseif a == '--reverse' then rest:push('-R')
     elseif a == '--batch' then rest:push('-t')
@@ -1043,6 +1053,7 @@ global function applet_patch(args: sequence(string)): integer
   if not o:ok() then return util.optfail(o) + 1 end
   local opt: Opt = {strip = -1, fuzz = 2, reverse = o:has('R'), forward = o:has('N'),
     batch = o:has('t'), force = o:has('f'), silent = o:has('s'), backup = o:has('b'),
+    posix = posix, backup_mismatch = backup_mismatch,
     remove_empty = o:has('E'), dry_run = dry, loose = o:has('l'), conditional = o:has('D')}
   if opt.conditional then opt.symbol = o:get('D') end
   if o:has('p') then

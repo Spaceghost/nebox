@@ -1,0 +1,324 @@
+-- Split an input by line numbers and basic regular expressions.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.regex'
+
+local long_options: []util.LongOpt = {
+  {'suffix-format', 1, 'b'_b}, {'prefix', 1, 'f'_b}, {'keep-files', 0, 'k'_b},
+  {'digits', 1, 'n'_b}, {'quiet', 0, 's'_b}, {'silent', 0, 's'_b},
+  {'elide-empty-files', 0, 'z'_b}, {'suppress-matched', 0, 130},
+  {'help', 0, 128}, {'version', 0, 129},
+}
+local BASIC <comptime> = regex.RE_CHAR_CLASSES | regex.RE_DOT_NEWLINE |
+  regex.RE_DOT_NOT_NULL | regex.RE_INTERVALS | regex.RE_BK_PLUS_QM
+
+local Pattern = @record{
+  raw: string, number: int64, offset: int64, repeat_count: int64,
+  regexp: boolean, skip: boolean, forever: boolean, re: regex.Prog,
+}
+
+local State = @record{
+  data: string, lines: sequence(string), first: integer, scan: integer,
+  prefix: string, format: string, digits: cint, suppress: boolean,
+  quiet: boolean, elide: boolean, keep: boolean,
+  files: sequence(string), fd: cint, bytes: uint64,
+}
+
+local function numeric_error(p: *Pattern, iteration: integer)
+  local extra = iteration == 0 and '' or (' on repetition ' .. tostring(iteration))
+  util.err(util.quote(tostring(p.number)) .. ': line number out of range' .. extra)
+end
+
+local function parse_patterns(operands: sequence(string)): (sequence(Pattern), boolean)
+  local patterns: sequence(Pattern)
+  local previous: uint64 = 0
+  local i = 2
+  while i <= #operands do
+    local text = operands[i]
+    local p: Pattern = {raw = text}
+    local delim: byte = text.size > 0 and text:byte(1) or 0
+    if delim == '/'_b or delim == 37 then
+      local close = #text
+      while close > 1 and text:byte(close) ~= delim do close = close - 1 end
+      if close <= 1 then
+        util.err(text .. ": closing delimiter '" .. string.char(delim) .. "' missing")
+        return patterns, false
+      end
+      local re, message = regex.compile_syntax(text:subview(2, close - 1), BASIC)
+      if message.size > 0 then
+        util.err(util.quote(text) .. ': invalid regular expression: ' .. message)
+        return patterns, false
+      end
+      p.regexp, p.skip, p.re = true, delim == 37, re
+      if close < #text then
+        local status, offset = util.xstrtoimax_base(text:subview(close + 1), 10, '')
+        if status ~= 0 then
+          util.err(util.quote(text) .. ': integer expected after delimiter')
+          return patterns, false
+        end
+        p.offset = offset
+      end
+    else
+      local status, number = util.xstrtoumax(text, '')
+      if status ~= 0 or number > 0x7fffffffffffffff then
+        util.err(util.quote(text) .. ': invalid pattern')
+        return patterns, false
+      end
+      if number == 0 then util.err(text .. ': line number must be greater than zero'); return patterns, false end
+      if number < previous then
+        util.err('line number ' .. util.quote(text) .. ' is smaller than preceding line number, ' .. tostring(previous))
+        return patterns, false
+      end
+      if number == previous then
+        util.err('warning: line number ' .. util.quote(text) .. ' is the same as preceding line number')
+      end
+      previous = number
+      p.number = (@int64)(number)
+    end
+    i = i + 1
+    if i <= #operands and operands[i].size > 0 and operands[i]:byte(1) == '{'_b then
+      local count = operands[i]
+      if count:byte(count.size) ~= '}'_b then
+        util.err(util.quote(count) .. ": '}' is required in repeat count")
+        return patterns, false
+      end
+      p.forever = count == '{*}'
+      if not p.forever then
+        local status, times = util.xstrtoumax(count:subview(2, count.size - 1), '')
+        if status ~= 0 or times > 0x7fffffffffffffff then
+          util.err(util.quote(count:subview(1, count.size - 1)) .. "}: integer required between '{' and '}'")
+          return patterns, false
+        end
+        p.repeat_count = (@int64)(times)
+      end
+      i = i + 1
+    end
+    patterns:push(p)
+  end
+  return patterns, true
+end
+
+local function validate_format(format: string): boolean
+  local conversion = false
+  local i = 1
+  while i <= #format do
+    local c = format:byte(i)
+    i = i + 1
+    if c ~= 37 then continue end
+    if i <= #format and format:byte(i) == 37 then i = i + 1; continue end
+    if conversion then util.err('too many % conversion specifications in suffix'); return false end
+    conversion = true
+    local alternate, grouping = false, false
+    while i <= #format do
+      c = format:byte(i)
+      if c == 35 then alternate = true
+      elseif c == 39 then grouping = true
+      elseif c ~= 45 and c ~= 48 then break end
+      i = i + 1
+    end
+    local width = 0
+    while i <= #format and format:byte(i) >= 48 and format:byte(i) <= 57 do
+      width = width * 10 + format:byte(i) - 48
+      if width >= 4096 then util.err('output file name is too long'); return false end
+      i = i + 1
+    end
+    if i <= #format and format:byte(i) == 46 then
+      i = i + 1
+      local precision = 0
+      while i <= #format and format:byte(i) >= 48 and format:byte(i) <= 57 do
+        precision = precision * 10 + format:byte(i) - 48
+        if precision >= 4096 then util.err('output file name is too long'); return false end
+        i = i + 1
+      end
+    end
+    if i > #format then util.err('missing conversion specifier in suffix'); return false end
+    c = format:byte(i)
+    local decimal = c == 'd'_b or c == 'i'_b or c == 'u'_b
+    if not decimal and c ~= 'o'_b and c ~= 'x'_b and c ~= 'X'_b then
+      local notation = c >= 32 and c <= 126 and string.char(c) or string.format('\\%03o', (@cuint)(c))
+      util.err('invalid conversion specifier in suffix: ' .. notation)
+      return false
+    end
+    if (decimal and alternate) or (not decimal and grouping) then
+      util.err('invalid flags in conversion specification: %' .. (decimal and '#' or "'") .. string.char(c))
+      return false
+    end
+    i = i + 1
+  end
+  if not conversion then util.err('missing % conversion specification in suffix') end
+  return conversion
+end
+
+local function c_snprintf(buf: cstring, size: csize, format: cstring, ...: cvarargs): cint
+  <cimport 'snprintf', cinclude '<stdio.h>'> end
+
+local function open_part(s: *State): boolean
+  if #s.files >= 0x7fffffff then util.err('too many output files'); return false end
+  local index = (@cint)(#s.files)
+  local buf: [4096]cchar
+  local count: cint
+  if s.format.size > 0 then count = c_snprintf(&buf[0], #buf, s.format, index)
+  else count = c_snprintf(&buf[0], #buf, '%0*d', s.digits, index) end
+  if count < 0 or count >= #buf then
+    util.err('output file name is too long')
+    return false
+  end
+  local name = s.prefix .. sys.cstr(&buf[0])
+  s.fd = sys.open(name, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC | sys.O_CLOEXEC, 0x1b6)
+  if s.fd < 0 then util.perror(util.quotef(name)); return false end
+  s.files:push(name)
+  s.bytes = 0
+  return true
+end
+
+local function close_part(s: *State): boolean
+  if s.fd < 0 then return true end
+  local rc = sys.close(s.fd)
+  s.fd = -1
+  local name = s.files[#s.files]
+  if rc ~= 0 then util.perror(util.quotef(name)); return false end
+  if s.elide and s.bytes == 0 then
+    s.files:pop()
+    if sys.unlink(name) ~= 0 and sys.errno() ~= sys.ENOENT then util.perror(util.quotef(name)) end
+  elseif not s.quiet then
+    util.line(tostring(s.bytes))
+  end
+  return true
+end
+
+local function take_line(s: *State, output: boolean): boolean
+  local i = s.first
+  if i > #s.lines then return false end
+  s.first = i + 1
+  if i > s.scan then s.scan = i end
+  if not output then return true end
+  local line = s.lines[i]
+  local size = line.size
+  if i < #s.lines or s.data.data[s.data.size - 1] == 10 then size = size + 1 end
+  local written: usize = 0
+  while written < size do
+    local count = sys.write(s.fd, &line.data[written], size - written)
+    if count < 0 and sys.errno() == sys.EINTR then continue end
+    if count <= 0 then
+      util.perror('write error for ' .. util.quotef(s.files[#s.files]))
+      sys.close(s.fd)
+      s.fd = -1
+      return false
+    end
+    written = written + (@usize)(count)
+  end
+  s.bytes = s.bytes + size
+  return true
+end
+
+local function take_until(s: *State, limit: integer, output: boolean): boolean
+  while s.first < limit do
+    if not take_line(s, output) then return false end
+  end
+  return true
+end
+
+local function split_at_number(s: *State, p: *Pattern, repetition: integer): boolean
+  if not open_part(s) then return false end
+  local target = p.number <= 0x7fffffffffffffff // (repetition + 1) and p.number * (repetition + 1) or 0x7fffffffffffffff
+  if s.suppress and s.scan >= #s.lines then numeric_error(p, repetition); return false end
+  local limit = target <= #s.lines + 1 and target or #s.lines + 1
+  if not take_until(s, limit, true) then return false end
+  if target > limit then numeric_error(p, repetition); return false end
+  if not close_part(s) then return false end
+  if s.suppress then take_line(s, false)
+  elseif s.scan >= #s.lines then numeric_error(p, repetition); return false end
+  return true
+end
+
+-- Status 2 signals a successful end of input under a repeating regexp.
+local function split_at_match(s: *State, p: *Pattern, repetition: integer): integer
+  if not p.skip and not open_part(s) then return 1 end
+  while true do
+    s.scan = s.scan + 1
+    if s.scan > #s.lines then
+      if not p.forever then
+        local extra = repetition == 0 and '' or (' on repetition ' .. tostring(repetition))
+        util.err(util.quote(p.raw) .. ': match not found' .. extra)
+      end
+      if not p.skip and (not take_until(s, #s.lines + 1, true) or not close_part(s)) then return 1 end
+      return p.forever and 2 or 1
+    end
+    if p.re:test(s.lines[s.scan]) then break end
+    if p.re.toocomplex then util.err('error in regular expression search'); return 1 end
+    if p.offset >= 0 and not take_line(s, not p.skip) then return 1 end
+  end
+  if p.offset > 0x7fffffffffffffff - s.scan or p.offset < s.first - s.scan then
+    util.err(util.quote(p.raw) .. ': line number out of range')
+    return 1
+  end
+  local target = s.scan + p.offset
+  local limit = target <= #s.lines + 1 and target or #s.lines + 1
+  if not take_until(s, limit, not p.skip) then return 1 end
+  if target > limit then util.err(util.quote(p.raw) .. ': line number out of range'); return 1 end
+  if not p.skip and not close_part(s) then return 1 end
+  if p.offset > 0 then s.scan = target end
+  if s.suppress then take_line(s, false) end
+  return 0
+end
+
+global function applet_csplit(args: sequence(string)): integer
+  local o = util.parsel(args, 'b:f:kn:sqz', &long_options[0], #long_options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'csplit [OPTION]... FILE PATTERN...') then return 0 end
+  if #o.operands == 0 then return util.die('missing operand') end
+  if #o.operands < 2 then return util.die('missing operand after ' .. util.quote(o.operands[1])) end
+  local s: State = {
+    prefix = o:has('f') and o:get('f') or 'xx', format = o:get('b'), digits = 2,
+    first = 1, fd = -1, suppress = o:has(string.char(130)),
+    quiet = o:has('q') or o:has('s'), elide = o:has('z'), keep = o:has('k'),
+  }
+  if o:has('b') and not validate_format(s.format) then return 1 end
+  if o:has('n') then
+    local ok, digits, error = util.xdectoimax(o:get('n'), 0, 0x7fffffff, '', 'invalid number')
+    if not ok then return util.die(error) end
+    if digits >= 4096 and not o:has('b') then return util.die('output file name is too long') end
+    s.digits = (@cint)(digits)
+  end
+  local path = o.operands[1]
+  local fd = path == '-' and 0 or sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then util.perror('cannot open ' .. util.quotef(path) .. ' for reading'); return 1 end
+  defer if fd ~= 0 then sys.close(fd) end end
+  local patterns, valid = parse_patterns(o.operands)
+  if not valid then return 1 end
+  local data, ok = util.readfd(fd)
+  if not ok then util.perror('read error'); return 1 end
+  s.data = data
+  s.lines = util.lines(data)
+  local success = false
+  defer
+    if not success then
+      close_part(&s)
+      if not s.keep then
+        for i = #s.files, 1, -1 do
+          local path = s.files[i]
+          if sys.unlink(path) ~= 0 and sys.errno() ~= sys.ENOENT then util.perror(util.quotef(path)) end
+        end
+      end
+    end
+  end
+  for i = 1, #patterns do
+    local p = &patterns[i]
+    local repetition = 0
+    while p.forever or repetition <= p.repeat_count do
+      if p.regexp then
+        local result = split_at_match(&s, p, repetition)
+        if result ~= 0 then
+          success = result == 2
+          return success and 0 or 1
+        end
+      elseif not split_at_number(&s, p, repetition) then return 1 end
+      repetition = repetition + 1
+    end
+  end
+  success = open_part(&s) and take_until(&s, #s.lines + 1, true) and close_part(&s)
+  return success and 0 or 1
+end

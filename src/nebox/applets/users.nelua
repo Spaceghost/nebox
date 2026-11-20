@@ -1,0 +1,441 @@
+-- User-session and system uptime utilities using the Linux x86-64 utmp format.
+## pragmas.nogc = true
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+require 'nebox.clock'
+require 'nebox.applets.hostname'
+
+local users_options: []util.LongOpt = {{'help', 0, 128}, {'version', 0, 129}}
+local who_options: []util.LongOpt = {
+  {'all', 0, 'a'_b}, {'boot', 0, 'b'_b}, {'count', 0, 'q'_b}, {'dead', 0, 'd'_b},
+  {'heading', 0, 'H'_b}, {'login', 0, 'l'_b}, {'lookup', 0, 130}, {'message', 0, 'T'_b},
+  {'mesg', 0, 'T'_b}, {'process', 0, 'p'_b}, {'runlevel', 0, 'r'_b}, {'short', 0, 's'_b},
+  {'time', 0, 't'_b}, {'users', 0, 'u'_b}, {'writable', 0, 'T'_b}, {'help', 0, 128}, {'version', 0, 129},
+}
+local RECORD_SIZE: usize <comptime> = 384
+local RUN_LEVEL <comptime> = 1
+local BOOT_TIME <comptime> = 2
+local NEW_TIME <comptime> = 3
+local INIT_PROCESS <comptime> = 5
+local LOGIN_PROCESS <comptime> = 6
+local USER_PROCESS <comptime> = 7
+local DEAD_PROCESS <comptime> = 8
+local UTMP = @[384]byte
+local ESRCH: cint <comptime> = 3
+
+local function c_qsort(base: pointer, count: csize, size: csize, compare: function(pointer, pointer): cint)
+  <cimport 'qsort', cinclude '<stdlib.h>'> end
+
+local function compare_names(a: pointer, b: pointer): cint
+  local left = $((@*string)(a))
+  local right = $((@*string)(b))
+  if left == right then return 0 end
+  return left < right and -1 or 1
+end
+
+local function field(entry: *UTMP, start: usize, width: usize): string
+  local size: usize = 0
+  while size < width and entry[start + size] ~= 0 do size = size + 1 end
+  return (@string){data = &entry[start], size = size}
+end
+
+local function word(entry: *UTMP, start: usize): cint
+  return (@cint)((@uint32)(entry[start]) | (@uint32)(entry[start + 1]) << 8 |
+                 (@uint32)(entry[start + 2]) << 16 | (@uint32)(entry[start + 3]) << 24)
+end
+
+local function short_word(entry: *UTMP, start: usize): integer
+  return (@int16)((@uint16)(entry[start]) | (@uint16)(entry[start + 1]) << 8)
+end
+
+local function trim_spaces(text: string): string
+  local size = #text
+  while size > 0 and text:byte(size) == ' '_b do size = size - 1 end
+  return text:subview(1, size)
+end
+
+local function read_session(fd: cint, entry: *UTMP, check_pid: boolean): boolean
+  while true do
+    local used: usize = 0
+    while used < RECORD_SIZE do
+      local count = sys.read(fd, &entry[used], RECORD_SIZE - used)
+      if count < 0 and sys.errno() == sys.EINTR then continue end
+      if count <= 0 then return false end
+      used = used + (@usize)(count)
+    end
+    local pid = word(entry, 4)
+    if not check_pid or short_word(entry, 0) ~= USER_PROCESS or pid <= 0 or
+       sys.kill(pid, 0) >= 0 or sys.errno() ~= ESRCH then return true end
+  end
+end
+
+global function applet_users(args: sequence(string)): integer
+  local o = util.parsel(args, '', &users_options[0], #users_options)
+  if not o:ok() then util.optfail(o); return 1 end
+  if util.core_info(&o, 'users [OPTION]... [FILE]') then return 0 end
+  if #o.operands > 1 then return util.die('extra operand ' .. util.quote(o.operands[2])) end
+  local default_file = #o.operands == 0
+  local path = default_file and '/var/run/utmp' or o.operands[1]
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return 0 end -- GNU reads utmp through getutent, which treats open failure as EOF.
+  local entries: sequence(string)
+  local entry: UTMP
+  while read_session(fd, &entry, default_file) do
+    if short_word(&entry, 0) == USER_PROCESS and entry[44] ~= 0 then
+      entries:push(string.copy(trim_spaces(field(&entry, 44, 32))))
+    end
+  end
+  sys.close(fd)
+  if #entries > 1 then c_qsort(&entries[1], #entries, #@string, compare_names) end
+  for i, name in ipairs(entries) do
+    if i > 1 then util.writebyte(32) end
+    util.write(name)
+  end
+  if #entries > 0 then util.writebyte(10) end
+  return 0
+end
+
+local Who = @record{
+  short: boolean, mesg: boolean, idle: boolean, exit_state: boolean,
+  iso_time: boolean, lookup: boolean, boot: integer,
+}
+
+local function print_session(options: *Who, name: string, message: string, line: string,
+    time: string, idle: string, pid: string, comment: string, exit_state: string)
+  local displayed_time = string.format(options.iso_time and '%-16s' or '%-12s', time)
+  local status = options.mesg and (' ' .. message) or ''
+  local details = ''
+  if not options.short then
+    if options.idle then details = string.format(' %-6s', idle) end
+    details = details .. string.format(' %10s', pid)
+  end
+  local termination = options.exit_state and string.format(' %-12s', exit_state) or ''
+  local text = string.format('%-8s%s %-12s %s%s %-8s%s',
+                             name, status, line, displayed_time, details, comment, termination)
+  util.line(trim_spaces(text))
+end
+
+local function session_time(stamp: integer, iso: boolean): string
+  local time, ok = util.breaktime(stamp, 0, false)
+  if not ok then return tostring(stamp) end
+  local formatted = util.timestr(iso and '%Y-%m-%d %H:%M' or '%b %e %H:%M', &time)
+  time.zone:destroy()
+  return formatted
+end
+
+local function idle_time(last: integer, boot: integer): string
+  if last == 0 then return '  ?' end
+  local age = sys.time(nilptr) - last
+  if last <= boot or age < 0 or age >= 86400 then return ' old ' end
+  if age < 60 then return '  .  ' end
+  return string.format('%02d:%02d', age // 3600, age // 60 % 60)
+end
+
+local function display_host(host: string, lookup: boolean): string
+  if not lookup or host.size == 0 then return host end
+  local display = host:find(':', 1, true)
+  if display == 1 then return host end
+  local address = display == 0 and host or host:subview(1, display - 1)
+  return nebox_canonical_host(address) .. (display == 0 and '' or host:subview(display))
+end
+
+local function print_login_session(options: *Who, entry: *UTMP, stamp: string)
+  local line = field(entry, 8, 32)
+  local device = line.size > 0 and line:byte(1) == '/'_b and line or '/dev/' .. line
+  local message = '?'
+  local last = 0
+  local st: sys.Stat
+  if sys.stat(device, &st) == 0 then
+    message = (st.st_mode & 0x10) ~= 0 and util.groupname(st.st_gid) == 'tty' and '+' or '-'
+    last = st.st_atim.tv_sec
+  end
+  local host = display_host(field(entry, 76, 256), options.lookup)
+  print_session(options, field(entry, 44, 32), message, line, stamp, idle_time(last, options.boot),
+                tostring(word(entry, 4)), host.size == 0 and '' or ('(' .. host .. ')'), '')
+end
+
+local function stdin_tty(): string
+  if sys.isatty(0) == 0 then return '' end
+  local buf: [4096]byte
+  local n = sys.readlink('/proc/self/fd/0', &buf[0], #buf - 1)
+  if n <= 5 then return '' end
+  local name: string = {data = &buf[0], size = (@usize)(n)}
+  if name:subview(1, 5) ~= '/dev/' then return '' end
+  return name:sub(6)
+end
+
+local function iso_login_time(): boolean
+  local locale = sys.getenv('LC_ALL')
+  if locale == nilptr or (@string)(locale).size == 0 then locale = sys.getenv('LC_TIME') end
+  if locale == nilptr or (@string)(locale).size == 0 then locale = sys.getenv('LANG') end
+  local time_locale = locale == nilptr and '' or (@string)(locale)
+  return time_locale ~= '' and time_locale ~= 'C' and time_locale ~= 'POSIX'
+end
+
+global function applet_who(args: sequence(string)): integer
+  local o = util.parsel(args, 'abdlmpqrstuwHT', &who_options[0], #who_options)
+  if not o:ok() then util.optfail(o); return 1 end
+  if util.core_info(&o, 'who [OPTION]... [ FILE | ARG1 ARG2 ]') then return 0 end
+  local n = #o.operands
+  if n > 2 then return util.die('extra operand ' .. util.quote(o.operands[3])) end
+  local all = o:has('a')
+  local boot = all or o:has('b')
+  local dead = all or o:has('d')
+  local login = all or o:has('l')
+  local init = all or o:has('p')
+  local runlevel = all or o:has('r')
+  local clock = all or o:has('t')
+  local sessions = all or o:has('u')
+  local defaults = not (boot or dead or login or init or runlevel or clock or sessions)
+  local count_only = o:has('q')
+  local current = n == 2 or o:has('m')
+  local output: Who = {
+    short = (defaults or o:has('s')) and not dead, mesg = all or o:has('T') or o:has('w'),
+    idle = dead or login or runlevel or sessions, exit_state = dead,
+    iso_time = iso_login_time(),
+    lookup = o:has(string.char(130)), boot = -0x7fffffffffffffff - 1,
+  }
+  if o:has('H') and not count_only then
+    print_session(&output, 'NAME', ' ', 'LINE', 'TIME', 'IDLE', 'PID', 'COMMENT', 'EXIT')
+  end
+  local tty = ''
+  if current and not count_only then
+    tty = stdin_tty()
+    if tty == '' then return 0 end
+  end
+  local path = n == 1 and o.operands[1] or '/var/run/utmp'
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  local count = 0
+  if fd >= 0 then
+    local entry: UTMP
+    while read_session(fd, &entry, n ~= 1) do
+      local kind = short_word(&entry, 0)
+      local user = kind == USER_PROCESS and entry[44] ~= 0
+      if count_only then
+        if user then
+          if count > 0 then util.writebyte(32) end
+          util.write(trim_spaces(field(&entry, 44, 32)))
+          count = count + 1
+        end
+        continue
+      end
+      local seconds = word(&entry, 340)
+      if not current or tty == field(&entry, 8, 32) then
+        local stamp = session_time(seconds, output.iso_time)
+        if (defaults or sessions) and user then
+          print_login_session(&output, &entry, stamp)
+        elseif kind == RUN_LEVEL and runlevel then
+          local pid = word(&entry, 4)
+          local last = (pid // 256) & 255
+          local comment = last >= 32 and last <= 126 and ('last=' .. string.char(last == 78 and 83 or last)) or ''
+          print_session(&output, '', ' ', 'run-level ' .. string.char(pid & 255), stamp, '', '', comment, '')
+        elseif kind == BOOT_TIME and boot then
+          print_session(&output, '', ' ', 'system boot', stamp, '', '', '', '')
+        elseif kind == NEW_TIME and clock then
+          print_session(&output, '', ' ', 'clock change', stamp, '', '', '', '')
+        elseif (kind == INIT_PROCESS and init) or (kind == LOGIN_PROCESS and login) or (kind == DEAD_PROCESS and dead) then
+          local name = kind == LOGIN_PROCESS and 'LOGIN' or ''
+          local termination = ''
+          if kind == DEAD_PROCESS then
+            termination = string.format('term=%d exit=%d', short_word(&entry, 332), short_word(&entry, 334))
+          end
+          print_session(&output, name, ' ', field(&entry, 8, 32), stamp, '', tostring(word(&entry, 4)),
+                        'id=' .. field(&entry, 40, 4), termination)
+        end
+      end
+      if kind == BOOT_TIME then output.boot = seconds end
+    end
+    sys.close(fd)
+  end
+  if count_only then util.writef('\n# users=%d\n', count) end
+  return 0
+end
+
+local function c_syscall(n: clong, ...: cvarargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
+local SYS_SYSINFO: clong <comptime> = 99
+
+local function system_uptime(): integer
+  local fd = sys.open('/proc/uptime', sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return 0 end
+  local buf: [128]cchar
+  local count = sys.read(fd, &buf[0], #buf - 1)
+  sys.close(fd)
+  if count <= 0 then return 0 end
+  buf[count] = 0
+  local parsed = sys.strtod(&buf[0], nilptr)
+  if parsed < 0 or parsed >= 0x1p63 or parsed ~= parsed then return -1 end
+  return (@integer)(parsed)
+end
+
+global function applet_uptime(args: sequence(string)): integer
+  local o = util.parsel(args, '', &users_options[0], #users_options)
+  if not o:ok() then util.optfail(o); return 1 end
+  if util.core_info(&o, 'uptime [OPTION]... [FILE]') then return 0 end
+  if #o.operands > 1 then return util.die('extra operand ' .. util.quote(o.operands[2])) end
+  local default_file = #o.operands == 0
+  local fd = sys.open(default_file and '/var/run/utmp' or o.operands[1],
+                      sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  local users, boot = 0, 0
+  if fd >= 0 then
+    local entry: UTMP
+    while read_session(fd, &entry, default_file) do
+      local kind = short_word(&entry, 0)
+      if kind == USER_PROCESS and entry[44] ~= 0 then users = users + 1 end
+      if kind == BOOT_TIME then boot = word(&entry, 340) end
+    end
+    sys.close(fd)
+  end
+  local now = sys.time(nilptr)
+  local age = system_uptime()
+  if age == 0 then
+    if boot == 0 then return util.die("couldn't get boot time") end
+    age = now - boot
+  end
+  local localtime, ok = util.breaktime(now, 0, false)
+  if ok then
+    util.write(util.timestr(' %H:%M:%S  ', &localtime))
+    localtime.zone:destroy()
+  else
+    util.write(' ??:????  ')
+  end
+  if age == -1 then
+    util.write('up ???? days ??:??,  ')
+  else
+    local days = age /// 86400
+    local hours = (age - days * 86400) /// 3600
+    local minutes = (age - days * 86400 - hours * 3600) /// 60
+    if days > 0 then util.writef('up %d %s ', days, days == 1 and 'day' or 'days')
+    else util.write('up  ') end
+    util.writef('%2d:%02d,  ', hours, minutes)
+  end
+  util.writef('%d %s', users, users == 1 and 'user' or 'users')
+  -- Linux x86-64 struct sysinfo starts with uptime and three fixed-point loads.
+  local info: [14]culong
+  if c_syscall(SYS_SYSINFO, &info[0]) == 0 then
+    util.writef(',  load average: %.2f, %.2f, %.2f',
+                (@float64)(info[1]) / 65536.0, (@float64)(info[2]) / 65536.0, (@float64)(info[3]) / 65536.0)
+  end
+  util.writebyte(10)
+  return 0
+end
+
+local Passwd <cimport 'passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint, pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local function c_getpwnam(name: cstring): *Passwd <cimport 'getpwnam', cinclude '<pwd.h>'> end
+
+local function full_name(pwd: *Passwd): string
+  local name = (@string)(pwd.pw_name)
+  local gecos = (@string)(pwd.pw_gecos)
+  local comma = gecos:find(',', 1, true)
+  if comma > 0 then gecos = gecos:subview(1, comma - 1) end
+  if name.size > 0 then name = name:subview(1, 1):upper() .. name:subview(2) end
+  local result: stringbuilder
+  for i = 1, #gecos do
+    local c = gecos:byte(i)
+    if c == '&'_b then result:write(name) else result:writebyte(c) end
+  end
+  return result:promote()
+end
+
+local function show_personal_file(home: string, basename: string, label: string)
+  local fd = sys.open(home .. basename, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return end
+  util.write(label)
+  util.copyfd(fd)
+  sys.close(fd)
+end
+
+local function pinky_long(o: *util.Opts): integer
+  if #o.operands == 0 then
+    return util.die('no username specified; at least one must be specified when using -l')
+  end
+  for _, name in ipairs(o.operands) do
+    local pwd = c_getpwnam(name)
+    util.writef('Login name: %-28sIn real life: ', name)
+    if pwd == nilptr then util.line(' ???'); continue end
+    util.line(' ' .. full_name(pwd))
+    local home = (@string)(pwd.pw_dir)
+    if not o:has('b') then util.writef('Directory: %-29sShell:  %s\n', home, (@string)(pwd.pw_shell)) end
+    if not o:has('h') then show_personal_file(home, '/.project', 'Project: ') end
+    if not o:has('p') then show_personal_file(home, '/.plan', 'Plan:\n') end
+    util.writebyte(10)
+  end
+  return 0
+end
+
+local function pinky_idle(last: integer): string
+  if last == 0 then return '?????' end
+  local age = sys.time(nilptr) - last
+  if age < 60 then return '     ' end
+  if age >= 86400 then return tostring(age // 86400) .. 'd' end
+  return string.format('%02d:%02d', age // 3600, age // 60 % 60)
+end
+
+local function pinky_short(o: *util.Opts): integer
+  local full = not (o:has('w') or o:has('i') or o:has('q'))
+  local where = not (o:has('i') or o:has('q'))
+  local idle = not o:has('q')
+  local iso = iso_login_time()
+  if not o:has('f') then
+    util.writef('%-8s', 'Login')
+    if full then util.writef(' %-19s', 'Name') end
+    util.writef(' %-9s', ' TTY')
+    if idle then util.writef(' %-6s', 'Idle') end
+    util.writef(iso and ' %-16s' or ' %-12s', 'When')
+    if where then util.write(' Where') end
+    util.writebyte(10)
+  end
+  local fd = sys.open('/var/run/utmp', sys.O_RDONLY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return 0 end
+  local entry: UTMP
+  while read_session(fd, &entry, false) do
+    if short_word(&entry, 0) ~= USER_PROCESS or entry[44] == 0 then continue end
+    local name = field(&entry, 44, 32)
+    local selected = #o.operands == 0
+    for _, candidate in ipairs(o.operands) do
+      if candidate == name then selected = true; break end
+    end
+    if not selected then continue end
+    local line = field(&entry, 8, 32)
+    local device = line.size > 0 and line:byte(1) == '/'_b and line or '/dev/' .. line
+    local st: sys.Stat
+    local message = '?'
+    local last = 0
+    if sys.stat(device, &st) == 0 then
+      message = (st.st_mode & 0x10) ~= 0 and ' ' or '*'
+      last = st.st_atim.tv_sec
+    end
+    util.writef('%-8s', name)
+    if full then
+      local pwd = c_getpwnam(name:copy())
+      if pwd == nilptr then util.writef(' %19s', '        ???')
+      else util.writef(' %-19s', full_name(pwd):subview(1, 19)) end
+    end
+    util.writef(' %s%-8s', message, line)
+    if idle then util.writef(' %-6s', pinky_idle(last)) end
+    util.write(' ' .. session_time(word(&entry, 340), iso))
+    if where then
+      local host = display_host(field(&entry, 76, 256), true)
+      if host.size > 0 then util.write(' ' .. host) end
+    end
+    util.writebyte(10)
+  end
+  sys.close(fd)
+  return 0
+end
+
+global function applet_pinky(args: sequence(string)): integer
+  local o = util.parsel(args, 'sfwiqbhlp', &users_options[0], #users_options)
+  if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'pinky [OPTION]... [USER]...') then return 0 end
+  local long = false
+  for _, c in ipairs(o.order) do
+    if c == 'l'_b then long = true elseif c == 's'_b then long = false end
+  end
+  if long then return pinky_long(&o) end
+  return pinky_short(&o)
+end

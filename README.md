@@ -124,18 +124,44 @@ and include files are prerequisites of the generated targets.
 ## Applets
 
 ```
-[ awk b2sum base32 base64 basename basenc cat chgrp chmod chown cksum cmp comm
-cp cut date df dir dirname dnsdomainname domainname du echo env expand expr
-factor false find fold free grep groups hd head hexdump hostname id install
-join kill link ln ls md5sum mkdir mktemp mv nisdomainname nl nproc nsh od paste
-patch printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
+[ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum cmp comm
+cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo env expand expr
+factor false find fmt fold free grep groups hd head hexdump hostid hostname id install
+join kill link ln logname ls md5sum mkdir mkfifo mknod mktemp mv nice nisdomainname nl nohup nproc nsh od paste
+patch pathchk pinky printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
 sync tac tail tee test timeout touch tr true truncate tsort tty uname unexpand
-uniq unlink vdir wc which whoami xargs yes ypdomainname
+uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
 per applet in `DIR`.
+
+The device applets `mkfifo` and `mknod` accept symbolic and octal
+modes. `chroot` sets the new root and optionally switches user, group and
+supplementary groups. `arch` reports the kernel architecture, `hostid` uses the host ID
+file or the IPv4 resolver, and `logname` uses the Linux login UID. Systems
+that record logins exclusively in utmp need a separate fallback.
+`nice`, `nohup` and `pathchk` provide process adjustment, hangup-safe
+launch and pathname portability checks.
+`dircolors` uses the GNU 9.1 database or a supplied file to build Bourne or
+C shell color settings and display color codes. `users` reads Linux utmp
+records, sorts session names, and filters stale processes for the default file.
+`who` reads the same records and displays login sessions, boot and clock
+changes, runlevels, and init, login and dead processes. It supports
+terminal message status, optional host canonicalization, and counting.
+`pinky` displays login sessions and detailed account information, including
+a user's project and plan files when present.
+`uptime` reports elapsed boot time, logged-in sessions and Linux load averages.
+`csplit` supports line numbers, basic regular expressions, offsets, repetition,
+file numbering and suppressing matched lines. It loads the input into memory
+before splitting and cleans up output files on ordinary errors unless asked
+to keep them. GNU can leave files behind when a numeric split begins after
+the last available input line. Nebox applies its ordinary error cleanup.
+`fmt` reflows paragraphs with GNU's line-break cost model, indentation
+modes, prefix matching and sentence spacing. It calculates line breaks
+across each paragraph in memory. GNU can flush part of a long paragraph
+early, so very long paragraphs can wrap differently.
 
 ## Known limits
 
@@ -689,9 +715,9 @@ Individual applets below list the operations that still use byte semantics.
   0 mismatches. Differences:
   - -V/--version prints nebox's line.
   - The DNS client retries truncated datagrams over TCP and supports
-    `use-vc` and `edns0` (covered in `tests/hostname_compare.py`). It has
-    no rotate, and a SERVFAIL, NOTIMP or REFUSED answer is
-    taken as it comes where glibc tries the next server. HOSTALIASES,
+    `use-vc`, `edns0` and `rotate`. When a server only returns UDP
+    SERVFAIL, NOTIMP or REFUSED responses, it tries the next server.
+    Transport fixtures cover these paths in `tests/hostname_compare.py`. HOSTALIASES,
     RES_OPTIONS' less common options, sortlist, /etc/gai.conf (the default
     tables are used), nscd and NSS modules other than files and dns (which
     count as unavailable, as a missing module does) are not read.
@@ -831,8 +857,9 @@ Individual applets below list the operations that still use byte semantics.
   file. GNU extension cases use gawk without `--posix`.
   Supports `**`, `**=`, `IGNORECASE`, `-e`/`--source`, `--file`,
   `--field-separator` and `--assign`. Relational string comparisons use
-  the available locale collation. Remaining gaps include other GNU long
-  options and the `PROCINFO["strftime"]` override. A multi-character `RS` is a streaming regular expression.
+  the available locale collation. `PROCINFO["strftime"]` sets the default format
+  for `strftime()`. Other GNU long options and PROCINFO entries remain open.
+  A multi-character `RS` is a streaming regular expression.
   `RT` contains the actual separator, including blank-line separators.
   Empty matches are skipped. In UTF-8 locales, string lengths, positions
   and case conversion use characters. Hexadecimal/`inf`/`nan` spellings in numeric strings are
@@ -982,7 +1009,9 @@ Individual applets below list the operations that still use byte semantics.
   `diff -e`, including its literal-dot escape. `-l`/`--ignore-whitespace`
   uses GNU's blank-run matching and preserves input context lines.
   `-D`/`--ifdef` wraps old and new text in C preprocessor conditionals.
-  Not supported: `--merge`, `--posix`,
+  `--posix` and `POSIXLY_CORRECT` select POSIX file-name and
+  empty-output rules. `POSIXLY_CORRECT` also disables automatic backups.
+  Not supported: `--merge`,
   git diffs (renames, modes, binary), version control lookups.
 - `dd` is a port of GNU coreutils 9.1 `src/dd.c` (read from its source):
   every operand (`iseek`/`oseek` too), conversion and flag, GNU's number
@@ -1056,7 +1085,10 @@ Individual applets below list the operations that still use byte semantics.
   `-t` expands tabs in standard, context, unified, ed and RCS output.
   `-T` aligns the output prefixes in normal, context and unified formats.
   `-l`/`--paginate` sends each file's diff through `/usr/bin/pr` as GNU diff
-  does. Tab expansion in custom templates remains unsupported.
+  does. `--strip-trailing-cr` strips CRLF line endings, `-Z` ignores
+  trailing white space, and `--no-dereference` compares symbolic link targets.
+  `--color` and `--palette` color normal, unified, context and side-by-side output.
+  Tab expansion in custom templates remains unsupported.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
   patches are kept (the `stray \` warnings appear only when

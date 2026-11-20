@@ -176,6 +176,15 @@ EOF
 printf "%s:%s\n" "$x" "$y"'"'"''
 same diff-minimal-horizon 'printf "z\na\nb\nb\nc\nz\n" > a; printf "z\nb\nb\na\nc\nz\n" > b; diff --minimal --horizon-lines=2 a b; diff -d -u --label a --label b a b'
 same diff-speed-large 'awk "BEGIN { for(i=1;i<=24000;i++) print i }" > a; awk "BEGIN { for(i=1;i<=24000;i++) print (i%35==1 && i<24000 ? i+1 : i%35==2 ? i-1 : i) }" > b; diff --speed-large-files -u --label a --label b a b | cksum'
+same diff-color 'diff --color=always words.txt spaces.txt; diff --color=always -u --label left --label right words.txt nonl.txt; diff --color=always -c --label left --label right words.txt spaces.txt; diff --color=always -y words.txt spaces.txt'
+same diff-palette 'diff --color=always --palette=hd=31:ad=34:de=35:ln=33 -u --label a --label b words.txt spaces.txt; diff --color=always --palette=bad words.txt spaces.txt; diff --color words.txt spaces.txt; diff --color=invalid words.txt spaces.txt'
+same diff-strip-cr 'printf "same\r\nold\r\n" > a; printf "same\nnew\n" > b; diff --strip-trailing-cr -u --label a --label b a b'
+same diff-ignore-trailing-space 'printf "same  \nold \t\n" > a; printf "same\nnew\n" > b; diff -Z a b'
+same diff-no-dereference 'ln -s nowhere a; ln -s nowhere b; ln -s elsewhere c; diff --no-dereference -s a b; diff --no-dereference a c'
+expect coreutils-information 'Usage: cat [OPTION]... [FILE]...
+pwd (nebox) after GNU coreutils 9.1
+Usage: uname [OPTION]...
+exit=0' 'cat --help; env pwd --version; uname --help'
 same diff-paginate 'mkdir left right; seq 1 72 > left/a; seq 73 144 > right/a; touch left/only; diff --paginate left right | sed "s/^[0-9][0-9-]* [0-9][0-9:]* /DATE /"; diff -lq left/a right/a'
 same diff-tab-output 'printf "a\t1\n\ncommon\n" > a; printf "b\t2\ntext\ncommon\n" > b; for opts in -t -T -tT -uT -cT -nt -et; do diff "$opts" --label a --label b a b; done'
 expect ls-help-version 'Usage: ls [OPTION]... [FILE]...
@@ -375,6 +384,54 @@ if printf 'ab\n' | "$BIN" grep -Pq '(?<=a)b' 2>/dev/null; then
   same grep-perl-utf8 'printf "Élan élan\n123٤５\n" | LC_ALL=C.UTF-8 grep -Poi "élan|\p{Mn}|\d+"'
   same grep-perl-nul-records 'printf "a\n2\000a\n4\000no\000" | grep -Pzo "(?s)a.\d" | od -An -tx1'
 fi
+same catalog-chroot-options 'chroot --skip-chdir nosuch /bin/pwd; echo $?; chroot; echo $?; chroot nosuch /bin/pwd'
+if [ "$(id -u)" = 0 ]; then
+  same catalog-chroot '/usr/bin/test "$(chroot --skip-chdir / /bin/pwd)" = "$PWD"; chroot --userspec=65534:65534 --groups=7,8 / /usr/bin/id; chroot / missing-nebox-command'
+fi
+same catalog-dircolors-default 'dircolors -p; TERM=xterm-256color dircolors -b; TERM=unknown COLORTERM= dircolors -b'
+same catalog-dircolors-input 'printf "%s\n" "NORMAL 00" "TERM unknown" "TERM xterm*" "DIR 01;34" ".c 31" "*.a:b=c 32" "TERM vt100" "OFF 7" > colors; TERM=xterm dircolors -b colors; TERM=xterm SHELL=/bin/tcsh dircolors colors; TERM=xterm dircolors --print-ls-colors colors'
+same catalog-dircolors-errors 'printf "TERM xterm*\nUNKNOWN 3\n" | TERM=xterm dircolors -b -; echo $?; printf "TERM xterm*\nDIR\n" | TERM=xterm dircolors -b -; echo $?; dircolors -b -p'
+python3 - "$W/fixture/session.utmp" <<'PY_UTMP'
+import struct
+import sys
+
+rows = [
+    (2, 0, "~", "", "", ""),
+    (1, ord("N") * 256 + ord("3"), "~", "", "", ""),
+    (3, 0, "|", "", "", ""),
+    (5, 42, "ttyinit", "init", "", ""),
+    (6, 43, "ttylogin", "log", "", ""),
+    (7, 44, "nebox-fixture", "sess", "alice", "localhost:0"),
+    (7, 45, "testmissing", "oth", "long.user.name   ", ":3"),
+    (7, 47, "othermissing", "dup", "alice", ""),
+    (7, 48, "testmissing", "emp", "", ""),
+    (8, 46, "ttydead", "dead", "", ""),
+]
+with open(sys.argv[1], "wb") as output:
+    for kind, pid, line, ident, user, host in rows:
+        output.write(struct.pack(
+            "<h2xi32s4s32s256shhii40x", kind, pid, line.encode(), ident.encode(),
+            user.encode(), host.encode(), 9, 1, 0, 946684800,
+        ))
+    output.write(b"partial")
+PY_UTMP
+same catalog-users 'users session.utmp; users nonexistent'
+same catalog-who 'who -aH session.utmp; who -H session.utmp; who -q session.utmp; who --lookup -T session.utmp; who -m session.utmp </dev/null; who -q nonexistent'
+expect catalog-uptime 'exit=0' 'uptime session.utmp | grep -Eq "^ [0-9]{2}:[0-9]{2}:[0-9]{2}  up .* 3 users,  load average: [0-9]+[.][0-9]{2}, [0-9]+[.][0-9]{2}, [0-9]+[.][0-9]{2}$"'
+same catalog-csplit-lines 'csplit -f out -n 3 words.txt 2 '"'"'{1}'"'"'; cat out000 out001 out002; cat words.txt | csplit --suppress-matched -f drop - 2 4; cat drop*'
+same catalog-csplit-patterns 'printf '"'"'lead\n--\na\n--\nb\n--\ntrail'"'"' > input; csplit -f pos input '"'"'/^--$/+1'"'"' '"'"'{*}'"'"'; csplit -f neg -b '"'"'part-%02x%%'"'"' input '"'"'/^--$/-1'"'"' '"'"'{*}'"'"'; csplit -zf ignore input '"'"'%^--$%'"'"' '"'"'/^--$/'"'"'; csplit -f clean input '"'"'/never/'"'"'; echo clean=$?; csplit -kf keep input 3 '"'"'/never/'"'"''
+same catalog-csplit-edge 'printf '"'"'a\n\nb\n'"'"' > input; csplit -zf empty input '"'"'/^a$/'"'"'; csplit -f same input 1 1; csplit -kf kept input 4; csplit -f eof input 2 '"'"'{*}'"'"'; csplit -f nosave input '"'"'/[/'"'"'; csplit -b '"'"'%s'"'"' input 1'
+same catalog-fmt-reflow 'printf '"'"'One initial sentence.  Another complete sentence!  And some (quoted) words.\nNew paragraph line with a single sentence.\n\n    indented words keep their space and wrap nicely\n\twords with tabs show the output spacing\nlast line without a newline'"'"' > paragraph; fmt -24 paragraph; fmt -u -g 21 -w 28 paragraph; fmt --split-only -w 22 paragraph'
+same catalog-fmt-layout 'printf '"'"'  A tag followed by paragraph text for testing.\n    second line of text with a larger indentation\n    third line continues the same paragraph\n  final line has the first line indentation\n'"'"' > tagged; fmt -w 22 -c tagged; fmt -w 22 -t tagged; printf '"'"'__ does not match\n# alpha beta gamma; a delta\n#   a second test of a prefix\n#\n  # zeta eta theta\n'"'"' | fmt -p '"'"'# '"'"' -w 18'
+same catalog-fmt-options 'fmt -w 2501 words.txt; echo $?; fmt -u -10 words.txt; echo $?; fmt -g100 words.txt; echo $?; fmt --width=10 words.txt absent nonl.txt'
+same catalog-pinky 'pinky -lbhp root nebox-no-such-user; pinky -lhp root; pinky -l; echo $?; pinky -q; pinky -qf; pinky -ls nebox-no-such-user'
+same catalog-arch 'arch'
+same catalog-hostid 'hostid'
+same catalog-logname 'logname'
+same catalog-fifos 'set -e; umask 077; mkfifo a b; mkfifo -m u=rw,go=r named; mknod -m 640 made p; stat -c "%F %a" a b named made; rm a b named made'
+same catalog-nice 'nice; nice -n 4 /bin/sh -c "exec nice"; nice -3 /bin/sh -c "exec nice"'
+same catalog-nohup 'nohup /bin/sh -c '"'"'kill -HUP $$; echo survived'"'"' < /dev/null; nohup nonexistent-nebox-catalog-command'
+same catalog-pathchk 'pathchk good/name; pathchk -p ordinary; pathchk -p abcdefghijklmno; pathchk -P "./-bad"; pathchk --portability ""'
 same hostname 'hostname'
 if python3 "$(dirname -- "$0")/hostname_compare.py" "$BIN" --transport; then
   pass=$((pass+1))
@@ -455,6 +512,9 @@ same grep-ctx-bad "$GR grep -A x x f; echo \$?; grep -A -1 x f; echo \$?; grep -
 same grep-ctx-edge "printf \"x\nx\n\" | grep -A1 x; printf \"x\na\nb\nx\" | grep -A1 x; printf \"a\nx\nb\nc\nd\nx\n\" | grep -B1 -A1 -n x; printf \"a\nb\n\" | grep -C1 x; echo \$?; printf \"x\n\" | grep -B3 x"
 same touch-d-fraction "touch -d '2026-01-02 03:04:05.123456789' f; TZ=UTC stat -c '%y' f; touch -d '2026-01-02 03:04:05,5' g; TZ=UTC stat -c '%y' g"
 # patch (GNU patch 2.7.6); tests/patch_fuzz.py compares hunk placement, fuzz, rejects and backups on random inputs
+same patch-posix-name 'printf '"'"'old\n'"'"' > longest; cp longest x; printf '"'"'%s\n'"'"' '"'"'--- longest'"'"' '"'"'+++ x'"'"' '"'"'@@ -1 +1 @@'"'"' '"'"'-old'"'"' '"'"'+new'"'"' > change; patch --posix -p0 -i change; cat longest x'
+same patch-posix-delete 'printf '"'"'old\n'"'"' > old; printf '"'"'%s\n'"'"' '"'"'--- old'"'"' '"'"'+++ /dev/null'"'"' '"'"'@@ -1 +0,0 @@'"'"' '"'"'-old'"'"' > change; patch --posix -p0 -i change; test -f old && wc -c < old'
+same patch-posix-backup 'printf '"'"'first\nkeep\nold\nlast\n'"'"' > target; printf '"'"'%s\n'"'"' '"'"'--- target'"'"' '"'"'+++ target'"'"' '"'"'@@ -1,3 +1,3 @@'"'"' '"'"' keep'"'"' '"'"'-old'"'"' '"'"'+new'"'"' '"'"' last'"'"' > change; POSIXLY_CORRECT=1 patch -p0 -i change; cat target; test ! -e target.orig'
 PF='seq 1 10 > a; seq 1 10 | sed "s/^5$/five/" > b; seq 1 6 > c; seq 1 6 | sed "s/^2$/two/" > d; mkdir -p src/x; seq 1 10 > src/x/a; touch -d "2026-01-02 03:04:05" a b c d src/x/a;'
 same patch-multi "$PF diff -u a b > m.diff; diff -u c d | sed 's/^+++ d/+++ c/; s/^--- c/--- c/' >> m.diff; sed -i 's/^+++ b/+++ a/' m.diff; patch < m.diff; echo \$?; cat a c"
 same patch-strip "$PF diff -u src/x/a b | sed 's#^--- src/x/a#--- old/src/x/a#; s#^+++ b#+++ new/src/x/a#' > p.diff; patch -p1 < p.diff; echo \$?; cat src/x/a; patch -p1 -R < p.diff; echo \$?; patch -p9 < p.diff; echo \$?"
@@ -1036,12 +1096,12 @@ same seq-f-hexfloat 'seq -f %a 1 1; seq -f %A 2 2; seq -f "%%%#018.3La%%" -0.75 
 . "$(dirname -- "$0")/sh.sh"
 # dispatch
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '106
+  expect list-count-theseus '122
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
   expect mount-rejects-unknown-option 'exit=2' 'mount -t tmpfs -x /mnt'
 else
-  expect list-count '104
+  expect list-count '120
 exit=0' "$BIN --list | wc -l"
 fi
 

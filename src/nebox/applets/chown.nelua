@@ -175,6 +175,13 @@ local function parse_user_spec_warn(spec: string, uid: *cuint, gid: *cuint, have
   return msg, warn
 end
 
+global function nebox_parse_user_spec(spec: string, uid: *cuint, gid: *cuint): (string, boolean)
+  local user: string
+  local group: string
+  local have_user, have_group = false, false
+  return parse_user_spec_warn(spec, uid, gid, true, &user, &have_user, &group, &have_group)
+end
+
 local function user_group_str(user: string, have_user: boolean, group: string, have_group: boolean): (string, boolean)
   if have_user then
     if have_group then return user .. ':' .. group, true end

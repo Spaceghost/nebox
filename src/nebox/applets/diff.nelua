@@ -24,6 +24,8 @@ require 'nebox.diff_format'
 
 local Opt = @record{
   paginate: boolean, messages: sequence(string),
+  strip_cr: boolean, trailing_space: boolean, no_dereference: boolean,
+  color: boolean, colors: [7]string,
   fmt: byte,          -- normal, context, unified, ed, ifdef, or side by side
   context: integer, horizon: integer, minimal: boolean, initial_tab: boolean, speed_large: boolean,
   icase: boolean, space_change: boolean, all_space: boolean, blank_lines: boolean,
@@ -68,8 +70,18 @@ end
 -- last line equals a complete one only under -b or -w, where the missing
 -- newline is white space, and in ed scripts, which cannot express it (GNU).
 local function line_key(o: *Opt, s: string, incomplete: boolean): string
+  if o.trailing_space then
+    local e = s.size
+    while e > 0 do
+      local last = nlocale.previous(s, e)
+      local wc = nlocale.decode(s, last)
+      if not (nlocale.multibyte and nlocale.space(wc) or not nlocale.multibyte and is_space(s.data[last])) then break end
+      e = last
+    end
+    s = s:subview(1, e)
+  end
   local sb: stringbuilder
-  sb:writebyte((incomplete and not o.space_change and not o.all_space and o.fmt ~= 101) and 73 or 67)
+  sb:writebyte((incomplete and not o.space_change and not o.all_space and not o.trailing_space and o.fmt ~= 101) and 73 or 67)
   if not o.icase and not o.space_change and not o.all_space then
     sb:write(s)
     return sb:promote()
@@ -100,7 +112,7 @@ end
 
 local function is_blank(o: *Opt, s: string): boolean
   if s.size == 0 then return true end
-  if not (o.space_change or o.all_space) then return false end
+  if not (o.space_change or o.all_space or o.trailing_space) then return false end
   local i: usize = 0
   while i < s.size do
     local c, used = nlocale.decode(s, i)
@@ -125,7 +137,7 @@ end
 -- Reading
 ----------------------------------------------------------------------
 
-local function load(path: string, label: string, f: *DFile): boolean
+local function load(path: string, label: string, f: *DFile, strip_cr: boolean): boolean
   f.name = label
   local fd: cint = 0
   if path ~= '-' then fd = sys.open(path, sys.O_RDONLY | sys.O_CLOEXEC, 0) end
@@ -144,6 +156,15 @@ local function load(path: string, label: string, f: *DFile): boolean
   local data, ok = util.readfd(fd)
   if fd > 0 then sys.close(fd) end
   if not ok then util.perror(path); return false end
+  if strip_cr then
+    local out: stringbuilder
+    for i: usize = 0, < data.size do
+      if data.data[i] == 13 and i + 1 < data.size and data.data[i + 1] == 10 then continue end
+      out:writebyte(data.data[i])
+    end
+    data:destroy()
+    data = out:promote()
+  end
   f.data = data
   f.lines = util.lines(data)
   f.incomplete = data.size > 0 and data.data[data.size - 1] ~= 10
@@ -655,7 +676,25 @@ local function put_text(o: *Opt, text: string)
   end
 end
 
-local function put_line(o: *Opt, prefix: string, f: *DFile, i: integer)
+local HEADER_COLOR <comptime> = 0
+local RANGE_COLOR <comptime> = 1
+local DELETE_COLOR <comptime> = 2
+local ADD_COLOR <comptime> = 3
+local LEFT_COLOR <comptime> = 4
+local RIGHT_COLOR <comptime> = 5
+local RESET_COLOR <comptime> = 6
+
+local function begin_color(o: *Opt, color: integer)
+  if o.color and color >= 0 then util.write(o.colors[LEFT_COLOR] .. o.colors[color] .. o.colors[RIGHT_COLOR]) end
+end
+
+local function end_color(o: *Opt, color: integer)
+  if color >= 0 then begin_color(o, RESET_COLOR) end
+  util.writebyte(10)
+end
+
+local function put_line(o: *Opt, prefix: string, f: *DFile, i: integer, color: integer)
+  begin_color(o, color)
   if o.initial_tab and prefix.size > 0 then
     if prefix ~= ' ' then util.writebyte(prefix.data[0]) end
     util.writebyte(9)
@@ -663,7 +702,7 @@ local function put_line(o: *Opt, prefix: string, f: *DFile, i: integer)
     util.write(prefix)
   end
   put_text(o, f.lines[i + 1])
-  util.writebyte(10)
+  end_color(o, color)
   if f.incomplete and i == #f.lines - 1 and not ed_mode then util.write('\\ No newline at end of file\n') end
 end
 
@@ -755,13 +794,14 @@ local function print_normal(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change)
   for k = 1, #ch do
     local f0, l0, f1, l1, changes = hunk_range(ch, k, k)
     if changes == 0 then continue end
+    begin_color(o, RANGE_COLOR)
     num_range(f0, l0)
     util.writebyte(changes == OLD and 100 or (changes == NEW and 97 or 99))
     num_range(f1, l1)
-    util.writebyte(10)
-    if changes & OLD ~= 0 then for i = f0, l0 do put_line(o, '< ', a, i) end end
+    end_color(o, RANGE_COLOR)
+    if changes & OLD ~= 0 then for i = f0, l0 do put_line(o, '< ', a, i, DELETE_COLOR) end end
     if changes == OLD | NEW then util.write('---\n') end
-    if changes & NEW ~= 0 then for i = f1, l1 do put_line(o, '> ', b, i) end end
+    if changes & NEW ~= 0 then for i = f1, l1 do put_line(o, '> ', b, i, ADD_COLOR) end end
   end
 end
 
@@ -781,7 +821,7 @@ local function print_ed(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
           util.write('..\n.\ns/.//\n')
           insert_mode = false
         else
-          put_line(o, '', b, i)
+          put_line(o, '', b, i, -1)
         end
       end
       if insert_mode then util.write('.\n') end
@@ -813,14 +853,15 @@ local function print_function(o: *Opt, a: *DFile, before: integer)
 end
 
 local function print_file_header(o: *Opt, prefix: string, f: *DFile, idx: integer)
+  begin_color(o, HEADER_COLOR)
   util.write(prefix)
   if idx <= #o.labels then
-    util.line(o.labels[idx])
+    util.write(o.labels[idx])
   else
     util.write(f.name); util.writebyte(9)
     if o.fmt == 117 then put_time(f) else put_ctime(f) end
-    util.writebyte(10)
   end
+  end_color(o, HEADER_COLOR)
 end
 
 local function print_unified(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
@@ -831,16 +872,18 @@ local function print_unified(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change
     local f0, l0, f1, l1, changes = hunk_range(ch, h0, h1)
     if changes == 0 then continue end
     f0, l0, f1, l1 = widen(a, b, f0, l0, f1, l1, context)
-    util.write('@@ -'); uni_range(f0, l0); util.write(' +'); uni_range(f1, l1); util.write(' @@'); print_function(o, a, f0); util.writebyte(10)
+    begin_color(o, RANGE_COLOR)
+    util.write('@@ -'); uni_range(f0, l0); util.write(' +'); uni_range(f1, l1); util.write(' @@'); print_function(o, a, f0)
+    end_color(o, RANGE_COLOR)
     local nx = h0
     local i, j = f0, f1
     while i <= l0 or j <= l1 do
       if nx > h1 or i < ch[nx].line0 then
-        put_line(o, ' ', a, i)
+        put_line(o, ' ', a, i, -1)
         i = i + 1; j = j + 1
       else
-        for _ = 1, ch[nx].deleted do put_line(o, '-', a, i); i = i + 1 end
-        for _ = 1, ch[nx].inserted do put_line(o, '+', b, j); j = j + 1 end
+        for _ = 1, ch[nx].deleted do put_line(o, '-', a, i, DELETE_COLOR); i = i + 1 end
+        for _ = 1, ch[nx].inserted do put_line(o, '+', b, j, ADD_COLOR); j = j + 1 end
         nx = nx + 1
       end
     end
@@ -855,25 +898,29 @@ local function print_context(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change
     local f0, l0, f1, l1, changes = hunk_range(ch, h0, h1)
     if changes == 0 then continue end
     f0, l0, f1, l1 = widen(a, b, f0, l0, f1, l1, context)
-    util.write('***************'); print_function(o, a, f0)
-    util.write('\n*** '); ctx_range(f0, l0); util.write(' ****\n')
+    util.write('***************'); print_function(o, a, f0); util.writebyte(10)
+    begin_color(o, RANGE_COLOR)
+    util.write('*** '); ctx_range(f0, l0); util.write(' ****')
+    end_color(o, RANGE_COLOR)
     if changes & OLD ~= 0 then
       local nx = h0
       for i = f0, l0 do
         while nx <= h1 and ch[nx].line0 + ch[nx].deleted <= i do nx = nx + 1 end
         local prefix: string = '  '
         if nx <= h1 and ch[nx].line0 <= i then prefix = ch[nx].inserted > 0 and '! ' or '- ' end
-        put_line(o, prefix, a, i)
+        put_line(o, prefix, a, i, DELETE_COLOR)
       end
     end
-    util.write('--- '); ctx_range(f1, l1); util.write(' ----\n')
+    begin_color(o, RANGE_COLOR)
+    util.write('--- '); ctx_range(f1, l1); util.write(' ----')
+    end_color(o, RANGE_COLOR)
     if changes & NEW ~= 0 then
       local nx = h0
       for j = f1, l1 do
         while nx <= h1 and ch[nx].line1 + ch[nx].inserted <= j do nx = nx + 1 end
         local prefix: string = '  '
         if nx <= h1 and ch[nx].line1 <= j then prefix = ch[nx].deleted > 0 and '! ' or '+ ' end
-        put_line(o, prefix, b, j)
+        put_line(o, prefix, b, j, ADD_COLOR)
       end
     end
   end
@@ -976,6 +1023,8 @@ end
 
 local function side_row(o: *Opt, a: *DFile, b: *DFile, i: integer, j: integer,
                         sep: byte, half: integer, right: integer)
+  local color = sep == '<'_b and DELETE_COLOR or (sep == '>'_b and ADD_COLOR or -1)
+  begin_color(o, color)
   local col = 0
   local left_nl = i >= 0 and (i < #a.lines - 1 or not a.missing_nl)
   local right_nl = j >= 0 and (j < #b.lines - 1 or not b.missing_nl)
@@ -992,6 +1041,7 @@ local function side_row(o: *Opt, a: *DFile, b: *DFile, i: integer, j: integer,
     side_text(o, b.lines[j + 1], half, right)
   end
   if left_nl or right_nl then util.writebyte(10) end
+  if color >= 0 then begin_color(o, RESET_COLOR) end
 end
 
 local function print_side(o: *Opt, a: *DFile, b: *DFile, ch: *sequence(Change))
@@ -1042,18 +1092,21 @@ end
 -- Comparing
 ----------------------------------------------------------------------
 
-local Kind = @enum{ NONE = 0, FILE, DIR, OTHER }
+local Kind = @enum{ NONE = 0, FILE, DIR, LINK, OTHER }
 
-local function kind_of(path: string, st: *sys.Stat): Kind
-  if sys.stat(path, st) ~= 0 then return Kind.NONE end
+local function kind_of(path: string, st: *sys.Stat, no_dereference: boolean): Kind
+  local rc = no_dereference and sys.lstat(path, st) or sys.stat(path, st)
+  if rc ~= 0 then return Kind.NONE end
   local m = st.st_mode & sys.S_IFMT
   if m == sys.S_IFDIR then return Kind.DIR end
+  if m == sys.S_IFLNK then return Kind.LINK end
   if m == sys.S_IFREG then return Kind.FILE end
   return Kind.OTHER
 end
 
 local function type_name(k: Kind, st: *sys.Stat): string
   if k == Kind.DIR then return 'directory' end
+  if k == Kind.LINK then return 'symbolic link' end
   if k == Kind.FILE then return st.st_size == 0 and 'regular empty file' or 'regular file' end
   return 'special file'
 end
@@ -1134,14 +1187,48 @@ end
 
 -- Returns 0 same, 1 different, 2 trouble.
 local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): integer
+  if o.no_dereference then
+    local st0: sys.Stat
+    local st1: sys.Stat
+    local k0 = p0 == '-' and Kind.FILE or kind_of(p0, &st0, true)
+    local k1 = p1 == '-' and Kind.FILE or kind_of(p1, &st1, true)
+    if k0 == Kind.LINK or k1 == Kind.LINK then
+      if not o.new_file and (k0 == Kind.NONE or k1 == Kind.NONE) then
+        util.perror(k0 == Kind.NONE and p0 or p1)
+        return 2
+      end
+      if k0 ~= k1 then
+        diff_message(o, string.format('File %s is a %s while file %s is a %s', p0, type_name(k0, &st0), p1, type_name(k1, &st1)))
+        return 1
+      end
+      local a: [4096]byte
+      local b: [4096]byte
+      local an = sys.readlink(p0, &a[0], #a)
+      if an < 0 then util.perror(p0); return 2 end
+      local bn = sys.readlink(p1, &b[0], #b)
+      if bn < 0 then util.perror(p1); return 2 end
+      local equal = an == bn
+      if equal then
+        for i = 0, < an do
+          if a[i] ~= b[i] then equal = false; break end
+        end
+      end
+      if equal then
+        if o.same then diff_message(o, string.format('Files %s and %s are identical', p0, p1)) end
+        return 0
+      end
+      diff_message(o, string.format('Symbolic links %s and %s differ', p0, p1))
+      return 1
+    end
+  end
   local a: DFile
   local b: DFile
   local ok0, ok1 = true, true
   local st: sys.Stat
-  if o.new_file and p0 ~= '-' and kind_of(p0, &st) == Kind.NONE then empty_file(p0, &a)
-  else ok0 = load(p0, p0, &a) end
-  if o.new_file and p1 ~= '-' and kind_of(p1, &st) == Kind.NONE then empty_file(p1, &b)
-  else ok1 = load(p1, p1, &b) end
+  if o.new_file and p0 ~= '-' and kind_of(p0, &st, o.no_dereference) == Kind.NONE then empty_file(p0, &a)
+  else ok0 = load(p0, p0, &a, o.strip_cr) end
+  if o.new_file and p1 ~= '-' and kind_of(p1, &st, o.no_dereference) == Kind.NONE then empty_file(p1, &b)
+  else ok1 = load(p1, p1, &b, o.strip_cr) end
   if not ok0 or not ok1 then return 2 end
   -- ed scripts compare the files as if the final newline were there (GNU
   -- supplies it for output styles that cannot show its absence)
@@ -1259,7 +1346,7 @@ local function diff_dirs(o: *Opt, d0: string, d1: string): integer
     local p0, p1 = util.join(d0, n), util.join(d1, n)
     local st0: sys.Stat
     local st1: sys.Stat
-    local k0, k1 = kind_of(p0, &st0), kind_of(p1, &st1)
+    local k0, k1 = kind_of(p0, &st0, o.no_dereference), kind_of(p1, &st1, o.no_dereference)
     local r = 0
     if where ~= 3 and not o.new_file then
       diff_message(o, string.format('Only in %s: %s', where == 1 and d0 or d1, n))
@@ -1289,8 +1376,8 @@ local LONGOPTS: []util.LongOpt = {
   {'new-file', 0, 'N'_b}, {'normal', 0, 128}, {'show-c-function', 0, 'p'_b},
   {'brief', 0, 'q'_b}, {'recursive', 0, 'r'_b}, {'report-identical-files', 0, 's'_b},
   {'unified', 2, 'U'_b}, {'ignore-all-space', 0, 'w'_b},
-  {'strip-trailing-cr', 0, util.UNSUPPORTED}, {'ignore-tab-expansion', 0, util.UNSUPPORTED},
-  {'ignore-trailing-space', 0, util.UNSUPPORTED}, {'ignore-file-name-case', 0, util.UNSUPPORTED},
+  {'strip-trailing-cr', 0, 142}, {'ignore-tab-expansion', 0, util.UNSUPPORTED},
+  {'ignore-trailing-space', 0, 'Z'_b}, {'ignore-file-name-case', 0, util.UNSUPPORTED},
   {'no-ignore-file-name-case', 0, util.UNSUPPORTED}, {'exclude', 1, 'x'_b},
   {'exclude-from', 1, 'X'_b}, {'from-file', 1, util.UNSUPPORTED},
   {'to-file', 1, util.UNSUPPORTED}, {'starting-file', 1, util.UNSUPPORTED},
@@ -1298,7 +1385,7 @@ local LONGOPTS: []util.LongOpt = {
   {'left-column', 0, 129}, {'suppress-common-lines', 0, 130},
   {'expand-tabs', 0, 't'_b}, {'initial-tab', 0, 'T'_b},
   {'tabsize', 1, 131}, {'suppress-blank-empty', 0, util.UNSUPPORTED},
-  {'paginate', 0, 'l'_b}, {'no-dereference', 0, util.UNSUPPORTED},
+  {'paginate', 0, 'l'_b}, {'no-dereference', 0, 143},
   {'unidirectional-new-file', 0, util.UNSUPPORTED}, {'ifdef', 1, 'D'_b},
   {'minimal', 0, 'd'_b}, {'horizon-lines', 1, 140},
   {'speed-large-files', 0, 141}, {'rcs', 0, 'n'_b},
@@ -1306,7 +1393,7 @@ local LONGOPTS: []util.LongOpt = {
   {'unchanged-line-format', 1, 134}, {'line-format', 1, 135},
   {'old-group-format', 1, 136}, {'new-group-format', 1, 137},
   {'unchanged-group-format', 1, 138}, {'changed-group-format', 1, 139},
-  {'color', 2, util.UNSUPPORTED}, {'palette', 1, util.UNSUPPORTED},
+  {'color', 2, 144}, {'palette', 1, 145},
   {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED},
 }
 
@@ -1367,9 +1454,47 @@ local function write_switch(sb: *stringbuilder, word: string)
   sb:writebyte(39)
 end
 
+local function parse_palette(o: *Opt, palette: string): boolean
+  local p = 0
+  while p < #palette do
+    local first = palette.data[p]
+    if first == ':'_b then p = p + 1; continue end
+    local code = -1
+    local name: string
+    if first == '*'_b then
+      p = p + 1
+      local _, ok = util.color_escape(palette, &p, true)
+      if not ok then return false end
+    else
+      if p + 2 >= #palette then return false end
+      name = palette:subview(p + 1, p + 2)
+      p = p + 2
+      if name == 'hd' then code = HEADER_COLOR
+      elseif name == 'ln' then code = RANGE_COLOR
+      elseif name == 'de' then code = DELETE_COLOR
+      elseif name == 'ad' then code = ADD_COLOR
+      elseif name == 'lc' then code = LEFT_COLOR
+      elseif name == 'rc' then code = RIGHT_COLOR
+      elseif name == 'rs' then code = RESET_COLOR end
+    end
+    if p >= #palette or palette.data[p] ~= '='_b then return false end
+    p = p + 1
+    if code < 0 and first ~= '*'_b and name ~= 'ec' then
+      util.err('unrecognized prefix: ' .. name)
+      return false
+    end
+    local value, ok = util.color_escape(palette, &p, false)
+    if not ok then return false end
+    if code >= 0 then o.colors[code] = value end
+  end
+  return true
+end
+
 global function applet_diff(args: sequence(string)): integer
-  local g = util.getopt(args, 'abBcC:dD:eiI:F:lL:nNpqrstTuU:W:wx:X:y', &LONGOPTS[0], #LONGOPTS)
-  local opt: Opt = {context = 3, width = 130, tabsize = 8}
+  local g = util.getopt(args, 'abBcC:dD:eiI:F:lL:nNpqrstTuU:W:wx:X:yZ', &LONGOPTS[0], #LONGOPTS)
+  local opt: Opt = {context = 3, width = 130, tabsize = 8, colors = {'1', '36', '31', '32', '\x1b[', 'm', '0'}}
+  local color_mode = 'never'
+  local palette = ''
   local sw: stringbuilder
   local last_switch = 0
   local c_function = false
@@ -1410,6 +1535,17 @@ global function applet_diff(args: sequence(string)): integer
     elseif c == 128 then fmt = 'n'_b
     elseif c == 129 then opt.left_column = true
     elseif c == 130 then opt.suppress_common = true
+    elseif c == 142 then opt.strip_cr = true
+    elseif c == 143 then opt.no_dereference = true
+    elseif c == 144 then
+      color_mode = g.has_optarg and g.optarg or 'auto'
+      if color_mode ~= 'auto' and color_mode ~= 'always' and color_mode ~= 'never' then
+        util.err('invalid color ' .. util.quote(color_mode))
+        util.err("Try 'diff --help' for more information.")
+        return 2
+      end
+    elseif c == 145 then palette = g.optarg
+    elseif c == 'Z'_b then opt.trailing_space = true
     elseif c == 'l'_b then opt.paginate = true
     elseif c == 't'_b then opt.expand_tabs = true
     elseif c == 'T'_b then opt.initial_tab = true
@@ -1465,6 +1601,13 @@ global function applet_diff(args: sequence(string)): integer
       end
     end
   end
+  local term = sys.getenv('TERM')
+  opt.color = color_mode == 'always' or (color_mode == 'auto' and sys.isatty(1) ~= 0 and
+              (term == nilptr or (@string)(term) ~= 'dumb'))
+  if opt.color and not parse_palette(&opt, palette) then
+    util.err('unparsable value for --palette')
+    opt.color = false
+  end
   opt.switches = sw:promote()
   if opt.fmt == 0 then opt.fmt = c_function and 'c'_b or 'n'_b end
   if opt.fmt == 'D'_b then default_templates(&opt) end
@@ -1480,8 +1623,8 @@ global function applet_diff(args: sequence(string)): integer
   local p0, p1 = operands[1], operands[2]
   local st0: sys.Stat
   local st1: sys.Stat
-  local k0 = p0 == '-' and Kind.FILE or kind_of(p0, &st0)
-  local k1 = p1 == '-' and Kind.FILE or kind_of(p1, &st1)
+  local k0 = p0 == '-' and Kind.FILE or kind_of(p0, &st0, opt.no_dereference)
+  local k1 = p1 == '-' and Kind.FILE or kind_of(p1, &st1, opt.no_dereference)
   local rc: integer
   if k0 == Kind.DIR and k1 == Kind.DIR then
     rc = diff_dirs(&opt, p0, p1)

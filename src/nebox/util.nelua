@@ -74,6 +74,70 @@ function util.writef(fmt: string, ...: varargs)
   util.write(string.format(fmt, ...))
 end
 
+local ST_GND <comptime> = 0
+local ST_BACKSLASH <comptime> = 1
+local ST_OCTAL <comptime> = 2
+local ST_HEX <comptime> = 3
+local ST_CARET <comptime> = 4
+local ST_END <comptime> = 5
+local ST_ERROR <comptime> = 6
+
+-- Decode one LS_COLORS or diff palette value starting at *PP.
+function util.color_escape(s: string, pp: *integer, equals_end: boolean): (string, boolean)
+  local p = $pp
+  local sb: stringbuilder
+  local num: integer = 0
+  local state = ST_GND
+  while state < ST_END do
+    local c: byte = p < #s and s.data[p] or 0
+    if state == ST_GND then
+      if c == 58 or c == 0 then state = ST_END
+      elseif c == 92 then state = ST_BACKSLASH; p = p + 1
+      elseif c == 94 then state = ST_CARET; p = p + 1
+      elseif c == 61 and equals_end then state = ST_END
+      else sb:writebyte(c); p = p + 1 end
+    elseif state == ST_BACKSLASH then
+      if c >= 48 and c <= 55 then state = ST_OCTAL; num = c - 48
+      elseif c == 120 or c == 88 then state = ST_HEX; num = 0
+      elseif c == 97 then num = 7
+      elseif c == 98 then num = 8
+      elseif c == 101 then num = 27
+      elseif c == 102 then num = 12
+      elseif c == 110 then num = 10
+      elseif c == 114 then num = 13
+      elseif c == 116 then num = 9
+      elseif c == 118 then num = 11
+      elseif c == 63 then num = 127
+      elseif c == 95 then num = 32
+      elseif c == 0 then state = ST_ERROR
+      else num = c end
+      if state == ST_BACKSLASH then
+        sb:writebyte((@byte)(num & 0xff))
+        state = ST_GND
+      end
+      p = p + 1
+    elseif state == ST_OCTAL then
+      if c < 48 or c > 55 then
+        sb:writebyte((@byte)(num & 0xff)); state = ST_GND
+      else
+        num = ((num << 3) + (c - 48)) & 0xff; p = p + 1
+      end
+    elseif state == ST_HEX then
+      if c >= 48 and c <= 57 then num = ((num << 4) + (c - 48)) & 0xff; p = p + 1
+      elseif c >= 97 and c <= 102 then num = ((num << 4) + (c - 97) + 10) & 0xff; p = p + 1
+      elseif c >= 65 and c <= 70 then num = ((num << 4) + (c - 65) + 10) & 0xff; p = p + 1
+      else sb:writebyte((@byte)(num & 0xff)); state = ST_GND end
+    elseif state == ST_CARET then
+      state = ST_GND
+      if c >= 64 and c <= 126 then sb:writebyte(c & 31); p = p + 1
+      elseif c == 63 then sb:writebyte(127) -- the '?' is not consumed, as in ls.c
+      else state = ST_ERROR end
+    end
+  end
+  $pp = p
+  return sb:promote(), state ~= ST_ERROR
+end
+
 -- Diagnostics go straight to fd 2, after stdout is flushed so ordering is sane.
 function util.err(s: string)
   util.flush()
@@ -514,6 +578,15 @@ global util.Opts = @record{
 }
 
 -- Every value given for a repeatable option such as grep -e.
+-- The standard information options for applets using IDs 128 and 129.
+function util.core_info(o: *util.Opts, synopsis: string): boolean
+  for _, c in ipairs(o.order) do
+    if c == 128 then util.line('Usage: ' .. synopsis); return true end
+    if c == 129 then util.line(util.applet .. ' (nebox) after GNU coreutils 9.1'); return true end
+  end
+  return false
+end
+
 function util.Opts:all(c: string): sequence(string)
   local out: sequence(string)
   local k = c:byte(1)

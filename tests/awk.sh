@@ -275,6 +275,7 @@ REFPATH="$W/refbin:"
 same awk-gensub 'awk '"'"'BEGIN { t="abc 12 ab 34"; print gensub(/([a-z]+) ([0-9]+)/,"<\\2:\\1:&: \\0>","g",t); print gensub(/[a-z]+/,"X",2,t),t; print gensub(/(a)?b/,"<\\1,\\7>","G","b ab"); print gensub(//,"X","g","abc"); print gensub(/a/,"X",10,"abc") }'"'"''
 same awk-gensub-record 'printf "a b a\nc\n" | awk '"'"'{ print gensub(/a/,"z",2),$0; print gensub(/a/,"<\\q\\&\\>","g") }'"'"''
 same awk-strftime 'TZ=EST5 awk '"'"'BEGIN { print strftime("%F %T %Z %z",0); print strftime("%F %T %Z %z",-1,1); print "[" strftime("",0) "]"; print systime()>0; print length(strftime())>10 }'"'"''
+same awk-procinfo-strftime 'TZ=UTC0 awk '"'"'BEGIN { print PROCINFO["strftime"]; PROCINFO["strftime"]="tag"; print strftime(), strftime("%Y",0,1); PROCINFO["strftime"]=""; print "[" strftime() "]"; delete PROCINFO["strftime"]; print (strftime() ~ /[0-9][0-9][0-9][0-9]$/), ("strftime" in PROCINFO) }'"'"''
 same awk-fflush 'awk '"'"'BEGIN { print "first" > "seen"; print fflush("seen"); getline s < "seen"; print s; print "second" > "seen"; print fflush(""); print "stdout"; print fflush(); print fflush("/dev/stderr"); print fflush("absent") }'"'"' 2>/dev/null'
 
 same awk-file-hooks 'awk '"'"'BEGINFILE {print "begin", FILENAME,FNR,"[" $0 "]",NF; if (ERRNO != "") { print ERRNO; nextfile }} ENDFILE {print "end",FILENAME,FNR,$0} {print NR,$0; nextfile}'"'"' left.txt /dev/null absent-file right.txt'

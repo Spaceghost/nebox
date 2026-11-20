@@ -50,6 +50,10 @@ function awkval.Array:get(key: string): *awkval.Cell
   return self.map:peek(k)
 end
 
+function awkval.Array:peek(key: string): *awkval.Cell
+  return self.map:peek(key)
+end
+
 function awkval.Array:has(key: string): boolean
   return self.map:has(key)
 end

@@ -74,6 +74,7 @@ end
 global function applet_cat(args: sequence(string)): integer
   local o = util.parsel(args, 'benstuvAET', &longopts.cat, #longopts.cat)
   if not o:ok() then return util.optfail(o) end
+  if util.core_info(&o, 'cat [OPTION]... [FILE]...') then return 0 end
   local number, number_nonblank, squeeze_blank = false, false, false
   local show_ends, show_nonprinting, show_tabs = false, false, false
   for _, c in ipairs(o.order) do
