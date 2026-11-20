@@ -67,6 +67,7 @@ $(NELIBC_LIB):
 
 test: $(OUT)/nebox
 	sh tests/run.sh $(abspath $(OUT)/nebox)
+	python3 tests/setsid.py $(abspath $(OUT)/nebox)
 	python3 tests/sh_interactive.py $(abspath $(OUT)/nebox)
 	python3 tests/diff_fuzz.py $(abspath $(OUT)/nebox) 200
 	python3 tests/patch_fuzz.py $(abspath $(OUT)/nebox) 200 < /dev/null

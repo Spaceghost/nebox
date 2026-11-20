@@ -251,6 +251,7 @@ function sys.getrlimit(resource: cint, limit: *sys.Rlimit): cint <cimport 'getrl
 function sys.setrlimit(resource: cint, limit: *sys.Rlimit): cint <cimport 'setrlimit', cinclude '<sys/resource.h>'> end
 function sys.times(buf: *sys.Tms): clong <cimport 'times', cinclude '<sys/times.h>'> end
 function sys.sysconf(name: cint): clong <cimport 'sysconf', cinclude '<unistd.h>'> end
+function sys.setsid(): cint <cimport 'setsid', cinclude '<unistd.h>'> end
 function sys.getpgrp(): cint <cimport 'getpgrp', cinclude '<unistd.h>'> end
 function sys.setpgid(pid: cint, pgid: cint): cint <cimport 'setpgid', cinclude '<unistd.h>'> end
 function sys.tcgetpgrp(fd: cint): cint <cimport 'tcgetpgrp', cinclude '<unistd.h>'> end

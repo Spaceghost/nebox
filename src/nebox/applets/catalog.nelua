@@ -39,6 +39,10 @@ local basic: []util.LongOpt = {{'help', 0, 128}, {'version', 0, 129}}
 local create_options: []util.LongOpt = {
   {'mode', 1, 'm'_b}, {'context', 2, util.UNSUPPORTED}, {'help', 0, 128}, {'version', 0, 129},
 }
+local setsid_options: []util.LongOpt = {
+  {'ctty', 0, 'c'_b}, {'fork', 0, 'f'_b}, {'wait', 0, 'w'_b},
+  {'help', 0, 'h'_b}, {'version', 0, 'V'_b},
+}
 local nice_options: []util.LongOpt = {{'adjustment', 1, 'n'_b}, {'help', 0, 128}, {'version', 0, 129}}
 local path_options: []util.LongOpt = {{'portability', 0, 130}, {'help', 0, 128}, {'version', 0, 129}}
 
@@ -327,6 +331,39 @@ global function applet_chroot(args: sequence(string)): integer
   end
   exec_command(command)
   return exec_failure(command[1])
+end
+
+global function applet_setsid(args: sequence(string)): integer
+  local o = util.parsel(args, '+cfwhV', &setsid_options[0], #setsid_options)
+  if not o:ok() then util.optfail(o); return 1 end
+  if o:has('h') then util.line('Usage: setsid [-cfw] COMMAND [ARG]...'); return 0 end
+  if o:has('V') then util.line('setsid (nebox)'); return 0 end
+  if #o.operands == 0 then return util.die('no command specified') end
+
+  -- A process group leader cannot create a session. Otherwise exec in place
+  -- so a supervisor keeps its direct child and its pidfd.
+  if o:has('f') or sys.getpgrp() == sys.getpid() then
+    local pid = sys.fork()
+    if pid < 0 then util.perror('fork'); return 1 end
+    if pid > 0 then
+      if not o:has('w') then return 0 end
+      local status: cint
+      local waited = sys.waitpid(pid, &status, 0)
+      while waited < 0 and sys.errno() == sys.EINTR do waited = sys.waitpid(pid, &status, 0) end
+      if waited ~= pid then util.perror('waitpid'); return 1 end
+      if (status & 0x7f) == 0 then return (status >> 8) & 0xff end
+      util.err('child did not exit normally')
+      return status & 0xff
+    end
+  end
+  if sys.setsid() < 0 then util.perror('setsid'); return 1 end
+  local TIOCSCTTY: culong <comptime> = 0x540e
+  if o:has('c') and sys.ioctl(0, TIOCSCTTY, (@pointer)(1)) < 0 then
+    util.perror('cannot set controlling terminal')
+    return 1
+  end
+  exec_command(o.operands)
+  return exec_failure(o.operands[1])
 end
 
 global function applet_nice(args: sequence(string)): integer

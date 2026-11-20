@@ -128,7 +128,7 @@ and include files are prerequisites of the generated targets.
 cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo env expand expr
 factor false find fmt fold free grep groups hd head hexdump hostid hostname id install
 join kill link ln logname ls md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
-patch pathchk pinky printenv printf pwd readlink realpath rev rm rmdir sed seq sh sha1sum
+patch pathchk pinky printenv printf pwd readlink realpath rev rm rmdir sed seq setsid sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
 sync tac tail tee test timeout touch tr true truncate tsort tty umount uname unexpand
 uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname
@@ -144,6 +144,9 @@ file or the IPv4 resolver, and `logname` uses the Linux login UID. Systems
 that record logins exclusively in utmp need a separate fallback.
 `nice`, `nohup` and `pathchk` provide process adjustment, hangup-safe
 launch and pathname portability checks.
+`setsid` runs a command in a new Linux session. It preserves the command
+PID when it can create the session directly. Use `--fork` to force a child,
+`--wait` to collect its exit status and `--ctty` to acquire the terminal on stdin.
 `dircolors` uses the GNU 9.1 database or a supplied file to build Bourne or
 C shell color settings and display color codes. `users` reads Linux utmp
 records, sorts session names, and filters stale processes for the default file.

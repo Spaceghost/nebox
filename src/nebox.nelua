@@ -110,7 +110,7 @@ local applets: []Applet = {
   {'paste', applet_paste}, {'patch', applet_patch}, {'pathchk', applet_pathchk}, {'pinky', applet_pinky}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
-  {'seq', applet_seq}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha224sum', applet_sha224sum}, {'sha256sum', applet_sha256sum},
+  {'seq', applet_seq}, {'setsid', applet_setsid}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha224sum', applet_sha224sum}, {'sha256sum', applet_sha256sum},
   {'sha384sum', applet_sha384sum}, {'sha512sum', applet_sha512sum},
   {'shuf', applet_shuf}, {'sleep', applet_sleep}, {'sort', applet_sort},
   {'split', applet_split}, {'stat', applet_stat}, {'strings', applet_strings}, {'sum', applet_sum},

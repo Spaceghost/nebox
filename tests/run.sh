@@ -438,6 +438,13 @@ same catalog-hostid 'hostid'
 same catalog-logname 'logname'
 same catalog-fifos 'set -e; umask 077; mkfifo a b; mkfifo -m u=rw,go=r named; mknod -m 640 made p; stat -c "%F %a" a b named made; rm a b named made'
 same catalog-nice 'nice; nice -n 4 /bin/sh -c "exec nice"; nice -3 /bin/sh -c "exec nice"'
+same setsid-session 'setsid python3 -c "import os; print(os.getpid() == os.getsid(0) == os.getpgrp())"'
+same setsid-arguments 'setsid -- printf "%s|%s\\n" "one arg" -w'
+same setsid-wait 'setsid --fork --wait /bin/sh -c "exit 37"'
+same setsid-signal 'setsid -fw /bin/sh -c "kill -TERM \\$\\$"'
+same setsid-ctty-no-terminal 'setsid --ctty /bin/true </dev/null'
+same setsid-missing-command 'setsid'
+same setsid-exec-error 'setsid command-that-does-not-exist'
 same catalog-nohup 'nohup /bin/sh -c '"'"'kill -HUP $$; echo survived'"'"' < /dev/null; nohup nonexistent-nebox-catalog-command'
 same catalog-pathchk 'pathchk good/name; pathchk -p ordinary; pathchk -p abcdefghijklmno; pathchk -P "./-bad"; pathchk --portability ""'
 same hostname 'hostname'
@@ -1134,11 +1141,11 @@ if unshare -rm true >/dev/null 2>&1; then
   '"'"''
 fi
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '123
+  expect list-count-theseus '124
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
 else
-  expect list-count '122
+  expect list-count '123
 exit=0' "$BIN --list | wc -l"
 fi
 
