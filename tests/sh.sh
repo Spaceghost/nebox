@@ -428,11 +428,22 @@ shf sh-redir-saved-fd-not-inherited 'echo a > f; { ls /proc/self/fd 2>/dev/null 
 shf sh-pipe-basic 'echo a | cat; printf "b\nc\n" | sort -r | cat; echo x | cat | cat | cat'
 shf sh-pipe-status 'true | false; echo $?; false | true; echo $?; (exit 5) | (exit 6) | (exit 7); echo $?; exit 7 | true; echo $?'
 shf sh-pipe-negate '! true; echo $?; ! false; echo $?; ! true | false; echo $?; ! false | true; echo $?; ! echo neg | cat; echo $?'
-shf sh-pipe-pipefail 'set -o pipefail; (exit 7) | (exit 4) | true; echo $?; false | true; echo $?; true | true; echo $?; set +o pipefail; false | true; echo $?'
-shf sh-pipe-pipefail-negated 'set -eo pipefail; ! false | true; echo $?; ! true | true; echo $?; if false | true; then echo bad; else echo condition; fi'
-shf sh-pipe-pipefail-errexit 'set -eo pipefail; (exit 7) | true; echo unreachable'
-shf sh-pipe-pipefail-async 'set -o pipefail; (exit 7) | true & p=$!; set +o pipefail; wait "$p"; echo $?'
-shf sh-pipe-pipefail-settings 'set -o pipefail; set -o | awk '\''$1=="pipefail" {print $2}'\''; set +o | sed -n "/pipefail/p"; set +o pipefail; set +o | sed -n "/pipefail/p"'
+shx sh-pipe-pipefail '4
+1
+0
+0
+exit=0' 'set -o pipefail; (exit 7) | (exit 4) | true; echo $?; false | true; echo $?; true | true; echo $?; set +o pipefail; false | true; echo $?'
+shx sh-pipe-pipefail-negated '0
+1
+condition
+exit=0' 'set -eo pipefail; ! false | true; echo $?; ! true | true; echo $?; if false | true; then echo bad; else echo condition; fi'
+shx sh-pipe-pipefail-errexit 'exit=7' 'set -eo pipefail; (exit 7) | true; echo unreachable'
+shx sh-pipe-pipefail-async '7
+exit=0' 'set -o pipefail; (exit 7) | true & p=$!; set +o pipefail; wait "$p"; echo $?'
+shx sh-pipe-pipefail-settings 'on
+set -o pipefail
+set +o pipefail
+exit=0' 'set -o pipefail; set -o | awk '\''$1=="pipefail" {print $2}'\''; set +o | sed -n "/pipefail/p"; set +o pipefail; set +o | sed -n "/pipefail/p"'
 shf sh-pipe-subshell-vars 'x=1; echo | x=2; echo $x; echo a | read y; echo "[$y]"; x=3 | cat; echo $x'
 shf sh-pipe-builtins 'echo a | { read x; echo "got $x"; }; echo b | while read l; do echo "w:$l"; done; printf "1\n2\n" | { read a; read b; echo $b$a; }'
 shf sh-pipe-large 'seq 1 100000 | wc -l; seq 1 100000 | tail -1; yes | head -5 | wc -l'

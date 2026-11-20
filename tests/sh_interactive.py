@@ -378,6 +378,17 @@ def _():
     sh.close()
 
 
+@case('job control: foreground pipelines honor pipefail')
+def _():
+    sh = Shell()
+    try:
+        sh.run('set -o pipefail; (exit 7) | (exit 4) | true; echo pipe=$?', 'pipe=4\r\n')
+        sh.prompt()
+        sh.run('set +o pipefail; false | true; echo pipe=$?', 'pipe=0\r\n')
+    finally:
+        sh.close()
+
+
 @case('job control: ^Z stops a job, jobs lists it, bg resumes it, kill %1 ends it')
 def _():
     sh = Shell()

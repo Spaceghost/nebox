@@ -916,7 +916,8 @@ Individual applets below list the operations that still use byte semantics.
   unset`) and the regular ones a shell must provide (`alias cd command
   echo false getopts hash kill pwd read test [ true type umask unalias
   wait fc`, plus `printf` through the `printf` applet); function-local
-  variables with `local NAME` and `local NAME=value`; traps, `set -e`
+  variables with `local NAME` and `local NAME=value`; `set -o pipefail`
+  uses the rightmost nonzero pipeline status; traps, `set -e`
   exceptions, `$!`/`wait` for asynchronous lists, `LINENO`, and
   diagnostics as `sh: line N: ...`. A login shell (`-sh` as the program
   name or the `-l` option) reads `/etc/profile` and `$HOME/.profile`.
