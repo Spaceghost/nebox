@@ -18,6 +18,22 @@ shs() { printf '%s\n' "$2" > "$W/fixture/case.sh"; same "$1" 'sh < case.sh'; }
 # shx NAME WANT SCRIPT: pinned output for a recorded choice (file operand)
 shx() { printf '%s\n' "$3" > "$W/fixture/case.sh"; expect "$1" "$2" 'sh case.sh'; }
 
+shx sh-local-dynamic-scope 'unset
+inner
+outer
+changed
+global
+exit=0' 'x=global; update(){ x=changed; }; nested(){ local x=inner; echo "$x"; }; outer(){ local x; echo "${x-unset}"; x=outer; nested; echo "$x"; local x; update; echo "$x"; return 3; }; outer || :; echo "$x"'
+shx sh-local-assignment-value 'two words
+first second
+unset
+global
+exit=0' 'value=global; f(){ local a=$(printf "%s" "two words") value="first second" absent; echo "$a"; echo "$value"; echo "${absent-unset}"; }; f; echo "$value"'
+shx sh-local-export-restore 'unset
+NEBOX_SCOPE=child
+NEBOX_SCOPE=global
+exit=0' 'export NEBOX_SCOPE=global; f(){ local NEBOX_SCOPE; env | grep "^NEBOX_SCOPE=" || echo unset; NEBOX_SCOPE=child; env | grep "^NEBOX_SCOPE="; }; f; env | grep "^NEBOX_SCOPE="'
+
 shc sh-echo 'echo hello world'
 shc sh-status 'false; echo $?; true; echo $?'
 shf sh-file-args 'echo "$0 $# $1"'

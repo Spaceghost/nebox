@@ -174,21 +174,6 @@ printf "%s:%s\n" "$x" "$y"; read x y <<EOF
 a\ébéc
 EOF
 printf "%s:%s\n" "$x" "$y"'"'"''
-expect sh-local-dynamic-scope 'unset
-inner
-outer
-changed
-global
-exit=0' 'x=global; update(){ x=changed; }; nested(){ local x=inner; echo "$x"; }; outer(){ local x; echo "${x-unset}"; x=outer; nested; echo "$x"; local x; update; echo "$x"; return 3; }; outer || :; echo "$x"'
-expect sh-local-assignment-value 'two words
-first second
-unset
-global
-exit=0' 'value=global; f(){ local a=$(printf "%s" "two words") value="first second" absent; echo "$a"; echo "$value"; echo "${absent-unset}"; }; f; echo "$value"'
-expect sh-local-export-restore 'unset
-NEBOX_SCOPE=child
-NEBOX_SCOPE=global
-exit=0' 'export NEBOX_SCOPE=global; f(){ local NEBOX_SCOPE; env | grep "^NEBOX_SCOPE=" || echo unset; NEBOX_SCOPE=child; env | grep "^NEBOX_SCOPE="; }; f; env | grep "^NEBOX_SCOPE="'
 same diff-minimal-horizon 'printf "z\na\nb\nb\nc\nz\n" > a; printf "z\nb\nb\na\nc\nz\n" > b; diff --minimal --horizon-lines=2 a b; diff -d -u --label a --label b a b'
 same diff-speed-large 'awk "BEGIN { for(i=1;i<=24000;i++) print i }" > a; awk "BEGIN { for(i=1;i<=24000;i++) print (i%35==1 && i<24000 ? i+1 : i%35==2 ? i-1 : i) }" > b; diff --speed-large-files -u --label a --label b a b | cksum'
 expect tool-information 'Usage: diff [OPTION]... FILES
