@@ -1514,7 +1514,89 @@ local function mapped(a: Addr): [16]byte
   return m
 end
 
-local function match_prefix(a: Addr, list: *[0]Prefix, n: integer): integer
+local gai_labels: sequence(Prefix)
+local gai_precedence: sequence(Prefix)
+local gai_scope: sequence(Prefix)
+local gai_loaded = false
+local gai_reload = false
+
+local function add_policy(list: *sequence(Prefix), rule: Prefix)
+  list:push(rule)
+  local i = #list
+  while i > 1 and list[i - 1].bits < rule.bits do
+    list[i] = list[i - 1]
+    i = i - 1
+  end
+  list[i] = rule
+end
+
+local function policy_prefix(spec: string, scope: boolean, value: integer): (Prefix, boolean)
+  local slash = findbyte(spec, '/'_b)
+  local text = slash == 0 and spec or spec:subview(1, slash - 1)
+  local a: Addr
+  local bits = 128
+  if inet_pton6(text, &a.b) then
+    if scope then
+      for i = 0, 9 do if a.b[i] ~= 0 then return (@Prefix){}, false end end
+      if a.b[10] ~= 255 or a.b[11] ~= 255 then return (@Prefix){}, false end
+    end
+    a.fam = AF_INET6
+  elseif scope then
+    local v4: [4]byte
+    if not inet_aton_exact(text, &v4) then return (@Prefix){}, false end
+    for i = 0, 3 do a.b[i] = v4[i] end
+    a.fam = AF_INET
+    bits = 32
+  else
+    return (@Prefix){}, false
+  end
+  if slash ~= 0 then
+    local status, mask = util.xstrtoumax(spec:subview(slash + 1), '')
+    if status ~= 0 or mask > (@uint64)(bits) or (scope and bits == 128 and mask < 96) then
+      return (@Prefix){}, false
+    end
+    bits = (@integer)(mask)
+  end
+  if a.fam == AF_INET then bits = bits + 96 end
+  return pfx(mapped(a), bits, value), true
+end
+
+local function load_gai_policy()
+  if gai_loaded and not gai_reload then return end
+  gai_loaded = true
+  gai_reload = false
+  gai_labels:clear()
+  gai_precedence:clear()
+  gai_scope:clear()
+  local ok, data = slurp('/etc/gai.conf')
+  if not ok then return end
+  local nul = findbyte(data, 0)
+  local lines = util.lines(nul > 0 and data:subview(1, nul - 1) or data)
+  defer
+    lines:destroy()
+    data:destroy()
+  end
+  for _, line in ipairs(lines) do
+    local comment = findbyte(line, '#'_b)
+    local fields = words(comment > 0 and line:subview(1, comment - 1) or line)
+    defer
+      for _, word in ipairs(fields) do word:destroy() end
+      fields:destroy()
+    end
+    if #fields < 2 then continue end
+    local tag = fields[1]
+    if tag == 'reload' then gai_reload = fields[2] == 'yes'; continue end
+    if #fields < 3 or (tag ~= 'label' and tag ~= 'precedence' and tag ~= 'scopev4') then continue end
+    local status, val = util.xstrtoumax(fields[3], '')
+    if status ~= 0 or val > 0x7fffffff then continue end
+    local rule, valid = policy_prefix(fields[2], tag == 'scopev4', (@integer)(val))
+    if not valid then continue end
+    local table = tag == 'label' and &gai_labels or (tag == 'precedence' and &gai_precedence or &gai_scope)
+    add_policy(table, rule)
+  end
+end
+
+local function match_prefix(a: Addr, list: *[0]Prefix, n: integer, fallback: integer): integer
   local v = mapped(a)
   for idx = 0, < n do
     local bits = list[idx].bits
@@ -1530,7 +1612,17 @@ local function match_prefix(a: Addr, list: *[0]Prefix, n: integer): integer
       if (list[idx].p[k] & mask) == (v[k] & mask) then return list[idx].val end
     end
   end
-  return list[n - 1].val
+  return fallback
+end
+
+local function get_label(a: Addr): integer
+  if #gai_labels > 0 then return match_prefix(a, &gai_labels[1], #gai_labels, 1) end
+  return match_prefix(a, &labels, #labels, 1)
+end
+
+local function get_precedence(a: Addr): integer
+  if #gai_precedence > 0 then return match_prefix(a, &gai_precedence[1], #gai_precedence, 40) end
+  return match_prefix(a, &precs, #precs, 40)
 end
 
 local function get_scope(a: Addr): integer
@@ -1546,6 +1638,7 @@ local function get_scope(a: Addr): integer
     end
     return b[1] & 0xf
   end
+  if #gai_scope > 0 then return match_prefix(a, &gai_scope[1], #gai_scope, 14) end
   if a.b[0] == 169 and a.b[1] == 254 then return 2 end
   if a.b[0] == 127 then return 2 end
   return 14
@@ -1588,12 +1681,12 @@ local function rfc3484(rs: sequence(SortRes), i1: integer, i2: integer): integer
     if a1.flags & 1 ~= 0 and a2.flags & 1 == 0 then return 1 end
     if a1.flags & 2 == 0 and a2.flags & 2 ~= 0 then return 1 end
     if a1.flags & 2 ~= 0 and a2.flags & 2 == 0 then return -1 end
-    local l1d, l1s = match_prefix(a1.dest, &labels, 8), match_prefix(a1.src, &labels, 8)
-    local l2d, l2s = match_prefix(a2.dest, &labels, 8), match_prefix(a2.src, &labels, 8)
+    local l1d, l1s = get_label(a1.dest), get_label(a1.src)
+    local l2d, l2s = get_label(a2.dest), get_label(a2.src)
     if l1d == l1s and l2d ~= l2s then return -1 end
     if l1d ~= l1s and l2d == l2s then return 1 end
   end
-  local p1, p2 = match_prefix(a1.dest, &precs, 5), match_prefix(a2.dest, &precs, 5)
+  local p1, p2 = get_precedence(a1.dest), get_precedence(a2.dest)
   if p1 > p2 then return -1 end
   if p1 < p2 then return 1 end
   if a1.got and a1.index ~= a2.index then
@@ -1671,6 +1764,7 @@ local function source_of(r: *SortRes)
 end
 
 local function sort_results(addrs: *sequence(Addr))
+  load_gai_policy()
   local rs: sequence(SortRes)
   load_netlink()
   -- __check_pf's list, kept only when a non-loopback IPv6 address exists

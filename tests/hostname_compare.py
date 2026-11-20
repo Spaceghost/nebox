@@ -207,16 +207,19 @@ FIX = {}
 
 
 def fixture(name, hosts=HOSTS_BASIC, hostconf='multi on\n', nss='hosts: files dns\n',
-            resolv='nameserver 127.0.0.1\nsearch example.com\n', net=NET_DUAL, dns=True, records=DNSREC):
+            resolv='nameserver 127.0.0.1\nsearch example.com\n', net=NET_DUAL, dns=True, records=DNSREC, gai=''):
     fd = os.path.join(d, 'fx-' + name)
     os.mkdir(fd)
-    for fn, content in (('hosts', hosts), ('host.conf', hostconf), ('nsswitch.conf', nss), ('resolv.conf', resolv)):
+    for fn, content in (('hosts', hosts), ('host.conf', hostconf), ('nsswitch.conf', nss), ('resolv.conf', resolv), ('gai.conf', gai)):
         open(os.path.join(fd, fn), 'w').write(content)
     json.dump(records, open(os.path.join(fd, 'rec.json'), 'w'))
     FIX[name] = (fd, net, dns)
 
 
 fixture('basic')
+fixture('gai-precedence', gai='precedence ::/0 8\nprecedence ::ffff:10.1.2.0/120 91 # prefer d0\n')
+fixture('gai-label', gai='label ::/0 3\nlabel ::ffff:192.168.0.0/112 29\nlabel invalid 12\n')
+fixture('gai-scope', gai='scopev4 192.168.0.0/16 1\nscopev4 ::ffff:10.1.2.0/120 4\nreload yes\n')
 fixture('nomulti', hostconf='multi off\n')
 fixture('nohostconf', hostconf='')
 fixture('v4', net=NET_V4)
@@ -341,7 +344,13 @@ TRANSPORT_CASES = [
     for host, args in [('dnshost', '-i'), ('www', '-f'), ('www', '-a'),
                        ('myhost', '-A'), ('unknownname', '-f')]
 ]
-CASES = TRANSPORT_CASES if '--transport' in sys.argv[2:] else CASES + TRANSPORT_CASES
+POLICY_CASES = [
+    ('net', fx, host, '@ -i')
+    for fx in ['gai-precedence', 'gai-label', 'gai-scope']
+    for host in ['dnshost', 'lo4', 'myhost']
+]
+CASES = (TRANSPORT_CASES + POLICY_CASES if '--transport' in sys.argv[2:]
+         else CASES + TRANSPORT_CASES + POLICY_CASES)
 
 
 def run(c, which):
@@ -357,7 +366,7 @@ def run(c, which):
     else:
         fd, net, dns = FIX[fx]
         parts = list(net)
-        for fn in ('hosts', 'host.conf', 'nsswitch.conf', 'resolv.conf'):
+        for fn in ('hosts', 'host.conf', 'nsswitch.conf', 'resolv.conf', 'gai.conf'):
             parts.append('mount --bind %s/%s /etc/%s' % (fd, fn, fn))
         parts.append('/bin/hostname %s' % host)
         if dns:

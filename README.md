@@ -717,9 +717,11 @@ Individual applets below list the operations that still use byte semantics.
   - The DNS client retries truncated datagrams over TCP and supports
     `use-vc`, `edns0` and `rotate`. When a server only returns UDP
     SERVFAIL, NOTIMP or REFUSED responses, it tries the next server.
-    Transport fixtures cover these paths in `tests/hostname_compare.py`. HOSTALIASES,
-    RES_OPTIONS' less common options, sortlist, /etc/gai.conf (the default
-    tables are used), nscd and NSS modules other than files and dns (which
+    Transport fixtures cover these paths in `tests/hostname_compare.py`.
+    Address ordering reads /etc/gai.conf label, precedence and scopev4
+    tables, with optional reloads before sorting. HOSTALIASES, the less
+    common RES_OPTIONS settings, sortlist, nscd and NSS modules other
+    than files and dns (which
     count as unavailable, as a missing module does) are not read.
     res_hnok is approximated as letters, digits, '-' and '_' with no label
     starting with '-'; DNS names are not escaped the way ns_name_ntop
