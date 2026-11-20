@@ -47,6 +47,8 @@ global shexec.Var = @record{
   readonly: boolean,
 }
 
+local SavedVar = @record{ name: string, old: shexec.Var, existed: boolean }
+
 global shexec.Job = @record{
   pid: cint,          -- the last process (for $! and wait)
   status: integer,
@@ -73,6 +75,8 @@ global shexec.FLOW_RETURN: integer <comptime> = 3
 
 global shexec.State = @record{
   vars: hashmap(string, shexec.Var),
+  locals: sequence(SavedVar),
+  local_mark: integer,
   funcs: hashmap(string, integer),
   func_defs: integer,
   params: sequence(string),
@@ -153,6 +157,7 @@ function shexec.errplain(msg: string)
 end
 
 local function run_string(text: string, line: integer): integer <forwarddecl> end
+local function restore_locals(mark: integer) <forwarddecl> end
 
 function shexec.exit_shell(code: integer) <noreturn>
   code = code & 255
@@ -182,6 +187,8 @@ end
 function shexec.error_exit(code: integer) <noreturn>
   if shst.interactive and shst.recover_armed and not shst.in_subshell and sys.getpid() == shst.shell_pid then
     shst.status = code
+    restore_locals(0)
+    shst.local_mark = 0
     util.flush()
     nebox_sh_longjmp()
   end
@@ -1088,35 +1095,60 @@ local function do_assign(a: string, export_it: boolean)
   if export_it then shexec.var(name).exported = true end
 end
 
--- Temporarily assign for a builtin or function call; returns the old cells.
-local TempVar = @record{ name: string, old: shexec.Var, existed: boolean }
+local function save_var(name: string): SavedVar
+  local p = shst.vars:peek(name)
+  if p == nilptr then return {name = name} end
+  return {name = name, old = $p, existed = true}
+end
 
-local function temp_assign(assigns: sequence(string)): sequence(TempVar)
-  local saved: sequence(TempVar)
+local function restore_var(saved: SavedVar)
+  if saved.existed then
+    shst.vars[saved.name] = saved.old
+  else
+    shst.vars:remove(saved.name)
+  end
+  if saved.name == 'PATH' then shst.cmd_hash:clear() end
+end
+
+function restore_locals(mark: integer)
+  while #shst.locals > mark do
+    restore_var(shst.locals:pop())
+  end
+end
+
+function shexec.declare_local(name: string, value: string, assigned: boolean)
+  for i = shst.local_mark + 1, #shst.locals do
+    if shst.locals[i].name == name then
+      if assigned then shexec.setvar(name, value) end
+      return
+    end
+  end
+  local saved = save_var(name)
+  if saved.old.readonly then shexec.fatal(name .. ': is read only') end
+  shst.locals:push(saved)
+  local variable = shexec.var(name)
+  variable.set = false
+  variable.value = ''
+  if assigned then shexec.setvar(name, value) end
+  if name == 'PATH' then shst.cmd_hash:clear() end
+end
+
+-- Temporarily assign for a builtin or function call; returns the old cells.
+local function temp_assign(assigns: sequence(string)): sequence(SavedVar)
+  local saved: sequence(SavedVar)
   for i = 1, #assigns do
     local a = assigns[i]
     local eq = a:find('=', 1, true)
     local name = a:sub(1, eq - 1)
-    local t: TempVar
-    t.name = name
-    local p = shst.vars:peek(name)
-    if p ~= nilptr then t.old = $p; t.existed = true end
-    saved:push(t)
+    saved:push(save_var(name))
     shexec.setvar(name, a:sub(eq + 1))
     shexec.var(name).exported = true
   end
   return saved
 end
 
-local function temp_restore(saved: sequence(TempVar))
-  for i = #saved, 1, -1 do
-    local t = saved[i]
-    if t.existed then
-      shst.vars[t.name] = t.old
-    else
-      shst.vars:remove(t.name)
-    end
-  end
+local function temp_restore(saved: sequence(SavedVar))
+  for i = #saved, 1, -1 do restore_var(saved[i]) end
 end
 
 -- Call a shell function with arguments.
@@ -1127,8 +1159,12 @@ function shexec.call_function(body: integer, args: sequence(string)): integer
   shst.params = np
   shst.func_depth = shst.func_depth + 1
   local saved_loops = shst.loop_depth
+  local saved_mark = shst.local_mark
+  shst.local_mark = #shst.locals
   shst.loop_depth = 0
   local st = exec_node(body)
+  restore_locals(shst.local_mark)
+  shst.local_mark = saved_mark
   shst.loop_depth = saved_loops
   shst.func_depth = shst.func_depth - 1
   if shst.flow == shexec.FLOW_RETURN then
@@ -1153,6 +1189,9 @@ local function exec_simple(n: *N.Node): integer
     local wi = N.L(n.a + i)
     if N.W(wi).assign and #args == 0 and #assign_words == i then
       assign_words:push(wi)
+    elseif N.W(wi).assign and #args > 0 and args[1] == 'local' and shst.funcs:peek('local') == nilptr then
+      local name, value = shexp.expand_assign(wi)
+      args:push(name .. '=' .. value)
     else
       local f = shexp.expand_word(wi)
       for j = 1, #f do args:push(f[j]) end

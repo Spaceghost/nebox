@@ -1312,7 +1312,16 @@ local function bi_ulimit(args: sequence(string)): integer
 end
 
 local function bi_local(args: sequence(string)): integer
-  return rberr('local: the local builtin (not POSIX) is not supported')
+  if shst.func_depth == 0 then return rberr('local: only valid in a function') end
+  for i = 2, #args do
+    local operand = args[i]
+    local equals = operand:find('=', 1, true)
+    local name = operand
+    if equals > 0 then name = operand:sub(1, equals - 1) end
+    if not N.is_name(name) then return rberr('local: ' .. name .. ': bad variable name') end
+    shexec.declare_local(name, operand:sub(equals + 1), equals > 0)
+  end
+  return 0
 end
 
 -- type / command -v / command -V
