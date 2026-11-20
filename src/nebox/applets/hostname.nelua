@@ -31,6 +31,7 @@ require 'nebox.util'
 
 local function c_socket(d: cint, t: cint, p: cint): cint <cimport 'socket', cinclude '<sys/socket.h>'> end
 local function c_connect(fd: cint, a: pointer, l: cuint): cint <cimport 'connect', cinclude '<sys/socket.h>'> end
+local function c_getsockopt(fd: cint, level: cint, option: cint, value: pointer, length: *cuint): cint <cimport 'getsockopt', cinclude '<sys/socket.h>'> end
 local function c_getsockname(fd: cint, a: pointer, l: *cuint): cint <cimport 'getsockname', cinclude '<sys/socket.h>'> end
 local function c_send(fd: cint, b: pointer, n: csize, f: cint): clong <cimport 'send', cinclude '<sys/socket.h>'> end
 local function c_sendto(fd: cint, b: pointer, n: csize, f: cint, a: pointer, l: cuint): clong <cimport 'sendto', cinclude '<sys/socket.h>'> end
@@ -44,7 +45,16 @@ local function c_poll(p: *PollFd, n: culong, t: cint): cint <cimport 'poll', cin
 local AF_INET <comptime> = 2
 local AF_INET6 <comptime> = 10
 local AF_NETLINK <comptime> = 16
+local SOCK_STREAM <comptime> = 1
 local SOCK_DGRAM <comptime> = 2
+local SOCK_NONBLOCK <comptime> = 0x800
+local SOL_SOCKET <comptime> = 1
+local SO_ERROR <comptime> = 4
+local MSG_NOSIGNAL <comptime> = 0x4000
+local POLLIN: cshort <comptime> = 1
+local POLLOUT: cshort <comptime> = 4
+local EAGAIN: cint <comptime> = 11
+local EINPROGRESS: cint <comptime> = 115
 local SOCK_RAW <comptime> = 3
 local SOCK_CLOEXEC <comptime> = 0x80000
 local EPERM: cint <comptime> = 1
@@ -362,7 +372,7 @@ local multi = false
 local Resconf = @record{
   ns: sequence(Addr), search: sequence(string),
   ndots: integer, attempts: integer, timeout: integer,
-  noaaaa: boolean, notld: boolean,
+  noaaaa: boolean, notld: boolean, usevc: boolean, edns: boolean,
 }
 local res: Resconf
 local res_loaded = false
@@ -477,6 +487,10 @@ local function setoptions(s: string)
     elseif w:sub(1, 9) == 'attempts:' then
       local n = atoi(w:sub(10))
       res.attempts = n <= 5 and n or 5
+    elseif w == 'use-vc' then
+      res.usevc = true
+    elseif w == 'edns0' then
+      res.edns = true
     elseif w:sub(1, 7) == 'no-aaaa' then
       res.noaaaa = true
     elseif w:sub(1, 12) == 'no_tld_query' or w:sub(1, 12) == 'no-tld-query' then
@@ -779,10 +793,16 @@ local function mkquery(id: integer, name: string, qtype: integer): (boolean, str
   sb:writebyte((@byte)(id >> 8)); sb:writebyte((@byte)(id & 0xff))
   sb:writebyte(1); sb:writebyte(0)
   sb:writebyte(0); sb:writebyte(1)
-  for k = 1, 6 do sb:writebyte(0) end
+  for k = 1, 5 do sb:writebyte(0) end
+  sb:writebyte(res.edns and 1 or 0)
   if not name_to_wire(name, &sb) then return false, '' end
   sb:writebyte((@byte)(qtype >> 8)); sb:writebyte((@byte)(qtype & 0xff))
   sb:writebyte(0); sb:writebyte(1)
+  if res.edns then
+    -- Root owner, OPT type (41), and a 1200-byte UDP payload limit.
+    sb:write('\x00\x00\x29\x04\xb0')
+    for k = 1, 6 do sb:writebyte(0) end
+  end
   return true, sb:promote()
 end
 
@@ -857,14 +877,113 @@ local function answers(q: string, r: string): boolean
   return u16(q, 13 + l1) == u16(r, 13 + l2) and u16(q, 15 + l1) == u16(r, 15 + l2)
 end
 
--- res_send over UDP: the answers to one or two queries; false with
--- res_errno set when no server answered
+local function monotonic_ms(): integer
+  local now: sys.Timespec
+  sys.clock_gettime(sys.CLOCK_MONOTONIC, &now)
+  return now.tv_sec * 1000 + now.tv_nsec // 1000000
+end
+
+local function tcp_ready(fd: cint, events: cshort, deadline: integer): boolean
+  while true do
+    local left = deadline - monotonic_ms()
+    if left <= 0 then res_errno = ETIMEDOUT; return false end
+    local pfd: PollFd = {fd = fd, events = events}
+    local n = c_poll(&pfd, 1, (@cint)(left))
+    if n > 0 then return true end
+    if n == 0 then res_errno = ETIMEDOUT; return false end
+    if sys.errno() ~= sys.EINTR then res_errno = sys.errno(); return false end
+  end
+end
+
+local function tcp_transfer(fd: cint, buf: *[0]byte, size: usize, sending: boolean, deadline: integer): boolean
+  local pos: usize = 0
+  while pos < size do
+    if monotonic_ms() >= deadline then res_errno = ETIMEDOUT; return false end
+    local n: clong
+    if sending then n = c_send(fd, &buf[pos], size - pos, MSG_NOSIGNAL)
+    else n = c_recv(fd, &buf[pos], size - pos, 0) end
+    if n > 0 then
+      pos = pos + (@usize)(n)
+    elseif n == 0 then
+      res_errno = ECONNREFUSED
+      return false
+    else
+      local err = sys.errno()
+      if err == sys.EINTR then continue end
+      if err ~= EAGAIN then res_errno = err; return false end
+      if not tcp_ready(fd, sending and POLLOUT or POLLIN, deadline) then return false end
+    end
+  end
+  return true
+end
+
+local function tcp_write_query(fd: cint, q: string, deadline: integer): boolean
+  local length: [2]byte = {(@byte)(q.size >> 8), (@byte)(q.size & 255)}
+  return tcp_transfer(fd, &length[0], 2, true, deadline)
+      and tcp_transfer(fd, q.data, q.size, true, deadline)
+end
+
+-- DNS over TCP prefixes every message with its unsigned 16-bit length.
+-- A single deadline covers connection, writes and both family responses.
+local function res_tcp(a: Addr, q1: string, q2: string, two: boolean,
+                       seconds: integer): (boolean, string, string)
+  local fd = c_socket((@cint)(a.fam), SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
+  if fd < 0 then res_errno = sys.errno(); return false, '', '' end
+  defer sys.close(fd) end
+  local deadline = monotonic_ms() + seconds * 1000
+  local sa: [28]byte
+  local sl = sockaddr(a, 53, &sa)
+  if c_connect(fd, &sa, sl) ~= 0 then
+    local err = sys.errno()
+    if err ~= EINPROGRESS and err ~= sys.EINTR then res_errno = err; return false, '', '' end
+    if not tcp_ready(fd, POLLOUT, deadline) then return false, '', '' end
+    local error_size: cuint = #@cint
+    if c_getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &error_size) ~= 0 then err = sys.errno() end
+    if err ~= 0 then res_errno = err; return false, '', '' end
+  end
+  if not tcp_write_query(fd, q1, deadline) or (two and not tcp_write_query(fd, q2, deadline)) then
+    return false, '', ''
+  end
+  local r1, r2 = '', ''
+  local complete = false
+  defer
+    if not complete then r1:destroy(); r2:destroy() end
+  end
+  local have1, have2 = false, not two
+  local buf: [65535]byte
+  local length: [2]byte
+  while not (have1 and have2) do
+    if not tcp_transfer(fd, &length[0], 2, false, deadline) then return false, '', '' end
+    local size = ((@usize)(length[0]) << 8) | (@usize)(length[1])
+    if size < 12 then res_errno = EINVAL; return false, '', '' end
+    if not tcp_transfer(fd, &buf[0], size, false, deadline) then return false, '', '' end
+    local r: string = {data = &buf[0], size = size}
+    if not have1 and answers(q1, r) then r1 = string.copy(r); have1 = true
+    elseif two and not have2 and answers(q2, r) then r2 = string.copy(r); have2 = true end
+  end
+  res_errno = 0
+  complete = true
+  return true, r1, r2
+end
+
+-- Send one or two queries. After a truncated datagram, retry the same
+-- server over TCP before advancing to the next configured server.
 local function res_send(q1: string, q2: string, two: boolean): (boolean, string, string)
   local gotsomewhere = false
+  local use_tcp = res.usevc
   local nscount = #res.ns
   for try = 0, < res.attempts do
+    if use_tcp and try > 0 then break end
     for nsi = 1, nscount do
       local a = res.ns[nsi]
+      local seconds = res.timeout << try
+      if nsi > 1 then seconds = seconds // nscount end
+      if seconds <= 0 then seconds = 1 end
+      if use_tcp then
+        local ok, r1, r2 = res_tcp(a, q1, q2, two, seconds)
+        if ok then return true, r1, r2 end
+        continue
+      end
       local fd = c_socket((@cint)(a.fam), SOCK_DGRAM | SOCK_CLOEXEC, 0)
       if fd < 0 then res_errno = sys.errno(); goto nextns end
       do
@@ -876,17 +995,10 @@ local function res_send(q1: string, q2: string, two: boolean): (boolean, string,
         if c_send(fd, q1.data, q1.size, 0) < 0 or (two and c_send(fd, q2.data, q2.size, 0) < 0) then
           res_errno = sys.errno(); sys.close(fd); goto nextns
         end
-        local seconds = res.timeout << try
-        if nsi > 1 then seconds = seconds // nscount end
-        if seconds <= 0 then seconds = 1 end
-        local start: sys.Timespec
-        sys.clock_gettime(sys.CLOCK_MONOTONIC, &start)
+        local deadline = monotonic_ms() + seconds * 1000
         local buf: [65536]byte
         while not (have1 and have2) do
-          local now: sys.Timespec
-          sys.clock_gettime(sys.CLOCK_MONOTONIC, &now)
-          local spent = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) // 1000000
-          local left = seconds * 1000 - spent
+          local left = deadline - monotonic_ms()
           if left <= 0 then gotsomewhere = true; break end
           local pfd: PollFd = {fd = fd, events = 1}
           local pr = c_poll(&pfd, 1, (@cint)(left))
@@ -897,17 +1009,26 @@ local function res_send(q1: string, q2: string, two: boolean): (boolean, string,
             res_errno = sys.errno()
             break
           end
-          local r = string.copy((@string){data = &buf[0], size = (@usize)(n)})
-          if not have1 and answers(q1, r) then r1 = r; have1 = true
-          elseif two and not have2 and answers(q2, r) then r2 = r; have2 = true end
+          local r: string = {data = &buf[0], size = (@usize)(n)}
+          local first = not have1 and answers(q1, r)
+          local second = not first and two and not have2 and answers(q2, r)
+          if not (first or second) then continue end
+          if r:byte(3) & 2 ~= 0 then use_tcp = true; break end
+          if first then r1 = string.copy(r); have1 = true
+          else r2 = string.copy(r); have2 = true end
         end
         sys.close(fd)
-        if have1 and have2 then res_errno = 0; return true, r1, r2 end
+        if use_tcp then
+          local ok, ans1, ans2 = res_tcp(a, q1, q2, two, seconds)
+          if ok then return true, ans1, ans2 end
+        elseif have1 and have2 then res_errno = 0; return true, r1, r2 end
+        r1:destroy()
+        r2:destroy()
       end
       ::nextns::
     end
   end
-  res_errno = gotsomewhere and ETIMEDOUT or ECONNREFUSED
+  if not use_tcp then res_errno = gotsomewhere and ETIMEDOUT or ECONNREFUSED end
   return false, '', ''
 end
 

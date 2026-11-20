@@ -31,11 +31,10 @@ REFPATH = '/usr/bin:/bin:/usr/sbin:/sbin'
 NEBPATH = nbin + ':' + REFPATH
 
 DNS = r'''
-import json, socket, struct, sys
+import json, socket, struct, sys, threading
 recs = json.load(open(sys.argv[1]))
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('127.0.0.1', 53))
-open(sys.argv[2], 'w').write('ready\n')
 TYPES = {'A': 1, 'CNAME': 5, 'PTR': 12, 'TXT': 16, 'AAAA': 28}
 def wire(name):
     out = b''
@@ -51,8 +50,7 @@ def rdata(t, v):
     if t in ('CNAME', 'PTR'):
         return wire(v)
     return bytes([len(v)]) + v.encode()
-while True:
-    q, peer = s.recvfrom(4096)
+def respond(q, tcp):
     qid, flags, qd = struct.unpack('>HHH', q[:6])
     i = 12
     labels = []
@@ -62,8 +60,13 @@ while True:
     qtype = struct.unpack('>H', q[i + 1:i + 3])[0]
     question = q[12:i + 5]
     name = '.'.join(labels).lower()
-    if name in recs.get('drop', []):
-        continue
+    if name in recs.get('drop', []) or (not tcp and recs.get('tcp_only')):
+        return None
+    if recs.get('edns') and (q[10:12] != b'\0\1' or
+                            q[i + 5:] != struct.pack('>BHHIH', 0, 41, 1200, 0, 0)):
+        return None
+    if not tcp and recs.get('truncate'):
+        return struct.pack('>HHHHHH', qid, 0x8380, 1, 0, 0, 0) + question
     rcode = 0
     ans = []
     cur = name
@@ -90,7 +93,40 @@ while True:
         rd = rdata(t, v)
         body += wire(owner) + struct.pack('>HHIH', TYPES[t], 1, 60, len(rd)) + rd
     hdr = struct.pack('>HHHHHH', qid, 0x8180 | (flags & 0x0100) | rcode, 1, len(ans), 0, 0)
-    s.sendto(hdr + question + body, peer)
+    return hdr + question + body
+
+def serve_tcp(listener):
+    while True:
+        conn, _ = listener.accept()
+        try:
+            with conn, conn.makefile('rb') as stream:
+                while length := stream.read(2):
+                    if len(length) != 2:
+                        break
+                    size = struct.unpack('>H', length)[0]
+                    query = stream.read(size)
+                    if len(query) != size or size < 12:
+                        break
+                    response = respond(query, True)
+                    if response is not None:
+                        length = struct.pack('>H', len(response))
+                        conn.sendall(length[:1])
+                        conn.sendall(length[1:] + response)
+        except OSError:
+            pass
+
+if recs.get('truncate') or recs.get('tcp_only'):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 53))
+    listener.listen()
+    threading.Thread(target=serve_tcp, args=(listener,), daemon=True).start()
+open(sys.argv[2], 'w').write('ready\n')
+
+while True:
+    q, peer = s.recvfrom(4096)
+    answer = respond(q, False)
+    if answer is not None:
+        s.sendto(answer, peer)
 '''
 open(os.path.join(d, 'dns.py'), 'w').write(DNS)
 
@@ -160,12 +196,12 @@ FIX = {}
 
 
 def fixture(name, hosts=HOSTS_BASIC, hostconf='multi on\n', nss='hosts: files dns\n',
-            resolv='nameserver 127.0.0.1\nsearch example.com\n', net=NET_DUAL, dns=True):
+            resolv='nameserver 127.0.0.1\nsearch example.com\n', net=NET_DUAL, dns=True, records=DNSREC):
     fd = os.path.join(d, 'fx-' + name)
     os.mkdir(fd)
     for fn, content in (('hosts', hosts), ('host.conf', hostconf), ('nsswitch.conf', nss), ('resolv.conf', resolv)):
         open(os.path.join(fd, fn), 'w').write(content)
-    json.dump(DNSREC, open(os.path.join(fd, 'rec.json'), 'w'))
+    json.dump(records, open(os.path.join(fd, 'rec.json'), 'w'))
     FIX[name] = (fd, net, dns)
 
 
@@ -194,6 +230,15 @@ fixture('multisearch', hosts='127.0.0.1 localhost\n',
 fixture('twons', hosts='127.0.0.1 localhost\n', resolv='nameserver 127.0.0.9\nnameserver 127.0.0.1\nsearch example.com\n')
 fixture('slow', hosts='127.0.0.1 localhost\n',
         resolv='nameserver 127.0.0.1\nsearch example.com\noptions timeout:1 attempts:1\n')
+fixture('edns-required',
+        resolv='nameserver 127.0.0.1\nsearch example.com\noptions edns0 timeout:1 attempts:1\n',
+        records=dict(DNSREC, edns=True))
+fixture('tcp-truncated', records=dict(DNSREC, truncate=True))
+fixture('tcp-required', resolv='nameserver 127.0.0.1\nsearch example.com\noptions use-vc timeout:1 attempts:1\n',
+        records=dict(DNSREC, tcp_only=True))
+fixture('tcp-second-server',
+        resolv='nameserver 127.0.0.9\nnameserver 127.0.0.1\nsearch example.com\noptions use-vc timeout:1 attempts:1\n',
+        records=dict(DNSREC, tcp_only=True))
 fixture('emptyhosts', hosts='')
 fixture('weird', hosts='127.0.0.1 localhost\n10.1.2.3\tTab.Example.COM\ttab\n10.1.2.3 dup dup\n'
         '10.1.2.4 dup\n2001:db8::5 dup\n\n   \n#\n10.1.2.3 a#b c\n10.1.2.3 \x00nul\n10.1.2.4 long' + 'x' * 300 + '\n')
@@ -272,6 +317,14 @@ for prog in ['dnsdomainname', 'domainname', 'ypdomainname', 'nisdomainname']:
     for h in ['myhost', 'myhost.example.com', 'unknownname', 'chain']:
         for a in ['', '-f', '-s', '-y', '-a']:
             CASES.append(('net', 'basic', h, prog + ' ' + a))
+
+TRANSPORT_CASES = [
+    ('net', fx, host, '@ ' + args)
+    for fx in ['tcp-truncated', 'tcp-required', 'tcp-second-server', 'edns-required']
+    for host, args in [('dnshost', '-i'), ('www', '-f'), ('www', '-a'),
+                       ('myhost', '-A'), ('unknownname', '-f')]
+]
+CASES = TRANSPORT_CASES if '--transport' in sys.argv[2:] else CASES + TRANSPORT_CASES
 
 
 def run(c, which):

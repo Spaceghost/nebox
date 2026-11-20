@@ -659,8 +659,9 @@ Individual applets below list the operations that still use byte semantics.
   refused and unanswered servers, unreachable addresses for the sort),
   0 mismatches. Differences:
   - -V/--version prints nebox's line.
-  - The DNS client is UDP only: no TCP retry for truncated answers, no
-    EDNS0, rotate or use-vc, and a SERVFAIL, NOTIMP or REFUSED answer is
+  - The DNS client retries truncated datagrams over TCP and supports
+    `use-vc` and `edns0` (covered in `tests/hostname_compare.py`). It has
+    no rotate, and a SERVFAIL, NOTIMP or REFUSED answer is
     taken as it comes where glibc tries the next server. HOSTALIASES,
     RES_OPTIONS' less common options, sortlist, /etc/gai.conf (the default
     tables are used), nscd and NSS modules other than files and dns (which
@@ -944,11 +945,14 @@ Individual applets below list the operations that still use byte semantics.
   default `--backup-if-mismatch`); an empty result of a deleting patch, or
   with `-E`, removes the file. Names come from the headers with `-p N`
   components stripped (the base name without `-p`), choosing among old, new
-  and `Index:` names as GNU does. Options `-b -E -f -F N -i -N -o -p -r -R -s
+  and `Index:` names as GNU does. Options `-b -e -E -f -F N -i -l -N -o -p -r -R -s
   -t -d --dry-run` and their long forms. `tests/patch_fuzz.py` compares
   output, status, result, reject and backup files with GNU patch on random
   patches and perturbed targets (2,000 cases, no difference; `make test` runs
-  200). Not supported: ed scripts (`-e`), `-D`, `-l`, `--merge`, `--posix`,
+  200). `-e`/`--ed` applies the numeric editing commands emitted by
+  `diff -e`, including its literal-dot escape. `-l`/`--ignore-whitespace`
+  uses GNU's blank-run matching and preserves input context lines.
+  Not supported: `-D`, `--merge`, `--posix`,
   git diffs (renames, modes, binary), version control lookups.
 - `dd` is a port of GNU coreutils 9.1 `src/dd.c` (read from its source):
   every operand (`iseek`/`oseek` too), conversion and flag, GNU's number
@@ -1021,8 +1025,8 @@ Individual applets below list the operations that still use byte semantics.
   `--speed-large-files` uses GNU's shortcut for long matching stretches.
   `-t` expands tabs in standard, context, unified, ed and RCS output.
   `-T` aligns the output prefixes in normal, context and unified formats.
-  Remaining gaps include `-l` and tab expansion
-  in custom templates.
+  `-l`/`--paginate` sends each file's diff through `/usr/bin/pr` as GNU diff
+  does. Tab expansion in custom templates remains unsupported.
 - `grep` ports GNU grep 3.8 (`src/nebox/applets/grep.nelua`, C locale) as
   Debian's grep 3.8-5 builds it, which is the reference: its two behaviour
   patches are kept (the `stray \` warnings appear only when

@@ -23,6 +23,7 @@ require 'nebox.fnmatch'
 require 'nebox.diff_format'
 
 local Opt = @record{
+  paginate: boolean, messages: sequence(string),
   fmt: byte,          -- normal, context, unified, ed, ifdef, or side by side
   context: integer, horizon: integer, minimal: boolean, initial_tab: boolean, speed_large: boolean,
   icase: boolean, space_change: boolean, all_space: boolean, blank_lines: boolean,
@@ -1057,6 +1058,80 @@ local function type_name(k: Kind, st: *sys.Stat): string
   return 'special file'
 end
 
+local function diff_message(o: *Opt, message: string)
+  if o.paginate then o.messages:push(message) else util.line(message) end
+end
+
+local function print_name(name: string): string
+  local quoted = false
+  local buf: stringbuilder
+  local controls = 'abtnvfr'
+  for i: usize = 1, name.size do
+    local c = name:byte(i)
+    if c >= 7 and c <= 13 then
+      buf:writebyte(92); buf:writebyte(controls:byte(c - 6)); quoted = true
+    elseif c == 34 or c == 92 then
+      buf:writebyte(92); buf:writebyte(c); quoted = true
+    elseif c < 32 or c >= 128 then
+      buf:writebyte(92)
+      buf:writebyte(48 + (c >> 6))
+      buf:writebyte(48 + ((c >> 3) & 7))
+      buf:writebyte(48 + (c & 7))
+      quoted = true
+    else
+      if c == 32 then quoted = true end
+      buf:writebyte(c)
+    end
+  end
+  if not quoted then buf:destroy(); return name end
+  return '"' .. buf:promote() .. '"'
+end
+
+local function start_page(o: *Opt, p0: string, p1: string): (cint, cint)
+  if not o.paginate then return 0, -1 end
+  if not util.flush() then util.perror('write failed'); return -1, -1 end
+  local pipes: [2]cint
+  if sys.pipe(&pipes) < 0 then util.perror('pipe'); return -1, -1 end
+  local title = 'diff' .. o.switches .. ' ' .. print_name(p0) .. ' ' .. print_name(p1)
+  local pid = sys.fork()
+  if pid == 0 then
+    sys.close(pipes[1])
+    if pipes[0] ~= 0 then
+      if sys.dup2(pipes[0], 0) < 0 then sys._exit(126) end
+      sys.close(pipes[0])
+    end
+    local argv: [4]cstring = {'/usr/bin/pr', '-h', (@cstring)(title), nilptr}
+    sys.execvp(argv[0], &argv[0])
+    sys._exit(sys.errno() == sys.ENOENT and 127 or 126)
+  end
+  sys.close(pipes[0])
+  if pid < 0 then util.perror('fork'); sys.close(pipes[1]); return -1, -1 end
+  util.setout(pipes[1])
+  return pid, pipes[1]
+end
+
+local function finish_page(pid: cint, fd: cint): boolean
+  if pid == 0 then return true end
+  local wrote = util.flush()
+  util.setout(1)
+  sys.close(fd)
+  local status: cint
+  local ret: cint
+  repeat ret = sys.waitpid(pid, &status, 0) until ret >= 0 or sys.errno() ~= sys.EINTR
+  if ret < 0 then util.perror('waitpid'); return false end
+  if status ~= 0 then
+    local msg = "subsidiary program '/usr/bin/pr' "
+    local code = (status >> 8) & 255
+    if (status & 127) ~= 0 then util.err(msg .. 'failed')
+    elseif code == 127 then util.err(msg .. 'not found')
+    elseif code == 126 then util.err(msg .. 'could not be invoked')
+    else util.err(msg .. 'failed (exit status ' .. tostring(code) .. ')') end
+    return false
+  end
+  if not wrote then util.err('write failed'); return false end
+  return true
+end
+
 -- Returns 0 same, 1 different, 2 trouble.
 local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): integer
   local a: DFile
@@ -1073,15 +1148,18 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
   if o.fmt == 101 then a.incomplete = false; b.incomplete = false end
   if a.data == b.data then
     local no_changes: sequence(Change)
-    if not o.brief then
+    if not o.brief and (o.fmt == 'D'_b or o.fmt == 'y'_b) then
+      local pid, fd = start_page(o, p0, p1)
+      if pid < 0 then return 2 end
       if o.fmt == 'D'_b then print_merged(o, &a, &b, &no_changes)
-      elseif o.fmt == 'y'_b then print_side(o, &a, &b, &no_changes) end
+      else print_side(o, &a, &b, &no_changes) end
+      if not finish_page(pid, fd) then return 2 end
     end
-    if o.same then util.writef('Files %s and %s are identical\n', p0, p1) end
+    if o.same then diff_message(o, string.format('Files %s and %s are identical', p0, p1)) end
     return 0
   end
   if not o.text and (has_nul(a.data) or has_nul(b.data)) then
-    util.writef('Binary files %s and %s differ\n', p0, p1)
+    diff_message(o, string.format('Binary files %s and %s differ', p0, p1))
     return 1
   end
   local horizon = (o.fmt == 99 or o.fmt == 117) and o.context or 0
@@ -1097,18 +1175,23 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
     return 2
   end
   if not any then
-    if not o.brief then
+    if not o.brief and (o.fmt == 'D'_b or o.fmt == 'y'_b) then
+      local pid, fd = start_page(o, p0, p1)
+      if pid < 0 then return 2 end
       if o.fmt == 'D'_b then print_merged(o, &a, &b, &ch)
-      elseif o.fmt == 'y'_b then print_side(o, &a, &b, &ch) end
+      else print_side(o, &a, &b, &ch) end
+      if not finish_page(pid, fd) then return 2 end
     end
-    if o.same then util.writef('Files %s and %s are identical\n', p0, p1) end
+    if o.same then diff_message(o, string.format('Files %s and %s are identical', p0, p1)) end
     return 0
   end
   if o.brief then
-    util.writef('Files %s and %s differ\n', p0, p1)
+    diff_message(o, string.format('Files %s and %s differ', p0, p1))
     return 1
   end
-  if header then util.writef('diff%s %s %s\n', o.switches, p0, p1) end
+  local pid, fd = start_page(o, p0, p1)
+  if pid < 0 then return 2 end
+  if header and pid == 0 then util.writef('diff%s %s %s\n', o.switches, p0, p1) end
   if o.fmt == 117 then
     print_file_header(o, '--- ', &a, 1)
     print_file_header(o, '+++ ', &b, 2)
@@ -1129,10 +1212,10 @@ local function diff_files(o: *Opt, p0: string, p1: string, header: boolean): int
     ed_mode = false
     if a.missing_nl then util.err(a.name .. ': No newline at end of file\n') end
     if b.missing_nl then util.err(b.name .. ': No newline at end of file\n') end
-    if ed_trouble then return 2 end
   else
     print_normal(o, &a, &b, &ch)
   end
+  if not finish_page(pid, fd) or ed_trouble then return 2 end
   return 1
 end
 
@@ -1179,17 +1262,17 @@ local function diff_dirs(o: *Opt, d0: string, d1: string): integer
     local k0, k1 = kind_of(p0, &st0), kind_of(p1, &st1)
     local r = 0
     if where ~= 3 and not o.new_file then
-      util.writef('Only in %s: %s\n', where == 1 and d0 or d1, n)
+      diff_message(o, string.format('Only in %s: %s', where == 1 and d0 or d1, n))
       r = 1
     elseif where ~= 3 and (k0 == Kind.DIR or k1 == Kind.DIR) then
       -- -N with a directory on one side: GNU recurses against nothing; report it
-      util.writef('Only in %s: %s\n', where == 1 and d0 or d1, n)
+      diff_message(o, string.format('Only in %s: %s', where == 1 and d0 or d1, n))
       r = 1
     elseif k0 == Kind.DIR and k1 == Kind.DIR then
       if o.recursive then r = diff_dirs(o, p0, p1)
-      else util.writef('Common subdirectories: %s and %s\n', p0, p1) end
+      else diff_message(o, string.format('Common subdirectories: %s and %s', p0, p1)) end
     elseif (k0 == Kind.DIR) ~= (k1 == Kind.DIR) then
-      util.writef('File %s is a %s while file %s is a %s\n', p0, type_name(k0, &st0), p1, type_name(k1, &st1))
+      diff_message(o, string.format('File %s is a %s while file %s is a %s', p0, type_name(k0, &st0), p1, type_name(k1, &st1)))
       r = 1
     else
       r = diff_files(o, p0, p1, true)
@@ -1215,7 +1298,7 @@ local LONGOPTS: []util.LongOpt = {
   {'left-column', 0, 129}, {'suppress-common-lines', 0, 130},
   {'expand-tabs', 0, 't'_b}, {'initial-tab', 0, 'T'_b},
   {'tabsize', 1, 131}, {'suppress-blank-empty', 0, util.UNSUPPORTED},
-  {'paginate', 0, util.UNSUPPORTED}, {'no-dereference', 0, util.UNSUPPORTED},
+  {'paginate', 0, 'l'_b}, {'no-dereference', 0, util.UNSUPPORTED},
   {'unidirectional-new-file', 0, util.UNSUPPORTED}, {'ifdef', 1, 'D'_b},
   {'minimal', 0, 'd'_b}, {'horizon-lines', 1, 140},
   {'speed-large-files', 0, 141}, {'rcs', 0, 'n'_b},
@@ -1285,7 +1368,7 @@ local function write_switch(sb: *stringbuilder, word: string)
 end
 
 global function applet_diff(args: sequence(string)): integer
-  local g = util.getopt(args, 'abBcC:dD:eiI:F:L:nNpqrstTuU:W:wx:X:y', &LONGOPTS[0], #LONGOPTS)
+  local g = util.getopt(args, 'abBcC:dD:eiI:F:lL:nNpqrstTuU:W:wx:X:y', &LONGOPTS[0], #LONGOPTS)
   local opt: Opt = {context = 3, width = 130, tabsize = 8}
   local sw: stringbuilder
   local last_switch = 0
@@ -1327,6 +1410,7 @@ global function applet_diff(args: sequence(string)): integer
     elseif c == 128 then fmt = 'n'_b
     elseif c == 129 then opt.left_column = true
     elseif c == 130 then opt.suppress_common = true
+    elseif c == 'l'_b then opt.paginate = true
     elseif c == 't'_b then opt.expand_tabs = true
     elseif c == 'T'_b then opt.initial_tab = true
     elseif c == 'd'_b then opt.minimal = true
@@ -1398,11 +1482,15 @@ global function applet_diff(args: sequence(string)): integer
   local st1: sys.Stat
   local k0 = p0 == '-' and Kind.FILE or kind_of(p0, &st0)
   local k1 = p1 == '-' and Kind.FILE or kind_of(p1, &st1)
+  local rc: integer
   if k0 == Kind.DIR and k1 == Kind.DIR then
-    return diff_dirs(&opt, p0, p1)
+    rc = diff_dirs(&opt, p0, p1)
+  else
+    -- a directory and a file: compare with the file of the same name in it
+    if k0 == Kind.DIR then p0 = util.join(p0, util.basename(p1)) end
+    if k1 == Kind.DIR then p1 = util.join(p1, util.basename(p0)) end
+    rc = diff_files(&opt, p0, p1, false)
   end
-  -- a directory and a file: compare with the file of the same name in it
-  if k0 == Kind.DIR then p0 = util.join(p0, util.basename(p1)) end
-  if k1 == Kind.DIR then p1 = util.join(p1, util.basename(p0)) end
-  return diff_files(&opt, p0, p1, false)
+  for _, message in ipairs(opt.messages) do util.line(message) end
+  return rc
 end

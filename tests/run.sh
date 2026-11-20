@@ -176,6 +176,7 @@ EOF
 printf "%s:%s\n" "$x" "$y"'"'"''
 same diff-minimal-horizon 'printf "z\na\nb\nb\nc\nz\n" > a; printf "z\nb\nb\na\nc\nz\n" > b; diff --minimal --horizon-lines=2 a b; diff -d -u --label a --label b a b'
 same diff-speed-large 'awk "BEGIN { for(i=1;i<=24000;i++) print i }" > a; awk "BEGIN { for(i=1;i<=24000;i++) print (i%35==1 && i<24000 ? i+1 : i%35==2 ? i-1 : i) }" > b; diff --speed-large-files -u --label a --label b a b | cksum'
+same diff-paginate 'mkdir left right; seq 1 72 > left/a; seq 73 144 > right/a; touch left/only; diff --paginate left right | sed "s/^[0-9][0-9-]* [0-9][0-9:]* /DATE /"; diff -lq left/a right/a'
 same diff-tab-output 'printf "a\t1\n\ncommon\n" > a; printf "b\t2\ntext\ncommon\n" > b; for opts in -t -T -tT -uT -cT -nt -et; do diff "$opts" --label a --label b a b; done'
 expect ls-help-version 'Usage: ls [OPTION]... [FILE]...
 dir (nebox) after GNU coreutils 9.1
@@ -369,6 +370,11 @@ same uname-m 'uname -m'
 same uname-r 'uname -r'
 same uname-n 'uname -n'
 same hostname 'hostname'
+if python3 "$(dirname -- "$0")/hostname_compare.py" "$BIN" --transport; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); failed="$failed hostname-dns-transport"
+fi
 same nproc 'nproc'
 same sleep-0 'sleep 0.1; echo done'
 same kill-0 'kill -0 $$; echo $?'
@@ -451,6 +457,18 @@ same patch-create-delete "$PF diff -u /dev/null b | sed 's#^+++ b#+++ newdir/new
 same patch-output-reject "$PF diff -u a b | sed 's/^+++ b/+++ a/; s#\t.*##' > o.diff; patch -o out < o.diff; echo \$?; cat out; cat a | head -5; sed 's/^5$/FIVE/' a > a2; mv a2 a; patch -r my.rej < o.diff; echo \$?; cat my.rej; ls"
 same patch-dir-empty "$PF diff -u a b | sed 's/^+++ b/+++ a/; s#\t.*##' > o.diff; mkdir w; cp a w/; patch -d w < o.diff; echo \$?; cat w/a; printf '1\n' > one; printf -- '--- one\n+++ one\n@@ -1 +0,0 @@\n-1\n' > e.diff; patch -E < e.diff; echo \$?; ls one 2>&1"
 same patch-nonl "printf 'a\nb' > f; printf 'a\nc' > g; diff -u f g | sed 's/^+++ g/+++ f/; s#\t.*##' > n.diff; patch < n.diff; echo \$?; od -c f; printf 'x\ny\n' > h; printf -- '--- h\n+++ h\n@@ -1,2 +1,2 @@\n x\n-y\n+z\n\\\\ No newline at end of file\n' > n2.diff; patch < n2.diff; echo \$?; od -c h"
+expect patch-ed-script 'patching file target
+a
+.
+inserted
+c
+exit=0' 'printf "a\nb\nc\n" > target; printf "a\n.\ninserted\nc\n" > after; diff -e target after > edits; patch -e target edits && cat target'
+expect patch-ed-dry-run 'checking file target
+a
+b
+exit=0' 'printf "a\nb\n" > target; printf "2d\n" > edits; patch --ed --dry-run target edits && cat target'
+same patch-ignore-whitespace 'printf "before one\nold one\nkeep two\n" > a; printf "before one\nnew one\nextra\nkeep two\n" > b; diff -u --label target --label target a b > change; printf "before\t one   \nold   one\nkeep\ttwo\n" > target; patch --ignore-whitespace < change; cat target'
+same patch-ignore-whitespace-reverse 'printf "x a\n" > a; printf "x b\n" > b; diff -u --label target --label target a b > change; printf "x\t b" > target; patch -lR < change; od -c target'
 same patch-normal-context "$PF diff a b > n.diff; patch a n.diff; echo \$?; cat a; diff -c c d | sed 's/^--- d/--- c/; s#\t.*##' > c.diff; patch < c.diff; echo \$?; cat c"
 same patch-garbage "echo hello | patch; echo \$?; printf '' | patch; echo \$?"
 # diff (GNU diffutils 3.8); tests/diff_fuzz.py compares the edit scripts on random inputs

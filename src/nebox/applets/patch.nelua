@@ -49,7 +49,7 @@ local FilePatch = @record{
 local Opt = @record{
   strip: integer, fuzz: integer,
   reverse: boolean, forward: boolean, batch: boolean, force: boolean, silent: boolean,
-  backup: boolean, remove_empty: boolean, dry_run: boolean,
+  backup: boolean, remove_empty: boolean, dry_run: boolean, loose: boolean,
   outfile: string, rejfile: string,
 }
 
@@ -411,20 +411,45 @@ local function line_eq(a: PLine, b: PLine): boolean
   return a.nonl == b.nonl and a.text == b.text
 end
 
+local function blank(c: byte): boolean
+  return c == 32 or c == 9
+end
+
+-- GNU similar: blank runs in the patch match input blank runs, and the
+-- comparison ignores the final newline. Keep the original text for copying.
+local function loose_line_eq(input: string, patch: string): boolean
+  local a, b: usize = 0, 0
+  while true do
+    if b == patch.size or blank(patch.data[b]) then
+      while b < patch.size and blank(patch.data[b]) do b = b + 1 end
+      if a < input.size then
+        if not blank(input.data[a]) then return false end
+        repeat a = a + 1 until a == input.size or not blank(input.data[a])
+      end
+      if a == input.size or b == patch.size then return a == input.size and b == patch.size end
+    else
+      if a == input.size or input.data[a] ~= patch.data[b] then return false end
+      a = a + 1; b = b + 1
+    end
+  end
+end
+
 -- GNU patch_match: the hunk's old lines (less the fuzzed ones) at `base`.
-local function patch_match(t: *Target, h: *Hunk, base: integer, prefix_fuzz: integer, suffix_fuzz: integer): boolean
+local function patch_match(t: *Target, h: *Hunk, base: integer, prefix_fuzz: integer, suffix_fuzz: integer, loose: boolean): boolean
   local n = #h.old - suffix_fuzz
   local iline = base + prefix_fuzz
   for pline = 1 + prefix_fuzz, n do
     if iline < 1 or iline > #t.lines then return false end
-    if not line_eq(t.lines[iline], h.old[pline]) then return false end
+    if loose then
+      if not loose_line_eq(t.lines[iline].text, h.old[pline].text) then return false end
+    elseif not line_eq(t.lines[iline], h.old[pline]) then return false end
     iline = iline + 1
   end
   return true
 end
 
 -- GNU locate_hunk: where (1-based) the hunk's old lines begin, or 0.
-local function locate_hunk(t: *Target, h: *Hunk, fuzz: integer, in_offset: *integer, last_frozen: integer): integer
+local function locate_hunk(t: *Target, h: *Hunk, fuzz: integer, in_offset: *integer, last_frozen: integer, loose: boolean): integer
   local first_guess = h.old_first + $in_offset
   local pat_lines = #h.old
   local prefix_context, suffix_context = h.prefix, h.suffix
@@ -445,7 +470,7 @@ local function locate_hunk(t: *Target, h: *Hunk, fuzz: integer, in_offset: *inte
     end
     local offset = 1 - first_guess
     if last_frozen <= prefix_context and offset <= max_pos_offset and
-       patch_match(t, h, first_guess + offset, 0, suffix_fuzz < 0 and 0 or suffix_fuzz) then
+       patch_match(t, h, first_guess + offset, 0, suffix_fuzz < 0 and 0 or suffix_fuzz, loose) then
       $in_offset = $in_offset + offset
       return first_guess + offset
     end
@@ -456,18 +481,18 @@ local function locate_hunk(t: *Target, h: *Hunk, fuzz: integer, in_offset: *inte
   if suffix_fuzz < 0 then
     -- can only match the end of the file
     local offset = first_guess - (#t.lines - pat_lines + 1)
-    if offset <= max_neg_offset and patch_match(t, h, first_guess - offset, prefix_fuzz, 0) then
+    if offset <= max_neg_offset and patch_match(t, h, first_guess - offset, prefix_fuzz, 0, loose) then
       $in_offset = $in_offset - offset
       return first_guess - offset
     end
     return 0
   end
   for offset = 0, max_offset do
-    if offset <= max_pos_offset and patch_match(t, h, first_guess + offset, prefix_fuzz, suffix_fuzz) then
+    if offset <= max_pos_offset and patch_match(t, h, first_guess + offset, prefix_fuzz, suffix_fuzz, loose) then
       $in_offset = $in_offset + offset
       return first_guess + offset
     end
-    if offset > 0 and offset <= max_neg_offset and patch_match(t, h, first_guess - offset, prefix_fuzz, suffix_fuzz) then
+    if offset > 0 and offset <= max_neg_offset and patch_match(t, h, first_guess - offset, prefix_fuzz, suffix_fuzz, loose) then
       $in_offset = $in_offset - offset
       return first_guess - offset
     end
@@ -724,12 +749,12 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
     local maxfuzz = o.fuzz < context and o.fuzz or context
     if not skip_rest then
       while true do
-        where = locate_hunk(&t, h, fuzz, &in_offset, copied)
+        where = locate_hunk(&t, h, fuzz, &in_offset, copied, o.loose)
         if where == 0 or fuzz > 0 or in_offset ~= 0 then mismatch = true end
         if hi == 1 and where == 0 and not (o.force or apply_anyway) and reverse == reverse_given then
           -- dwim for a reversed patch: try the hunk the other way round
           swap_hunk(h)
-          where = locate_hunk(&t, h, fuzz, &in_offset, copied)
+          where = locate_hunk(&t, h, fuzz, &in_offset, copied, o.loose)
           local accepted = false
           if where ~= 0 then
             local r, skip = ok_to_reverse(o, (reverse and 'Unreversed' or 'Reversed (or previously applied)') .. ' patch detected!', reverse)
@@ -771,7 +796,19 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
       sf = fuzz + h.suffix - context; if sf < 0 then sf = 0 end
     end
     for i = 1, pf do out:push(t.lines[where + i - 1]) end
-    for i = 1 + pf, #h.new - sf do out:push(h.new[i]) end
+    local old_context = pf + 1
+    for i = 1 + pf, #h.new - sf do
+      if o.loose and h.new_marks[i] == 32 then
+        while old_context <= #h.old and h.old_marks[old_context] ~= 32 do old_context = old_context + 1 end
+        local input_line = where + old_context - 1
+        if old_context <= #h.old and input_line <= #t.lines then
+          out:push(t.lines[input_line])
+          old_context = old_context + 1
+          continue
+        end
+      end
+      out:push(h.new[i])
+    end
     -- fuzzed suffix lines may lie past the end of the file: only those
     -- that exist are copied (never index past the end: that would grow it)
     for i = 1, sf do
@@ -837,6 +874,106 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
   return rc
 end
 
+-- Accept only the editing commands that GNU patch passes to ed.
+-- In particular, patch input can never run a shell command.
+local function ed_command(line: string, current: integer): (byte, integer, integer, boolean)
+  local first, last, offset, addressed = range_at(line, 0)
+  if not addressed then
+    if line.size > 0 and isdigit(line.data[0]) then return 0, 0, 0, false end
+    first, last, offset = current, -1, 0
+  end
+  if offset >= line.size then return 0, 0, 0, false end
+  local cmd = line.data[offset]
+  offset = offset + 1
+  if cmd == 's'_b then
+    if line:subview(offset + 1, offset + 4) ~= '/.//' then return 0, 0, 0, false end
+    offset = offset + 4
+  elseif cmd == 'a'_b or cmd == 'i'_b then
+    if last >= 0 then return 0, 0, 0, false end
+  elseif cmd ~= 'c'_b and cmd ~= 'd'_b then return 0, 0, 0, false end
+  while offset < line.size and blank(line.data[offset]) do offset = offset + 1 end
+  return cmd, first, last < 0 and first or last, offset == line.size
+end
+
+local function ed_error(line: integer): integer
+  util.flush()
+  local msg = 'patch: **** Invalid ed command at input line ' .. tostring(line) .. '\n'
+  sys.write(2, msg.data, msg.size)
+  return 2
+end
+
+local function apply_ed(data: string, o: *Opt, name: string): integer
+  local script = util.lines(data)
+  local pos = 1
+  local index_name: string = ''
+  while pos <= #script do
+    local line = script[pos]
+    local _, _, _, ok = ed_command(line, 0)
+    if ok then break end
+    if starts(line, 'Index: ') then index_name = line:sub(8) end
+    pos = pos + 1
+  end
+  if pos > #script then return ed_error(1) end
+  if o.reverse then util.err("can't reverse an ed script"); return 2 end
+  if name.size == 0 then name = strip_name(index_name, o.strip) end
+  if name.size == 0 then util.err('missing file to patch'); return 2 end
+  local t: Target
+  if not load_target(name, &t) then util.perror(name); return 2 end
+  if not o.silent then
+    local verb = o.dry_run and 'checking file ' or 'patching file '
+    if o.outfile.size > 0 and o.outfile ~= name then
+      say(verb .. o.outfile .. ' (read from ' .. name .. ')\n')
+    else say(verb .. name .. '\n') end
+  end
+  if #t.lines > 0 then t.lines[#t.lines].nonl = false end
+  local current = #t.lines
+  while pos <= #script do
+    local cmd, first, last, ok = ed_command(script[pos], current)
+    local command_line = pos
+    if not ok or first < 0 or first > last or last > #t.lines then return ed_error(pos) end
+    pos = pos + 1
+    if cmd == 's'_b then
+      if first < 1 then return ed_error(command_line) end
+      for i = first, last do
+        if t.lines[i].text.size == 0 then return ed_error(command_line) end
+        t.lines[i].text = t.lines[i].text:subview(2)
+      end
+      current = last
+      continue
+    end
+    local before, after = first - 1, last + 1
+    if cmd == 'a'_b then before, after = first, first + 1
+    elseif cmd == 'i'_b then before, after = first - 1, first end
+    if before < 0 then return ed_error(command_line) end
+    local out: sequence(PLine)
+    for i = 1, before do out:push(t.lines[i]) end
+    if cmd ~= 'd'_b then
+      while pos <= #script and script[pos] ~= '.' do
+        out:push({script[pos], false})
+        pos = pos + 1
+      end
+      if pos > #script then return ed_error(command_line) end
+      pos = pos + 1
+    end
+    current = #out
+    if cmd == 'd'_b and after <= #t.lines then current = current + 1 end
+    for i = after, #t.lines do out:push(t.lines[i]) end
+    t.lines:destroy()
+    t.lines = out
+  end
+  if o.dry_run then return 0 end
+  if o.backup and o.outfile.size == 0 then
+    local original, ok = util.readfile(name)
+    if ok then save_file(name .. '.orig', original) end
+  end
+  if o.remove_empty and o.outfile.size == 0 and #t.lines == 0 then
+    if sys.unlink(name) ~= 0 then util.perror(name); return 2 end
+    return 0
+  end
+  local target = o.outfile.size == 0 and name or o.outfile
+  return write_file(target, &t.lines, o.outfile.size > 0 and 0x180 or 0x1a4) and 0 or 2
+end
+
 global function applet_patch(args: sequence(string)): integer
   -- long options GNU patch users write, mapped to the short ones
   local rest: sequence(string)
@@ -848,6 +985,7 @@ global function applet_patch(args: sequence(string)): integer
     elseif a == '--reverse' then rest:push('-R')
     elseif a == '--batch' then rest:push('-t')
     elseif a == '--force' then rest:push('-f')
+    elseif a == '--ignore-whitespace' then rest:push('-l')
     elseif a == '--silent' or a == '--quiet' then rest:push('-s')
     elseif a == '--backup' then rest:push('-b')
     elseif a == '--remove-empty-files' then rest:push('-E')
@@ -860,13 +998,14 @@ global function applet_patch(args: sequence(string)): integer
     elseif a == '--unified' then rest:push('-u')
     elseif a == '--context' then rest:push('-c')
     elseif a == '--normal' then rest:push('-n')
+    elseif a == '--ed' then rest:push('-e')
     else rest:push(a) end
   end
-  local o = util.parse(rest, 'bcd:EfF:i:no:p:Rr:stuN')
+  local o = util.parse(rest, 'bcd:eEfF:i:lno:p:Rr:stuN')
   if not o:ok() then return util.optfail(o) + 1 end
   local opt: Opt = {strip = -1, fuzz = 2, reverse = o:has('R'), forward = o:has('N'),
     batch = o:has('t'), force = o:has('f'), silent = o:has('s'), backup = o:has('b'),
-    remove_empty = o:has('E'), dry_run = dry}
+    remove_empty = o:has('E'), dry_run = dry, loose = o:has('l')}
   if o:has('p') then
     local v, ok = util.toint(o:get('p'))
     if not ok or v < 0 then util.err("strip count " .. o:get('p') .. " is not a number"); return 2 end
@@ -895,6 +1034,7 @@ global function applet_patch(args: sequence(string)): integer
     data = d
   end
   if o:has('d') and sys.chdir(o:get('d')) ~= 0 then util.perror(o:get('d')); return 2 end
+  if o:has('e') and data.size > 0 then return apply_ed(data, &opt, file_operand) end
   local fps = parse_patch(data)
   if #fps == 0 and data.size == 0 then return 0 end   -- empty input: nothing to do
   if #fps == 0 then
