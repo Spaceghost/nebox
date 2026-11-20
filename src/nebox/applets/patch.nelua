@@ -51,6 +51,7 @@ local Opt = @record{
   reverse: boolean, forward: boolean, batch: boolean, force: boolean, silent: boolean,
   backup: boolean, remove_empty: boolean, dry_run: boolean, loose: boolean,
   outfile: string, rejfile: string,
+  conditional: boolean, symbol: string,
 }
 
 local function starts(s: string, p: string): boolean
@@ -665,6 +666,37 @@ local function ok_to_reverse(o: *Opt, message: string, reverse: boolean): (boole
 end
 
 -- Apply one file's hunks. Returns 0, 1 (some hunks failed or were skipped) or 2.
+local function directive(out: *sequence(PLine), text: string)
+  if #out > 0 then out[#out].nonl = false end
+  out:push({text, false})
+end
+
+local function ifdef_hunk(out: *sequence(PLine), t: *Target, h: *Hunk, where: integer,
+                          prefix_fuzz: integer, suffix_fuzz: integer, symbol: string)
+  local old, new = prefix_fuzz + 1, prefix_fuzz + 1
+  local old_limit, new_limit = #h.old - suffix_fuzz, #h.new - suffix_fuzz
+  while old <= old_limit or new <= new_limit do
+    if old <= old_limit and new <= new_limit and h.old_marks[old] == 32 and h.new_marks[new] == 32 then
+      out:push(t.lines[where + old - 1])
+      old = old + 1; new = new + 1
+      continue
+    end
+    local old_start, new_start = old, new
+    while old <= old_limit and h.old_marks[old] ~= 32 do old = old + 1 end
+    while new <= new_limit and h.new_marks[new] ~= 32 do new = new + 1 end
+    if old_start == old and new_start == new then break end
+    if old_start < old then
+      directive(out, '#ifndef ' .. symbol)
+      for i = old_start, < old do out:push(h.old[i]) end
+    end
+    if new_start < new then
+      directive(out, old_start < old and '#else' or ('#ifdef ' .. symbol))
+      for i = new_start, < new do out:push(h.new[i]) end
+    end
+    directive(out, '#endif')
+  end
+end
+
 local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): integer
   local name = file_operand.size > 0 and file_operand or choose_name(fp, o)
   local nhunks = #fp.hunks
@@ -796,18 +828,22 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
       sf = fuzz + h.suffix - context; if sf < 0 then sf = 0 end
     end
     for i = 1, pf do out:push(t.lines[where + i - 1]) end
-    local old_context = pf + 1
-    for i = 1 + pf, #h.new - sf do
-      if o.loose and h.new_marks[i] == 32 then
-        while old_context <= #h.old and h.old_marks[old_context] ~= 32 do old_context = old_context + 1 end
-        local input_line = where + old_context - 1
-        if old_context <= #h.old and input_line <= #t.lines then
-          out:push(t.lines[input_line])
-          old_context = old_context + 1
-          continue
+    if o.conditional then
+      ifdef_hunk(&out, &t, h, where, pf, sf, o.symbol)
+    else
+      local old_context = pf + 1
+      for i = 1 + pf, #h.new - sf do
+        if o.loose and h.new_marks[i] == 32 then
+          while old_context <= #h.old and h.old_marks[old_context] ~= 32 do old_context = old_context + 1 end
+          local input_line = where + old_context - 1
+          if old_context <= #h.old and input_line <= #t.lines then
+            out:push(t.lines[input_line])
+            old_context = old_context + 1
+            continue
+          end
         end
+        out:push(h.new[i])
       end
-      out:push(h.new[i])
     end
     -- fuzzed suffix lines may lie past the end of the file: only those
     -- that exist are copied (never index past the end: that would grow it)
@@ -855,7 +891,7 @@ local function apply_file(fp: *FilePatch, o: *Opt, file_operand: string): intege
     if util.exists(name) and sys.unlink(name) ~= 0 then util.perror(name); return 2 end
     return rc
   end
-  if o.outfile.size == 0 and #out > 0 and deletes then
+  if o.outfile.size == 0 and #out > 0 and deletes and not o.conditional then
     if not o.silent then say('Not deleting file ' .. name .. ' as content differs from patch\n') end
     rc = 1
   end
@@ -994,6 +1030,8 @@ global function applet_patch(args: sequence(string)): integer
     elseif starts(a, '--output=') then rest:push('-o'); rest:push(a:sub(10))
     elseif starts(a, '--reject-file=') then rest:push('-r'); rest:push(a:sub(15))
     elseif starts(a, '--directory=') then rest:push('-d'); rest:push(a:sub(13))
+    elseif a == '--ifdef' then rest:push('-D')
+    elseif starts(a, '--ifdef=') then rest:push('-D'); rest:push(a:sub(9))
     elseif starts(a, '--fuzz=') then rest:push('-F'); rest:push(a:sub(8))
     elseif a == '--unified' then rest:push('-u')
     elseif a == '--context' then rest:push('-c')
@@ -1001,11 +1039,12 @@ global function applet_patch(args: sequence(string)): integer
     elseif a == '--ed' then rest:push('-e')
     else rest:push(a) end
   end
-  local o = util.parse(rest, 'bcd:eEfF:i:lno:p:Rr:stuN')
+  local o = util.parse(rest, 'bcd:D:eEfF:i:lno:p:Rr:stuN')
   if not o:ok() then return util.optfail(o) + 1 end
   local opt: Opt = {strip = -1, fuzz = 2, reverse = o:has('R'), forward = o:has('N'),
     batch = o:has('t'), force = o:has('f'), silent = o:has('s'), backup = o:has('b'),
-    remove_empty = o:has('E'), dry_run = dry, loose = o:has('l')}
+    remove_empty = o:has('E'), dry_run = dry, loose = o:has('l'), conditional = o:has('D')}
+  if opt.conditional then opt.symbol = o:get('D') end
   if o:has('p') then
     local v, ok = util.toint(o:get('p'))
     if not ok or v < 0 then util.err("strip count " .. o:get('p') .. " is not a number"); return 2 end

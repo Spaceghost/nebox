@@ -981,7 +981,8 @@ Individual applets below list the operations that still use byte semantics.
   200). `-e`/`--ed` applies the numeric editing commands emitted by
   `diff -e`, including its literal-dot escape. `-l`/`--ignore-whitespace`
   uses GNU's blank-run matching and preserves input context lines.
-  Not supported: `-D`, `--merge`, `--posix`,
+  `-D`/`--ifdef` wraps old and new text in C preprocessor conditionals.
+  Not supported: `--merge`, `--posix`,
   git diffs (renames, modes, binary), version control lookups.
 - `dd` is a port of GNU coreutils 9.1 `src/dd.c` (read from its source):
   every operand (`iseek`/`oseek` too), conversion and flag, GNU's number
@@ -1100,7 +1101,8 @@ Individual applets below list the operations that still use byte semantics.
   other seeds also gave 0). Differences:
   - `-P` uses the optional PCRE2 8-bit interpreter. Set
     `PCRE2_LIB=/path/to/libpcre2-8.a` and
-    `PCRE2_INCLUDE=/path/to/include` when invoking make. Use an archive
+    `PCRE2_INCLUDE=/path/to/include` when invoking make. The default
+    output path for this configuration is `build-pcre2/nebox`. Use an archive
     compiled against Nelibc headers with stack protection and JIT disabled,
     or another archive that links with standalone Nelibc. The default build
     omits this dependency and prints GNU's disabled-Perl diagnostic.

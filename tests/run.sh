@@ -369,7 +369,7 @@ same uname-s 'uname -s'
 same uname-m 'uname -m'
 same uname-r 'uname -r'
 same uname-n 'uname -n'
-if printf 'ab\n' | "$BIN" grep -Pq '(?<=a)b'; then
+if printf 'ab\n' | "$BIN" grep -Pq '(?<=a)b' 2>/dev/null; then
   same grep-perl-lookarounds 'printf "a:123 x:4\na:56z\n" | grep -Pon "(?<=a:)\d+(?![0-9z])"; printf "abcb abc abc_\n" | grep -Pow "abc"; printf "x12\n12\n" | grep -Px "[0-9]+"'
   same grep-perl-captures 'printf "cat cat\ncat dog\nfoo=42 bar=7\n" | grep -P "(\w+) \1"; printf "foo=42 bar=7\n" | grep -Po "\w+=\K\d+"'
   same grep-perl-utf8 'printf "Élan élan\n123٤５\n" | LC_ALL=C.UTF-8 grep -Poi "élan|\p{Mn}|\d+"'
@@ -463,6 +463,8 @@ same patch-create-delete "$PF diff -u /dev/null b | sed 's#^+++ b#+++ newdir/new
 same patch-output-reject "$PF diff -u a b | sed 's/^+++ b/+++ a/; s#\t.*##' > o.diff; patch -o out < o.diff; echo \$?; cat out; cat a | head -5; sed 's/^5$/FIVE/' a > a2; mv a2 a; patch -r my.rej < o.diff; echo \$?; cat my.rej; ls"
 same patch-dir-empty "$PF diff -u a b | sed 's/^+++ b/+++ a/; s#\t.*##' > o.diff; mkdir w; cp a w/; patch -d w < o.diff; echo \$?; cat w/a; printf '1\n' > one; printf -- '--- one\n+++ one\n@@ -1 +0,0 @@\n-1\n' > e.diff; patch -E < e.diff; echo \$?; ls one 2>&1"
 same patch-nonl "printf 'a\nb' > f; printf 'a\nc' > g; diff -u f g | sed 's/^+++ g/+++ f/; s#\t.*##' > n.diff; patch < n.diff; echo \$?; od -c f; printf 'x\ny\n' > h; printf -- '--- h\n+++ h\n@@ -1,2 +1,2 @@\n x\n-y\n+z\n\\\\ No newline at end of file\n' > n2.diff; patch < n2.diff; echo \$?; od -c h"
+same patch-ifdef 'printf "before\nold\nmid\ndrop\nend\n" > target; printf "before\nnew\nextra\nmid\nend\nadd\n" > after; diff -u --label target --label target target after > changes; patch --ifdef=FEATURE < changes; cat target'
+same patch-ifdef-context 'printf "before\nold\nend\n" > target; printf "before\nnew\nend\n" > after; diff -c --label target --label target target after > changes; patch -D FEATURE -o result < changes; cat result'
 expect patch-ed-script 'patching file target
 a
 .
