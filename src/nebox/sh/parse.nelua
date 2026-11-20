@@ -158,13 +158,11 @@ local function parse_simple(lx: *shlex.Lexer): integer
     elseif t.kind == T.T_WORD then
       local wi = t.word
       lx:take()
-      if not have_cmd then
-        mark_assignment(wi)
-        if N.W(wi).assign then
-          words:push(wi)
-          first = false
-          continue
-        end
+      mark_assignment(wi)
+      if not have_cmd and N.W(wi).assign then
+        words:push(wi)
+        first = false
+        continue
       end
       if first and not have_cmd then
         -- function definition? (copy the word: peeking may grow the arena)
