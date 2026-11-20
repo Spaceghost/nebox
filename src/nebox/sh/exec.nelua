@@ -1274,6 +1274,13 @@ end
 
 local function exec_pipeline(n: *N.Node): integer
   local count = n.b
+  -- A single negated command still runs in the current shell.
+  if count == 1 then
+    shst.errexit_ignore = shst.errexit_ignore + 1
+    local status = exec_node(N.L(n.a))
+    shst.errexit_ignore = shst.errexit_ignore - 1
+    return status == 0 and 1 or 0
+  end
   local pids: sequence(cint)
   local prev_read: cint = -1
   local jc = shexec.jc_active()

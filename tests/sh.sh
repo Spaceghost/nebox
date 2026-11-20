@@ -34,6 +34,13 @@ NEBOX_SCOPE=child
 NEBOX_SCOPE=global
 exit=0' 'export NEBOX_SCOPE=global; f(){ local NEBOX_SCOPE; env | grep "^NEBOX_SCOPE=" || echo unset; NEBOX_SCOPE=child; env | grep "^NEBOX_SCOPE="; }; f; env | grep "^NEBOX_SCOPE="'
 
+shx sh-negated-source-keeps-functions 'helper available
+exit=0' 'printf "%s\n" "helper() { echo helper available; }" >helpers
+load() { if ! . ./helpers; then exit 5; fi; }
+load
+helper'
+shx sh-negated-assignment-keeps-value '1:new
+exit=0' 'set -e; x=old; ! x=new; echo "$?:$x"'
 shc sh-echo 'echo hello world'
 shc sh-status 'false; echo $?; true; echo $?'
 shf sh-file-args 'echo "$0 $# $1"'
