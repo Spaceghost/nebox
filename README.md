@@ -148,9 +148,10 @@ interpreted in this nine-argument form; existing three through eight argument
 manifest invocations keep their original meanings.
 
 Append a compiled Theseus graph to the manifest command to build and install
-the native PID 1, supervisor, client and installer. This mode requires an SDK
-with the standalone Nelibc interfaces used by native Theseus. An optional last
-argument names a Nelua test service to install as `/bin/control-test`.
+the PID 1, supervisor, client and installer. Passing the staged compiler as
+the ninth argument also builds all four programs and the optional test
+service with necc's native backend. This mode requires an SDK with the
+standalone Nelibc interfaces used by Theseus.
 
 ```sh
 "$NECC" --lua "$NEBOX_SRC/tools/distro_manifest.lua" \

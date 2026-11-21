@@ -115,13 +115,18 @@ if graph then
     {'theseus-init', 'init'}, {'theseusd', 'supervisor'},
     {'theseus', 'live_client'}, {'theseus-install', 'install'},
   }) do
-    edge(target[1], theseus .. '/src/' .. target[2] .. '.nelua', theseus_sources, {'-L', theseus}, compiler, linker)
+    local theseus_options = {'-L', theseus}
+    if stage_compiler then table.insert(theseus_options, 1, '--native') end
+    edge(target[1], theseus .. '/src/' .. target[2] .. '.nelua', theseus_sources,
+      theseus_options, compiler, linker)
   end
   native_inputs = ' theseus-init theseusd theseus theseus-install ' .. path_token(graph)
   native_args = ' ' .. quote(graph)
   if control_source then
     local control_inputs = {control_source, theseus .. '/tests/command.nelua'}
-    edge('control-test', control_source, control_inputs, {'-L', theseus}, compiler, linker)
+    local control_options = {'-L', theseus}
+    if stage_compiler then table.insert(control_options, 1, '--native') end
+    edge('control-test', control_source, control_inputs, control_options, compiler, linker)
     native_inputs = native_inputs .. ' control-test'
     native_args = native_args .. ' ./control-test'
   end
