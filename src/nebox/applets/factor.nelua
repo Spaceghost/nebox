@@ -981,7 +981,9 @@ global function applet_factor(args: sequence(string)): integer
       local r = sys.read(0, &chunk[0], #chunk)
       if r < 0 then
         if sys.errno() == sys.EINTR then continue end
-        break -- readtoken treats a read error as the end of input, silently
+        util.err('error reading input: ' .. sys.errstr())
+        ok = false
+        break
       end
       if r == 0 then break end
       for k = 0, < r do
