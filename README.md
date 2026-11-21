@@ -129,6 +129,24 @@ uses both rebuilt tools to link Nebox and nebuild and installs them in the image
 python3 "$NEBOX_SRC/tests/theseus_boot.py" "$KERNEL" --boot-image rootfs.cpio --expect-nelinker
 ```
 
+To bootstrap necc and nelinker with a staged native necc, pass its path as the
+ninth manifest argument. The staged compiler builds nelinker and necc with
+`--native --release`; necc links with the new nelinker. That necc then builds
+the installed nebuild with `--native --release`. Use `-` for an omitted Theseus
+source, graph, or control-test argument so the stage compiler remains ninth:
+
+```sh
+"$NECC" --lua "$NEBOX_SRC/tools/distro_manifest.lua" \
+  "$NECC" "$SDK" "$NEBOX_SRC" - "$NECC_SRC" "$NELINKER_SRC" \
+  - - "$STAGE_NECC" > build.ne
+"$NEBUILD" -j 2 build.ne
+```
+
+When building a Theseus graph without a control-test service, place the graph
+path before the `-` control-test placeholder. The `-` placeholders are only
+interpreted in this nine-argument form; existing three through eight argument
+manifest invocations keep their original meanings.
+
 Append a compiled Theseus graph to the manifest command to build and install
 the native PID 1, supervisor, client and installer. This mode requires an SDK
 with the standalone Nelibc interfaces used by native Theseus. An optional last

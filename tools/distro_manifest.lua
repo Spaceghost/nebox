@@ -1,7 +1,7 @@
 -- Print a nebuild manifest for the development image using a staged necc SDK.
 local lfs = require 'lfs'
-assert(#arg == 3 or #arg == 4 or #arg == 6 or #arg == 7 or #arg == 8,
-  'usage: distro_manifest.lua NECC SDK NEBOX_SRC [THESEUS_SRC [NECC_SRC NELINKER_SRC [GRAPH [CONTROL_SRC]]]]')
+assert(#arg == 3 or #arg == 4 or #arg == 6 or #arg == 7 or #arg == 8 or #arg == 9,
+  'usage: distro_manifest.lua NECC SDK NEBOX_SRC [THESEUS_SRC [NECC_SRC NELINKER_SRC [GRAPH [CONTROL_SRC [STAGE_NECC]]]]]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -14,6 +14,16 @@ local necc_source = arg[5] and absolute(arg[5])
 local linker_source = arg[6] and absolute(arg[6]) .. '/src'
 local graph = arg[7] and absolute(arg[7])
 local control_source = arg[8] and absolute(arg[8])
+local stage_compiler = arg[9] and absolute(arg[9])
+if stage_compiler then
+  assert(necc_source and linker_source, 'STAGE_NECC requires NECC_SRC and NELINKER_SRC')
+  -- Preserve the positional 9th argument while allowing callers to omit the
+  -- optional Theseus, graph, and control sources. The sentinel is only special
+  -- in this new 9-argument form; older 3-8 argument invocations retain meaning.
+  if arg[4] == '-' then theseus = nil end
+  if arg[7] == '-' then graph = nil end
+  if arg[8] == '-' then control_source = nil end
+end
 local function quote(word)
   return "'" .. word:gsub("'", "'\\''") .. "'"
 end
@@ -72,8 +82,17 @@ if necc_source then
   local driver_files, linker_files = {}, {}
   sources(necc_source, '%.nelua$', driver_files)
   sources(linker_source, '%.nelua$', linker_files)
-  edge('nelinker', linker_source .. '/nelinker.nelua', linker_files, {'-L', linker_source}, cc)
-  edge('necc', necc_source .. '/necc.nelua', driver_files, {'-L', necc_source}, cc, 'nelinker')
+  local bootstrap = stage_compiler or cc
+  local bootstrap_options = {}
+  if stage_compiler then bootstrap_options[#bootstrap_options + 1] = '--native' end
+  local linker_options = {table.unpack(bootstrap_options)}
+  linker_options[#linker_options + 1] = '-L'
+  linker_options[#linker_options + 1] = linker_source
+  local necc_options = {table.unpack(bootstrap_options)}
+  necc_options[#necc_options + 1] = '-L'
+  necc_options[#necc_options + 1] = necc_source
+  edge('nelinker', linker_source .. '/nelinker.nelua', linker_files, linker_options, bootstrap)
+  edge('necc', necc_source .. '/necc.nelua', driver_files, necc_options, bootstrap, 'nelinker')
   compiler, linker = 'necc', 'nelinker'
 end
 
@@ -85,7 +104,9 @@ if theseus then
 end
 edge('nebox', nebox .. '/src/nebox.nelua', app_sources, options, compiler, linker)
 local builder = nebox .. '/tools/nebuild.nelua'
-edge('nebuild', builder, {builder, nebox .. '/src/nebox/sys.nelua'}, {'-L', nebox .. '/src'}, compiler, linker)
+local builder_options = {'-L', nebox .. '/src'}
+if stage_compiler then table.insert(builder_options, 1, '--native') end
+edge('nebuild', builder, {builder, nebox .. '/src/nebox/sys.nelua'}, builder_options, compiler, linker)
 local native_inputs, native_args = '', ''
 if graph then
   local theseus_sources = {}
