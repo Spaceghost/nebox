@@ -13,8 +13,6 @@ require 'nebox.util'
 require 'nebox.getdate'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
-local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
-local function c_futimens(fd: cint, ts: *[2]sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
 
 local AT_FDCWD: cint <comptime> = -100
 local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
@@ -69,10 +67,10 @@ local function touch(file: string): boolean
   end
   local r: cint
   if fd >= 0 then
-    if amtime_now then r = c_futimens(fd, nilptr) else r = c_futimens(fd, &newtime) end
+    if amtime_now then r = sys.futimens(fd, nilptr) else r = sys.futimens(fd, &newtime[0]) end
   else
     local flags = no_dereference and AT_SYMLINK_NOFOLLOW or 0
-    if amtime_now then r = c_utimensat(AT_FDCWD, file, nilptr, flags) else r = c_utimensat(AT_FDCWD, file, &newtime, flags) end
+    if amtime_now then r = sys.utimensat(AT_FDCWD, file, nilptr, flags) else r = sys.utimensat(AT_FDCWD, file, &newtime[0], flags) end
   end
   local utime_errno: cint = r == 0 and 0 or sys.errno()
   if fd >= 0 and fd ~= 1 then

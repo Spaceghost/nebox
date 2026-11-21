@@ -14,10 +14,8 @@ local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', nore
 local function c_malloc(n: csize): pointer <cimport 'malloc', cinclude '<stdlib.h>'> end
 local function c_execv(path: cstring, argv: *[0]cstring): cint <cimport 'execv', cinclude '<unistd.h>'> end
 local function c_ftruncate(fd: cint, len: clong): cint <cimport 'ftruncate', cinclude '<unistd.h>'> end
-local Sigset: type <cimport 'sigset_t', cinclude '<signal.h>', nodecl> = @record{ __val: [16]culong }
-local function c_sigemptyset(s: *Sigset): cint <cimport 'sigemptyset', cinclude '<signal.h>'> end
-local function c_sigaddset(s: *Sigset, n: cint): cint <cimport 'sigaddset', cinclude '<signal.h>'> end
-local function c_sigprocmask(how: cint, s: *Sigset, old: *Sigset): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
+local function c_sigemptyset(s: *sys.SigSet): cint <cimport 'sigemptyset', cinclude '<signal.h>'> end
+local function c_sigaddset(s: *sys.SigSet, n: cint): cint <cimport 'sigaddset', cinclude '<signal.h>'> end
 local SIG_BLOCK: cint <comptime> = 0
 local SIG_SETMASK: cint <comptime> = 2
 local EOVERFLOW: cint <comptime> = 75
@@ -68,8 +66,8 @@ local unbuffered = false
 local eolchar: integer = -1
 local in_dev: culong
 local in_ino: culong
-local oldblocked: Sigset
-local newblocked: Sigset
+local oldblocked: sys.SigSet
+local newblocked: sys.SigSet
 
 local function die(msg: string)
   util.err(msg)
@@ -251,7 +249,7 @@ local function create(name: string): cint
       if sys.dup2(fds[0], 0) ~= 0 then die_errno(sys.errno(), 'moving input pipe') end
       if sys.close(fds[0]) ~= 0 then die_errno(sys.errno(), 'closing input pipe') end
     end
-    c_sigprocmask(SIG_SETMASK, &oldblocked, nilptr)
+    sys.sigprocmask(SIG_SETMASK, &oldblocked, nilptr)
     local argv: [4]cstring = {last_component(shell), '-c', filter_command, nilptr}
     c_execv(shell, &argv)
     die_errno(sys.errno(), 'failed to run command: "' .. shell .. ' -c ' .. filter_command .. '"')
@@ -918,7 +916,7 @@ global function applet_split(args: sequence(string)): integer
     c_sigemptyset(&newblocked)
     sys.sigaction(sys.SIGPIPE, nilptr, &act)
     if (@usize)((@pointer)(act.sa_handler)) ~= sys.SIG_IGN then c_sigaddset(&newblocked, sys.SIGPIPE) end
-    c_sigprocmask(SIG_BLOCK, &newblocked, &oldblocked)
+    sys.sigprocmask(SIG_BLOCK, &newblocked, &oldblocked)
   end
   if split_type == T_DIGITS or split_type == T_LINES then
     lines_split(n_units, buf, in_blk_size)

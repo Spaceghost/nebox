@@ -42,8 +42,6 @@ local Group <cimport 'group', cinclude '<grp.h>', nodecl, ctypedef 'group'> = @r
 }
 local function c_getpwuid(uid: cuint): *Passwd <cimport 'getpwuid', cinclude '<pwd.h>'> end
 local function c_getgrgid(gid: cuint): *Group <cimport 'getgrgid', cinclude '<grp.h>'> end
-local SigSet = @record{bits: [16]culong}
-local function c_sigprocmask(how: cint, set: *SigSet, old: *SigSet): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
 
 -- struct statx (the Linux UAPI layout, 256 bytes)
 local StatxTs = @record{tv_sec: int64, tv_nsec: uint32, reserved: int32}
@@ -287,7 +285,7 @@ local group_cache: sequence(IdName)
 local long_time_width: integer = -1
 local interrupt_signal: cint = 0
 local stop_signal_count: cint = 0
-local caught_signals: SigSet
+local caught_signals: sys.SigSet
 
 local function stdout_isatty(): boolean
   if out_tty < 0 then out_tty = sys.isatty(1) == 1 and 1 or 0 end
@@ -405,14 +403,14 @@ end
 
 local sig_list: [12]cint = {20, 14, 1, 2, 13, 3, 15, 29, 27, 26, 24, 25}
 
-local function sigaddset(set: *SigSet, n: cint)
+local function sigaddset(set: *sys.SigSet, n: cint)
   local b = n - 1
-  set.bits[b // 64] = set.bits[b // 64] | ((@culong)(1) << (b % 64))
+  set.__bits[b // 64] = set.__bits[b // 64] | ((@culong)(1) << (b % 64))
 end
 
-local function sigismember(set: *SigSet, n: cint): boolean
+local function sigismember(set: *sys.SigSet, n: cint): boolean
   local b = n - 1
-  return (set.bits[b // 64] & ((@culong)(1) << (b % 64))) ~= 0
+  return (set.__bits[b // 64] & ((@culong)(1) << (b % 64))) ~= 0
 end
 
 local function sighandler(sig: cint)
@@ -426,13 +424,12 @@ end
 local function signal_setup(init: boolean)
   if init then
     local act: sys.Sigaction
-    caught_signals = (@SigSet)()
+    caught_signals = (@sys.SigSet)()
     for j = 0, < #sig_list do
       sys.sigaction(sig_list[j], nilptr, &act)
       if (@usize)((@pointer)(act.sa_handler)) ~= sys.SIG_IGN then sigaddset(&caught_signals, sig_list[j]) end
     end
-    local mask = (@*[16]culong)(&act.sa_mask)
-    for k = 0, < 16 do mask[k] = caught_signals.bits[k] end
+    act.sa_mask = caught_signals
     act.sa_flags = SA_RESTART
     for j = 0, < #sig_list do
       if sigismember(&caught_signals, sig_list[j]) then
@@ -502,8 +499,8 @@ local function process_signals()
   while interrupt_signal ~= 0 or stop_signal_count ~= 0 do
     if used_color then restore_default_color() end
     util.flush()
-    local oldset: SigSet
-    c_sigprocmask(SIG_BLOCK, &caught_signals, &oldset)
+    local oldset: sys.SigSet
+    sys.sigprocmask(SIG_BLOCK, &caught_signals, &oldset)
     local sig = interrupt_signal
     local stops = stop_signal_count
     if stops ~= 0 then
@@ -515,7 +512,7 @@ local function process_signals()
       sys.sigaction(sig, &act, nilptr)
     end
     raise(sig)
-    c_sigprocmask(SIG_SETMASK, &oldset, nilptr)
+    sys.sigprocmask(SIG_SETMASK, &oldset, nilptr)
   end
 end
 

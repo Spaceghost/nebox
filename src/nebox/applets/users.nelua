@@ -26,16 +26,6 @@ local DEAD_PROCESS <comptime> = 8
 local UTMP = @[384]byte
 local ESRCH: cint <comptime> = 3
 
-local function c_qsort(base: pointer, count: csize, size: csize, compare: function(pointer, pointer): cint)
-  <cimport 'qsort', cinclude '<stdlib.h>'> end
-
-local function compare_names(a: pointer, b: pointer): cint
-  local left = $((@*string)(a))
-  local right = $((@*string)(b))
-  if left == right then return 0 end
-  return left < right and -1 or 1
-end
-
 local function field(entry: *UTMP, start: usize, width: usize): string
   local size: usize = 0
   while size < width and entry[start + size] ~= 0 do size = size + 1 end
@@ -89,7 +79,7 @@ global function applet_users(args: sequence(string)): integer
     end
   end
   sys.close(fd)
-  if #entries > 1 then c_qsort(&entries[1], #entries, #@string, compare_names) end
+  util.sort(entries, util.name_less)
   for i, name in ipairs(entries) do
     if i > 1 then util.writebyte(32) end
     util.write(name)

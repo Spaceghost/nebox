@@ -15,11 +15,9 @@ require 'nebox.sig'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 local function c_strtod(s: cstring, e: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
-local SigSet = @record{bits: [16]culong}
-local function c_sigprocmask(how: cint, set: *SigSet, old: *SigSet): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
-local function c_sigsuspend(set: *SigSet): cint <cimport 'sigsuspend', cinclude '<signal.h>'> end
-local Timeval = @record{tv_sec: clong, tv_usec: clong}
-local Itimerval = @record{it_interval: Timeval, it_value: Timeval}
+local function c_sigsuspend(set: *sys.SigSet): cint <cimport 'sigsuspend', cinclude '<signal.h>'> end
+local Timeval: type <cimport 'timeval', cinclude '<sys/time.h>', nodecl, ctypedef 'timeval'> = @record{tv_sec: clong, tv_usec: clong}
+local Itimerval: type <cimport 'itimerval', cinclude '<sys/time.h>', nodecl, ctypedef 'itimerval'> = @record{it_interval: Timeval, it_value: Timeval}
 local function c_setitimer(which: cint, new: *Itimerval, old: *Itimerval): cint <cimport 'setitimer', cinclude '<sys/time.h>'> end
 local function c_setpgid(pid: cint, pgid: cint): cint <cimport 'setpgid', cinclude '<unistd.h>'> end
 local function c_waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', cinclude '<sys/wait.h>'> end
@@ -45,9 +43,9 @@ local foreground: boolean
 local verbose: boolean
 local command: string
 
-local function sigaddset(set: *SigSet, n: cint)
+local function sigaddset(set: *sys.SigSet, n: cint)
   local b = n - 1
-  set.bits[b // 64] = set.bits[b // 64] | ((@culong)(1) << (b % 64))
+  set.__bits[b // 64] = set.__bits[b // 64] | ((@culong)(1) << (b % 64))
 end
 
 local function set_handler(n: cint, handler: function(cint), flags: cint)
@@ -64,9 +62,9 @@ local function set_disposition(n: cint, ign: boolean)
 end
 
 local function unblock_signal(n: cint)
-  local set: SigSet
+  local set: sys.SigSet
   sigaddset(&set, n)
-  if c_sigprocmask(SIG_UNBLOCK, &set, nilptr) ~= 0 then util.err('warning: sigprocmask: ' .. sys.errstr()) end
+  if sys.sigprocmask(SIG_UNBLOCK, &set, nilptr) ~= 0 then util.err('warning: sigprocmask: ' .. sys.errstr()) end
 end
 
 local function settimeout(duration: float64, warn: boolean)
@@ -220,13 +218,13 @@ global function applet_timeout(args: sequence(string)): integer
   monitored_pid = pid
   unblock_signal(SIGALRM)
   settimeout(timeout, true)
-  local block: SigSet
+  local block: sys.SigSet
   local blocked: [7]cint = {SIGALRM, sys.SIGINT, sys.SIGQUIT, sys.SIGHUP, SIGTERM, term_signal, sys.SIGCHLD}
   for k = 0, 6 do
     if blocked[k] > 0 then sigaddset(&block, blocked[k]) end
   end
-  local old: SigSet
-  if c_sigprocmask(SIG_BLOCK, &block, &old) ~= 0 then util.err('warning: sigprocmask: ' .. sys.errstr()) end
+  local old: sys.SigSet
+  if sys.sigprocmask(SIG_BLOCK, &block, &old) ~= 0 then util.err('warning: sigprocmask: ' .. sys.errstr()) end
   local status: cint = 0
   local wait_result: cint
   while true do

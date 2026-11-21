@@ -427,13 +427,10 @@ end
 
 -- Read the rest of an escape sequence after ESC; returns its final form, e.g.
 -- "[A", "[3~", "[1;5C", "OH", "b" (Alt-b).
-local PollFd = @record{fd: cint, events: cshort, revents: cshort}
-local function poll_fds(fds: pointer, n: culong, timeout: cint): cint <cimport 'poll', nodecl> end
-
 local function read_escape(vi: boolean): string
   if vi then
-    local p: PollFd = {fd = 0, events = 1}
-    if poll_fds(&p, 1, 40) <= 0 then return '' end
+    local p: sys.PollFd = {fd = 0, events = 1}
+    if sys.poll(&p, 1, 40) <= 0 then return '' end
   end
   local c = read_byte_retry()
   if c < 0 then return '' end
