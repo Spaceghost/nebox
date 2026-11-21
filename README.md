@@ -130,6 +130,8 @@ and include files are prerequisites of the generated targets.
 
 ## Applets
 
+The [applet queue](docs/APPLET-QUEUE.md) tracks the next BusyBox and Toybox compatibility work.
+
 ```
 [ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum cmp comm
 cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo env expand expr
