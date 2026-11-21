@@ -143,9 +143,9 @@ source, graph, or control-test argument so the stage compiler remains ninth:
 ```
 
 When building a Theseus graph without a control-test service, place the graph
-path before the `-` control-test placeholder. The `-` placeholders are only
-interpreted in this nine-argument form; existing three through eight argument
-manifest invocations keep their original meanings.
+path before the `-` control-test placeholder. The staged build also accepts
+`--native-nebox` after `"$STAGE_NECC"` to compile the multicall binary with
+the rebuilt necc's native backend and link it with the rebuilt nelinker.
 
 Append a compiled Theseus graph to the manifest command to build and install
 the PID 1, supervisor, client and installer. Passing the staged compiler as

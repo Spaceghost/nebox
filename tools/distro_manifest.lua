@@ -1,7 +1,8 @@
 -- Print a nebuild manifest for the development image using a staged necc SDK.
 local lfs = require 'lfs'
-assert(#arg == 3 or #arg == 4 or #arg == 6 or #arg == 7 or #arg == 8 or #arg == 9,
-  'usage: distro_manifest.lua NECC SDK NEBOX_SRC [THESEUS_SRC [NECC_SRC NELINKER_SRC [GRAPH [CONTROL_SRC [STAGE_NECC]]]]]')
+local native_nebox = #arg == 10 and arg[10] == '--native-nebox'
+assert(#arg == 3 or #arg == 4 or #arg == 6 or #arg == 7 or #arg == 8 or #arg == 9 or native_nebox,
+  'usage: distro_manifest.lua NECC SDK NEBOX_SRC [THESEUS_SRC [NECC_SRC NELINKER_SRC [GRAPH [CONTROL_SRC [STAGE_NECC [--native-nebox]]]]]]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -18,8 +19,7 @@ local stage_compiler = arg[9] and absolute(arg[9])
 if stage_compiler then
   assert(necc_source and linker_source, 'STAGE_NECC requires NECC_SRC and NELINKER_SRC')
   -- Preserve the positional 9th argument while allowing callers to omit the
-  -- optional Theseus, graph, and control sources. The sentinel is only special
-  -- in this new 9-argument form; older 3-8 argument invocations retain meaning.
+  -- optional Theseus, graph, and control sources in the staged build.
   if arg[4] == '-' then theseus = nil end
   if arg[7] == '-' then graph = nil end
   if arg[8] == '-' then control_source = nil end
@@ -102,6 +102,7 @@ if theseus then
   app_sources[#app_sources + 1] = theseus .. '/src/theseus/earlyboot.nelua'
   options = {'-L', nebox .. '/src', '-L', theseus .. '/src', '--define', 'THESEUS_BOOT=true'}
 end
+if native_nebox then table.insert(options, 1, '--native') end
 edge('nebox', nebox .. '/src/nebox.nelua', app_sources, options, compiler, linker)
 local builder = nebox .. '/tools/nebuild.nelua'
 local builder_options = {'-L', nebox .. '/src'}
