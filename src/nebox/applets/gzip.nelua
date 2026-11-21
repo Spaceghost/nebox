@@ -6,7 +6,7 @@ require 'nebox.util'
 
 local function mkstemp(path: cstring): cint <cimport 'mkstemp', cinclude '<stdlib.h>'> end
 local function fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
-local function futimens(fd: cint, times: *[2]sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
+local function futimens(fd: cint, times: *sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
 
 local Options = @record{decode: boolean, stdout: boolean, keep: boolean, force: boolean, test: boolean, level: integer}
 
@@ -70,7 +70,7 @@ local function process(name: string, opts: *Options): boolean
   if out < 0 then util.perror(dest); sys.close(input); return false end
   local ok = transform(input, out, opts, name)
   local times: [2]sys.Timespec = {source.st_atim, source.st_mtim}
-  if ok and (fchmod(out, source.st_mode & 0x1ff) ~= 0 or futimens(out, &times) ~= 0) then
+  if ok and (fchmod(out, source.st_mode & 0x1ff) ~= 0 or futimens(out, &times[0]) ~= 0) then
     util.perror(dest); ok = false
   end
   if sys.close(out) ~= 0 then util.perror(dest); ok = false end
