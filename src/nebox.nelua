@@ -17,6 +17,8 @@ require 'nebox.applets.text'
 require 'nebox.applets.fs'
 require 'nebox.applets.proc'
 require 'nebox.applets.text2'
+require 'nebox.applets.ttysize'
+require 'nebox.applets.randomid'
 require 'nebox.applets.fs2'
 require 'nebox.applets.proc2'
 require 'nebox.applets.xargs'
@@ -82,6 +84,7 @@ require 'nebox.applets.which'
 require 'nebox.applets.sync'
 require 'nebox.applets.free'
 require 'nebox.applets.kill'
+require 'nebox.applets.pidof'
 require 'nebox.applets.hostname'
 require 'nebox.applets.catalog'
 require 'nebox.applets.dircolors'
@@ -105,13 +108,13 @@ local applets: []Applet = {
   {'domainname', applet_hostname}, {'du', applet_du},
   {'echo', applet_echo}, {'egrep', applet_grep}, {'env', applet_env}, {'expand', applet_expand}, {'expr', applet_expr},
   {'factor', applet_factor}, {'false', applet_false}, {'fgrep', applet_grep}, {'find', applet_find}, {'fmt', applet_fmt},
-  {'fold', applet_fold}, {'free', applet_free}, {'grep', applet_grep},
+  {'fold', applet_fold}, {'free', applet_free}, {'fsync', applet_fsync}, {'grep', applet_grep},
   {'groups', applet_groups}, {'gunzip', applet_gunzip}, {'gzip', applet_gzip}, {'hd', applet_hd}, {'head', applet_head}, {'hexdump', applet_hexdump},
   {'hostid', applet_hostid}, {'hostname', applet_hostname}, {'id', applet_id}, {'install', applet_install}, {'join', applet_join},
   {'kill', applet_kill}, {'link', applet_link}, {'ln', applet_ln}, {'logname', applet_logname}, {'ls', applet_ls}, {'lsmod', applet_lsmod},
-  {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mkfifo', applet_mkfifo}, {'mknod', applet_mknod}, {'mktemp', applet_mktemp},
+  {'mcookie', applet_mcookie}, {'md5sum', applet_md5sum}, {'mkdir', applet_mkdir}, {'mkfifo', applet_mkfifo}, {'mknod', applet_mknod}, {'mktemp', applet_mktemp},
   {'mount', applet_mount}, {'mv', applet_mv}, {'nice', applet_nice}, {'nisdomainname', applet_hostname}, {'nl', applet_nl}, {'nohup', applet_nohup}, {'nproc', applet_nproc}, {'nsh', applet_nsh}, {'od', applet_od},
-  {'paste', applet_paste}, {'patch', applet_patch}, {'pathchk', applet_pathchk}, {'pinky', applet_pinky}, {'printenv', applet_printenv}, {'printf', applet_printf},
+  {'paste', applet_paste}, {'patch', applet_patch}, {'pathchk', applet_pathchk}, {'pidof', applet_pidof}, {'pinky', applet_pinky}, {'printenv', applet_printenv}, {'printf', applet_printf},
   {'pwd', applet_pwd}, {'pwdx', applet_pwdx}, {'readlink', applet_readlink}, {'realpath', applet_realpath},
   {'rev', applet_rev}, {'rm', applet_rm}, {'rmdir', applet_rmdir}, {'sed', applet_sed},
   {'seq', applet_seq}, {'setsid', applet_setsid}, {'sh', applet_sh}, {'sha1sum', applet_sha1sum}, {'sha224sum', applet_sha224sum}, {'sha256sum', applet_sha256sum},
@@ -121,8 +124,8 @@ local applets: []Applet = {
   {'sync', applet_sync}, {'tac', applet_tac}, {'tail', applet_tail}, {'tar', applet_tar}, {'tee', applet_tee},
   {'test', applet_test}, {'timeout', applet_timeout}, {'touch', applet_touch},
   {'tr', applet_tr}, {'true', applet_true}, {'truncate', applet_truncate},
-  {'tsort', applet_tsort}, {'tty', applet_tty}, {'umount', applet_umount},
-  {'uname', applet_uname}, {'unexpand', applet_unexpand}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'uptime', applet_uptime}, {'users', applet_users}, {'vdir', applet_vdir}, {'wc', applet_wc},
+  {'tsort', applet_tsort}, {'tty', applet_tty}, {'ttysize', applet_ttysize}, {'umount', applet_umount},
+  {'uname', applet_uname}, {'unexpand', applet_unexpand}, {'uniq', applet_uniq}, {'unlink', applet_unlink}, {'uptime', applet_uptime}, {'users', applet_users}, {'usleep', applet_usleep}, {'uuidgen', applet_uuidgen}, {'vdir', applet_vdir}, {'wc', applet_wc},
   {'which', applet_which}, {'who', applet_who}, {'whoami', applet_whoami}, {'xargs', applet_xargs},
   {'yes', applet_yes}, {'ypdomainname', applet_hostname}, {'zcat', applet_zcat},
 }

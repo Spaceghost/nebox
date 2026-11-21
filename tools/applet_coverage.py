@@ -43,12 +43,18 @@ def report(busybox, toybox, nebox):
     for title, group in [*groups, ("Union", union)]:
         lines.append(f"| {title} | {len(nebox & group)} | {len(group - nebox)} | {len(group)} |")
 
-    for heading in ("Missing", "Registered"):
-        lines.extend(["", f"## {heading} applets"])
-        for title, group in groups:
-            subset = group - nebox if heading == "Missing" else group & nebox
-            formatted = ", ".join(f"`{name}`" for name in sorted(subset)) or "None"
-            lines.extend(["", f"### {title}", "", formatted])
+    lines.extend([
+        "",
+        "## Applet names",
+        "",
+        "| Applet | BusyBox | Toybox | Nebox |",
+        "|---|:---:|:---:|---|",
+    ])
+    for name in sorted(union):
+        busy = "yes" if name in busybox else ""
+        toy = "yes" if name in toybox else ""
+        status = "Registered" if name in nebox else "Missing"
+        lines.append(f"| `{name}` | {busy} | {toy} | {status} |")
 
     extras = ", ".join(f"`{name}`" for name in sorted(nebox - union)) or "None"
     lines.extend(["", "## Additional Nebox names", "", extras, ""])

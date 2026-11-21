@@ -30,6 +30,15 @@ local function errno_msg(msg: string, e: cint): string
   return msg .. ': ' .. sys.strerror(e)
 end
 
+local function sync_fd(mode: integer, fd: cint, file: string): boolean
+  local st: cint
+  if mode == MODE_DATA then st = c_fdatasync(fd)
+  elseif mode == MODE_FILE then st = c_fsync(fd)
+  else st = c_syncfs(fd) end
+  if st < 0 then util.err(errno_msg('error syncing ' .. util.quoteaf(file), sys.errno())); return false end
+  return true
+end
+
 local function sync_arg(mode: integer, file: string): boolean
   local ret = true
   local fd = sys.open(file, sys.O_RDONLY | O_NONBLOCK, 0)
@@ -46,16 +55,7 @@ local function sync_arg(mode: integer, file: string): boolean
     util.err(errno_msg("couldn't reset non-blocking mode " .. util.quoteaf(file), sys.errno()))
     ret = false
   end
-  if ret then
-    local st: cint
-    if mode == MODE_DATA then st = c_fdatasync(fd)
-    elseif mode == MODE_FILE then st = c_fsync(fd)
-    else st = c_syncfs(fd) end
-    if st < 0 then
-      util.err(errno_msg('error syncing ' .. util.quoteaf(file), sys.errno()))
-      ret = false
-    end
-  end
+  if ret then ret = sync_fd(mode, fd, file) end
   if sys.close(fd) < 0 then
     util.err(errno_msg('failed to close ' .. util.quoteaf(file), sys.errno()))
     ret = false
@@ -117,6 +117,28 @@ or their containing file systems.
   local ok = true
   for _, f in ipairs(files) do
     if not sync_arg(mode, f) then ok = false end
+  end
+  return ok and 0 or 1
+end
+
+global function applet_fsync(args: sequence(string)): integer
+  local longs: []util.LongOpt = {{'help', 0, HELP_OPTION}}
+  local g = util.getopt(args, 'd', &longs, #longs)
+  local mode = MODE_FILE
+  while true do
+    local opt = g:next()
+    if opt == -1 then break end
+    if opt == 100 then mode = MODE_DATA
+    elseif opt == HELP_OPTION then util.line('usage: fsync [-d] FILE...'); return 0
+    else return 1 end
+  end
+  local files = g:operands()
+  if #files == 0 then return util.die('expected at least one file') end
+  local ok = true
+  for _, file in ipairs(files) do
+    if file == '-' then
+      if not sync_fd(mode, 0, file) then ok = false end
+    elseif not sync_arg(mode, file) then ok = false end
   end
   return ok and 0 or 1
 end

@@ -71,6 +71,12 @@ expect() { # name expected-stdout command
   fi
 }
 
+if python3 "$(dirname -- "$0")/ttysize_random.py" "$BIN" "$W/bin"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); failed="$failed ttysize-random"
+fi
+
 # echo / printf
 same echo-plain 'echo hello world'
 same echo-n 'echo -n hi; echo'
@@ -482,7 +488,25 @@ else
   fail=$((fail+1)); failed="$failed hostname-dns-transport"
 fi
 same nproc 'nproc'
+expect fsync-files 'exit=0' 'fsync words.txt empty && fsync -d words.txt zero'
+expect fsync-stdin 'exit=0' 'fsync -d - < words.txt'
+expect fsync-pipe 'exit=1' 'echo data | fsync -'
+expect fsync-missing 'exit=1' 'fsync words.txt nonexistent zero'
+expect fsync-needs-file 'exit=1' 'fsync < words.txt'
+expect fsync-multicall 'exit=0' "\"$BIN\" fsync -d words.txt"
+expect usleep-multicall 'exit=0' "\"$BIN\" usleep 1"
+expect usleep-zero 'exit=0' 'usleep 0 && usleep -- 10'
+expect usleep-duration 'exit=0' 'python3 -c "import subprocess, time; start = time.monotonic(); subprocess.run([\"usleep\", \"100000\"], timeout=5, check=True); assert time.monotonic() - start >= 0.1"'
+expect usleep-invalid 'exit=1' 'usleep 2ms'
+expect usleep-overflow 'exit=1' 'usleep 18446744073709551616'
+expect usleep-negative 'exit=1' 'usleep -1'
+expect usleep-arity 'exit=1' 'usleep 0 1'
 same sleep-0 'sleep 0.1; echo done'
+if python3 "$(dirname -- "$0")/pidof.py" "$BIN" "$W/bin/pidof"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); failed="$failed pidof"
+fi
 same kill-0 'kill -0 $$; echo $?'
 same kill-l 'kill -l TERM >/dev/null; echo $?'
 same date-r 'date -u -r words.txt +%Y-%m-%d'
@@ -1175,11 +1199,11 @@ if unshare -rm true >/dev/null 2>&1; then
   '"'"''
 fi
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '133
+  expect list-count-theseus '139
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
 else
-  expect list-count '132
+  expect list-count '138
 exit=0' "$BIN --list | wc -l"
 fi
 

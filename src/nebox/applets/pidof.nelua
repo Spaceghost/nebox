@@ -1,0 +1,148 @@
+-- Inspect live procfs entries. A process may exit or deny access at any step.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+local Target = @record{name: string, path: boolean, stat_ok: boolean, info: sys.Stat}
+
+-- Read only the arguments used for matching, even when the process has a
+-- large argument vector. comm is a small newline-terminated procfs file.
+local function proc_fields(path: string, fields: integer): string
+  local fd = sys.open(path, sys.O_RDONLY, 0)
+  if fd < 0 then return '' end
+  local text: stringbuilder
+  local buf: [1024]byte
+  while fields > 0 do
+    local n = sys.read(fd, &buf[0], #buf)
+    if n < 0 and sys.errno() == sys.EINTR then continue end
+    if n <= 0 then break end
+    local used = n
+    for i: integer = 0, < n do
+      if buf[i] == 0 then
+        fields = fields - 1
+        if fields == 0 then used = i + 1; break end
+      end
+    end
+    text:write((@string){data=&buf[0], size=(@usize)(used)})
+  end
+  sys.close(fd)
+  return text:promote()
+end
+
+local function matches(pid: string, targets: sequence(Target), scripts: boolean): boolean
+  local base = '/proc/' .. pid
+  local cmd = proc_fields(base .. '/cmdline', scripts and 2 or 1)
+  local split = cmd:find('\0', 1, true)
+  local argv0 = split == 0 and cmd or cmd:sub(1, split-1)
+  local argv1 = ''
+  if scripts and split > 0 then
+    local finish = cmd:find('\0', split+1, true)
+    argv1 = cmd:sub(split+1, finish > 0 and finish-1 or #cmd)
+  end
+  local comm = ''
+  if scripts or #argv0 == 0 then
+    comm = proc_fields(base .. '/comm', 1)
+    if #comm > 0 and comm:byte(#comm) == 10 then comm = comm:sub(1, #comm-1) end
+  end
+  local exe_path = base .. '/exe'
+  local linked, exe = util.readlink(exe_path)
+  local exe_info: sys.Stat
+  local have_info = false
+  for _, target in ipairs(targets) do
+    if target.path then
+      if target.stat_ok then
+        if not have_info then have_info = sys.stat(exe_path, &exe_info) == 0 end
+        if have_info and target.info.st_ino == exe_info.st_ino and target.info.st_dev == exe_info.st_dev then
+          return true
+        end
+      elseif target.name == argv0 then return true end
+      if scripts and target.name == argv1 then return true end
+    else
+      if (#argv0 > 0 and util.basename(argv0) == target.name)
+          or (linked and util.basename(exe) == target.name)
+          or (#comm > 0 and #comm < 15 and comm == target.name)
+          or (#argv1 > 0 and util.basename(argv1) == target.name) then return true end
+    end
+  end
+  return false
+end
+
+local function higher_pid(a: string, b: string): boolean
+  if #a ~= #b then return #a > #b end
+  return a > b
+end
+
+local function omit_pid(text: string, omitted: *sequence(string)): boolean
+  if text == '%PPID' then omitted:push(tostring(sys.getppid())); return true end
+  local err, pid = util.xstrtoumax_base(text, 10, '')
+  if #text == 0 or text:byte(1) < 48 or text:byte(1) > 57 or err ~= 0 or pid > 0xffffffff then
+    return false
+  end
+  omitted:push(tostring(pid))
+  return true
+end
+
+global function applet_pidof(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('usage: pidof [-sx] [-o PID[,PID...]] NAME...')
+    return 0
+  end
+  local opts = util.parse(args, 'sxo:')
+  if not opts:ok() then return util.optfail(opts) end
+  local omitted: sequence(string)
+  for _, arg in ipairs(opts:all('o')) do
+    local start = 1
+    repeat
+      local comma = arg:find(',', start, true)
+      local field = arg:sub(start, comma > 0 and comma-1 or #arg)
+      if not omit_pid(field, &omitted) then return util.die("invalid omit PID: '" .. field .. "'") end
+      if comma == 0 then break end
+      start = comma + 1
+    until false
+  end
+
+  local targets: sequence(Target)
+  for _, name in ipairs(opts.operands) do
+    if #name == 0 then continue end
+    local target = (@Target){name=name, path=name:find('/', 1, true) > 0}
+    if target.path then target.stat_ok = sys.stat(name, &target.info) == 0 end
+    targets:push(target)
+  end
+  if #targets == 0 then return 1 end
+
+  local dir = sys.opendir('/proc')
+  if dir == nilptr then util.perror('/proc'); return 1 end
+  local pids: sequence(string)
+  while true do
+    sys.seterrno(0)
+    local entry = sys.readdir(dir)
+    if entry == nilptr then break end
+    if entry.d_name[0] < 48 or entry.d_name[0] > 57 then continue end
+    local pid = (@string)((@cstring)(&entry.d_name[0]))
+    local skip = false
+    for _, ignored in ipairs(omitted) do
+      if pid == ignored then skip = true; break end
+    end
+    if not skip then pids:push(pid:copy()) end
+  end
+  local err = sys.errno()
+  sys.closedir(dir)
+  if err ~= 0 then return util.die('/proc: ' .. sys.strerror(err)) end
+
+  util.sort(pids, higher_pid)
+  local found = false
+  for _, pid in ipairs(pids) do
+    if matches(pid, targets, opts:has('x')) then
+      if found then util.writebyte(32) end
+      util.write(pid)
+      found = true
+      if opts:has('s') then break end
+    end
+  end
+  if found then util.writebyte(10); return 0 end
+  return 1
+end

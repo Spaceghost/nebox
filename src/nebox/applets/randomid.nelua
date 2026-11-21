@@ -1,0 +1,56 @@
+-- Random X cookies and UUIDs use the blocking Linux kernel entropy source.
+## pragmas.nogc = true
+require 'nebox.util'
+
+local function print_id(uuid: boolean, verbose: boolean): integer
+  local data: [16]byte
+  local pos = 0
+  while pos < #data do
+    local n = sys.getrandom(&data[pos], (@csize)(#data-pos), 0)
+    if n < 0 and sys.errno() == sys.EINTR then continue end
+    if n < 0 then util.perror('getrandom'); return 1 end
+    if n == 0 then return util.die('getrandom returned no data') end
+    pos = pos + n
+  end
+  if uuid then
+    -- Random (version 4) UUID with the RFC variant bits 10.
+    data[6] = (data[6] & 0x0f) | 0x40
+    data[8] = (data[8] & 0x3f) | 0x80
+  end
+  if verbose then util.err('Got 16 bytes from getrandom()') end
+  local hex: string = '0123456789abcdef'
+  for i = 0, < #data do
+    if uuid and (i == 4 or i == 6 or i == 8 or i == 10) then util.writebyte(45) end
+    util.writebyte(hex.data[data[i] >> 4])
+    util.writebyte(hex.data[data[i] & 15])
+  end
+  util.writebyte(10)
+  return 0
+end
+
+global function applet_mcookie(args: sequence(string)): integer
+  local opts: []util.LongOpt = {{'verbose', 0, 118}, {'version', 0, 86}}
+  local g = util.getopt(args, 'vV', &opts, #opts)
+  local verbose, version = false, false
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c == 118 then verbose = true
+    elseif c == 86 then version = true
+    else return 1 end
+  end
+  if version then util.line('mcookie from nebox'); return 0 end
+  return print_id(false, verbose)
+end
+
+global function applet_uuidgen(args: sequence(string)): integer
+  local opts: []util.LongOpt = {{'random', 0, 114}}
+  local g = util.getopt(args, 'r', &opts, #opts)
+  while true do
+    local c = g:next()
+    if c == -1 then break end
+    if c ~= 114 then return 1 end
+  end
+  if #g:operands() > 0 then return util.die('usage: uuidgen [-r]') end
+  return print_id(true, false)
+end

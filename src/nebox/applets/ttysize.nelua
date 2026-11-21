@@ -1,0 +1,27 @@
+## pragmas.nogc = true
+require 'nebox.util'
+
+global function applet_ttysize(args: sequence(string)): integer
+  local size: sys.Winsize
+  local width, height: integer = 80, 24
+  for fd = 0, 2 do
+    if sys.ioctl(fd, sys.TIOCGWINSZ, &size) == 0 then
+      width, height = size.ws_col, size.ws_row
+      break
+    end
+  end
+  if #args == 0 then
+    util.writef('%d %d', width, height)
+  else
+    for i, arg in ipairs(args) do
+      if #arg == 0 then continue end
+      local which = arg:byte(1)
+      if which == 119 or which == 104 then
+        if i > 1 then util.writebyte(32) end
+        util.write(tostring(which == 119 and width or height))
+      end
+    end
+  end
+  util.writebyte(10)
+  return 0
+end

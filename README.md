@@ -134,13 +134,13 @@ The [coverage report](docs/APPLET-COVERAGE.md) compares Nebox with every applet 
 
 ```
 [ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum clear cmp comm
-cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo egrep env expand expr
-factor false fgrep find fmt fold free grep groups gunzip gzip hd head hexdump hostid hostname id install
-join kill link ln logname ls lsmod md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
-patch pathchk pinky printenv printf pwd pwdx readlink realpath rev rm rmdir sed seq setsid sh sha1sum
+cp csplit cut date dd df diff dir dircolors dirname dnsdomainname domainname du echo egrep env expand expr
+factor false fgrep find fmt fold free fsync grep groups gunzip gzip hd head hexdump hostid hostname id install
+join kill link ln logname ls lsmod mcookie md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
+patch pathchk pidof pinky printenv printf pwd pwdx readlink realpath rev rm rmdir sed seq setsid sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
-sync tac tail tar tee test timeout touch tr true truncate tsort tty umount uname unexpand
-uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname zcat
+sync tac tail tar tee test timeout touch tr true truncate tsort tty ttysize umount uname unexpand
+uniq unlink uptime users usleep uuidgen vdir wc which who whoami xargs yes ypdomainname zcat
 ```
 
 `egrep` selects extended regular expressions and `fgrep` selects fixed
@@ -148,8 +148,14 @@ strings in the native grep implementation. `clear` homes the cursor and
 clears the screen using the BusyBox escape sequence. On Linux, `lsmod`
 lists the modules and their dependents from `/proc/modules`. `pwdx` accepts
 one or more PIDs, including `/proc/PID` operands, and returns a failure
-status if any lookup fails.
+status if any lookup fails. `pidof` finds processes by name or executable path and
+supports `-s`, `-x`, and `-o` with a PID list or `%PPID`.
 
+`ttysize` prints terminal dimensions or selected width and height fields.
+`mcookie` prints a 128-bit X cookie. `uuidgen` prints a version 4 UUID. Both
+read kernel randomness with `getrandom`. Use `fsync [-d] FILE...` to flush
+writes for individual files and `usleep MICROSECONDS` for an integer
+microsecond delay.
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
 per applet in `DIR`.

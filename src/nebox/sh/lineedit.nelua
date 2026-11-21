@@ -15,10 +15,6 @@ require 'nebox.util'
 
 global lineedit = @record{}
 
-local TIOCGWINSZ: culong <comptime> = 0x5413
-
-local Winsize = @record{ws_row: uint16, ws_col: uint16, ws_xpixel: uint16, ws_ypixel: uint16}
-
 global lineedit.READ_OK: integer <comptime> = 0
 global lineedit.READ_EOF: integer <comptime> = 1
 global lineedit.READ_INTR: integer <comptime> = 2
@@ -153,9 +149,9 @@ local function strip_markers(s: string): string
 end
 
 local function term_cols(): integer
-  local ws: Winsize
-  if sys.ioctl(2, TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0 then return ws.ws_col end
-  if sys.ioctl(0, TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0 then return ws.ws_col end
+  local ws: sys.Winsize
+  if sys.ioctl(2, sys.TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0 then return ws.ws_col end
+  if sys.ioctl(0, sys.TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0 then return ws.ws_col end
   local c = sys.getenv('COLUMNS')
   if c ~= nilptr then
     local v, ok = util.toint(sys.cstr((@*[0]cchar)(c)))

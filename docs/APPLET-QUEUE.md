@@ -100,7 +100,7 @@ Exercise the log sender and receiver on a private Unix socket.
 - [ ] `top` — refresh process and system statistics in interactive and batch modes.
 - [ ] `pgrep` — match process names and command lines with stable exit codes.
 - [ ] `pkill` — reuse process selection and signal matching processes.
-- [ ] `pidof` — find process IDs by executable name or path.
+- [x] `pidof` — find process IDs by executable name or path.
 
 ### Logs
 

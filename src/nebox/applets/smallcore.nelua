@@ -172,6 +172,24 @@ global function applet_sleep(args: sequence(string)): integer
   return 0
 end
 
+global function applet_usleep(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then util.line('usage: usleep MICROSECONDS'); return 0 end
+  local first = #args > 0 and args[1] == '--' and 2 or 1
+  if #args ~= first then return util.die('usage: usleep MICROSECONDS') end
+  local operand = args[first]
+  local err, usec = util.xstrtoumax_base(operand, 10, '')
+  if err ~= 0 then return util.die('invalid microsecond interval ' .. util.quote(operand)) end
+  local ts: sys.Timespec
+  ts.tv_sec = (@clong)(usec // 1000000)
+  ts.tv_nsec = (@clong)((usec % 1000000) * 1000)
+  local rem: sys.Timespec
+  while c_nanosleep(&ts, &rem) ~= 0 do
+    if sys.errno() ~= sys.EINTR then return util.die(sys.errstr()) end
+    ts = rem
+  end
+  return 0
+end
+
 global function applet_printenv(args: sequence(string)): integer
   local nul = false
   local longs: []util.LongOpt = {{'null', 0, 48}, {'help', 0, util.UNSUPPORTED}, {'version', 0, util.UNSUPPORTED}}
