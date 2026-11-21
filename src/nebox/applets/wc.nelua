@@ -136,6 +136,14 @@ local function wc(fd: cint, name: string, has_name: boolean, fs: *FStatus, curre
       end
       if n == 0 then break end
       bytes = bytes + (@uint64)(n)
+      if not count_complicated then
+        local newlines: uint64 = 0
+        for i = 0, < n do
+          if buf[i] == 10 then newlines = newlines + 1 end
+        end
+        lines = lines + newlines
+        continue
+      end
       for i = 0, < n do
         local c = buf[i]
         if c == 10 then
