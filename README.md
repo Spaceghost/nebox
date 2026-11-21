@@ -129,6 +129,18 @@ uses both rebuilt tools to link Nebox and nebuild and installs them in the image
 python3 "$NEBOX_SRC/tests/theseus_boot.py" "$KERNEL" --boot-image rootfs.cpio --expect-nelinker
 ```
 
+Append a compiled Theseus graph to the manifest command to build and install
+the native PID 1, supervisor, client and installer. This mode requires an SDK
+with the standalone Nelibc interfaces used by native Theseus. An optional last
+argument names a Nelua test service to install as `/bin/control-test`.
+
+```sh
+"$NECC" --lua "$NEBOX_SRC/tools/distro_manifest.lua" \
+  "$NECC" "$SDK" "$NEBOX_SRC" "$THESEUS" "$NECC_SRC" "$NELINKER_SRC" \
+  "$THESEUS_GRAPH" "$THESEUS/tests/live_control.nelua" > build.ne
+"$NEBUILD" -j 2 build.ne
+```
+
 The final build invocation uses the newly built runner. Omit the Theseus argument
 for the ordinary multicall binary. This graph uses the SDK's Nelua frontend,
 TinyCC backend, and standalone Nelibc archive. The compiler and all source

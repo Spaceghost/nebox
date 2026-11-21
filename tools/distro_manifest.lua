@@ -1,7 +1,7 @@
 -- Print a nebuild manifest for the development image using a staged necc SDK.
 local lfs = require 'lfs'
-assert(#arg == 3 or #arg == 4 or #arg == 6,
-  'usage: distro_manifest.lua NECC SDK NEBOX_SRC [THESEUS_SRC [NECC_SRC NELINKER_SRC]]')
+assert(#arg == 3 or #arg == 4 or #arg == 6 or #arg == 7 or #arg == 8,
+  'usage: distro_manifest.lua NECC SDK NEBOX_SRC [THESEUS_SRC [NECC_SRC NELINKER_SRC [GRAPH [CONTROL_SRC]]]]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -12,8 +12,15 @@ local cc, sdk, nebox = absolute(arg[1]), absolute(arg[2]), absolute(arg[3])
 local theseus = arg[4] and absolute(arg[4])
 local necc_source = arg[5] and absolute(arg[5])
 local linker_source = arg[6] and absolute(arg[6]) .. '/src'
+local graph = arg[7] and absolute(arg[7])
+local control_source = arg[8] and absolute(arg[8])
 local function quote(word)
   return "'" .. word:gsub("'", "'\\''") .. "'"
+end
+
+local function path_token(path)
+  assert(not path:find('%s'), 'nebuild manifest paths cannot contain whitespace: ' .. path)
+  return path
 end
 
 local function sources(dir, suffix, list)
@@ -42,9 +49,7 @@ local function edge(target, src, inputs, options, compiler, linker)
   if linker then paths[#paths + 1] = linker end
   for _, input in ipairs(inputs) do paths[#paths + 1] = input end
   table.sort(paths)
-  for _, path in ipairs(paths) do
-    assert(not path:find('%s'), 'nebuild manifest paths cannot contain whitespace: ' .. path)
-  end
+  for _, path in ipairs(paths) do path_token(path) end
   local executable = compiler:sub(1, 1) == '/' and compiler or './' .. compiler
   local command = {executable, '--release'}
   for _, option in ipairs(options) do command[#command + 1] = option end
@@ -81,19 +86,37 @@ end
 edge('nebox', nebox .. '/src/nebox.nelua', app_sources, options, compiler, linker)
 local builder = nebox .. '/tools/nebuild.nelua'
 edge('nebuild', builder, {builder, nebox .. '/src/nebox/sys.nelua'}, {'-L', nebox .. '/src'}, compiler, linker)
+local native_inputs, native_args = '', ''
+if graph then
+  local theseus_sources = {}
+  sources(theseus .. '/src', '%.nelua$', theseus_sources)
+  for _, target in ipairs({
+    {'theseus-init', 'init'}, {'theseusd', 'supervisor'},
+    {'theseus', 'live_client'}, {'theseus-install', 'install'},
+  }) do
+    edge(target[1], theseus .. '/src/' .. target[2] .. '.nelua', theseus_sources, {'-L', theseus}, compiler, linker)
+  end
+  native_inputs = ' theseus-init theseusd theseus theseus-install ' .. path_token(graph)
+  native_args = ' ' .. quote(graph)
+  if control_source then
+    local control_inputs = {control_source, theseus .. '/tests/command.nelua'}
+    edge('control-test', control_source, control_inputs, {'-L', theseus}, compiler, linker)
+    native_inputs = native_inputs .. ' control-test'
+    native_args = native_args .. ' ./control-test'
+  end
+end
 if theseus then
   local packer = nebox .. '/tools/distro_image.lua'
   local sdk_files = {}
   sources(sdk, '.', sdk_files)
   table.sort(sdk_files)
-  for _, path in ipairs(sdk_files) do
-    assert(not path:find('%s'), 'nebuild manifest paths cannot contain whitespace: ' .. path)
-  end
+  for _, path in ipairs(sdk_files) do path_token(path) end
   local executable = necc_source and './necc' or cc
   io.write('build rootfs.cpio nebox nebuild ', compiler, linker and ' ' .. linker or '', ' ', packer,
-    ' ', table.concat(sdk_files, ' '), '\n')
+    native_inputs, ' ', table.concat(sdk_files, ' '), '\n')
   io.write('\tNECC_SYSROOT=', quote(sdk), ' ', quote(executable), ' --lua ', quote(packer),
-    ' ./nebox ./nebuild ', quote(executable), ' ', quote(sdk), ' rootfs.cpio', linker and ' ./nelinker' or '', '\n')
+    ' ./nebox ./nebuild ', quote(executable), ' ', quote(sdk), ' rootfs.cpio',
+    linker and ' ./nelinker' or '', native_args, '\n')
   print('default rootfs.cpio')
 else
   print('default nebox nebuild')

@@ -1,6 +1,7 @@
 -- Write the x86-64 Theseus development initramfs using the built SDK and applets.
 local lfs = require 'lfs'
-assert(#arg == 5 or #arg == 6, 'usage: distro_image.lua NEBOX NEBUILD NECC SDK OUTPUT.cpio [NELINKER]')
+assert(#arg >= 5 and #arg <= 8,
+  'usage: distro_image.lua NEBOX NEBUILD NECC SDK OUTPUT.cpio [NELINKER [THESEUS_GRAPH [CONTROL_TEST]]]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -21,6 +22,9 @@ end
 local nebox, nebuild, necc, sdk, output = table.unpack(arg, 1, 5)
 nebox, nebuild, necc, sdk, output = absolute(nebox), absolute(nebuild), absolute(necc), absolute(sdk), absolute(output)
 local nelinker = arg[6] and absolute(arg[6])
+local graph = arg[7] and absolute(arg[7])
+local control = arg[8] and absolute(arg[8])
+local native_bins = {'theseus-init', 'theseusd', 'theseus', 'theseus-install'}
 assert(nebox:match('/nebox$'), 'supply the multicall executable named nebox')
 assert(not (output == sdk or output:sub(1, #sdk + 1) == sdk .. '/'), 'choose an output outside the staged SDK')
 local parent = output:match('^(.*/)') or './'
@@ -34,7 +38,14 @@ while true do
   if current.dev == above.dev and current.ino == above.ino then break end
 end
 local old = lfs.attributes(output)
-for _, input in ipairs({nebox, nebuild, necc, sdk .. '/nelua-lua', sdk .. '/nlc', sdk .. '/tcc/tcc', sdk .. '/libnelibc.a', nelinker}) do
+local inputs = {nebox, nebuild, necc, sdk .. '/nelua-lua', sdk .. '/nlc', sdk .. '/tcc/tcc', sdk .. '/libnelibc.a'}
+if nelinker then inputs[#inputs + 1] = nelinker end
+if graph then
+  inputs[#inputs + 1] = graph
+  for _, name in ipairs(native_bins) do inputs[#inputs + 1] = name end
+end
+if control then inputs[#inputs + 1] = control end
+for _, input in ipairs(inputs) do
   local attr = assert(lfs.attributes(input), 'missing input: ' .. input)
   assert(not old or old.dev ~= attr.dev or old.ino ~= attr.ino, 'output aliases input: ' .. input)
 end
@@ -125,7 +136,15 @@ local function build()
   file('bin/nebuild', nebuild, true)
   file('bin/necc', necc, true)
   if nelinker then file('bin/nelinker', nelinker, true) end
-  link('init', 'bin/nebox')
+  if graph then
+    for _, name in ipairs(native_bins) do file('bin/' .. name, name, true) end
+    if control then file('bin/control-test', control, true) end
+    link('bin/the', 'theseus')
+    entry('dev/ttyS0', 0x2180, 0, 4, 64)
+    directory('etc/theseus')
+    file('etc/theseus/graph.tsc', graph, false)
+  end
+  link('init', graph and 'bin/theseus-init' or 'bin/nebox')
   link('sbin', 'bin')
   link('usr/bin', '../bin')
   link('bin/cc', 'necc')
