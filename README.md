@@ -130,18 +130,26 @@ and include files are prerequisites of the generated targets.
 
 ## Applets
 
-The [applet queue](docs/APPLET-QUEUE.md) tracks the next BusyBox and Toybox compatibility work.
+The [coverage report](docs/APPLET-COVERAGE.md) compares Nebox with every applet declared by either BusyBox or Toybox. The [applet queue](docs/APPLET-QUEUE.md) prioritizes Cascadia commands.
 
 ```
-[ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum cmp comm
-cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo env expand expr
-factor false find fmt fold free grep groups gunzip gzip hd head hexdump hostid hostname id install
-join kill link ln logname ls md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
-patch pathchk pinky printenv printf pwd readlink realpath rev rm rmdir sed seq setsid sh sha1sum
+[ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum clear cmp comm
+cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo egrep env expand expr
+factor false fgrep find fmt fold free grep groups gunzip gzip hd head hexdump hostid hostname id install
+join kill link ln logname ls lsmod md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
+patch pathchk pinky printenv printf pwd pwdx readlink realpath rev rm rmdir sed seq setsid sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
 sync tac tail tar tee test timeout touch tr true truncate tsort tty umount uname unexpand
 uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname zcat
 ```
+
+`egrep` selects extended regular expressions and `fgrep` selects fixed
+strings in the native grep implementation. `clear` homes the cursor and
+clears the screen using the BusyBox escape sequence. On Linux, `lsmod`
+lists the modules and their dependents from `/proc/modules`. `pwdx` accepts
+one or more PIDs, including `/proc/PID` operands, and returns a failure
+status if any lookup fails.
+
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
 per applet in `DIR`.

@@ -65,7 +65,25 @@ $(OUT):
 $(NELIBC_LIB):
 	$(MAKE) -C $(NELIBC) lib-standalone-zig NELUA="$(NELUA)" ZIG=$(ZIG)
 
+.PHONY: applet-coverage applet-parity update-applet-coverage
+
+applet-coverage: $(OUT)/nebox
+	@python3 tools/applet_coverage.py $(abspath $<)
+
+applet-parity: $(OUT)/nebox
+	@python3 tools/applet_coverage.py $(abspath $<) --require-complete
+
+update-applet-coverage: $(OUT)/nebox
+ifneq ($(strip $(THESEUS)),)
+	$(error The checked-in coverage report uses the standalone build)
+endif
+	@python3 tools/applet_coverage.py $(abspath $<) > $(OUT)/applet-coverage.md
+	@cp $(OUT)/applet-coverage.md docs/APPLET-COVERAGE.md
+
 test: $(OUT)/nebox
+ifeq ($(strip $(THESEUS)),)
+	python3 tools/applet_coverage.py $(abspath $<) --check-report
+endif
 	sh tests/run.sh $(abspath $(OUT)/nebox)
 	python3 tests/setsid.py $(abspath $(OUT)/nebox)
 	python3 tests/sh_interactive.py $(abspath $(OUT)/nebox)

@@ -333,19 +333,6 @@ end
 
 local function quoteN(s: string): string return quotearg.style(s, quoting_style) end
 
-local function readlink_str(path: string): (boolean, string)
-  local size = 128
-  while true do
-    local buf: sequence(byte)
-    buf:resize(size)
-    local n = sys.readlink(path, &buf[1], (@csize)(size))
-    if n < 0 then return false, '' end
-    if n < size then return true, string.copy((@string){data = &buf[1], size = (@usize)(n)}) end
-    size = size * 2
-  end
-  return false, ''
-end
-
 -- Mount points -----------------------------------------------------------------
 local mounts: sequence(mountlist.Entry)
 local tried_mount_list = false
@@ -495,7 +482,7 @@ local function print_stat(pf: string, mod: byte, m: byte, filename: string, st: 
   elseif m == 78 then
     out_string(pf, quoteN(filename))
     if (st.mode & S_IFMT) == S_IFLNK then
-      local ok, link = readlink_str(filename)
+      local ok, link = util.readlink(filename)
       if not ok then
         util.err(errno_msg('cannot read symbolic link ' .. util.quoteaf(filename), sys.errno()))
         return true

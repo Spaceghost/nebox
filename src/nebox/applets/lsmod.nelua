@@ -1,0 +1,35 @@
+-- Report Linux's loaded modules in kernel order.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.util'
+
+global function applet_lsmod(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('usage: lsmod')
+    return 0
+  end
+  if #args ~= 0 then return util.die('usage: lsmod') end
+
+  local data, ok = util.readfile('/proc/modules')
+  if not ok then return 1 end
+  util.writef('%-23s Size  Used by\n', 'Module')
+  for _, line in ipairs(util.lines(data)) do
+    local fields: [4]string
+    local count: integer = 0
+    for word in line:gmatch('%S+') do
+      fields[count] = word
+      count = count + 1
+      if count == 4 then break end
+    end
+    if count ~= 4 then return util.die('malformed /proc/modules record') end
+
+    -- The fourth Linux field is "-" or a comma-terminated list of users.
+    local users = fields[3]
+    if users == '-' then users = ''
+    elseif users:byte(#users) == 44 then users = users:sub(1, #users-1) end
+    util.writef('%-19s %8s  %s %s\n', fields[0], fields[1], fields[2], users)
+  end
+  return 0
+end

@@ -244,6 +244,24 @@ same uniq-c 'sort words.txt | uniq -c'
 same uniq-d 'sort words.txt | uniq -d'
 same uniq-u 'sort words.txt | uniq -u'
 same uniq-i 'printf "a\nA\nb\n" | uniq -i'
+# Multicall dispatch and installed names select the same native implementations.
+expect egrep-mode 'alpha
+beta
+exit=0' 'printf "alpha\nbeta\ngamma\n" | egrep "^(alpha|beta)$"'
+expect fgrep-mode 'a.b
+exit=0' 'printf "axb\na.b\n" | fgrep a.b'
+expect egrep-dispatch 'beta
+exit=0' "printf 'a\nbeta\n' | '$BIN' egrep '^(beta|gamma)$'"
+expect fgrep-dispatch 'exit=1' "printf 'axb\n' | '$BIN' fgrep 'a.b'"
+expect egrep-fixed 'a.b
+exit=0' 'printf "axb\na.b\n" | egrep -F a.b'
+expect fgrep-fixed-with-E 'a.b
+exit=0' 'printf "axb\na.b\n" | fgrep -E a.b'
+expect clear-bytes '1b5b481b5b4a
+exit=0' "clear | od -An -tx1 | tr -d ' \n'; echo"
+expect clear-dispatch '1b5b481b5b4a
+exit=0' "'$BIN' clear | od -An -tx1 | tr -d ' \n'; echo"
+
 # grep (fixed strings)
 same grep-plain 'grep alpha words.txt'
 same grep-i 'grep -i APPLE case.txt'
@@ -438,6 +456,16 @@ same catalog-hostid 'hostid'
 same catalog-logname 'logname'
 same catalog-fifos 'set -e; umask 077; mkfifo a b; mkfifo -m u=rw,go=r named; mknod -m 640 made p; stat -c "%F %a" a b named made; rm a b named made'
 same catalog-nice 'nice; nice -n 4 /bin/sh -c "exec nice"; nice -3 /bin/sh -c "exec nice"'
+if python3 "$(dirname -- "$0")/lsmod.py" "$BIN" "$W/bin/lsmod"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); failed="$failed lsmod"
+fi
+if python3 "$(dirname -- "$0")/pwdx.py" "$BIN" "$W/bin/pwdx"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); failed="$failed pwdx"
+fi
 same setsid-session 'setsid python3 -c "import os; print(os.getpid() == os.getsid(0) == os.getpgrp())"'
 same setsid-arguments 'setsid -- printf "%s|%s\\n" "one arg" -w'
 same setsid-wait 'setsid --fork --wait /bin/sh -c "exit 37"'
@@ -1147,11 +1175,11 @@ if unshare -rm true >/dev/null 2>&1; then
   '"'"''
 fi
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '128
+  expect list-count-theseus '133
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
 else
-  expect list-count '127
+  expect list-count '132
 exit=0' "$BIN --list | wc -l"
 fi
 

@@ -788,6 +788,19 @@ function util.isdir(path: string): boolean
   return (st.st_mode & sys.S_IFMT) == sys.S_IFDIR
 end
 
+function util.readlink(path: string): (boolean, string)
+  local size = 128
+  while true do
+    local buf: sequence(byte)
+    buf:resize(size)
+    local n = sys.readlink(path, &buf[1], (@csize)(size))
+    if n < 0 then return false, '' end
+    if n < size then return true, string.copy((@string){data = &buf[1], size = (@usize)(n)}) end
+    size = size * 2
+  end
+  return false, ''
+end
+
 function util.exists(path: string): boolean
   local st: sys.Stat
   return sys.lstat(path, &st) == 0

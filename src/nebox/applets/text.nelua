@@ -283,6 +283,11 @@ end
 
 
 
+global function applet_clear(args: sequence(string)): integer
+  util.write('\x1b[H\x1b[J')
+  return 0
+end
+
 global function applet_yes(args: sequence(string)): integer
   local s: string = 'y'
   if #args > 0 then

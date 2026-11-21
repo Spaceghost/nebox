@@ -1,10 +1,31 @@
 # Applet queue
 
-The queue covers 37 commands. Each entry stays open until the native applet
-builds against standalone Nelibc and its tests pass in the Linux x86-64
-container. Compare behavior with BusyBox and Toybox where each supplies the
-applet. Record differences in the Nebox documentation and test the public
-CLI through both multicall dispatch and installed links.
+The target is the union of the BusyBox and Toybox applet catalogs. The
+[coverage report](APPLET-COVERAGE.md) lists every name, which upstream
+declares it, and whether the standalone Nebox binary registers it. It
+includes optional, platform-specific, pending, demo and shell entries.
+Shell-only names such as `.` will need shell-specific dispatch tests.
+
+Run `make applet-coverage` for the selected build. Run `make applet-parity`
+to require every upstream name. After adding a native applet, regenerate
+the standalone snapshot with `make update-applet-coverage` and review
+the diff. `make test` checks the snapshot and exercises real commands.
+
+The catalogs use the [BusyBox 1.38.0 release](https://busybox.net/downloads/busybox-1.38.0.tar.bz2)
+and the [Toybox 0.8.15 release](https://landley.net/toybox/downloads/toybox-0.8.15.tar.gz).
+To reproduce them from the downloaded archives, run:
+
+```sh
+python3 tools/import_applet_catalogs.py busybox-1.38.0.tar.bz2 toybox-0.8.15.tar.gz
+```
+
+The importer checks both release hashes and reads the applet declarations
+before configuration filtering, including aliases.
+
+The sections below prioritize 37 commands for Cascadia. Each entry stays
+open until the native applet builds against standalone Nelibc and its tests
+pass in the Linux x86-64 container. Test both multicall dispatch and installed
+links, and record behavioral differences where the upstreams disagree.
 
 ## 1. Archives
 
@@ -95,7 +116,7 @@ operations. Verify error paths in addition to successful boot and shutdown.
 
 - [ ] `mdev` — scan sysfs and handle device events with rule-driven permissions.
 - [ ] `modprobe` — resolve module aliases and dependencies and load or unload them.
-- [ ] `lsmod` — list loaded modules and their dependencies.
+- [x] `lsmod` — list loaded modules and their dependencies.
 - [ ] `dmesg` — read and format kernel messages and report permission failures.
 
 ### Console and lifecycle

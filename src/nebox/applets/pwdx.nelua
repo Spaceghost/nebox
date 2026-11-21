@@ -1,0 +1,38 @@
+-- Resolve a process's current directory through its procfs magic link.
+## pragmas.nogc = true
+
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local ESRCH: cint <comptime> = 3
+
+global function applet_pwdx(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('usage: pwdx PID...')
+    return 0
+  end
+  local first = #args > 0 and args[1] == '--' and 2 or 1
+  if first > #args then return util.die('usage: pwdx PID...') end
+  local status = 0
+  for i = first, #args do
+    local operand = args[i]
+    local digits = operand
+    if digits:sub(1, 6) == '/proc/' then digits = digits:sub(7) end
+    local err, pid = util.xstrtoumax_base(digits, 10, '')
+    if #digits == 0 or digits:byte(1) < 48 or digits:byte(1) > 57 or err ~= 0 or pid > 0xffffffff then
+      return util.die("invalid process id: '" .. operand .. "'")
+    end
+
+    local ok, cwd = util.readlink('/proc/' .. tostring(pid) .. '/cwd')
+    if not ok then
+      local cause = sys.errno()
+      if cause == sys.ENOENT then cause = ESRCH end
+      cwd = (@string)(sys.strerror(cause))
+      status = 1
+    end
+    util.line(operand .. ': ' .. cwd)
+  end
+  return status
+end

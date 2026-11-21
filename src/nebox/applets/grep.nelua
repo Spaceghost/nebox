@@ -3269,6 +3269,14 @@ global function applet_grep(args: sequence(string)): integer
   end
   local operands = gg:operands()
 
+  -- Both grep aliases accept -F for literal patterns. Apply the applet's
+  -- mode before normalizing the pattern, including a leading backslash.
+  if util.applet == 'fgrep' and (matcher < 0 or matcher == E_MATCHER_INDEX or matcher == G_MATCHER_INDEX) then
+    matcher = F_MATCHER_INDEX
+  elseif util.applet == 'egrep' and (matcher < 0 or matcher == G_MATCHER_INDEX) then
+    matcher = E_MATCHER_INDEX
+  end
+
   if show_version then
     fputs_errno('grep (nebox) after GNU grep 3.8\n')
     gexit(0)
