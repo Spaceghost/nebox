@@ -51,15 +51,15 @@ local function edge(target, src, inputs, options)
   io.write('\tNECC_SYSROOT=', quote(sdk), ' ', table.concat(command, ' '), '\n')
 end
 
-local app_sources, options = {}, {}
-sources(nebox .. '/src', '%.nelua$', app_sources)
+local app_sources, options = {nebox .. '/src/nebox.nelua'}, {}
+sources(nebox .. '/src/nebox', '%.nelua$', app_sources)
 if theseus then
   sources(theseus .. '/src', '%.nelua$', app_sources)
   options = {'-L', theseus .. '/src', '--define', 'THESEUS_BOOT=true'}
 end
 edge('nebox', nebox .. '/src/nebox.nelua', app_sources, options)
 local builder = nebox .. '/tools/nebuild.nelua'
-edge('nebuild', builder, {builder, nebox .. '/src/nebox/sys.nelua'}, {})
+edge('nebuild', builder, {builder, nebox .. '/src/nebuild/sys.nelua'}, {})
 if theseus then
   local packer = nebox .. '/tools/distro_image.lua'
   local sdk_files = {}

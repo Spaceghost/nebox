@@ -1,0 +1,56 @@
+-- Linux x86-64 interfaces required by the nebuild runner.
+## pragmas.nogc = true
+
+global sys = @record{}
+
+global sys.Timespec: type <cimport 'nebuild_timespec', cinclude '<time.h>', nodecl, ctypedef 'timespec'> = @record{
+  tv_sec: clong,
+  tv_nsec: clong,
+}
+
+global sys.Stat: type <cimport 'nebuild_stat', cinclude '<sys/stat.h>', nodecl, ctypedef 'stat'> = @record{
+  st_dev: culong,
+  st_ino: culong,
+  st_nlink: culong,
+  st_mode: cuint,
+  st_uid: cuint,
+  st_gid: cuint,
+  __pad0: cint,
+  st_rdev: culong,
+  st_size: clong,
+  st_blksize: clong,
+  st_blocks: clong,
+  st_atim: sys.Timespec,
+  st_mtim: sys.Timespec,
+  st_ctim: sys.Timespec,
+  __reserved: [3]clong,
+}
+
+global sys.O_RDONLY: cint <comptime> = 0
+global sys.O_DIRECTORY: cint <comptime> = 0x10000
+global sys.S_IFMT: cuint <comptime> = 0xF000
+global sys.S_IFREG: cuint <comptime> = 0x8000
+global sys.CLOCK_MONOTONIC: cint <comptime> = 1
+global sys.ENOENT: cint <comptime> = 2
+global sys.EINTR: cint <comptime> = 4
+
+function sys.open(path: cstring, flags: cint, mode: cuint): cint <cimport 'open', cinclude '<fcntl.h>'> end
+function sys.stat(path: cstring, st: *sys.Stat): cint <cimport 'stat', cinclude '<sys/stat.h>'> end
+function sys.unlink(path: cstring): cint <cimport 'unlink', cinclude '<unistd.h>'> end
+function sys.clock_gettime(clk: cint, ts: *sys.Timespec): cint <cimport 'clock_gettime', cinclude '<time.h>'> end
+function sys.getpid(): cint <cimport 'getpid', cinclude '<unistd.h>'> end
+function sys.execvp(file: cstring, argv: *[0]cstring): cint <cimport 'execvp', cinclude '<unistd.h>'> end
+function sys._exit(code: cint): void <cimport '_exit', cinclude '<unistd.h>', noreturn> end
+function sys.fork(): cint <cimport 'fork', cinclude '<unistd.h>'> end
+function sys.waitpid(pid: cint, status: *cint, options: cint): cint <cimport 'waitpid', cinclude '<sys/wait.h>'> end
+function sys.getrandom(buf: pointer, n: csize, flags: cuint): clong <cimport 'getrandom', cinclude '<sys/random.h>'> end
+local function errno_location(): *cint <cimport 'nelibc_errno_location', cinclude '<errno.h>'> end
+function sys.strerror(error: cint): cstring <cimport 'strerror', cinclude '<string.h>'> end
+
+function sys.errno(): cint
+  return $errno_location()
+end
+
+function sys.errstr(): string
+  return sys.strerror(sys.errno())
+end

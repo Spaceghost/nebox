@@ -4,7 +4,7 @@
 require 'arg'
 require 'hashmap'
 require 'io'
-require 'nebox.sys'
+require 'nebuild.sys'
 require 'os'
 require 'sequence'
 require 'string'

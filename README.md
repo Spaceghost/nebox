@@ -40,6 +40,13 @@ stdout, exit status, and the resulting directory tree.
 
 ## Build runner for the distro bootstrap
 
+`nebuild` is maintained in [Spaceghost/nebuild](https://github.com/Spaceghost/nebuild).
+For offline builds, Nebox bundles the runner, its Linux interface, and its tests
+from [nebuild commit 22b396e](https://github.com/Spaceghost/nebuild/tree/22b396e97bc4670a14e5ec15357ec06b91b5a012).
+When updating the snapshot, copy upstream `src/nebuild.nelua` to
+`tools/nebuild.nelua`. The other two files are `src/nebuild/sys.nelua` and
+`tests/nebuild.py` in both repositories.
+
 `make nebuild` builds a static Linux x86-64 dependency runner written in
 Nelua and linked against standalone Nelibc. `make test-nebuild` verifies
 incremental builds, target selection, failure recovery and directory locking.

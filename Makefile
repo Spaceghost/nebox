@@ -52,7 +52,7 @@ $(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) $(PCRE2_LIB) | $(OUT)
 
 nebuild: $(OUT)/nebuild
 
-$(OUT)/nebuild: tools/nebuild.nelua src/nebox/sys.nelua Makefile $(NELIBC_LIB) | $(OUT)
+$(OUT)/nebuild: tools/nebuild.nelua src/nebuild/sys.nelua Makefile $(NELIBC_LIB) | $(OUT)
 	$(NELUA) -r -L src --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(NELIBC_LDFLAGS)' -o $@ tools/nebuild.nelua
 	@undefined=$$($(NM) -u $@) && test -z "$$undefined" || { echo "$$undefined"; exit 1; }
 
