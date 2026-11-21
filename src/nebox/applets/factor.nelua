@@ -20,35 +20,79 @@ require 'nebox.util'
 ----------------------------------------------------------------------------
 -- 64-bit path
 
--- a * b mod m for a, b < m. On x86-64 one mulq/divq pair (the high word
--- is below m, so divq cannot overflow); the standalone build has no
--- compiler-rt for a 128-bit '%'.
-##[==[
-cemitdecl[[
-#include <stdint.h>
-static inline uint64_t nebox_mulmod64(uint64_t a, uint64_t b, uint64_t m) {
-#if defined(__x86_64__)
-  uint64_t q, r;
-  __asm__("mulq %3\n\tdivq %4" : "=a"(q), "=&d"(r) : "a"(a), "rm"(b), "rm"(m) : "cc");
-  (void)q;
-  return r;
-#else
-  return (uint64_t)(((unsigned __int128)a * b) % m);
-#endif
-}
-]]
-]==]
-local function mulmod64(a: uint64, b: uint64, m: uint64): uint64 <cimport 'nebox_mulmod64', nodecl> end
+-- Montgomery reduction keeps 64-bit modular multiplication in ordinary
+-- integer arithmetic. Split each 64x64 product into four 32x32 products,
+-- then reduce the 128-bit result using R = 2^64.
+local MASK32: uint64 <comptime> = 0xffffffff
 
-local function powmod64(b: uint64, e: uint64, m: uint64): uint64
+local function mulwide64(a: uint64, b: uint64): (uint64, uint64)
+  local a0 = a & MASK32
+  local a1 = a >> 32
+  local b0 = b & MASK32
+  local b1 = b >> 32
+  local p00 = a0 * b0
+  local p01 = a0 * b1
+  local p10 = a1 * b0
+  local p11 = a1 * b1
+  local mid = (p00 >> 32) + (p01 & MASK32) + (p10 & MASK32)
+  local lo = (p00 & MASK32) | (mid << 32)
+  local hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
+  return hi, lo
+end
+
+local function addmod64(a: uint64, b: uint64, m: uint64): uint64
+  local gap = m - b
+  if a >= gap then return a - gap end
+  return a + b
+end
+
+local Mont64 = @record{n: uint64, ninv: uint64, r2: uint64}
+
+local function mont64_init(n: uint64): Mont64
+  local mont: Mont64
+  mont.n = n
+  local inv = n -- an odd integer is its own inverse modulo 8
+  for _ = 1, 6 do inv = inv * (2 - n * inv) end
+  mont.ninv = 0 - inv
   local r: uint64 = 1
-  b = b % m
+  for _ = 1, 128 do r = addmod64(r, r, n) end
+  mont.r2 = r
+  return mont
+end
+
+local function redc64(mont: *Mont64, hi: uint64, lo: uint64): uint64
+  local q = lo * mont.ninv
+  local qhi, qlo = mulwide64(q, mont.n)
+  local low = lo + qlo
+  local carry: uint64 = low < lo and 1 or 0
+  local value = hi + qhi
+  local overflow = value < hi
+  local reduced = value + carry
+  if reduced < value then overflow = true end
+  if overflow or reduced >= mont.n then reduced = reduced - mont.n end
+  return reduced
+end
+
+local function mont64_mul(mont: *Mont64, a: uint64, b: uint64): uint64
+  local hi, lo = mulwide64(a, b)
+  return redc64(mont, hi, lo)
+end
+
+local function mulmod64(a: uint64, b: uint64, mont: *Mont64): uint64
+  local bmont = mont64_mul(mont, b, mont.r2)
+  return mont64_mul(mont, a, bmont)
+end
+
+local function powmod64(b: uint64, e: uint64, mont: *Mont64): uint64
+  local r = mont64_mul(mont, 1, mont.r2)
+  b = b % mont.n
+  b = mont64_mul(mont, b, mont.r2)
   while e > 0 do
-    if e & 1 ~= 0 then r = mulmod64(r, b, m) end
-    b = mulmod64(b, b, m)
+    if e & 1 ~= 0 then r = mont64_mul(mont, r, b) end
+    b = mont64_mul(mont, b, b)
     e = e >> 1
   end
-  return r
+  return mont64_mul(mont, r, 1)
 end
 
 local SMALL_PRIMES: [25]uint64 = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97}
@@ -63,12 +107,13 @@ local function isprime64(n: uint64): boolean
   local d = n - 1
   local s = 0
   while d & 1 == 0 do d = d >> 1; s = s + 1 end
+  local mont = mont64_init(n)
   for i = 0, < 12 do
-    local x = powmod64(SMALL_PRIMES[i], d, n)
+    local x = powmod64(SMALL_PRIMES[i], d, &mont)
     if x ~= 1 and x ~= n - 1 then
       local comp = true
       for _ = 1, s - 1 do
-        x = mulmod64(x, x, n)
+        x = mulmod64(x, x, &mont)
         if x == n - 1 then comp = false; break end
       end
       if comp then return false end
@@ -84,8 +129,10 @@ end
 
 -- Pollard-Brent: a nontrivial factor of the odd composite n.
 local function rho64(n: uint64): uint64
+  local mont = mont64_init(n)
   local c: uint64 = 1
   while true do
+    local addend = c % n
     local y: uint64 = 2
     local x: uint64 = 2
     local g: uint64 = 1
@@ -95,14 +142,14 @@ local function rho64(n: uint64): uint64
     local m: uint64 = 128
     repeat
       x = y
-      for _ = 1, r do y = (mulmod64(y, y, n) + c) % n end
+      for _ = 1, r do y = addmod64(mulmod64(y, y, &mont), addend, n) end
       local k: uint64 = 0
       repeat
         ys = y
         local lim = m < r - k and m or r - k
         for _ = 1, lim do
-          y = (mulmod64(y, y, n) + c) % n
-          q = mulmod64(q, x > y and x - y or y - x, n)
+          y = addmod64(mulmod64(y, y, &mont), addend, n)
+          q = mulmod64(q, x > y and x - y or y - x, &mont)
         end
         g = gcd64(q, n)
         k = k + m
@@ -111,7 +158,7 @@ local function rho64(n: uint64): uint64
     until g ~= 1
     if g == n then
       repeat
-        ys = (mulmod64(ys, ys, n) + c) % n
+        ys = addmod64(mulmod64(ys, ys, &mont), addend, n)
         g = gcd64(x > ys and x - ys or ys - x, n)
       until g ~= 1
     end
