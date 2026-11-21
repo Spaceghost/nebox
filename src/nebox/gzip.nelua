@@ -1,0 +1,427 @@
+-- RFC 1951 DEFLATE inside RFC 1952 gzip members, streamed between descriptors.
+## pragmas.nogc = true
+require 'nebox.sys'
+
+global gzip = @record{}
+
+local function read_some(fd: cint, buf: pointer, n: integer): integer
+  while true do
+    local got = sys.read(fd, buf, n)
+    if got >= 0 or sys.errno() ~= sys.EINTR then return got end
+  end
+end
+
+local function write_all(fd: cint, buf: *[0]byte, n: integer): boolean
+  local pos = 0
+  while pos < n do
+    local put = sys.write(fd, &buf[pos], n - pos)
+    if put < 0 and sys.errno() == sys.EINTR then continue end
+    if put <= 0 then return false end
+    pos = pos + put
+  end
+  return true
+end
+
+local crc_table: [256]uint32
+local function prepare_crc()
+  if crc_table[1] ~= 0 then return end
+  for i = 0, 255 do
+    local c: uint32 = i
+    for j = 1, 8 do
+      if (c & 1) ~= 0 then c = (c >> 1) ~ 0xedb88320 else c = c >> 1 end
+    end
+    crc_table[i] = c
+  end
+end
+local function crc_byte(c: uint32, b: byte): uint32
+  return (c >> 8) ~ crc_table[(c ~ b) & 255]
+end
+
+local Reader = @record{
+  fd: cint, buf: [16384]byte, pos: integer, limit: integer,
+  bits: uint32, count: integer, eof: boolean, failed: boolean,
+}
+local function raw_byte(r: *Reader): integer
+  if r.pos >= r.limit then
+    if r.eof or r.failed then return -1 end
+    r.limit = read_some(r.fd, &r.buf[0], #r.buf)
+    r.pos = 0
+    if r.limit <= 0 then
+      r.failed = r.limit < 0
+      r.eof = true
+      return -1
+    end
+  end
+  local b = r.buf[r.pos]
+  r.pos = r.pos + 1
+  return b
+end
+
+local function fill(r: *Reader, n: integer): boolean
+  while r.count < n do
+    local b = raw_byte(r)
+    if b < 0 then return false end
+    r.bits = r.bits | ((@uint32)(b) << r.count)
+    r.count = r.count + 8
+  end
+  return true
+end
+local function drop(r: *Reader, n: integer)
+  r.bits = r.bits >> n
+  r.count = r.count - n
+end
+local function bits(r: *Reader, n: integer): integer
+  if not fill(r, n) then return -1 end
+  local v = r.bits & ((1 << n) - 1)
+  drop(r, n)
+  return v
+end
+
+-- Replicate short canonical codes into a nine-bit lookup table. Longer
+-- codes use the first code and the symbol list at each length.
+local Tree = @record{
+  quick: [512]uint16, first: [16]integer, offsets: [16]integer,
+  counts: [16]integer, symbols: [288]uint16,
+}
+local function reverse_code(code: integer, n: integer): integer
+  local x = 0
+  for i = 1, n do x = (x << 1) | (code & 1); code = code >> 1 end
+  return x
+end
+local function build(t: *Tree, lengths: *[0]byte, size: integer, code_tree: boolean): boolean
+  local used = 0
+  for i = 0, 15 do t.counts[i] = 0 end
+  for i = 0, 511 do t.quick[i] = 0 end
+  for i = 0, size - 1 do
+    local n = lengths[i]
+    if n > 0 then t.counts[n] = t.counts[n] + 1; used = used + 1 end
+  end
+  local code, off = 0, 0
+  local nextsym: [16]integer
+  for n = 1, 15 do
+    code = (code + t.counts[n-1]) << 1
+    if code + t.counts[n] > (1 << n) then return false end
+    t.first[n], t.offsets[n], nextsym[n] = code, off, off
+    off = off + t.counts[n]
+  end
+  if code + t.counts[15] ~= (1 << 15) then
+    if code_tree or (used > 0 and (used ~= 1 or t.counts[1] ~= 1)) then return false end
+  end
+  for sym = 0, size - 1 do
+    local n = lengths[sym]
+    if n == 0 then continue end
+    local idx = nextsym[n]
+    t.symbols[idx] = sym
+    nextsym[n] = idx + 1
+    if n <= 9 then
+      local prefix = reverse_code(t.first[n] + idx - t.offsets[n], n)
+      for k = prefix, 511, 1 << n do t.quick[k] = (sym << 4) | n end
+    end
+  end
+  return true
+end
+local function symbol(r: *Reader, t: *Tree): integer
+  if not fill(r, 9) then return -1 end
+  local q = t.quick[r.bits & 511]
+  if q ~= 0 then drop(r, q & 15); return q >> 4 end
+  local code = reverse_code(r.bits & 511, 9)
+  drop(r, 9)
+  for n = 10, 15 do
+    local b = bits(r, 1)
+    if b < 0 then return -1 end
+    code = (code << 1) | b
+    local index = code - t.first[n]
+    if index >= 0 and index < t.counts[n] then return t.symbols[t.offsets[n] + index] end
+  end
+  return -1
+end
+
+local code_order: [19]byte = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15}
+local function dynamic_trees(r: *Reader, lit: *Tree, dist: *Tree): boolean
+  local nl = bits(r, 5) + 257
+  local nd = bits(r, 5) + 1
+  local nc = bits(r, 4) + 4
+  if nl < 257 or nl > 286 or nd < 1 or nc < 4 then return false end
+  local lens: [320]byte
+  for i = 0, nc-1 do
+    local n = bits(r, 3)
+    if n < 0 then return false end
+    lens[code_order[i]] = n
+  end
+  local codes: Tree
+  if not build(&codes, &lens[0], 19, true) then return false end
+  local pos = 0
+  while pos < nl + nd do
+    local s = symbol(r, &codes)
+    if s < 0 then return false end
+    if s <= 15 then lens[pos] = s; pos = pos + 1
+    else
+      local value: byte = 0
+      local extra, base = 3, 3
+      if s == 16 then
+        if pos == 0 then return false end
+        value, extra = lens[pos-1], 2
+      elseif s == 18 then extra, base = 7, 11 end
+      local run = bits(r, extra)
+      if run < 0 then return false end
+      run = run + base
+      if run > nl + nd - pos then return false end
+      for i = 1, run do lens[pos] = value; pos = pos + 1 end
+    end
+  end
+  return lens[256] ~= 0 and build(lit, &lens[0], nl, false) and build(dist, &lens[nl], nd, false)
+end
+
+local function fixed_trees(lit: *Tree, dist: *Tree)
+  local lens: [288]byte
+  for i = 0, 143 do lens[i] = 8 end
+  for i = 144, 255 do lens[i] = 9 end
+  for i = 256, 279 do lens[i] = 7 end
+  for i = 280, 287 do lens[i] = 8 end
+  build(lit, &lens[0], 288, false)
+  for i = 0, 31 do lens[i] = 5 end
+  build(dist, &lens[0], 32, false)
+end
+
+local len_base: [29]uint16 = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258}
+local len_extra: [29]byte = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0}
+local dist_base: [30]uint16 = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577}
+local dist_extra: [30]byte = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13}
+
+local Window = @record{fd: cint, buf: [32768]byte, pos: integer, valid: integer, length: uint32, crc: uint32}
+local function emit(w: *Window, b: byte): boolean
+  w.buf[w.pos] = b
+  w.pos = w.pos + 1
+  w.length = w.length + 1
+  w.crc = crc_byte(w.crc, b)
+  if w.valid < 32768 then w.valid = w.valid + 1 end
+  if w.pos == 32768 then
+    w.pos = 0
+    return w.fd < 0 or write_all(w.fd, &w.buf[0], 32768)
+  end
+  return true
+end
+
+local function inflate(r: *Reader, w: *Window): boolean
+  local lit: Tree
+  local dist: Tree
+  local final: integer
+  repeat
+    final = bits(r, 1)
+    local kind = bits(r, 2)
+    if kind == 0 then
+      drop(r, r.count & 7)
+      local size = bits(r, 16)
+      if size < 0 or bits(r, 16) ~= (size ~ 65535) then return false end
+      for i = 1, size do
+        local b = bits(r, 8)
+        if b < 0 or not emit(w, b) then return false end
+      end
+    elseif kind == 1 or kind == 2 then
+      if kind == 1 then fixed_trees(&lit, &dist)
+      elseif not dynamic_trees(r, &lit, &dist) then return false end
+      while true do
+        local s = symbol(r, &lit)
+        if s < 0 or s > 285 then return false end
+        if s == 256 then break end
+        if s < 256 then
+          if not emit(w, s) then return false end
+        else
+          local le = bits(r, len_extra[s-257])
+          local ds = symbol(r, &dist)
+          if le < 0 or ds < 0 or ds > 29 then return false end
+          local de = bits(r, dist_extra[ds])
+          if de < 0 then return false end
+          local distance = dist_base[ds] + de
+          if distance > w.valid then return false end
+          for i = 1, len_base[s-257] + le do
+            if not emit(w, w.buf[(w.pos - distance) & 32767]) then return false end
+          end
+        end
+      end
+    else return false end
+  until final == 1
+  drop(r, r.count & 7)
+  return true
+end
+
+local function read_header(r: *Reader): boolean
+  -- First magic byte was consumed by the caller.
+  local crc = crc_byte(0xffffffff, 31)
+  local flags = 0
+  for pos = 1, 9 do
+    local b = bits(r, 8)
+    if b < 0 or (pos == 1 and b ~= 139) or (pos == 2 and b ~= 8) then return false end
+    if pos == 3 then flags = b; if (b & 224) ~= 0 then return false end end
+    crc = crc_byte(crc, b)
+  end
+  if (flags & 4) ~= 0 then
+    local lo, hi = bits(r, 8), bits(r, 8)
+    if lo < 0 or hi < 0 then return false end
+    crc = crc_byte(crc_byte(crc, lo), hi)
+    for i = 1, lo + hi*256 do
+      local b = bits(r, 8)
+      if b < 0 then return false end
+      crc = crc_byte(crc, b)
+    end
+  end
+  for flag = 8, 16, 8 do
+    if (flags & flag) ~= 0 then
+      local b: integer
+      repeat
+        b = bits(r, 8)
+        if b < 0 then return false end
+        crc = crc_byte(crc, b)
+      until b == 0
+    end
+  end
+  return (flags & 2) == 0 or bits(r, 16) == ((~crc) & 65535)
+end
+
+local function check_u32(r: *Reader, expected: uint32): boolean
+  for i = 0, 3 do
+    if bits(r, 8) ~= ((expected >> (8*i)) & 255) then return false end
+  end
+  return true
+end
+
+function gzip.decode(input_fd: cint, output_fd: cint): boolean
+  prepare_crc()
+  local r: Reader
+  r.fd = input_fd
+  local b = bits(&r, 8)
+  repeat
+    if b ~= 31 or not read_header(&r) then return false end
+    local w: Window
+    w.fd, w.crc = output_fd, 0xffffffff
+    if not inflate(&r, &w) or not check_u32(&r, ~w.crc) or not check_u32(&r, w.length) then return false end
+    if output_fd >= 0 and not write_all(output_fd, &w.buf[0], w.pos) then return false end
+    b = bits(&r, 8)
+  until b < 0
+  return r.eof and not r.failed
+end
+local Writer = @record{fd: cint, buf: [16384]byte, pos: integer, bits: uint32, count: integer, failed: boolean}
+local function write_byte(w: *Writer, b: byte)
+  w.buf[w.pos] = b
+  w.pos = w.pos + 1
+  if w.pos == #w.buf then
+    if not write_all(w.fd, &w.buf[0], w.pos) then w.failed = true end
+    w.pos = 0
+  end
+end
+local function put(w: *Writer, value: integer, width: integer)
+  w.bits = w.bits | ((@uint32)(value) << w.count)
+  w.count = w.count + width
+  while w.count >= 8 do
+    write_byte(w, (@byte)(w.bits & 255))
+    w.bits = w.bits >> 8
+    w.count = w.count - 8
+  end
+end
+
+local fixed_codes: [288]uint16
+local fixed_widths: [288]byte
+local function prepare_codes()
+  if fixed_widths[0] ~= 0 then return end
+  for i = 0, 287 do
+    local code, width = 0, 0
+    if i < 144 then code, width = 48 + i, 8
+    elseif i < 256 then code, width = 400 + i - 144, 9
+    elseif i < 280 then code, width = i - 256, 7
+    else code, width = 192 + i - 280, 8 end
+    fixed_codes[i], fixed_widths[i] = reverse_code(code, width), width
+  end
+end
+local function literal(w: *Writer, s: integer)
+  put(w, fixed_codes[s], fixed_widths[s])
+end
+local function write_match(w: *Writer, length: integer, distance: integer)
+  local lc = 0
+  while lc < 28 and len_base[lc+1] <= length do lc = lc + 1 end
+  literal(w, 257 + lc)
+  put(w, length - len_base[lc], len_extra[lc])
+  local dc = 0
+  while dc < 29 and dist_base[dc+1] <= distance do dc = dc + 1 end
+  put(w, reverse_code(dc, 5), 5)
+  put(w, distance - dist_base[dc], dist_extra[dc])
+end
+
+-- One 32 KiB input block at a time. Each hash bucket links positions with
+-- similar triples. Bound the chain search by the requested compression level.
+local MatchIndex = @record{head: [16384]uint16, prev: [32768]uint16}
+local function insert(idx: *MatchIndex, buf: *[0]byte, pos: integer): integer
+  local key = (((@integer)(buf[pos]) * 251 + buf[pos+1]) * 251 + buf[pos+2]) & 16383
+  local prev = idx.head[key]
+  idx.prev[pos] = prev
+  idx.head[key] = pos + 1
+  return (@integer)(prev) - 1
+end
+local search_depth: [9]byte = {1,2,4,6,8,12,16,24,32}
+local function deflate_block(w: *Writer, buf: *[0]byte, size: integer, depth: integer)
+  local idx: MatchIndex
+  put(w, 2, 3) -- non-final block, fixed codes
+  local pos = 0
+  while pos < size do
+    local best, distance = 2, 0
+    if pos + 2 < size then
+      local prev = insert(&idx, buf, pos)
+      local limit = size - pos
+      if limit > 258 then limit = 258 end
+      for i = 1, depth do
+        if prev < 0 then break end
+        local n = 0
+        if buf[prev + best] == buf[pos + best] then
+          while n < limit and buf[prev+n] == buf[pos+n] do n = n + 1 end
+          if n > best then
+            best, distance = n, pos - prev
+            if best == limit then break end
+          end
+        end
+        prev = (@integer)(idx.prev[prev]) - 1
+      end
+    end
+    if distance == 0 then literal(w, buf[pos]); pos = pos + 1
+    else
+      write_match(w, best, distance)
+      for p = pos + 1, pos + best - 1 do
+        if p + 2 < size then insert(&idx, buf, p) end
+      end
+      pos = pos + best
+    end
+  end
+  literal(w, 256)
+end
+local function footer_u32(w: *Writer, x: uint32)
+  for i = 0, 3 do write_byte(w, (@byte)((x >> (8*i)) & 255)) end
+end
+
+function gzip.encode_level(input_fd: cint, output_fd: cint, level: integer): boolean
+  if level < 1 or level > 9 then return false end
+  prepare_crc()
+  prepare_codes()
+  local w: Writer
+  w.fd = output_fd
+  local header: [10]byte = {31,139,8,0,0,0,0,0,0,3}
+  if not write_all(w.fd, &header[0], #header) then return false end
+  local buf: [32768]byte
+  local crc: uint32 = 0xffffffff
+  local size: uint32 = 0
+  while true do
+    local n = read_some(input_fd, &buf[0], #buf)
+    if n < 0 then return false end
+    if n == 0 then break end
+    for i = 0, n-1 do crc = crc_byte(crc, buf[i]) end
+    size = size + (@uint32)(n)
+    deflate_block(&w, &buf[0], n, search_depth[level-1])
+    if w.failed then return false end
+  end
+  put(&w, 3, 3) -- final, empty fixed-code block
+  literal(&w, 256)
+  if w.count > 0 then put(&w, 0, 8 - w.count) end
+  footer_u32(&w, ~crc)
+  footer_u32(&w, size)
+  return not w.failed and write_all(w.fd, &w.buf[0], w.pos)
+end
+function gzip.encode(input_fd: cint, output_fd: cint): boolean
+  return gzip.encode_level(input_fd, output_fd, 6)
+end

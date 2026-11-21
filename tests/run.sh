@@ -459,6 +459,12 @@ same kill-0 'kill -0 $$; echo $?'
 same kill-l 'kill -l TERM >/dev/null; echo $?'
 same date-r 'date -u -r words.txt +%Y-%m-%d'
 same date-d 'date -u -d @0 "+%Y %H:%M"'
+# Exercise archive interoperability with an independent format implementation.
+if python3 "$(dirname -- "$0")/archives.py" "$BIN" "$W/bin"; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); failed="$failed archives"
+fi
 # dispatch
 expect list-has-cat 'exit=0' "$BIN --list | grep -qx cat"
 expect unknown-applet 'exit=127' "$BIN nosuchapplet"
@@ -1141,11 +1147,11 @@ if unshare -rm true >/dev/null 2>&1; then
   '"'"''
 fi
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '124
+  expect list-count-theseus '128
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
 else
-  expect list-count '123
+  expect list-count '127
 exit=0' "$BIN --list | wc -l"
 fi
 

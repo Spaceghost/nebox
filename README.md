@@ -135,16 +135,28 @@ The [applet queue](docs/APPLET-QUEUE.md) tracks the next BusyBox and Toybox comp
 ```
 [ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum cmp comm
 cp csplit cut date df dir dircolors dirname dnsdomainname domainname du echo env expand expr
-factor false find fmt fold free grep groups hd head hexdump hostid hostname id install
+factor false find fmt fold free grep groups gunzip gzip hd head hexdump hostid hostname id install
 join kill link ln logname ls md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
 patch pathchk pinky printenv printf pwd readlink realpath rev rm rmdir sed seq setsid sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
-sync tac tail tee test timeout touch tr true truncate tsort tty umount uname unexpand
-uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname
+sync tac tail tar tee test timeout touch tr true truncate tsort tty umount uname unexpand
+uniq unlink uptime users vdir wc which who whoami xargs yes ypdomainname zcat
 ```
 
 `nebox --list` prints the names; `nebox --install [-s] DIR` creates one link
 per applet in `DIR`.
+
+`tar -xzf ARCHIVE -C DIR` extracts a gzip-compressed archive into an existing
+directory. Nebox also creates archives with `-c`, lists with `-t`, and
+streams archives through `-f -`. It writes ustar and reads regular files,
+directories and relative symbolic links. Extraction reads pax path names and ignores timestamp and ownership metadata.
+Absolute paths and parent-directory components are rejected. Hard links,
+sparse files and special devices are unsupported.
+
+`gzip`, `gunzip` and `zcat` share the native streaming codec. `gzip -c`
+writes compressed output to stdout, and `gzip -t` validates member checksums
+and sizes. `zcat` decodes concatenated members. Named-file conversions keep
+the input on error and protect an existing destination unless given `-f`.
 
 The device applets `mkfifo` and `mknod` accept symbolic and octal
 modes. `chroot` sets the new root and optionally switches user, group and

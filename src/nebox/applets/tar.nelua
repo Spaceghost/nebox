@@ -1,0 +1,510 @@
+-- POSIX ustar reader and writer with an optional native gzip pipeline.
+## pragmas.nogc = true
+require 'nebox.util'
+require 'nebox.gzip'
+
+local function openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
+local function mkdirat(fd: cint, path: cstring, mode: cuint): cint <cimport 'mkdirat', cinclude '<sys/stat.h>'> end
+local function symlinkat(target: cstring, fd: cint, path: cstring): cint <cimport 'symlinkat', cinclude '<unistd.h>'> end
+local function unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
+local function renameat(oldfd: cint, old: cstring, newfd: cint, newname: cstring): cint <cimport 'renameat', cinclude '<stdio.h>'> end
+local function fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
+
+local Block = @[512]byte
+local zeros: Block
+local buffer: [65536]byte
+local dir_flags: cint <comptime> = sys.O_RDONLY | sys.O_DIRECTORY | sys.O_NOFOLLOW
+
+local function fail(message: string): boolean
+  util.err(message)
+  return false
+end
+
+local function path_error(path: string): boolean
+  util.perror(path)
+  return false
+end
+
+local function read_exact(fd: cint, bytes: *[0]byte, count: integer): boolean
+  local pos = 0
+  while pos < count do
+    local n = sys.read(fd, &bytes[pos], (@csize)(count - pos))
+    if n < 0 and sys.errno() == sys.EINTR then continue end
+    if n < 0 then return path_error('read') end
+    if n == 0 then return fail('unexpected end of input') end
+    pos = pos + n
+  end
+  return true
+end
+
+local function write_exact(fd: cint, bytes: *[0]byte, count: integer): boolean
+  local pos = 0
+  while pos < count do
+    local n = sys.write(fd, &bytes[pos], (@csize)(count - pos))
+    if n < 0 and sys.errno() == sys.EINTR then continue end
+    if n <= 0 then return path_error('write') end
+    pos = pos + n
+  end
+  return true
+end
+
+local function transfer(input: cint, output: cint, remaining: integer): boolean
+  while remaining > 0 do
+    local n = remaining < #buffer and remaining or #buffer
+    if not read_exact(input, &buffer, n) then return false end
+    if output >= 0 and not write_exact(output, &buffer, n) then return false end
+    remaining = remaining - n
+  end
+  return true
+end
+
+local function padding(size: integer): integer
+  return (512 - (size % 512)) % 512
+end
+
+local function put_text(h: *Block, start: integer, text: string)
+  for i = 0, < #text do h[start + i] = text.data[i] end
+end
+
+local function get_text(h: *Block, start: integer, width: integer): string
+  local n = 0
+  while n < width and h[start + n] ~= 0 do n = n + 1 end
+  return string.copy((@string){data = &h[start], size = (@usize)(n)})
+end
+
+local function put_octal(h: *Block, start: integer, width: integer, value: integer): boolean
+  if value < 0 then return false end
+  for i = start + width - 2, start, -1 do
+    h[i] = (@byte)(48 + value % 8)
+    value = value // 8
+  end
+  return value == 0
+end
+
+local function get_octal(h: *Block, start: integer, width: integer): integer
+  local pos = start
+  while pos < start + width and h[pos] == 32 do pos = pos + 1 end
+  local value = 0
+  local digits = 0
+  while pos < start + width and h[pos] >= 48 and h[pos] <= 55 do
+    value = value * 8 + h[pos] - 48
+    digits = digits + 1
+    pos = pos + 1
+  end
+  if digits == 0 then return -1 end
+  while pos < start + width do
+    if h[pos] ~= 32 and h[pos] ~= 0 then return -1 end
+    pos = pos + 1
+  end
+  return value
+end
+
+local function checksum(h: *Block): integer
+  local value = 8 * 32
+  for i = 0, < 512 do
+    if i < 148 or i >= 156 then value = value + h[i] end
+  end
+  return value
+end
+
+local function is_zero(h: *Block): boolean
+  for i = 0, < 512 do if h[i] ~= 0 then return false end end
+  return true
+end
+
+-- Reject absolute and parent-relative paths before creating anything on disk.
+local function safe_path(path: string): boolean
+  if #path == 0 or path:byte(1) == 47 then return false end
+  local start = 1
+  for i = 1, #path + 1 do
+    if i <= #path and path:byte(i) == 0 then return false end
+    if i > #path or path:byte(i) == 47 then
+      if i - start == 2 and path:byte(start) == 46 and path:byte(start + 1) == 46 then return false end
+      start = i + 1
+    end
+  end
+  return true
+end
+
+local function put_name(h: *Block, path: string): boolean
+  if #path <= 100 then put_text(h, 0, path); return true end
+  for i = #path - 1, 2, -1 do
+    if i - 1 <= 155 and #path - i <= 100 and path:byte(i) == 47 then
+      put_text(h, 345, path:sub(1, i - 1))
+      put_text(h, 0, path:sub(i + 1))
+      return true
+    end
+  end
+  return fail('path does not fit a ustar header: ' .. path)
+end
+
+local function write_header(fd: cint, name: string, kind: byte, size: integer, st: *sys.Stat, link: string): boolean
+  local h: Block
+  if not put_name(&h, name) then return false end
+  if not put_octal(&h, 100, 8, st.st_mode & 0xfff) or not put_octal(&h, 108, 8, st.st_uid) or
+     not put_octal(&h, 116, 8, st.st_gid) or not put_octal(&h, 124, 12, size) or
+     not put_octal(&h, 136, 12, st.st_mtim.tv_sec) then return fail('metadata exceeds ustar field: ' .. name) end
+  h[156] = kind
+  put_text(&h, 157, link)
+  put_text(&h, 257, 'ustar')
+  put_text(&h, 263, '00')
+  put_octal(&h, 148, 7, checksum(&h)); h[155] = 32
+  return write_exact(fd, &h, 512)
+end
+
+local function show_name(fd: cint, name: string): boolean
+  local newline: [1]byte = {10}
+  return write_exact(fd, name.data, #name) and write_exact(fd, &newline, 1)
+end
+
+local Writer = @record{fd: cint, archive: sys.Stat, verbose: boolean}
+local function add_entry(w: *Writer, path: string, name: string): boolean
+  local st: sys.Stat
+  if sys.lstat(path, &st) ~= 0 then return path_error(path) end
+  if st.st_dev == w.archive.st_dev and st.st_ino == w.archive.st_ino then return true end
+  local kind = st.st_mode & sys.S_IFMT
+  if kind == sys.S_IFDIR then
+    local dirname = name:byte(#name) == 47 and name or name .. '/'
+    if not write_header(w.fd, dirname, 53, 0, &st, '') then return false end
+    if w.verbose and not show_name(2, dirname) then return false end
+    local d = sys.opendir(path)
+    if d == nilptr then return path_error(path) end
+    defer sys.closedir(d) end
+    while true do
+      sys.seterrno(0)
+      local ent = sys.readdir(d)
+      if ent == nilptr then
+        if sys.errno() ~= 0 then return path_error(path) end
+        break
+      end
+      local child = sys.cstr(&ent.d_name)
+      if child ~= '.' and child ~= '..' then
+        if not add_entry(w, util.join(path, child), util.join(name, child)) then return false end
+      end
+    end
+    return true
+  end
+  if w.verbose and not show_name(2, name) then return false end
+  if kind == sys.S_IFLNK then
+    local link: [101]byte
+    local n = sys.readlink(path, &link, #link)
+    if n < 0 then return path_error(path) end
+    if n > 100 then return fail('link target exceeds ustar field: ' .. name) end
+    local target = (@string){data = &link[0], size = (@usize)(n)}
+    return write_header(w.fd, name, 50, 0, &st, target)
+  end
+  if kind ~= sys.S_IFREG then return fail('unsupported file type: ' .. path) end
+  local input = sys.open(path, sys.O_RDONLY | sys.O_NOFOLLOW, 0)
+  if input < 0 then return path_error(path) end
+  defer sys.close(input) end
+  if sys.fstat(input, &st) ~= 0 then return path_error(path) end
+  if (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG then return fail('file type changed: ' .. path) end
+  return write_header(w.fd, name, 48, st.st_size, &st, '') and transfer(input, w.fd, st.st_size)
+     and write_exact(w.fd, &zeros, padding(st.st_size))
+end
+
+-- Traverse extraction parents through held directory descriptors. A symlink
+-- created by an earlier member cannot redirect a later member's write.
+local function enter_dir(fd: cint, name: string, create: boolean): cint
+  local nextfd = openat(fd, name, dir_flags, 0)
+  if nextfd < 0 and sys.errno() == sys.ENOENT and create then
+    if mkdirat(fd, name, 0x1ff) ~= 0 and sys.errno() ~= sys.EEXIST then return -1 end
+    nextfd = openat(fd, name, dir_flags, 0)
+  end
+  return nextfd
+end
+
+local function parent_for(root: cint, path: string, create: boolean): (cint, string)
+  local fd = sys.dup(root)
+  local leaf: string = '.'
+  local start = 1
+  for i = 1, #path + 1 do
+    if i <= #path and path:byte(i) ~= 47 then continue end
+    if i > start then
+      local part = path:sub(start, i - 1)
+      if part ~= '.' then
+        if leaf ~= '.' and fd >= 0 then
+          local child = enter_dir(fd, leaf, create)
+          sys.close(fd)
+          fd = child
+        end
+        leaf = part
+      end
+    end
+    start = i + 1
+  end
+  return fd, leaf
+end
+
+local temp_counter = 0
+local function temp_name(): string
+  temp_counter = temp_counter + 1
+  return string.format('.nebox-tar-%d-%d', (@integer)(sys.getpid()), temp_counter)
+end
+
+local function unpack_file(input: cint, parent: cint, leaf: string, path: string, size: integer, mode: cuint): boolean
+  local temp: string
+  local output: cint
+  repeat
+    temp = temp_name()
+    output = openat(parent, temp, sys.O_WRONLY | sys.O_CREAT | sys.O_EXCL, 0x180)
+  until output >= 0 or sys.errno() ~= sys.EEXIST
+  if output < 0 then return path_error(path) end
+  local ok = transfer(input, output, size)
+  if ok and fchmod(output, mode) ~= 0 then ok = path_error(path) end
+  if sys.close(output) ~= 0 then ok = path_error(path) end
+  if ok and renameat(parent, temp, parent, leaf) ~= 0 then ok = path_error(path) end
+  if not ok then unlinkat(parent, temp, 0) end
+  return ok
+end
+
+local DirMode = @record{path: string, mode: cuint}
+local Reader = @record{input: cint, root: cint, list: boolean, verbose: boolean,
+                       mask: cuint, dirs: sequence(DirMode)}
+local function read_member(r: *Reader, path: string, target: string, kind: byte, size: integer, mode: cuint): boolean
+  if r.list or r.verbose then
+    if not show_name(1, path) then return false end
+  end
+  if r.list then return transfer(r.input, -1, size) end
+  if not safe_path(path) then return fail('unsafe member path: ' .. path) end
+  local parent, leaf = parent_for(r.root, path, true)
+  if parent < 0 then return path_error(path) end
+  defer sys.close(parent) end
+  mode = mode & 0x1ff & (~r.mask)
+  if kind == 48 or kind == 0 then return unpack_file(r.input, parent, leaf, path, size, mode) end
+  if size ~= 0 then return fail('unexpected non-file payload: ' .. path) end
+  if kind == 53 then
+    if leaf == '.' then return true end
+    if mkdirat(parent, leaf, 0x1ff) ~= 0 and sys.errno() ~= sys.EEXIST then return path_error(path) end
+    local d = enter_dir(parent, leaf, false)
+    if d < 0 then return path_error(path) end
+    sys.close(d)
+    r.dirs:push((@DirMode){path = path, mode = mode})
+    return true
+  elseif kind == 50 then
+    if not safe_path(target) then return fail('unsafe link target: ' .. target) end
+    local temp: string
+    local created: cint
+    repeat
+      temp = temp_name()
+      created = symlinkat(target, parent, temp)
+    until created == 0 or sys.errno() ~= sys.EEXIST
+    if created ~= 0 then return path_error(path) end
+    if renameat(parent, temp, parent, leaf) ~= 0 then
+      path_error(path)
+      unlinkat(parent, temp, 0)
+      return false
+    end
+    return true
+  end
+  return fail('unsupported member type: ' .. path)
+end
+
+-- POSIX pax records have byte-counted lengths. Handle attributes that change
+-- the byte stream or destination. Ignore descriptive metadata, which Nebox
+-- also omits for ordinary ustar entries (owner names, timestamps and xattrs).
+local Overrides = @record{path: string, link: string, size: integer, pending: boolean}
+local function pax(data: string, o: *Overrides, global_header: boolean): boolean
+  local pos = 0
+  while pos < #data do
+    local start = pos
+    local length = 0
+    while pos < #data and data.data[pos] >= 48 and data.data[pos] <= 57 do
+      length = length * 10 + data.data[pos] - 48
+      if length > #data - start then return false end
+      pos = pos + 1
+    end
+    local last = start + length - 1
+    if pos == start or pos >= last or data.data[pos] ~= 32 or data.data[last] ~= 10 then return false end
+    local begin = pos + 1
+    pos = begin
+    while pos < last and data.data[pos] ~= 61 do pos = pos + 1 end
+    if pos == begin or pos == last then return false end
+    local key = data:sub(begin + 1, pos)
+    local value = data:sub(pos + 2, last)
+    if key == 'path' or key == 'linkpath' then
+      if global_header or #value == 0 or #value > 4095 then return false end
+      if key == 'path' then o.path = string.copy(value) else o.link = string.copy(value) end
+    elseif key == 'size' then
+      if global_header or #value == 0 then return false end
+      local good, n = util.xdectoimax(value, 0, 0x7fffffffffffffff, '', 'invalid pax size')
+      if not good then return false end
+      o.size = n
+    elseif key:sub(1, 11) == 'GNU.sparse.' or key == 'SCHILY.realsize' or key == 'SCHILY.filetype' then
+      return false
+    end
+    pos = last + 1
+  end
+  return true
+end
+
+local function extended(input: cint, kind: byte, size: integer, o: *Overrides): boolean
+  if size <= 0 or size > #buffer then return fail('extended header exceeds 64 KiB or is empty') end
+  if not read_exact(input, &buffer, size) then return false end
+  local data = (@string){data = &buffer[0], size = (@usize)(size)}
+  if kind == 76 or kind == 75 then
+    if size > 4096 or buffer[size - 1] ~= 0 then return fail('invalid extended member name') end
+    local value = data:sub(1, size - 1)
+    if kind == 76 then o.path = string.copy(value) else o.link = string.copy(value) end
+  elseif not pax(data, o, kind == 103) then return fail('invalid or unsupported pax attributes') end
+  if kind ~= 103 then o.pending = true end
+  return read_exact(input, &buffer, padding(size))
+end
+
+local function read_archive(r: *Reader): boolean
+  local h: Block
+  local overrides: Overrides
+  overrides.size = -1
+  while true do
+    if not read_exact(r.input, &h, 512) then return false end
+    if is_zero(&h) then
+      if overrides.pending then return fail('extended header is missing its member') end
+      if not read_exact(r.input, &h, 512) then return false end
+      if not is_zero(&h) then return fail('invalid end of archive') end
+      break
+    end
+    if get_octal(&h, 148, 8) ~= checksum(&h) then return fail('invalid header checksum') end
+    local path = get_text(&h, 0, 100)
+    if get_text(&h, 257, 6) == 'ustar' then
+      local prefix = get_text(&h, 345, 155)
+      if #prefix > 0 then path = prefix .. '/' .. path end
+    end
+    local size = get_octal(&h, 124, 12)
+    local mode = get_octal(&h, 100, 8)
+    if size < 0 or mode < 0 or #path == 0 then return fail('invalid member header') end
+    local kind = h[156]
+    if kind == 120 or kind == 103 or kind == 76 or kind == 75 then
+      if not extended(r.input, kind, size, &overrides) then return false end
+      continue
+    end
+    if kind == 83 then return fail('sparse members are unsupported') end
+    local target = get_text(&h, 157, 100)
+    if #overrides.path > 0 then path = overrides.path end
+    if #overrides.link > 0 then target = overrides.link end
+    if overrides.size >= 0 then size = overrides.size end
+    overrides.path = ''; overrides.link = ''; overrides.size = -1; overrides.pending = false
+    if not read_member(r, path, target, kind, size, (@cuint)(mode)) then return false end
+    if not read_exact(r.input, &buffer, padding(size)) then return false end
+  end
+  for i = #r.dirs, 1, -1 do
+    local dir = r.dirs[i]
+    local parent, leaf = parent_for(r.root, dir.path, false)
+    if parent < 0 then return path_error(dir.path) end
+    local fd = enter_dir(parent, leaf, false)
+    sys.close(parent)
+    if fd < 0 then return path_error(dir.path) end
+    local ok = fchmod(fd, dir.mode) == 0
+    sys.close(fd)
+    if not ok then return path_error(dir.path) end
+  end
+  return true
+end
+
+-- The child runs the in-process codec. Closing unused pipe ends and checking
+-- its exit status propagates gzip checksum failures after tar's end marker.
+local function codec_pipe(archive: cint, create: boolean): (cint, cint)
+  local ends: [2]cint
+  if sys.pipe(&ends) < 0 then return -1, -1 end
+  local pid = sys.fork()
+  if pid == 0 then
+    local ok: boolean
+    if create then
+      sys.close(ends[1])
+      ok = gzip.encode(ends[0], archive)
+    else
+      sys.close(ends[0])
+      ok = gzip.decode(archive, ends[1])
+    end
+    sys._exit(ok and 0 or 1)
+  end
+  if pid < 0 then sys.close(ends[0]); sys.close(ends[1]); return -1, -1 end
+  if create then sys.close(ends[0]); return ends[1], pid end
+  sys.close(ends[1]); return ends[0], pid
+end
+
+local function drain(fd: cint): boolean
+  while true do
+    local n = sys.read(fd, &buffer, #buffer)
+    if n < 0 and sys.errno() == sys.EINTR then continue end
+    if n <= 0 then return n == 0 end
+  end
+end
+
+local Operand = @record{dir: string, name: string}
+global function applet_tar(args: sequence(string)): integer
+  local opts: []util.LongOpt = {
+    {'create', 0, 99}, {'extract', 0, 120}, {'list', 0, 116}, {'file', 1, 102},
+    {'gzip', 0, 122}, {'directory', 1, 67}, {'verbose', 0, 118},
+  }
+  if #args > 0 and #args[1] > 0 and args[1]:byte(1) ~= 45 then args[1] = '-' .. args[1] end
+  local g = util.getopt(args, '-cxtzf:C:v', &opts, #opts)
+  local action = 0
+  local zipped, verbose = false, false
+  local directory: string = '.'
+  local archive: string = '-'
+  local operands: sequence(Operand)
+  while true do
+    local c = g:next()
+    if c == -1 then break
+    elseif c == 99 or c == 120 or c == 116 then
+      if action ~= 0 and action ~= c then return util.die('specify one of -c, -x, -t') end
+      action = c
+    elseif c == 102 then archive = g.optarg
+    elseif c == 67 then
+      if #g.optarg == 0 then return util.die('empty directory name') end
+      if g.optarg:byte(1) == 47 then directory = g.optarg else directory = util.join(directory, g.optarg) end
+    elseif c == 1 then operands:push((@Operand){dir = directory, name = g.optarg})
+    elseif c == 122 then zipped = true
+    elseif c == 118 then verbose = true
+    else return 1 end
+  end
+  for _, operand in ipairs(g:operands()) do operands:push((@Operand){dir = directory, name = operand}) end
+  if action == 0 then return util.die('usage: tar -c|-t|-x [-zv] [-f ARCHIVE] [-C DIR] [FILE...]') end
+  local create = action == 99
+  if create and #operands == 0 then return util.die('missing input files') end
+  if not create and #operands ~= 0 then return util.die('member selection is unsupported') end
+  local fd: cint
+  if archive == '-' then fd = create and 1 or 0
+  elseif create then fd = sys.open(archive, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0x1b6)
+  else fd = sys.open(archive, sys.O_RDONLY, 0) end
+  if fd < 0 then util.perror(archive); return 1 end
+  local w: Writer
+  w.verbose = verbose
+  if sys.fstat(fd, &w.archive) ~= 0 then util.perror(archive); if archive ~= '-' then sys.close(fd) end; return 1 end
+  local input: cint = fd
+  local pid: cint = -1
+  if zipped then
+    input, pid = codec_pipe(fd, create)
+    if pid < 0 then util.perror('gzip pipe'); if archive ~= '-' then sys.close(fd) end; return 1 end
+  end
+  local ok = true
+  if create then
+    w.fd = input
+    for _, operand in ipairs(operands) do
+      if not safe_path(operand.name) then ok = fail('unsafe input path: ' .. operand.name); break end
+      if not add_entry(&w, util.join(operand.dir, operand.name), operand.name) then ok = false; break end
+    end
+    if ok then ok = write_exact(input, &zeros, 512) and write_exact(input, &zeros, 512) end
+  else
+    local r: Reader
+    r.input = input; r.list = action == 116; r.verbose = verbose
+    r.root = sys.open(directory, sys.O_DIRECTORY | sys.O_RDONLY, 0)
+    if r.root < 0 then ok = path_error(directory)
+    else
+      r.mask = sys.umask(0); sys.umask(r.mask)
+      ok = read_archive(&r)
+      sys.close(r.root)
+    end
+    if zipped and ok then ok = drain(input) end
+  end
+  if zipped then
+    sys.close(input)
+    local status: cint
+    while sys.waitpid(pid, &status, 0) < 0 do
+      if sys.errno() ~= sys.EINTR then ok = path_error('waitpid'); break end
+    end
+    if status ~= 0 and ok then ok = fail('gzip stream failed') end
+  end
+  if archive ~= '-' and sys.close(fd) ~= 0 then ok = path_error(archive) end
+  return ok and 0 or 1
+end

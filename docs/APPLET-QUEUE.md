@@ -14,10 +14,10 @@ entry points.
 
 ### Installer path
 
-- [ ] `gzip` — create and validate gzip streams, including stdin/stdout.
-- [ ] `gunzip` — extract files and streams with gzip trailer validation.
-- [ ] `zcat` — decode gzip inputs to stdout and handle concatenated members.
-- [ ] `tar` — list, create and extract tar, including gzip-compressed archives.
+- [x] `gzip` — create and validate gzip streams, including stdin/stdout.
+- [x] `gunzip` — extract files and streams with gzip trailer validation.
+- [x] `zcat` — decode gzip inputs to stdout and handle concatenated members.
+- [x] `tar` — list, create and extract tar, including gzip-compressed archives.
 
 ### Other formats
 
