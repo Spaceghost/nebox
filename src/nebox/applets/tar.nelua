@@ -488,12 +488,16 @@ global function applet_tar(args: sequence(string)): integer
   else
     local r: Reader
     r.input = input; r.list = action == 116; r.verbose = verbose
-    r.root = sys.open(directory, sys.O_DIRECTORY | sys.O_RDONLY, 0)
-    if r.root < 0 then ok = path_error(directory)
-    else
-      r.mask = sys.umask(0); sys.umask(r.mask)
+    if r.list then
       ok = read_archive(&r)
-      sys.close(r.root)
+    else
+      r.root = sys.open(directory, sys.O_DIRECTORY | sys.O_RDONLY, 0)
+      if r.root < 0 then ok = path_error(directory)
+      else
+        r.mask = sys.umask(0); sys.umask(r.mask)
+        ok = read_archive(&r)
+        sys.close(r.root)
+      end
     end
     if zipped and ok then ok = drain(input) end
   end

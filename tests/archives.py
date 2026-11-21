@@ -84,6 +84,16 @@ def test_tar():
     assert os.readlink("stage/bin/alias") == "tool"
     listed = run(nebox, "tar", "-tzf", "fixture.tgz").splitlines()
     assert b"bin/tool" in listed and b"bin/alias" in listed
+    if os.geteuid() != 0:
+        archive_data = Path("fixture.tgz").read_bytes()
+        root = Path.cwd()
+        Path("search-only").mkdir(mode=0o111)
+        os.chdir("search-only")
+        try:
+            assert run(nebox, "tar", "-tzf", "-", data=archive_data).splitlines() == listed
+        finally:
+            os.chdir(root)
+            Path("search-only").chmod(0o700)
     for args, mode in (("-cf", "r:"), ("-czf", "r:gz")):
         output = run(links / "tar", args, "-", "bin")
         with tarfile.open(fileobj=io.BytesIO(output), mode=mode) as archive:
