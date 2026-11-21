@@ -19,7 +19,6 @@ local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): c
 local function c_mkdirat(fd: cint, path: cstring, mode: cuint): cint <cimport 'mkdirat', cinclude '<sys/stat.h>'> end
 local function c_fchmodat(fd: cint, path: cstring, mode: cuint, flags: cint): cint <cimport 'fchmodat', cinclude '<sys/stat.h>'> end
 local function c_fchownat(fd: cint, path: cstring, uid: cuint, gid: cuint, flags: cint): cint <cimport 'fchownat', cinclude '<unistd.h>'> end
-local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
 
 local AT_FDCWD: cint <comptime> = -100
 local AT_SYMLINK_NOFOLLOW: cint <comptime> = 0x100
@@ -67,7 +66,7 @@ local function re_protect(dst_name: string, dst_dirfd: cint, dst_reloff: integer
     local rel = name:sub(dst_reloff + 1)
     if x.preserve_timestamps then
       local ts: [2]sys.Timespec = {p.st.st_atim, p.st.st_mtim}
-      if c_utimensat(dst_dirfd, rel, &ts, 0) ~= 0 then
+      if sys.utimensat(dst_dirfd, rel, &ts[0], 0) ~= 0 then
         util.err(errno_msg('failed to preserve times for ' .. util.quoteaf(name), sys.errno()))
         return false
       end

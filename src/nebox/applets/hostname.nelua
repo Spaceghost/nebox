@@ -39,8 +39,6 @@ local function c_recv(fd: cint, b: pointer, n: csize, f: cint): clong <cimport '
 local function c_sethostname(n: cstring, l: csize): cint <cimport 'sethostname', cinclude '<unistd.h>'> end
 local function c_getdomainname(n: cstring, l: csize): cint <cimport 'getdomainname', cinclude '<unistd.h>'> end
 local function c_setdomainname(n: cstring, l: csize): cint <cimport 'setdomainname', cinclude '<unistd.h>'> end
-local PollFd = @record{fd: cint, events: cshort, revents: cshort}
-local function c_poll(p: *PollFd, n: culong, t: cint): cint <cimport 'poll', cinclude '<poll.h>'> end
 
 local AF_INET <comptime> = 2
 local AF_INET6 <comptime> = 10
@@ -897,8 +895,8 @@ local function tcp_ready(fd: cint, events: cshort, deadline: integer): boolean
   while true do
     local left = deadline - monotonic_ms()
     if left <= 0 then res_errno = ETIMEDOUT; return false end
-    local pfd: PollFd = {fd = fd, events = events}
-    local n = c_poll(&pfd, 1, (@cint)(left))
+    local pfd: sys.PollFd = {fd = fd, events = events}
+    local n = sys.poll(&pfd, 1, (@cint)(left))
     if n > 0 then return true end
     if n == 0 then res_errno = ETIMEDOUT; return false end
     if sys.errno() ~= sys.EINTR then res_errno = sys.errno(); return false end
@@ -1017,8 +1015,8 @@ local function res_send(q1: string, q2: string, two: boolean): (boolean, string,
         while not (have1 and have2) do
           local left = deadline - monotonic_ms()
           if left <= 0 then gotsomewhere = true; break end
-          local pfd: PollFd = {fd = fd, events = 1}
-          local pr = c_poll(&pfd, 1, (@cint)(left))
+          local pfd: sys.PollFd = {fd = fd, events = 1}
+          local pr = sys.poll(&pfd, 1, (@cint)(left))
           if pr == 0 then gotsomewhere = true; break end
           if pr < 0 then continue end
           local n = c_recv(fd, &buf[0], #buf, 0)

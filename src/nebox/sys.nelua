@@ -2,6 +2,7 @@
 -- Every function here is provided by libnelibc-standalone; nothing comes from
 -- a host libc. Constants are the Linux x86-64 ABI values.
 ## pragmas.nogc = true
+## cdefine '_DEFAULT_SOURCE'
 
 global sys = @record{}
 
@@ -104,7 +105,8 @@ function sys.chdir(path: cstring): cint <cimport 'chdir', cinclude '<unistd.h>'>
 function sys.getcwd(buf: cstring, n: csize): cstring <cimport 'getcwd', cinclude '<unistd.h>'> end
 function sys.chmod(path: cstring, mode: cuint): cint <cimport 'chmod', cinclude '<sys/stat.h>'> end
 function sys.access(path: cstring, mode: cint): cint <cimport 'access', cinclude '<unistd.h>'> end
-function sys.utimensat(dirfd: cint, path: cstring, times: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
+function sys.futimens(fd: cint, times: *sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
+function sys.utimensat(dirfd: cint, path: cstring, times: *sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
 function sys.opendir(path: cstring): *sys.DIR <cimport 'opendir', cinclude '<dirent.h>'> end
 function sys.readdir(d: *sys.DIR): *sys.Dirent <cimport 'readdir', cinclude '<dirent.h>'> end
 function sys.closedir(d: *sys.DIR): cint <cimport 'closedir', cinclude '<dirent.h>'> end
@@ -152,7 +154,14 @@ function sys.getrandom(buf: pointer, n: csize, flags: cuint): clong <cimport 'ge
 function sys.getgroups(n: cint, list: *[0]cuint): cint <cimport 'getgroups', cinclude '<unistd.h>'> end
 function sys.strtod(s: cstring, endp: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
 function sys.strtold(s: cstring, endp: *cstring): clongdouble <cimport 'strtold', cinclude '<stdlib.h>'> end
-function sys.pipe(fds: *[2]cint): cint <cimport 'pipe', cinclude '<unistd.h>'> end
+global sys.PollFd: type <cimport 'nebox_pollfd', cinclude '<poll.h>', nodecl, ctypedef 'pollfd'> = @record{
+  fd: cint, events: cshort, revents: cshort
+}
+function sys.poll(fds: *sys.PollFd, count: culong, timeout: cint): cint <cimport 'poll', cinclude '<poll.h>'> end
+local function c_pipe(fds: *cint): cint <cimport 'pipe', cinclude '<unistd.h>'> end
+function sys.pipe(fds: *[2]cint): cint
+  return c_pipe(&fds[0])
+end
 function sys.dup2(oldfd: cint, newfd: cint): cint <cimport 'dup2', cinclude '<unistd.h>'> end
 function sys.execve(path: cstring, argv: *[0]cstring, envp: *[0]cstring): cint <cimport 'execve', cinclude '<unistd.h>'> end
 function sys.time(t: *clong): clong <cimport 'time', cinclude '<time.h>'> end
@@ -204,9 +213,10 @@ function sys.cstr(buf: *[0]cchar): string
 end
 
 -- Signals, descriptors and process accounting for the shell applet.
+global sys.SigSet: type <cimport 'sigset_t', cinclude '<signal.h>', nodecl> = @record{__bits: [16]culong}
 global sys.Sigaction: type <cimport 'nebox_sigaction', cinclude '<signal.h>', nodecl, ctypedef 'sigaction'> = @record{
   sa_handler: function(cint): void,
-  sa_mask: [16]culong,
+  sa_mask: sys.SigSet,
   sa_flags: cint,
   sa_restorer: pointer,
 }
@@ -240,11 +250,15 @@ global sys.EISDIR: cint <comptime> = 21
 global sys.ESPIPE: cint <comptime> = 29
 global sys.EPIPE: cint <comptime> = 32
 global sys._SC_CLK_TCK: cint <comptime> = 2
+function sys.sigprocmask(how: cint, set: *sys.SigSet, old: *sys.SigSet): cint <cimport 'sigprocmask', cinclude '<signal.h>'> end
 function sys.sigaction(sig: cint, act: *sys.Sigaction, old: *sys.Sigaction): cint <cimport 'sigaction', cinclude '<signal.h>'> end
 function sys.fcntl(fd: cint, cmd: cint, arg: cint): cint <cimport 'fcntl', cinclude '<fcntl.h>'> end
 function sys.dup(fd: cint): cint <cimport 'dup', cinclude '<unistd.h>'> end
 -- Linux x86-64 rlimit ABI, exposed by nelibc.
-global sys.Rlimit = @record{cur: culong, max: culong}
+global sys.Rlimit: type <cimport 'nebox_rlimit', cinclude '<sys/resource.h>', nodecl, ctypedef 'rlimit'> = @record{
+  rlim_cur: culong,
+  rlim_max: culong,
+}
 global sys.RLIMIT_CORE: cint <comptime> = 4
 global sys.RLIM_INFINITY: culong <comptime> = 0xffffffffffffffff
 function sys.getrlimit(resource: cint, limit: *sys.Rlimit): cint <cimport 'getrlimit', cinclude '<sys/resource.h>'> end

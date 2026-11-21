@@ -12,7 +12,6 @@ require 'nebox.sys'
 require 'nebox.util'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
-local function c_sched_getaffinity(pid: cint, size: csize, mask: *[128]byte): cint <cimport 'sched_getaffinity', cinclude '<sched.h>'> end
 local function c_strtod(s: cstring, endp: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
 local function c_nanosleep(req: *sys.Timespec, rem: *sys.Timespec): cint <cimport 'nanosleep', cinclude '<time.h>'> end
 local environ: *[0]cstring <cimport 'environ', cinclude '<unistd.h>', nodecl>
@@ -55,15 +54,8 @@ local function nprocs_all(): uint64
 end
 
 local function nprocs_current(): uint64
-  local mask: [128]byte
-  if c_sched_getaffinity(0, #mask, &mask) == 0 then
-    local n: uint64 = 0
-    for i = 0, #mask - 1 do
-      local b = mask[i]
-      while b ~= 0 do n = n + (b & 1); b = b >> 1 end
-    end
-    if n > 0 then return n end
-  end
+  local count = util.cpucount()
+  if count > 0 then return (@uint64)(count) end
   return nprocs_all()
 end
 

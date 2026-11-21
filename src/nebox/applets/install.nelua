@@ -19,7 +19,6 @@ local function c_fchownat(fd: cint, path: cstring, uid: cuint, gid: cuint, flags
 local function c_fchmodat(fd: cint, path: cstring, mode: cuint, flags: cint): cint <cimport 'fchmodat', cinclude '<sys/stat.h>'> end
 local function c_fstatat(fd: cint, path: cstring, st: *sys.Stat, flags: cint): cint <cimport 'fstatat', cinclude '<sys/stat.h>'> end
 local function c_unlinkat(fd: cint, path: cstring, flags: cint): cint <cimport 'unlinkat', cinclude '<unistd.h>'> end
-local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
 local function c_openat(fd: cint, path: cstring, flags: cint, mode: cuint): cint <cimport 'openat', cinclude '<fcntl.h>'> end
 local function c_fchown(fd: cint, uid: cuint, gid: cuint): cint <cimport 'fchown', cinclude '<unistd.h>'> end
 local function c_fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
@@ -293,7 +292,7 @@ end
 
 local function change_timestamps(src_sb: *sys.Stat, dest: string, dirfd: cint, relname: string): boolean
   local ts: [2]sys.Timespec = {src_sb.st_atim, src_sb.st_mtim}
-  if c_utimensat(dirfd, relname, &ts, 0) ~= 0 then
+  if sys.utimensat(dirfd, relname, &ts[0], 0) ~= 0 then
     util.err(errno_msg('cannot set timestamps for ' .. util.quoteaf(dest), sys.errno()))
     return false
   end

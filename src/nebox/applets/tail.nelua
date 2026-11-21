@@ -12,8 +12,6 @@ require 'nebox.util'
 
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 local function c_strtod(s: cstring, e: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
-local PollFd = @record{fd: cint, events: int16, revents: int16}
-local function c_poll(fds: *PollFd, n: culong, timeout: cint): cint <cimport 'poll', cinclude '<poll.h>'> end
 local function linux_syscall(n: clong, ...: varargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
 local SYS_INOTIFY_ADD_WATCH: clong <comptime> = 254
 local SYS_INOTIFY_INIT1: clong <comptime> = 294
@@ -60,8 +58,8 @@ local monitor_output: boolean
 -- If stdout is a pipe whose reader has gone, exit as a write would.
 local function check_output_alive()
   if not monitor_output then return end
-  local pfd: PollFd = {fd = 1, events = 0, revents = 0}
-  if c_poll(&pfd, 1, 0) >= 0 and (pfd.revents & (8 | 16)) ~= 0 then
+  local pfd: sys.PollFd = {fd = 1, events = 0, revents = 0}
+  if sys.poll(&pfd, 1, 0) >= 0 and (pfd.revents & (8 | 16)) ~= 0 then
     sys.kill(sys.getpid(), sys.SIGPIPE)
     c_exit(1)
   end
@@ -495,12 +493,12 @@ local function follow_watch(fs: *sequence(Spec)): cint
 end
 
 local function wait_for_follow(watch: cint, interval: float64): boolean
-  local fds: [2]PollFd = {{fd = watch, events = 1}, {fd = monitor_output and 1 or -1}}
+  local fds: [2]sys.PollFd = {{fd = watch, events = 1}, {fd = monitor_output and 1 or -1}}
   local millis = interval * 1000
   if millis > 0x7fffffff then millis = 0x7fffffff end
   local timeout = (@cint)(millis)
   if timeout < millis then timeout = timeout + 1 end
-  if c_poll(&fds[0], 2, timeout) <= 0 then return false end
+  if sys.poll(&fds[0], 2, timeout) <= 0 then return false end
   check_output_alive()
   if (fds[0].revents & 1) == 0 then return false end
   -- The current file/descriptor state is the authority. A batch can also

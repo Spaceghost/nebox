@@ -36,8 +36,6 @@ local function c_fchmodat(fd: cint, path: cstring, mode: cuint, flags: cint): ci
 local function c_fchownat(fd: cint, path: cstring, uid: cuint, gid: cuint, flags: cint): cint <cimport 'fchownat', cinclude '<unistd.h>'> end
 local function c_fchown(fd: cint, uid: cuint, gid: cuint): cint <cimport 'fchown', cinclude '<unistd.h>'> end
 local function c_fchmod(fd: cint, mode: cuint): cint <cimport 'fchmod', cinclude '<sys/stat.h>'> end
-local function c_utimensat(fd: cint, path: cstring, ts: *[2]sys.Timespec, flags: cint): cint <cimport 'utimensat', cinclude '<sys/stat.h>'> end
-local function c_futimens(fd: cint, ts: *[2]sys.Timespec): cint <cimport 'futimens', cinclude '<sys/stat.h>'> end
 local function c_faccessat(fd: cint, path: cstring, mode: cint, flags: cint): cint <cimport 'faccessat', cinclude '<unistd.h>'> end
 local function c_ioctl(fd: cint, req: culong, arg: clong): cint <cimport 'ioctl', cinclude '<sys/ioctl.h>'> end
 local function c_copy_file_range(i: cint, io: pointer, o: cint, oo: pointer, n: csize, flags: cuint): clong <cimport 'copy_file_range', cinclude '<unistd.h>'> end
@@ -865,7 +863,7 @@ local function copy_reg(src_name: string, dst_name: string, dst_dirfd: cint, dst
   end
   if x.preserve_timestamps then
     local ts: [2]sys.Timespec = {src_sb.st_atim, src_sb.st_mtim}
-    if c_futimens(dest_desc, &ts) ~= 0 then
+    if sys.futimens(dest_desc, &ts[0]) ~= 0 then
       err('preserving times for ' .. util.quoteaf(dst_name), sys.errno())
       if x.require_preserve then
         return_val = false
@@ -1585,7 +1583,7 @@ copy_internal = function(src_name: string, dst_name: string, dst_dirfd: cint, ds
   if copied_as_regular then return delayed_ok end
   if x.preserve_timestamps then
     local ts: [2]sys.Timespec = {src_sb.st_atim, src_sb.st_mtim}
-    if c_utimensat(dst_dirfd, dst_relname, &ts, dest_is_symlink and AT_SYMLINK_NOFOLLOW or 0) ~= 0 then
+    if sys.utimensat(dst_dirfd, dst_relname, &ts[0], dest_is_symlink and AT_SYMLINK_NOFOLLOW or 0) ~= 0 then
       err('preserving times for ' .. util.quoteaf(dst_name), sys.errno())
       if x.require_preserve then return false end
     end

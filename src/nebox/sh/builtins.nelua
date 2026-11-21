@@ -1254,7 +1254,7 @@ local function parse_limit(value: string, unit: culong): (culong, boolean)
 end
 
 local function print_limit(entry: *Limit, limit: *sys.Rlimit, hard: boolean, label: boolean)
-  local value = hard and limit.max or limit.cur
+  local value = hard and limit.rlim_max or limit.rlim_cur
   if label then
     util.write(entry.name)
     for i: usize = entry.name.size, < 20 do util.write(' ') end
@@ -1309,8 +1309,8 @@ local function bi_ulimit(args: sequence(string)): integer
   end
   local value, ok = parse_limit(args[i], entry.unit)
   if not ok then return rberr('ulimit: bad number') end
-  if soft then limit.cur = value end
-  if hard then limit.max = value end
+  if soft then limit.rlim_cur = value end
+  if hard then limit.rlim_max = value end
   if sys.setrlimit(entry.resource, &limit) ~= 0 then
     return rberr('ulimit: error setting limit (' .. sys.errstr() .. ')')
   end
