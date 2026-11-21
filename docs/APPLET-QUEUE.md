@@ -2,9 +2,11 @@
 
 The target is the union of the BusyBox and Toybox applet catalogs. The
 [coverage report](APPLET-COVERAGE.md) lists every name, which upstream
-declares it, and whether the standalone Nebox binary registers it. It
-includes optional, platform-specific, pending, demo and shell entries.
-Shell-only names such as `.` will need shell-specific dispatch tests.
+declares it, and how Nebox dispatches it. It includes optional,
+platform-specific, pending, demo and shell entries. Executables are checked
+with `nebox --list`. Toybox shell commands such as `.` are checked inside
+`nebox sh` with external command lookup disabled. BusyBox provides `[[`
+as an executable and Toybox provides it in the shell, so it needs both.
 
 Run `make applet-coverage` for the selected build. Run `make applet-parity`
 to require every upstream name. After adding a native applet, regenerate
