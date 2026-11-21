@@ -748,6 +748,8 @@ same expr-syntax 'expr 1 + 2>/dev/null; echo $?'
 same expr-plus-kw 'expr + match'
 same factor-basic 'factor 1 2 12 97 360 1001'
 same factor-stdin 'echo "100 65537" | factor'
+expect factor-read-error 'factor: error reading input: Is a directory
+exit=1' 'factor < / 2>&1'
 same factor-big 'factor 600851475143'
 same factor-u64-max 'factor 18446744073709551615'
 same factor-u64-semiprime 'factor 18446743979220271189'
