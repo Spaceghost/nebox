@@ -116,6 +116,19 @@ qemu-system-x86_64 -nodefaults -display none -serial stdio -m 512M -no-reboot \
 Use `python3 tests/theseus_boot.py "$KERNEL" --boot-image rootfs.cpio`
 to verify the packaged shell, applet commands, C, Lua and Nelua.
 
+To rebuild necc and nelinker from their source checkouts as part of the same
+graph, pass both checkout paths after `THESEUS`. The seed necc builds nelinker
+with the staged TinyCC, then builds necc using the rebuilt nelinker. The graph
+uses both rebuilt tools to link Nebox and nebuild and installs them in the image.
+
+```sh
+"$NECC" --lua "$NEBOX_SRC/tools/distro_manifest.lua" \
+  "$NECC" "$SDK" "$NEBOX_SRC" "$THESEUS" "$NECC_SRC" "$NELINKER_SRC" > build.ne
+"$NEBUILD" -j 2 build.ne
+./nebuild -j 2 build.ne
+python3 "$NEBOX_SRC/tests/theseus_boot.py" "$KERNEL" --boot-image rootfs.cpio --expect-nelinker
+```
+
 The final build invocation uses the newly built runner. Omit the Theseus argument
 for the ordinary multicall binary. This graph uses the SDK's Nelua frontend,
 TinyCC backend, and standalone Nelibc archive. The compiler and all source

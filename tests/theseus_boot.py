@@ -128,7 +128,8 @@ def write_initramfs(path, nebox, lua=None, necc=None, nebuild=None, nlc=None,
 
 
 def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
-          sdk=False, compiler_source=False, runtime_source=False, serial_log=None, distro=False, timeout_scale=1):
+          sdk=False, compiler_source=False, runtime_source=False, serial_log=None, distro=False, timeout_scale=1,
+          expect_nelinker=False):
     vm = subprocess.Popen(
         ["qemu-system-x86_64", "-nodefaults", "-display", "none",
          "-serial", "stdio", "-m", "512M" if sdk or distro else "256M", "-no-reboot",
@@ -182,6 +183,15 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
                 )
                 vm.stdin.flush()
                 expect(b"THESEUS_DISTRO_OK", 120, b"THESEUS_DISTRO_FAILED")
+            if expect_nelinker:
+                vm.stdin.write(
+                    b"(cd /mnt && test -x /bin/nelinker && "
+                    b"NECC_NELINKER=/bin/nelinker necc check.c -o linked && "
+                    b"{ rc=0; ./linked || rc=$?; test \"$rc\" = 42; }) && "
+                    b"printf 'THESEUS_%s\\n' LINKER_OK || printf 'THESEUS_%s\\n' LINKER_FAILED\n"
+                )
+                vm.stdin.flush()
+                expect(b"THESEUS_LINKER_OK", 120, b"THESEUS_LINKER_FAILED")
             if lua:
                 vm.stdin.write(
                     b"/bin/nelua-lua -e 'assert(require(\"lfs\").attributes(\"/mnt\", \"mode\") == \"directory\"); "
@@ -190,7 +200,7 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
                 )
                 vm.stdin.flush()
                 expect(b"THESEUS_LUA_OK", 15)
-            if necc:
+            if necc and not sdk:
                 vm.stdin.write(
                     b"/bin/necc /answer.c -o /mnt/answer.s && "
                     b"/bin/nebox grep -q 'imull %ecx, %eax' /mnt/answer.s && "
@@ -280,9 +290,11 @@ def smoke(kernel, initramfs, lua=False, necc=False, nebuild=False, nlc=False,
     print("Theseus boot, tmpfs mount, child execution, orphan reaping, and shell respawn passed")
     if distro:
         print("The packaged distro booted with applet links, root account lookup, Lua, a native C build and a full Nelua executable")
+    if expect_nelinker:
+        print("The packaged necc used nelinker to link and run a C program in the guest")
     if lua:
         print("Lua arithmetic, filesystem access, and Nebox shell execution passed")
-    if necc:
+    if necc and not sdk:
         print("necc compiled C to x86-64 assembly inside the guest")
     if nebuild:
         print("nebuild built a target and skipped a no-op rebuild inside the guest")
@@ -301,6 +313,7 @@ if __name__ == "__main__":
     parser.add_argument("kernel", type=Path)
     parser.add_argument("nebox", type=Path, nargs="?")
     parser.add_argument("--boot-image", type=Path, help="boot and test a development initramfs from tools/distro_image.lua")
+    parser.add_argument("--expect-nelinker", action="store_true", help="link and run a program with nelinker in the boot image")
     parser.add_argument("--lua", type=Path, help="standalone Nelua Lua interpreter")
     parser.add_argument("--necc", type=Path, help="standalone necc compiler")
     parser.add_argument("--nebuild", type=Path, help="standalone nebuild runner")
@@ -318,8 +331,11 @@ if __name__ == "__main__":
     if args.boot_image:
         if any((args.nebox, args.lua, args.necc, args.nebuild, args.nlc, args.sdk, args.necc_source, args.runtime_source, args.initramfs_out)):
             parser.error("--boot-image accepts a kernel and an optional --serial-log")
-        smoke(args.kernel, args.boot_image, serial_log=args.serial_log, distro=True, timeout_scale=args.timeout_scale)
+        smoke(args.kernel, args.boot_image, serial_log=args.serial_log, distro=True,
+              timeout_scale=args.timeout_scale, expect_nelinker=args.expect_nelinker)
         parser.exit()
+    if args.expect_nelinker:
+        parser.error("--expect-nelinker requires --boot-image")
     if not args.nebox:
         parser.error("supply a Nebox executable or --boot-image")
     if args.sdk and not (args.necc and args.nebuild):

@@ -1,6 +1,6 @@
 -- Write the x86-64 Theseus development initramfs using the built SDK and applets.
 local lfs = require 'lfs'
-assert(#arg == 5, 'usage: distro_image.lua NEBOX NEBUILD NECC SDK OUTPUT.cpio')
+assert(#arg == 5 or #arg == 6, 'usage: distro_image.lua NEBOX NEBUILD NECC SDK OUTPUT.cpio [NELINKER]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -20,6 +20,7 @@ end
 
 local nebox, nebuild, necc, sdk, output = table.unpack(arg, 1, 5)
 nebox, nebuild, necc, sdk, output = absolute(nebox), absolute(nebuild), absolute(necc), absolute(sdk), absolute(output)
+local nelinker = arg[6] and absolute(arg[6])
 assert(nebox:match('/nebox$'), 'supply the multicall executable named nebox')
 assert(not (output == sdk or output:sub(1, #sdk + 1) == sdk .. '/'), 'choose an output outside the staged SDK')
 local parent = output:match('^(.*/)') or './'
@@ -33,7 +34,7 @@ while true do
   if current.dev == above.dev and current.ino == above.ino then break end
 end
 local old = lfs.attributes(output)
-for _, input in ipairs({nebox, nebuild, necc, sdk .. '/nelua-lua', sdk .. '/nlc', sdk .. '/tcc/tcc', sdk .. '/libnelibc.a'}) do
+for _, input in ipairs({nebox, nebuild, necc, sdk .. '/nelua-lua', sdk .. '/nlc', sdk .. '/tcc/tcc', sdk .. '/libnelibc.a', nelinker}) do
   local attr = assert(lfs.attributes(input), 'missing input: ' .. input)
   assert(not old or old.dev ~= attr.dev or old.ino ~= attr.ino, 'output aliases input: ' .. input)
 end
@@ -123,6 +124,7 @@ local function build()
   file('bin/nebox', nebox, true)
   file('bin/nebuild', nebuild, true)
   file('bin/necc', necc, true)
+  if nelinker then file('bin/nelinker', nelinker, true) end
   link('init', 'bin/nebox')
   link('sbin', 'bin')
   link('usr/bin', '../bin')
