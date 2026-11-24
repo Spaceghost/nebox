@@ -1,0 +1,49 @@
+-- Run the executable entries selected by Alpine's /etc/periodic convention.
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function valid_name(name: string): boolean
+  for i = 1, #name do
+    local c = name:byte(i)
+    if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+        or (c >= 97 and c <= 122) or c == 45 or c == 95) then return false end
+  end
+  return true
+end
+
+global function applet_runparts(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('Usage: run-parts [-t] DIRECTORY')
+    return 0
+  end
+  local o = util.parse(args, 't')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands ~= 1 then return util.die('expected one directory') end
+  local directory = o.operands[1]
+  local names, ok = util.readnames(directory, false)
+  if not ok then util.perror(directory); return 1 end
+  local failed = false
+  for _, name in ipairs(names) do
+    if not valid_name(name) then continue end
+    local path = util.join(directory, name)
+    local st: sys.Stat
+    if sys.stat(path, &st) < 0 or (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG or
+       sys.access(path, sys.X_OK) < 0 then continue end
+    if o:has('t') then util.line(path); continue end
+    local pid = sys.fork()
+    if pid < 0 then util.perror(path); return 1 end
+    if pid == 0 then
+      local argv: [2]cstring = {path, nilptr}
+      sys.execvp(path, &argv[0])
+      util.perror(path)
+      sys._exit(127)
+    end
+    local status: cint
+    local done = sys.waitpid(pid, &status, 0)
+    while done < 0 and sys.errno() == sys.EINTR do done = sys.waitpid(pid, &status, 0) end
+    if done < 0 or status ~= 0 then failed = true end
+  end
+  return failed and 1 or 0
+end

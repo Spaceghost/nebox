@@ -6,10 +6,10 @@ The standalone Nebox binary reports executable applets through `--list`. Toybox 
 
 | Upstream catalog | Covered | Missing | Total |
 |---|---:|---:|---:|
-| Both projects | 118 | 154 | 272 |
-| BusyBox only | 4 | 163 | 167 |
+| Both projects | 121 | 151 | 272 |
+| BusyBox only | 5 | 162 | 167 |
 | Toybox only | 26 | 59 | 85 |
-| Union | 148 | 376 | 524 |
+| Union | 152 | 372 | 524 |
 
 ## Applet names
 
@@ -80,7 +80,7 @@ A dash in a Nebox column means neither upstream requires that form.
 | `cp` | yes | yes | Registered | — |
 | `cpio` | yes | yes | Missing | — |
 | `crc32` | yes | yes | Missing | — |
-| `crond` | yes | yes | Missing | — |
+| `crond` | yes | yes | Registered | — |
 | `crontab` | yes | yes | Missing | — |
 | `cryptpw` | yes |  | Missing | — |
 | `csplit` |  | yes | Registered | — |
@@ -169,7 +169,7 @@ A dash in a Nebox column means neither upstream requires that form.
 | `getfattr` | yes | yes | Missing | — |
 | `getopt` | yes | yes | Missing | — |
 | `getsebool` | yes |  | Missing | — |
-| `getty` | yes | yes | Missing | — |
+| `getty` | yes | yes | Registered | — |
 | `gitcheckout` |  | yes | Missing | — |
 | `gitclone` |  | yes | Missing | — |
 | `gitfetch` |  | yes | Missing | — |
@@ -377,7 +377,7 @@ A dash in a Nebox column means neither upstream requires that form.
 | `rpm2cpio` | yes |  | Missing | — |
 | `rtcwake` | yes | yes | Missing | — |
 | `run-init` | yes |  | Missing | — |
-| `run-parts` | yes |  | Missing | — |
+| `run-parts` | yes |  | Registered | — |
 | `runcon` | yes | yes | Missing | — |
 | `runlevel` | yes |  | Missing | — |
 | `runsv` | yes |  | Missing | — |
@@ -446,7 +446,7 @@ A dash in a Nebox column means neither upstream requires that form.
 | `switch_root` | yes | yes | Missing | — |
 | `sync` | yes | yes | Registered | — |
 | `sysctl` | yes | yes | Missing | — |
-| `syslogd` | yes | yes | Missing | — |
+| `syslogd` | yes | yes | Registered | — |
 | `tac` | yes | yes | Registered | — |
 | `tail` | yes | yes | Registered | — |
 | `tar` | yes | yes | Registered | — |

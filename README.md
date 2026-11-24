@@ -128,18 +128,39 @@ for the ordinary multicall binary. This graph uses the SDK's Nelua frontend,
 TinyCC backend, and standalone Nelibc archive. The compiler and all source
 and include files are prerequisites of the generated targets.
 
+## OpenRC console, cron, and logging
+
+- The Cascadia OpenRC cron service runs `crond -c /etc/crontabs -f`.
+  Per-account crontabs support five numeric time fields, lists, ranges, steps,
+  and `SHELL`, `PATH`, and `HOME` settings. Jobs run with the named account's
+  credentials. Alpine's periodic jobs use the Nebox `run-parts` applet.
+- The local syslog service runs `syslogd -t -n`. It accepts Unix datagrams,
+  writes `/var/log/messages`, and keeps one rotated file. Remote forwarding,
+  shared-memory `logread`, and `syslog.conf` rules are unsupported.
+- The Theseus console runs `getty 38400 console`. Getty configures the
+  terminal and passes the username to `/bin/login`. Install an authentication
+  provider such as Shadow. The applet handles local terminals and PTYs with
+  one baud rate and prints `/etc/issue` as plain text.
+
+The cron applet uses scheduled minute boundaries. Cron macros, named months
+and weekdays, percent-to-stdin conversion, and mail delivery are unsupported.
+
+Run the root integration checks in a disposable Linux container.
+
+    python3 tests/openrc_services.py build/nebox
+
 ## Applets
 
 The [coverage report](docs/APPLET-COVERAGE.md) compares Nebox with every applet declared by either BusyBox or Toybox. The [applet queue](docs/APPLET-QUEUE.md) prioritizes Cascadia commands.
 
 ```
 [ arch awk b2sum base32 base64 basename basenc cat chgrp chmod chown chroot cksum clear cmp comm
-cp csplit cut date dd df diff dir dircolors dirname dnsdomainname domainname du echo egrep env expand expr
-factor false fgrep find fmt fold free fsync grep groups gunzip gzip hd head hexdump hostid hostname id install
+cp crond csplit cut date dd df diff dir dircolors dirname dnsdomainname domainname du echo egrep env expand expr
+factor false fgrep find fmt fold free fsync getty grep groups gunzip gzip hd head hexdump hostid hostname id install
 join kill link ln logname ls lsmod mcookie md5sum mkdir mkfifo mknod mktemp mount mv nice nisdomainname nl nohup nproc nsh od paste
-patch pathchk pidof pinky printenv printf pwd pwdx readlink realpath rev rm rmdir sed seq setsid sh sha1sum
+patch pathchk pidof pinky printenv printf pwd pwdx readlink realpath rev rm rmdir run-parts sed seq setsid sh sha1sum
 sha224sum sha256sum sha384sum sha512sum shuf sleep sort split stat strings sum
-sync tac tail tar tee test timeout touch tr true truncate tsort tty ttysize umount uname unexpand
+sync syslogd tac tail tar tee test timeout touch tr true truncate tsort tty ttysize umount uname unexpand
 uniq unlink uptime users usleep uuidgen vdir wc which who whoami xargs yes ypdomainname zcat
 ```
 

@@ -1,0 +1,241 @@
+-- Per-account crontabs, as used by Alpine OpenRC and /etc/periodic.
+require 'string'
+require 'sequence'
+require 'stringbuilder'
+require 'nebox.sys'
+require 'nebox.util'
+
+local Passwd: type <cimport 'nebox_passwd', cinclude '<pwd.h>', nodecl, ctypedef 'passwd'> = @record{
+  pw_name: cstring, pw_passwd: cstring, pw_uid: cuint, pw_gid: cuint,
+  pw_gecos: cstring, pw_dir: cstring, pw_shell: cstring,
+}
+local function getpwnam(user: cstring): *Passwd <cimport, cinclude '<pwd.h>'> end
+local function initgroups(user: cstring, gid: cuint): cint <cimport, cinclude '<grp.h>'> end
+local function setgid(gid: cuint): cint <cimport, cinclude '<unistd.h>'> end
+local function setuid(uid: cuint): cint <cimport, cinclude '<unistd.h>'> end
+local function openat(dir: cint, path: cstring, flags: cint, mode: cuint): cint <cimport, cinclude '<fcntl.h>'> end
+local function fdopendir(fd: cint): *sys.DIR <cimport, cinclude '<dirent.h>'> end
+local function dirfd(dir: *sys.DIR): cint <cimport, cinclude '<dirent.h>'> end
+local function daemon(nochdir: cint, noclose: cint): cint <cimport, cinclude '<unistd.h>'> end
+local function clearenv(): cint <cimport, cinclude '<stdlib.h>'> end
+
+local function read_number(s: string, pos: integer): (integer, integer)
+  local value = 0
+  local start = pos
+  while pos <= #s do
+    local c = s:byte(pos)
+    if c < 48 or c > 57 then break end
+    value = value * 10 + c - 48
+    if value > 1000000 then return -1, pos end
+    pos = pos + 1
+  end
+  return pos == start and -1 or value, pos
+end
+
+local function match_field(field: string, value: integer, minimum: integer, maximum: integer): (boolean, boolean)
+  local match = false
+  local pos = 1
+  while pos <= #field do
+    local first, last = minimum, maximum
+    if field:byte(pos) == 42 then
+      pos = pos + 1
+    else
+      first, pos = read_number(field, pos)
+      last = first
+      if pos <= #field and field:byte(pos) == 45 then last, pos = read_number(field, pos + 1) end
+    end
+    if first < minimum or last < first or last > maximum then return false, false end
+    local step = 1
+    if pos <= #field and field:byte(pos) == 47 then
+      step, pos = read_number(field, pos + 1)
+      if step < 1 then return false, false end
+    end
+    if value >= first and value <= last and (value - first) % step == 0 then match = true end
+    if maximum == 7 and value == 0 and last == 7 and (7 - first) % step == 0 then match = true end
+    if pos > #field then return match, true end
+    if field:byte(pos) ~= 44 or pos == #field then return false, false end
+    pos = pos + 1
+  end
+  return false, false
+end
+
+local function whitespace(c: byte): boolean
+  return c == 32 or c == 9
+end
+
+local function skip_spaces(line: string, pos: integer): integer
+  while pos <= #line and whitespace(line:byte(pos)) do pos = pos + 1 end
+  return pos
+end
+
+local function run_job(user: *Passwd, shell: cstring, path: cstring, home: cstring, command: string)
+  local pid = sys.fork()
+  if pid < 0 then util.perror('fork'); return end
+  if pid > 0 then return end
+  if initgroups(user.pw_name, user.pw_gid) < 0 or setgid(user.pw_gid) < 0 or setuid(user.pw_uid) < 0 then
+    util.perror('switch cron credentials')
+    sys._exit(126)
+  end
+  if sys.chdir(home) < 0 and sys.chdir('/') < 0 then sys._exit(126) end
+  if clearenv() < 0 or sys.setenv('PATH', path, 1) < 0 or sys.setenv('HOME', home, 1) < 0
+     or sys.setenv('SHELL', shell, 1) < 0 or sys.setenv('LOGNAME', user.pw_name, 1) < 0
+     or sys.setenv('USER', user.pw_name, 1) < 0 then sys._exit(126) end
+  local input = sys.open('/dev/null', sys.O_RDONLY, 0)
+  if input < 0 or sys.dup2(input, 0) < 0 then sys._exit(126) end
+  if input ~= 0 then sys.close(input) end
+  local argv: [4]cstring = {shell, '-c', command, nilptr}
+  sys.execvp(shell, &argv[0])
+  util.perror((@string)(shell))
+  sys._exit(127)
+end
+
+local function run_table(table: string, user: *Passwd, tm: *sys.Tm)
+  local shell: string = '/bin/sh'
+  local path: string = '/usr/sbin:/usr/bin:/sbin:/bin'
+  local home: string = (@string)(user.pw_dir)
+  local value: [5]integer = {tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon + 1, tm.tm_wday}
+  local minimum: [5]integer = {0, 0, 1, 1, 0}
+  local maximum: [5]integer = {59, 23, 31, 12, 7}
+  local pos = 1
+  while pos <= #table do
+    local ending = pos
+    while ending <= #table and table:byte(ending) ~= 10 do ending = ending + 1 end
+    local line = table:sub(pos, ending - 1)
+    pos = ending + 1
+    local start = skip_spaces(line, 1)
+    if start > #line or line:byte(start) == 35 then continue end
+    local assignment = start
+    while assignment <= #line do
+      local c = line:byte(assignment)
+      if not ((c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95) then break end
+      assignment = assignment + 1
+    end
+    local eq = skip_spaces(line, assignment)
+    if assignment > start and eq <= #line and line:byte(eq) == 61 then
+      local name = line:sub(start, assignment - 1)
+      local setting = line:sub(skip_spaces(line, eq + 1))
+      if name == 'SHELL' and #setting > 0 and setting:byte(1) == 47 then shell = setting
+      elseif name == 'HOME' and #setting > 0 and setting:byte(1) == 47 then home = setting
+      elseif name == 'PATH' then path = setting end
+      continue
+    end
+
+    local matches: [5]boolean
+    local valid = true
+    local fixed_day, fixed_weekday = false, false
+    for i = 0, 4 do
+      local e = start
+      while e <= #line and not whitespace(line:byte(e)) do e = e + 1 end
+      if e == start then valid = false; break end
+      local field = line:sub(start, e - 1)
+      matches[i], valid = match_field(field, value[i], minimum[i], maximum[i])
+      if not valid then break end
+      if i == 2 then fixed_day = field:byte(1) ~= 42 end
+      if i == 4 then fixed_weekday = field:byte(1) ~= 42 end
+      start = skip_spaces(line, e)
+    end
+    if not valid or start > #line then continue end
+    local day = matches[2] and matches[4]
+    if fixed_day and fixed_weekday then day = matches[2] or matches[4] end
+    if matches[0] and matches[1] and matches[3] and day then
+      run_job(user, shell, path, home, line:sub(start))
+    end
+  end
+end
+
+local function read_table(fd: cint): (string, boolean)
+  local st: sys.Stat
+  if sys.fstat(fd, &st) < 0 or (st.st_mode & sys.S_IFMT) ~= sys.S_IFREG
+     or st.st_uid ~= 0 or (st.st_mode & 0x12) ~= 0 or st.st_size > 65536 then return '', false end
+  local data: [65537]byte
+  local used = 0
+  while used < #data do
+    local n = sys.read(fd, &data[used], #data - used)
+    if n == 0 then
+      local copy: stringbuilder
+      copy:write((@string){data = &data[0], size = (@usize)(used)})
+      return copy:promote(), true
+    end
+    if n < 0 then
+      if sys.errno() == sys.EINTR then continue end
+      return '', false
+    end
+    used = used + n
+  end
+  return '', false
+end
+
+local function spool(path: string): *sys.DIR
+  local fd = sys.open(path, sys.O_RDONLY | sys.O_DIRECTORY | sys.O_CLOEXEC, 0)
+  if fd < 0 then return nilptr end
+  local st: sys.Stat
+  if sys.fstat(fd, &st) < 0 or st.st_uid ~= 0 or (st.st_mode & 0x12) ~= 0 then
+    sys.close(fd)
+    sys.seterrno(sys.EACCES)
+    return nilptr
+  end
+  local dir = fdopendir(fd)
+  if dir == nilptr then sys.close(fd) end
+  return dir
+end
+
+local function run_minute(directory: string, now: clong)
+  local tm: sys.Tm
+  if sys.localtime_r(&now, &tm) == nilptr then return end
+  local dir = spool(directory)
+  if dir == nilptr then util.perror(directory); return end
+  while true do
+    local entry = sys.readdir(dir)
+    if entry == nilptr then break end
+    local name = sys.cstr(&entry.d_name)
+    if name:byte(1) == 46 then continue end
+    local user = getpwnam(name)
+    if user == nilptr then continue end
+    local fd = openat(dirfd(dir), name, sys.O_RDONLY | sys.O_NOFOLLOW | sys.O_CLOEXEC | 0x800, 0)
+    if fd < 0 then continue end
+    local table, valid = read_table(fd)
+    sys.close(fd)
+    if valid then run_table(table, user, &tm) end
+  end
+  sys.closedir(dir)
+end
+
+global function applet_crond(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('Usage: crond [-fb] [-c DIRECTORY]')
+    return 0
+  end
+  local o = util.parse(args, 'fbc:')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands ~= 0 then return util.die('unexpected operand') end
+  if sys.geteuid() ~= 0 then return util.die('must be root') end
+  local directory = o:has('c') and o:get('c') or '/var/spool/cron/crontabs'
+  local dir = spool(directory)
+  if dir == nilptr then util.perror(directory); return 1 end
+  sys.closedir(dir)
+  local foreground = false
+  for _, flag in ipairs(o.order) do
+    if flag == 'f'_b or flag == 'b'_b then foreground = flag == 'f'_b end
+  end
+  if not foreground and daemon(1, 0) < 0 then util.perror('daemon'); return 1 end
+  local last = sys.time(nilptr) // 60
+  while true do
+    while sys.waitpid(-1, nilptr, sys.WNOHANG) > 0 do end
+    local now = sys.time(nilptr)
+    local minute = now // 60
+    if minute ~= last then
+      -- Parse in a short-lived process so schedules are reloaded and their
+      -- allocations are released after each pass.
+      local child = sys.fork()
+      if child == 0 then
+        run_minute(directory, now)
+        while sys.waitpid(-1, nilptr, 0) > 0 or sys.errno() == sys.EINTR do end
+        sys._exit(0)
+      end
+      if child < 0 then util.perror('fork') end
+      last = minute
+    end
+    local delay: sys.Timespec = {tv_sec = 1}
+    sys.nanosleep(&delay, nilptr)
+  end
+end

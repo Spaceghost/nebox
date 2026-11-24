@@ -107,7 +107,7 @@ Exercise the log sender and receiver on a private Unix socket.
 ### Logs
 
 - [ ] `logger` — send messages with facility, priority, and tag.
-- [ ] `syslogd` — receive local messages and write them with safe socket permissions.
+- [x] `syslogd` — receive local messages and write them with safe socket permissions.
 
 ## 5. Boot and devices
 
@@ -123,7 +123,7 @@ operations. Verify error paths in addition to successful boot and shutdown.
 
 ### Console and lifecycle
 
-- [ ] `getty` — configure a TTY and hand off to login.
+- [x] `getty` — configure a TTY and hand off to login.
 - [ ] `switch_root` — switch mounts and execute init from the new root as PID 1.
 - [ ] `reboot` — request a reboot through init and qualify the direct mode in QEMU.
 - [ ] `poweroff` — request shutdown through init and verify the guest powers off.

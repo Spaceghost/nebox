@@ -1,0 +1,163 @@
+-- Local Unix datagram syslog for OpenRC.
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local Sockaddr = @record{family: uint16, path: [108]cchar}
+local function socket(domain: cint, kind: cint, protocol: cint): cint <cimport, cinclude '<sys/socket.h>'> end
+local function bind(fd: cint, addr: pointer, len: cuint): cint <cimport, cinclude '<sys/socket.h>'> end
+local function recv(fd: cint, buf: pointer, len: csize, flags: cint): clong <cimport, cinclude '<sys/socket.h>'> end
+local function daemon(nochdir: cint, noclose: cint): cint <cimport, cinclude '<unistd.h>'> end
+local function strftime(buf: cstring, size: csize, format: cstring, tm: *sys.Tm): csize <cimport, cinclude '<time.h>'> end
+
+local stopped = false
+local function stop(sig: cint)
+  stopped = true
+end
+
+local function log_socket(path: string): cint
+  local addr: Sockaddr = {family = 1} -- AF_UNIX
+  local fd = socket(1, 2 | sys.O_CLOEXEC, 0) -- AF_UNIX, SOCK_DGRAM
+  if fd < 0 then return -1 end
+  for i = 0, < #path do addr.path[i] = (@cchar)(path.data[i]) end
+  local mask = sys.umask(0x49) -- world-writable socket, no execute bits
+  local result = bind(fd, &addr, (@cuint)(3 + #path))
+  local err = sys.errno()
+  sys.umask(mask)
+  if result == 0 then return fd end
+  sys.close(fd)
+  sys.seterrno(err)
+  return -1
+end
+
+local function log_file(path: string): cint
+  if path == '-' then return 1 end
+  local fd = sys.open(path, sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND |
+    sys.O_NOFOLLOW | sys.O_CLOEXEC | 0x800, 0x1a0) -- O_NONBLOCK, mode 0640
+  if fd < 0 then return -1 end
+  local st: sys.Stat
+  if sys.fstat(fd, &st) == 0 and (st.st_mode & sys.S_IFMT) == sys.S_IFREG then return fd end
+  sys.close(fd)
+  sys.seterrno(22) -- EINVAL
+  return -1
+end
+
+local function rotate_file(fd: cint, path: string, limit: integer): cint
+  local st: sys.Stat
+  if fd == 1 or limit == 0 or sys.fstat(fd, &st) < 0 or st.st_size < limit then return fd end
+  sys.close(fd)
+  local backup = path .. '.0'
+  local moved = sys.rename(path, backup)
+  backup:destroy()
+  if moved < 0 then return -1 end
+  return log_file(path)
+end
+
+local function message_start(buf: *[0]byte, size: integer, strip: boolean): integer
+  local start = 0
+  if size >= 3 and buf[0] == 60 then -- <PRI>
+    local priority = 0
+    local i = 1
+    while i < size and i <= 3 and buf[i] >= 48 and buf[i] <= 57 do
+      priority = priority * 10 + buf[i] - 48
+      i = i + 1
+    end
+    if i > 1 and i < size and buf[i] == 62 and priority < 192 then start = i + 1 end
+  end
+  if strip and size - start >= 16 and buf[start + 3] == 32 and buf[start + 6] == 32
+     and buf[start + 9] == 58 and buf[start + 12] == 58 and buf[start + 15] == 32 then
+    start = start + 16
+  end
+  return start
+end
+
+local function write_message(buf: *[0]byte, size: integer, strip: boolean, hostname: string)
+  while size > 0 and (buf[size - 1] == 0 or buf[size - 1] == 10) do size = size - 1 end
+  if size == 0 then return end
+  local now = sys.time(nilptr)
+  local tm: sys.Tm
+  local stamp: [32]cchar
+  if sys.localtime_r(&now, &tm) ~= nilptr then
+    local len = strftime(&stamp[0], #stamp, '%b %e %T ', &tm)
+    util.writebytes((@*[0]byte)(&stamp[0]), len)
+  end
+  util.write(hostname)
+  util.writebyte(32)
+  for i = message_start(buf, size, strip), < size do
+    local c = buf[i]
+    if c == 10 or c == 13 or c == 9 then util.writebyte(32)
+    elseif c < 32 or c == 127 then
+      util.writebyte(94)
+      util.writebyte(c ~ 64)
+    else util.writebyte(c) end
+  end
+  util.writebyte(10)
+end
+
+global function applet_syslogd(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('Usage: syslogd [-nt] [-O FILE] [-p SOCKET] [-s SIZE_KIB]')
+    return 0
+  end
+  local o = util.parse(args, 'ntO:p:s:')
+  if not o:ok() then return util.optfail(o) end
+  if #o.operands ~= 0 then return util.die('unexpected operand') end
+  local path = o:has('p') and o:get('p') or '/dev/log'
+  local output = o:has('O') and o:get('O') or '/var/log/messages'
+  if path:byte(1) ~= 47 or #path >= 108 then return util.die('expected an absolute socket path shorter than 108 bytes') end
+  local limit: integer = 200 * 1024
+  if o:has('s') then
+    local raw = o:get('s')
+    if #raw == 0 or #raw > 7 then return util.die('expected a log size in KiB from 0 to 1048576') end
+    local size = 0
+    for i = 1, #raw do
+      local c = raw:byte(i)
+      if c < 48 or c > 57 then return util.die('expected a log size in KiB from 0 to 1048576') end
+      size = size * 10 + c - 48
+    end
+    if size > 1048576 then return util.die('expected a log size in KiB from 0 to 1048576') end
+    limit = size * 1024
+  end
+  if not o:has('n') and daemon(1, 0) < 0 then util.perror('daemon'); return 1 end
+  local action: sys.Sigaction = {sa_handler = stop}
+  if sys.sigaction(15, &action, nilptr) < 0 or sys.sigaction(sys.SIGINT, &action, nilptr) < 0 then
+    util.perror('sigaction')
+    return 1
+  end
+  local initial = log_file(output)
+  if initial < 0 then util.perror(output); return 1 end
+  if initial ~= 1 then sys.close(initial) end
+  local fd = log_socket(path)
+  if fd < 0 then util.perror(path); return 1 end
+  local owned: sys.Stat
+  local track_socket = sys.lstat(path, &owned) == 0
+  local host: [256]cchar
+  sys.gethostname(&host[0], #host - 1)
+  local hostname = sys.cstr(&host[0])
+  local result = 0
+  local packet: [8192]byte
+  while not stopped do
+    local ready: sys.PollFd = {fd = fd, events = 1}
+    local status = sys.poll(&ready, 1, 1000)
+    if status == 0 or (status < 0 and sys.errno() == sys.EINTR) then continue end
+    if status < 0 then util.perror(path); result = 1; break end
+    local size = recv(fd, &packet[0], #packet, 0x40) -- MSG_DONTWAIT
+    if size < 0 and (sys.errno() == sys.EINTR or sys.errno() == 11) then continue end
+    if size < 0 then util.perror(path); result = 1; break end
+    local out = log_file(output)
+    if out >= 0 then out = rotate_file(out, output, limit) end
+    if out < 0 then util.perror(output); result = 1; break end
+    util.setout(out)
+    write_message(&packet[0], size, o:has('t'), hostname)
+    if not util.flush() then util.perror(output); result = 1 end
+    util.setout(1)
+    if out ~= 1 then sys.close(out) end
+    if result ~= 0 then break end
+  end
+  sys.close(fd)
+  local current: sys.Stat
+  if track_socket and sys.lstat(path, &current) == 0 and owned.st_ino == current.st_ino
+     and owned.st_dev == current.st_dev then sys.unlink(path) end
+  return result
+end

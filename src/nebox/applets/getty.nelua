@@ -1,0 +1,111 @@
+-- Configure a local console and hand the terminal to the system login program.
+require 'string'
+require 'sequence'
+require 'nebox.sys'
+require 'nebox.util'
+
+local function cfsetispeed(t: *sys.Termios, speed: cuint): cint <cimport, cinclude '<termios.h>'> end
+local function cfsetospeed(t: *sys.Termios, speed: cuint): cint <cimport, cinclude '<termios.h>'> end
+
+local function baud_rate(s: string): integer
+  local rates: [16]string = {'0','50','75','110','134','150','200','300',
+    '600','1200','1800','2400','4800','9600','19200','38400'}
+  for i = 0, < #rates do
+    if s == rates[i] then return i end
+  end
+  if s == '57600' then return 0x1001 end
+  if s == '115200' then return 0x1002 end
+  if s == '230400' then return 0x1003 end
+  return -1
+end
+
+local function configure_console(speed: cuint)
+  local tty: sys.Termios
+  if sys.tcgetattr(0, &tty) < 0 then return false end
+  tty.c_iflag = 0x100 | 0x400 -- ICRNL | IXON
+  tty.c_oflag = 0x1 | 0x4 -- OPOST | ONLCR
+  tty.c_lflag = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x8000 -- canonical mode and echo
+  tty.c_cflag = (tty.c_cflag & ~(0x30 | 0x40 | 0x100 | 0x200)) | 0x30 | 0x80
+  if speed ~= 0 then
+    if cfsetispeed(&tty, speed) < 0 or cfsetospeed(&tty, speed) < 0 then return false end
+  end
+  return sys.tcsetattr(0, sys.TCSADRAIN, &tty) == 0
+end
+
+local function login_name(line: *[256]byte): boolean
+  while true do
+    util.write('login: ')
+    util.flush()
+    local length = sys.read(0, &line[0], 256)
+    if length <= 0 then return false end
+    if line[length - 1] ~= 10 then return false end
+    if length == 1 then continue end
+    local valid = line[0] ~= 45
+    for i = 0, < length - 1 do
+      local c = line[i]
+      if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+          or (c >= 97 and c <= 122) or c == 45 or c == 95 or c == 46 or c == 36) then
+        valid = false
+        break
+      end
+    end
+    if valid then
+      line[length - 1] = 0
+      return true
+    end
+    util.line('Invalid login name')
+  end
+end
+
+global function applet_getty(args: sequence(string)): integer
+  if #args == 1 and args[1] == '--help' then
+    util.line('Usage: getty [-i] [-l LOGIN] BAUD_RATE TTY [TERM]')
+    return 0
+  end
+  local o = util.parse(args, 'il:')
+  if not o:ok() then return util.optfail(o) end
+  local a = o.operands
+  if #a < 2 or #a > 3 then return util.die('expected BAUD_RATE TTY [TERM]') end
+  if sys.geteuid() ~= 0 then return util.die('must be root') end
+  local speed = baud_rate(a[1])
+  if speed < 0 then return util.die('unsupported baud rate') end
+  local program = o:has('l') and o:get('l') or '/bin/login'
+  if program:byte(1) ~= 47 then return util.die('login program must be an absolute path') end
+  if sys.access(program, sys.X_OK) < 0 then util.perror(program); return 1 end
+  local device = a[2]
+  if device ~= '-' then
+    if device:byte(1) ~= 47 then device = '/dev/' .. device end
+    if sys.getpid() ~= sys.getpgrp() and sys.setsid() < 0 then
+      util.perror('setsid')
+      return 1
+    end
+    local fd = sys.open(device, sys.O_RDWR | sys.O_CLOEXEC | 0x100, 0) -- O_NOCTTY
+    if fd < 0 then util.perror(device); return 1 end
+    if sys.isatty(fd) == 0 then return util.die('device is not a terminal') end
+    if sys.ioctl(fd, 0x540e, nilptr) < 0 then util.perror('TIOCSCTTY'); return 1 end
+    for i = 0, 2 do
+      if fd == i then
+        if sys.fcntl(fd, sys.F_SETFD, 0) < 0 then util.perror(device); return 1 end
+      elseif sys.dup2(fd, i) < 0 then
+        util.perror(device)
+        return 1
+      end
+    end
+    if fd > 2 then sys.close(fd) end
+  end
+  if not configure_console((@cuint)(speed)) then util.perror('terminal'); return 1 end
+  if sys.setenv('TERM', #a == 3 and a[3] or 'linux', 1) < 0 then
+    util.perror('TERM')
+    return 1
+  end
+  if not o:has('i') then
+    local issue, ok = util.readfile('/etc/issue')
+    if ok then util.write(issue) end
+  end
+  local username: [256]byte
+  if not login_name(&username) then return 1 end
+  local argv: [4]cstring = {program, '--', (@cstring)(&username[0]), nilptr}
+  sys.execvp(program, &argv[0])
+  util.perror(program)
+  return 1
+end

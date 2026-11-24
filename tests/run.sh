@@ -1202,12 +1202,29 @@ if unshare -rm true >/dev/null 2>&1; then
     umount "with space" bulk
   '"'"''
 fi
+expect crond-rejects-unknown 'exit=1' 'crond -x'
+expect syslogd-rejects-relative-socket 'exit=1' 'syslogd -np relative'
+expect getty-requires-terminal 'exit=1' 'getty'
+expect run-parts-selection 'jobs/early
+jobs/later
+early
+later
+exit=0' '
+  mkdir jobs
+  printf "#!/bin/sh\\necho early\\n" > jobs/early
+  printf "#!/bin/sh\\necho later\\n" > jobs/later
+  cp jobs/later jobs/skip.bak
+  touch jobs/nonexecuting
+  chmod +x jobs/early jobs/later jobs/skip.bak
+  run-parts -t jobs
+  run-parts jobs
+'
 if [ -L "$W/bin/init" ]; then
-  expect list-count-theseus '139
+  expect list-count-theseus '143
 exit=0' "$BIN --list | wc -l"
   expect init-requires-pid1 'exit=2' 'init'
 else
-  expect list-count '138
+  expect list-count '142
 exit=0' "$BIN --list | wc -l"
 fi
 
