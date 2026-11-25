@@ -24,7 +24,7 @@ local O_NONBLOCK: cint <comptime> = 2048
 local EINVAL: cint <comptime> = 22
 
 local mount_options: []util.LongOpt = {
-  {'all', 0, 'a'_b}, {'fstab', 1, 'T'_b}, {'types', 1, 't'_b}, {'options', 1, 'o'_b},
+  {'all', 0, 'a'_b}, {'fstab', 1, 'T'_b}, {'types', 1, 't'_b}, {'options', 1, 'o'_b}, {'test-opts', 1, 'O'_b},
   {'read-only', 0, 'r'_b}, {'ro', 0, 'r'_b}, {'read-write', 0, 'w'_b}, {'rw', 0, 'w'_b},
   {'bind', 0, 'B'_b}, {'rbind', 0, 'R'_b}, {'move', 0, 'M'_b},
   {'internal-only', 0, 'i'_b}, {'no-mtab', 0, 'n'_b}, {'verbose', 0, 'v'_b},
@@ -224,8 +224,28 @@ local function print_mounts(filter: string): integer
   return 0
 end
 
+-- Mount -a requires all the listed predicates to match the fstab entry.
+local function options_allowed(options: string, filters: string): boolean
+  local opts = ',' .. options .. ','
+  local start = 1
+  while start <= #filters do
+    local stop = filters:find(',', start, true)
+    if stop == 0 then stop = #filters + 1 end
+    local filter = filters:subview(start, stop - 1)
+    local absent = filter:subview(1, 2) == 'no'
+    local option = absent and filter:subview(3) or filter
+    if #option > 0 then
+      local found = opts:find(',' .. option .. ',', 1, true) ~= 0
+      if found == absent then return false end
+    end
+    start = stop + 1
+  end
+  return true
+end
+
 local function mount_one(item: Fstab, o: *util.Opts, all: boolean): integer
-  if all and (item.kind == 'swap' or not type_allowed(item.kind, o:get('t'))) then return 0 end
+  if all and (item.kind == 'swap' or not type_allowed(item.kind, o:get('t')) or
+              not options_allowed(item.opts, o:get('O'))) then return 0 end
   local cfg: Config
   if not apply_options(&cfg, item.opts) then return 1 end
   if all and cfg.skip then return 0 end
@@ -312,11 +332,11 @@ local function mount_one(item: Fstab, o: *util.Opts, all: boolean): integer
 end
 
 global function applet_mount(args: sequence(string)): integer
-  local o = util.parsel(args, 'aT:t:o:rwBRMinv', &mount_options[0], #mount_options)
+  local o = util.parsel(args, 'aT:t:o:O:rwBRMinv', &mount_options[0], #mount_options)
   if not o:ok() then util.optfail(o); return 2 end
   if o:has(string.char(128)) then
     util.line('Usage: mount [-r|-w] [-t TYPE] [-o OPTIONS] [-T FSTAB] [SOURCE] [TARGET]')
-    util.line('       mount -a [-T FSTAB] [-t TYPES]')
+    util.line('       mount -a [-T FSTAB] [-t TYPES] [-O OPTS]')
     return 0
   end
   if o:has(string.char(129)) then util.line('mount (nebox)'); return 0 end

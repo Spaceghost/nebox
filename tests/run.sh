@@ -1175,6 +1175,13 @@ same seq-f-hexfloat 'seq -f %a 1 1; seq -f %A 2 2; seq -f "%%%#018.3La%%" -0.75 
 # dispatch
 expect mount-rejects-unknown-option 'exit=2' 'mount -t tmpfs -x /mnt'
 expect mount-list 'exit=0' 'mount -t proc | grep -q " on /proc type proc "'
+expect mount-fstab-filter 'exit=0' '
+  set -e
+  printf "%s\\n" "bogus /missing bogus defaults,_netdev 0 0" > table
+  mount -a -T table -O no_netdev
+  mount -a -T table --test-opts nodev
+  mount -a -T table -O _netdev -t tmpfs
+'
 if unshare -rm true >/dev/null 2>&1; then
   expect mount-options-private 'exit=0' 'unshare -rm sh -c '"'"'
     set -e
