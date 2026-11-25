@@ -1179,7 +1179,7 @@ expect mount-fstab-filter 'exit=0' '
   set -e
   printf "%s\\n" "bogus /missing bogus defaults,_netdev 0 0" > table
   mount -a -T table -O no_netdev
-  mount -a -T table --test-opts nodev
+  mount -a -T table --test-opts rw
   mount -a -T table -O _netdev -t tmpfs
 '
 if unshare -rm true >/dev/null 2>&1; then
