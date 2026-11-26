@@ -13,8 +13,8 @@ require 'nebox.util'
 local function c_exit(status: cint) <cimport 'exit', cinclude '<stdlib.h>', noreturn> end
 local function c_strtod(s: cstring, e: *cstring): float64 <cimport 'strtod', cinclude '<stdlib.h>'> end
 local function linux_syscall(n: clong, ...: varargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
-local SYS_INOTIFY_ADD_WATCH: clong <comptime> = 254
-local SYS_INOTIFY_INIT1: clong <comptime> = 294
+local SYS_INOTIFY_ADD_WATCH: clong <cimport 'SYS_inotify_add_watch', nodecl, cinclude '<sys/syscall.h>'>
+local SYS_INOTIFY_INIT1: clong <cimport 'SYS_inotify_init1', nodecl, cinclude '<sys/syscall.h>'>
 local IN_MODIFY: cuint <comptime> = 0x002
 local IN_ATTRIB: cuint <comptime> = 0x004
 local IN_MOVED_FROM: cuint <comptime> = 0x040

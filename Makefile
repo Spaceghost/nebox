@@ -1,12 +1,21 @@
 # nebox: Nelua multicall binary linked against libnelibc-standalone.
-# Builds run in a Linux x86-64 container with Nelua and Zig (see AGENTS.md).
-# Override NELUA, ZIG and NELIBC for your layout; NELIBC is a nelibc checkout
-# with build/libnelibc-standalone-zig.a already built.
+# The native AArch64 build uses GCC. Other supported Linux builds use Zig.
 NELUA ?= nelua
 ZIG ?= zig
 ZIGFLAGS ?= -mcpu=x86_64
 NELIBC ?= ../nelibc
+ARCH ?= $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+NEBOX_CC := gcc -mno-outline-atomics
+NELIBC_TARGET := lib-standalone-aarch64-gcc
+NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-aarch64-gcc.a
+NELIBC_LDFLAGS = -Wl,-u,_start,--gc-sections $(NELIBC_LIB) -lgcc
+else
+NEBOX_CC := $(ZIG) cc $(ZIGFLAGS)
+NELIBC_TARGET := lib-standalone-zig
 NELIBC_LIB ?= $(NELIBC)/build/libnelibc-standalone-zig.a
+NELIBC_LDFLAGS = -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive
+endif
 # Nelua's binary cache keys on the generated C and the command line, not on
 # the archive given in --ldflags: the archive's checksum goes into the C
 # flags so that a rebuilt nelibc is linked instead of a cached binary.
@@ -27,7 +36,6 @@ CFLAGS := -DNELIBC_STANDALONE -nostdlib -static -no-pie -fno-pie -fno-stack-prot
   -ffreestanding -fno-builtin -fno-sanitize=all -Wl,-e,_start -Wl,--build-id=none \
   -I$(NELIBC)/include \
   -DNEBOX_NELIBC_STAMP=$(NELIBC_STAMP)
-NELIBC_LDFLAGS := -Wl,--whole-archive $(NELIBC_LIB) -Wl,--no-whole-archive
 LDFLAGS := $(NELIBC_LDFLAGS) -Wl,--strip-all
 
 # Optional 8-bit PCRE2 archive built for the standalone libc environment.
@@ -46,14 +54,14 @@ all: nebox
 nebox: $(OUT)/nebox
 
 $(OUT)/nebox: $(SOURCES) Makefile $(NELIBC_LIB) $(PCRE2_LIB) | $(OUT)
-	$(NELUA) -r -L src $(THESEUS_FLAGS) $(PCRE2_FLAGS) --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS) $(PCRE2_CFLAGS)' --ldflags='$(PCRE2_LDFLAGS) $(LDFLAGS)' -o $@ src/nebox.nelua
+	$(NELUA) -r -L src $(THESEUS_FLAGS) $(PCRE2_FLAGS) --cc '$(NEBOX_CC)' --cflags='$(CFLAGS) $(PCRE2_CFLAGS)' --ldflags='$(PCRE2_LDFLAGS) $(LDFLAGS)' -o $@ src/nebox.nelua
 	@test -z "$$($(NM) -u $@)" || { echo "undefined symbols:"; $(NM) -u $@; exit 1; }
 	@echo "built $@ ($$(stat -c %s $@) bytes, static, no host libc)"
 
 nebuild: $(OUT)/nebuild
 
 $(OUT)/nebuild: tools/nebuild.nelua src/nebuild/sys.nelua Makefile $(NELIBC_LIB) | $(OUT)
-	$(NELUA) -r -L src --cc '$(ZIG) cc $(ZIGFLAGS)' --cflags='$(CFLAGS)' --ldflags='$(NELIBC_LDFLAGS)' -o $@ tools/nebuild.nelua
+	$(NELUA) -r -L src --cc '$(NEBOX_CC)' --cflags='$(CFLAGS)' --ldflags='$(NELIBC_LDFLAGS)' -o $@ tools/nebuild.nelua
 	@undefined=$$($(NM) -u $@) && test -z "$$undefined" || { echo "$$undefined"; exit 1; }
 
 test-nebuild: $(OUT)/nebuild
@@ -63,7 +71,7 @@ $(OUT):
 	mkdir -p $(OUT)
 
 $(NELIBC_LIB):
-	$(MAKE) -C $(NELIBC) lib-standalone-zig NELUA="$(NELUA)" ZIG=$(ZIG)
+	$(MAKE) -C $(NELIBC) $(NELIBC_TARGET) NELUA="$(NELUA)" ZIG=$(ZIG)
 
 .PHONY: applet-coverage applet-parity update-applet-coverage
 

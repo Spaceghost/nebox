@@ -374,7 +374,7 @@ end
 
 -- gnulib find_mount_point, chdir walk included.
 local function find_mount_point(file: string, fst: *FileStat): (boolean, string)
-  local cwd = sys.open('.', sys.O_RDONLY | 0x10000 | 0x200000, 0) -- O_DIRECTORY|O_PATH
+  local cwd = sys.open('.', sys.O_RDONLY | sys.O_DIRECTORY | 0x200000, 0) -- O_DIRECTORY|O_PATH
   if cwd < 0 then util.err(errno_msg('cannot get current directory', sys.errno())); return false, '' end
   local last_dev: uint64
   local last_ino: uint64

@@ -27,7 +27,7 @@ global sys.Stat: type <cimport 'nebuild_stat', cinclude '<sys/stat.h>', nodecl, 
 }
 
 global sys.O_RDONLY: cint <comptime> = 0
-global sys.O_DIRECTORY: cint <comptime> = 0x10000
+global sys.O_DIRECTORY: cint <comptime> = #[ccinfo.is_arm64 and 0x4000 or 0x10000]#
 global sys.S_IFMT: cuint <comptime> = 0xF000
 global sys.S_IFREG: cuint <comptime> = 0x8000
 global sys.CLOCK_MONOTONIC: cint <comptime> = 1

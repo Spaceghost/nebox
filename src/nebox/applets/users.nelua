@@ -245,7 +245,7 @@ global function applet_who(args: sequence(string)): integer
 end
 
 local function c_syscall(n: clong, ...: cvarargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
-local SYS_SYSINFO: clong <comptime> = 99
+local SYS_SYSINFO: clong <cimport 'SYS_sysinfo', nodecl, cinclude '<sys/syscall.h>'>
 
 local function system_uptime(): integer
   local fd = sys.open('/proc/uptime', sys.O_RDONLY | sys.O_CLOEXEC, 0)

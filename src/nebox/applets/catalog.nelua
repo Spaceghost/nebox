@@ -27,7 +27,7 @@ local function c_setgroups(count: csize, list: *[0]cuint): cint <cimport 'setgro
 local function c_setgid(gid: cuint): cint <cimport 'setgid', cinclude '<unistd.h>'> end
 local function c_setuid(uid: cuint): cint <cimport 'setuid', cinclude '<unistd.h>'> end
 local function c_syscall(n: clong, ...: cvarargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
-local SYS_CHROOT: clong <comptime> = 161
+local SYS_CHROOT: clong <cimport 'SYS_chroot', nodecl, cinclude '<sys/syscall.h>'>
 local NO_ID: cuint <comptime> = 0xffffffff
 local SYS_FCHMODAT2: clong <comptime> = 452
 local O_PATH: cint <comptime> = 0x200000

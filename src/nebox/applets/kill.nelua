@@ -24,7 +24,7 @@ require 'nebox.sys'
 require 'nebox.util'
 
 local function c_syscall(n: clong, ...: cvarargs): clong <cimport 'syscall', cinclude '<unistd.h>'> end
-local SYS_rt_sigqueueinfo: clong <comptime> = 129
+local SYS_rt_sigqueueinfo: clong <cimport 'SYS_rt_sigqueueinfo', nodecl, cinclude '<sys/syscall.h>'>
 local SIGRTMIN: integer <comptime> = 34
 local ERANGE: cint <comptime> = 34
 
